@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-03/schema#",
+  "type": "object",
+  "properties": {
+    "gas_url": {
+      "title": "GAS WebアプリケーションURL",
+      "description": "Google Apps Script のデプロイURL (https://script.google.com/macros/s/.../exec)",
+      "type": "string"
+    },
+    "school_name": {
+      "title": "所属学校名 (任意)",
+      "description": "英田小学校、第一小学校など。指定すると端末一覧で初期自動登録されます。",
+      "type": "string"
+    },
+    "student_id": {
+      "title": "固定児童ID (任意)",
+      "description": "通常は空欄にしてください。空欄の場合、Chromebookログイン中の児童Googleアカウント（メールアドレス）が自動使用されます。",
+      "type": "string"
+    }
+  }
+}

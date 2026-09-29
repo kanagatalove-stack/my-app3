@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>端末管理設定</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-800 w-80 p-4 font-sans select-none">
+  <div class="space-y-4">
+    <!-- ヘッダー -->
+    <div class="flex items-center justify-between border-b pb-2">
+      <div class="flex items-center space-x-2">
+        <div class="p-1.5 bg-indigo-600 text-white rounded-lg">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+          </svg>
+        </div>
+        <span class="text-sm font-bold text-slate-800">端末クライアント</span>
+      </div>
+      <span id="connectionBadge" class="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-slate-200 text-slate-600">未接続</span>
+    </div>
+
+    <!-- 端末ステータス表示 -->
+    <div class="bg-white p-3 rounded-xl border border-slate-200 space-y-2 text-xs">
+      <div class="flex justify-between items-center">
+        <span class="text-slate-500">所属学校:</span>
+        <span id="statusSchool" class="font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded text-[11px]">-</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="text-slate-500">児童ID / アカウント:</span>
+        <span id="statusId" class="font-mono text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded text-[10px] truncate max-w-[160px]">-</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="text-slate-500">児童氏名:</span>
+        <span id="statusName" class="font-semibold text-slate-800">-</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="text-slate-500">画面ロック:</span>
+        <span id="statusLock" class="font-bold text-slate-700">解除中</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="text-slate-500">URL規制モード:</span>
+        <span id="statusFilter" class="font-bold text-slate-700">OFF</span>
+      </div>
+      <div class="flex justify-between items-center">
+        <span class="text-slate-500">最終同期:</span>
+        <span id="statusLastSync" class="font-mono text-slate-600">-</span>
+      </div>
+    </div>
+
+    <!-- 設定入力フォーム -->
+    <div class="space-y-3 text-xs">
+      <div>
+        <div class="flex items-center justify-between mb-1">
+          <label class="font-semibold text-slate-700">児童ID（Googleアカウント）</label>
+          <span id="autoDetectedBadge" class="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 py-0.2 rounded font-semibold hidden">Google自動連携</span>
+        </div>
+        <input type="text" id="studentIdInput" placeholder="student@school.ed.jp" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs focus:ring-indigo-500 focus:border-indigo-500">
+      </div>
+
+      <div>
+        <label class="block font-semibold text-slate-700 mb-1">GAS WebアプリURL</label>
+        <input type="url" id="gasUrlInput" placeholder="https://script.google.com/macros/s/.../exec" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-mono focus:ring-indigo-500 focus:border-indigo-500">
+      </div>
+
+      <div class="flex space-x-2 pt-1">
+        <button id="saveBtn" class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 rounded-lg transition text-xs shadow-sm">
+          保存
+        </button>
+        <button id="syncBtn" class="px-3 bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold py-2 rounded-lg transition text-xs">
+          手動同期
+        </button>
+      </div>
+    </div>
+
+    <div id="msgBox" class="text-center text-[11px] hidden font-semibold"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

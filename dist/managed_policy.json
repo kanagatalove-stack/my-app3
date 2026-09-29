@@ -1,0 +1,11 @@
+{
+  "gas_url": {
+    "Value": "https://script.google.com/macros/s/AKfycb.../exec"
+  },
+  "student_id": {
+    "Value": "${USER_EMAIL}"
+  },
+  "school_name": {
+    "Value": ""
+  }
+}

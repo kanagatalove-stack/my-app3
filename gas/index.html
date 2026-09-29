@@ -1,0 +1,1797 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chromebook 児童端末管理システム</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    // GASテンプレートから注入されるWeb App URL (GAS実行時)
+    const EMBEDDED_WEB_APP_URL = "<?= (typeof webAppUrl !== 'undefined') ? webAppUrl : '' ?>";
+  </script>
+  <style>
+    @keyframes pulse-subtle {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .animate-pulse-subtle {
+      animation: pulse-subtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen flex flex-col font-sans">
+
+  <!-- ==================== A. ログイン画面（未認証時） ==================== -->
+  <div id="loginView" class="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-indigo-900 via-slate-900 to-slate-950">
+    <div class="bg-white rounded-3xl shadow-2xl border border-slate-200 p-8 max-w-md w-full space-y-6">
+      
+      <!-- ロゴ / タイトル -->
+      <div class="text-center space-y-2">
+        <div class="w-16 h-16 bg-indigo-600 rounded-2xl mx-auto flex items-center justify-center text-white shadow-lg shadow-indigo-500/30">
+          <svg class="w-9 h-9" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+          </svg>
+        </div>
+        <h1 class="text-2xl font-extrabold text-slate-900 tracking-tight">教員管理コンソール</h1>
+        <p class="text-xs text-slate-500 font-medium">美作市 14小中学校 Chromebook児童端末一括管理</p>
+      </div>
+
+      <!-- ログインフォーム -->
+      <form id="loginForm" onsubmit="handleLoginSubmit(event)" class="space-y-4">
+        <div>
+          <label class="block text-xs font-bold text-slate-700 mb-1.5">教員Googleアカウント（メールアドレス）</label>
+          <div class="relative">
+            <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 12a4 4 0 10-8 0 4 4 0 008 0zm0 0v1.5a2.5 2.5 0 005 0V12a9 9 0 10-9 9m4.5-1.206a8.959 8.959 0 01-4.5 1.207"></path>
+              </svg>
+            </div>
+            <input type="email" id="loginEmail" required placeholder="teacher@school.ed.jp" class="w-full bg-slate-50 border border-slate-300 rounded-xl pl-10 pr-3 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition">
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs font-bold text-slate-700 mb-1.5">管理パスワード</label>
+          <div class="relative">
+            <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
+              </svg>
+            </div>
+            <input type="password" id="loginPassword" required placeholder="••••••••" class="w-full bg-slate-50 border border-slate-300 rounded-xl pl-10 pr-3 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition">
+          </div>
+        </div>
+
+        <div id="loginError" class="hidden p-3 bg-rose-50 border border-rose-200 text-rose-600 text-xs rounded-xl font-medium leading-relaxed"></div>
+
+        <button type="submit" id="loginSubmitBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-bold py-3 rounded-xl shadow-lg shadow-indigo-600/25 transition text-sm flex items-center justify-center space-x-2">
+          <span id="loginBtnText">ログイン</span>
+          <svg id="loginBtnSpinner" class="w-4 h-4 animate-spin hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+          </svg>
+        </button>
+      </form>
+
+      <!-- 接続先ステータス & 設定アコーディオン -->
+      <div class="border-t pt-3">
+        <div class="flex items-center justify-between text-[11px] text-slate-500">
+          <span class="flex items-center space-x-1.5">
+            <span id="envIndicatorDot" class="w-2 h-2 rounded-full bg-emerald-500"></span>
+            <span id="envIndicatorText" class="font-medium">接続環境: 検出中...</span>
+          </span>
+          <button type="button" onclick="toggleApiUrlForm()" class="text-indigo-600 hover:underline font-semibold">
+            API接続先変更
+          </button>
+        </div>
+
+        <!-- 外部起動時のAPI URL入力欄 (必要時のみ展開) -->
+        <div id="apiUrlFormContainer" class="hidden mt-3 bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2 text-xs">
+          <label class="block font-bold text-slate-700">GAS WebアプリURL (exec URL)</label>
+          <input type="text" id="manualApiUrl" placeholder="https://script.google.com/macros/s/.../exec" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-mono">
+          <p class="text-[10px] text-slate-400">※ ブラウザで直接HTMLファイルを開いている場合は、デプロイ時に取得したURLを入力してください。</p>
+          <div class="flex justify-end pt-1">
+            <button type="button" onclick="saveManualApiUrl()" class="bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-lg text-xs font-semibold">
+              URLを保存
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 初期設定ヒント -->
+      <div class="text-[11px] text-slate-500 space-y-1 bg-slate-50 p-3 rounded-xl border border-slate-100">
+        <div class="font-bold text-slate-700">【初期アカウント情報】</div>
+        <div>管理者: <code class="text-indigo-600 font-mono">admin@school.ed.jp</code> / PW: <code class="font-mono">Admin1234!</code></div>
+        <div>教員例: <code class="text-indigo-600 font-mono">teacher.daiichi@school.ed.jp</code> / PW: <code class="font-mono">Teacher1234!</code></div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ==================== B. 教員管理ダッシュボード（認証後） ==================== -->
+  <div id="dashboardView" class="hidden flex-1 flex flex-col min-h-screen">
+    
+    <!-- ヘッダー -->
+    <header class="bg-indigo-700 text-white shadow-md sticky top-0 z-30">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex items-center space-x-3">
+          <div class="p-2 bg-indigo-800 rounded-lg shadow-inner">
+            <svg class="w-6 h-6 text-indigo-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+            </svg>
+          </div>
+          <div>
+            <h1 class="text-lg font-bold tracking-tight flex items-center space-x-2">
+              <span>Chromebook 児童端末管理コンソール</span>
+              <span class="text-[11px] bg-indigo-900/90 text-indigo-200 border border-indigo-500/50 px-2 py-0.5 rounded-full font-normal">Googleアカウント対応</span>
+            </h1>
+            <div class="flex items-center space-x-2 text-xs text-indigo-200 flex-wrap">
+              <span id="currentTeacherName" class="font-semibold text-white">-</span>
+              <span>|</span>
+              <span id="currentTeacherSchool" class="bg-indigo-800 px-2 py-0.5 rounded text-[11px] font-bold text-indigo-100">-</span>
+              <span>|</span>
+              <span id="currentTeacherClassBadge" class="bg-indigo-900/90 border border-indigo-400/40 px-2 py-0.5 rounded text-[11px] font-semibold text-amber-300">対象: 未設定</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ツール・ログアウト -->
+        <div class="flex items-center space-x-2.5 flex-wrap">
+          <!-- 自動更新トグル -->
+          <label class="flex items-center cursor-pointer text-xs bg-indigo-800/90 px-3 py-1.5 rounded-lg border border-indigo-600 hover:bg-indigo-800 transition">
+            <input type="checkbox" id="autoRefreshToggle" checked class="sr-only peer">
+            <div class="w-7 h-4 bg-indigo-950 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-emerald-400 relative mr-2"></div>
+            <span class="font-medium text-indigo-100 text-[11px]">自動更新</span>
+          </label>
+
+          <!-- 更新ボタン -->
+          <button id="refreshBtn" onclick="loadDevices()" class="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-indigo-400">
+            <svg id="refreshSpinner" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+            </svg>
+            <span>再読み込み</span>
+          </button>
+
+          <!-- 教員設定ボタン (対象クラス & URL管理) -->
+          <button onclick="openTeacherSettingsModal()" title="教員アカウント設定（対象クラス・登録URL情報の管理）" class="flex items-center space-x-1.5 bg-indigo-800 hover:bg-indigo-900 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-indigo-500">
+            <svg class="w-4 h-4 text-indigo-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+            </svg>
+            <span>設定 (クラス・URL)</span>
+          </button>
+
+          <!-- ログアウトボタン -->
+          <button onclick="logout()" title="ログアウト" class="flex items-center space-x-1 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
+            </svg>
+            <span>ログアウト</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- メインコンテンツ -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full space-y-5">
+
+      <!-- 統計サマリーカード (4カラムグリッド) -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <!-- カード1: 管理対象端末 -->
+        <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200/80 flex items-center space-x-3.5 hover:shadow-md transition">
+          <div class="p-3 bg-indigo-50 text-indigo-600 rounded-xl">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path>
+            </svg>
+          </div>
+          <div>
+            <div class="text-xs font-medium text-slate-500">管理対象端末</div>
+            <div id="statTotal" class="text-2xl font-bold text-slate-800">0</div>
+          </div>
+        </div>
+
+        <!-- カード2: オンライン接続中 -->
+        <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200/80 flex items-center space-x-3.5 hover:shadow-md transition">
+          <div class="p-3 bg-emerald-50 text-emerald-600 rounded-xl relative">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.636 18.364a9 9 0 010-12.728m12.728 0a9 9 0 010 12.728m-9.9-2.828a5 5 0 010-7.07m7.072 0a5 5 0 010 7.07M13 12a1 1 0 11-2 0 1 1 0 012 0z"></path>
+            </svg>
+            <span class="absolute top-2 right-2 w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+          </div>
+          <div>
+            <div class="text-xs font-medium text-slate-500">接続中 (オンライン)</div>
+            <div id="statOnline" class="text-2xl font-bold text-emerald-600">0</div>
+          </div>
+        </div>
+
+        <!-- カード3: 画面ロック中 -->
+        <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200/80 flex items-center space-x-3.5 hover:shadow-md transition">
+          <div class="p-3 bg-rose-50 text-rose-600 rounded-xl">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
+            </svg>
+          </div>
+          <div>
+            <div class="text-xs font-medium text-slate-500">画面ロック中</div>
+            <div id="statLocked" class="text-2xl font-bold text-rose-600">0</div>
+          </div>
+        </div>
+
+        <!-- カード4: URL規制中 -->
+        <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200/80 flex items-center space-x-3.5 hover:shadow-md transition">
+          <div class="p-3 bg-amber-50 text-amber-600 rounded-xl">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
+            </svg>
+          </div>
+          <div>
+            <div class="text-xs font-medium text-slate-500">URL規制モード中</div>
+            <div id="statFiltered" class="text-2xl font-bold text-amber-600">0</div>
+          </div>
+        </div>
+      </div> <!-- /統計サマリーグリッドの閉じタグを正しく配置 -->
+
+      <!-- マイURLクイック配信バー (教員アカウント毎の登録URLショートカット) -->
+      <div id="quickUrlBar" class="bg-gradient-to-r from-indigo-50/90 via-blue-50/80 to-slate-50 border border-indigo-100 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+        <div class="flex items-center space-x-2 flex-wrap gap-y-1.5">
+          <span class="text-xs font-bold text-indigo-900 flex items-center space-x-1">
+            <svg class="w-4 h-4 text-indigo-600" fill="currentColor" viewBox="0 0 20 20">
+              <path d="M5 4a2 2 0 012-2h6a2 2 0 012 2v14l-5-2.5L5 18V4z"></path>
+            </svg>
+            <span>マイURLショートカット:</span>
+          </span>
+          <div id="quickUrlButtons" class="flex flex-wrap gap-1.5 items-center">
+            <span class="text-[11px] text-slate-400">（設定からよく使う教材URLを登録できます）</span>
+          </div>
+        </div>
+        <button onclick="openTeacherSettingsModal()" class="text-xs text-indigo-700 hover:text-indigo-900 font-bold flex items-center space-x-1 hover:underline">
+          <span>＋ URL登録・編集</span>
+        </button>
+      </div>
+
+      <!-- コントロールバー（検索・フィルター & 一括操作ボタン群） -->
+      <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200/80 space-y-4">
+        
+        <!-- 上段: 絞り込みフィルター＆児童Googleアカウント検索 -->
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+          <div class="flex items-center space-x-2.5 flex-wrap gap-y-2">
+            <!-- 学校選択 (14校 + 未設定) -->
+            <div class="flex items-center space-x-1.5">
+              <label class="text-xs font-bold text-slate-600">学校:</label>
+              <select id="schoolFilter" onchange="onSchoolChange()" class="bg-slate-50 border border-slate-300 text-slate-800 text-xs font-semibold rounded-lg focus:ring-indigo-500 focus:border-indigo-500 p-2">
+                <option value="ALL">全14校を表示</option>
+                <option value="UNASSIGNED">★ 未設定の端末のみ</option>
+              </select>
+            </div>
+
+            <!-- クラス選択 -->
+            <div class="flex items-center space-x-1.5">
+              <label class="text-xs font-bold text-slate-600">クラス:</label>
+              <select id="classFilter" onchange="renderDevices()" class="bg-slate-50 border border-slate-300 text-slate-700 text-xs rounded-lg focus:ring-indigo-500 focus:border-indigo-500 p-2">
+                <option value="ALL">すべてのクラス</option>
+              </select>
+            </div>
+
+            <!-- 未設定端末も含めるチェックボックス -->
+            <label class="flex items-center space-x-1.5 text-xs text-slate-600 cursor-pointer bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-100">
+              <input type="checkbox" id="includeUnassignedCheckbox" checked onchange="onSchoolChange()" class="w-3.5 h-3.5 text-indigo-600 rounded">
+              <span class="text-[11px] font-medium">未設定端末も常に表示</span>
+            </label>
+
+            <!-- 選択数バッジ -->
+            <span id="selectedCountBadge" class="bg-indigo-50 text-indigo-700 border border-indigo-200 font-semibold text-xs px-2.5 py-1 rounded-full">0 台選択中</span>
+          </div>
+
+          <!-- 児童Googleアカウント・氏名のインクリメンタル検索ボックス -->
+          <div class="relative w-full sm:w-72">
+            <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+              <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+              </svg>
+            </div>
+            <input type="text" id="deviceSearchInput" oninput="renderDevices()" placeholder="Googleアカウント・氏名で検索..." class="w-full pl-9 pr-3 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs focus:ring-indigo-500 focus:border-indigo-500">
+          </div>
+        </div>
+
+        <!-- 下段: 一括制御アクションボタン群 -->
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="text-xs text-slate-500 font-medium">
+            チェックを入れた児童端末（未選択時は全表示端末）に一括指示:
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <!-- 一括ロック ON -->
+            <button onclick="executeBulkLock(true)" class="flex items-center space-x-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold px-3.5 py-2 rounded-lg shadow-sm transition">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
+              </svg>
+              <span>画面を一括ロック</span>
+            </button>
+
+            <!-- 一括ロック OFF -->
+            <button onclick="executeBulkLock(false)" class="flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold px-3.5 py-2 rounded-lg shadow-sm transition">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"></path>
+              </svg>
+              <span>ロック解除</span>
+            </button>
+
+            <!-- 一斉URL配信 -->
+            <button onclick="openBroadcastModal()" class="flex items-center space-x-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-3.5 py-2 rounded-lg shadow-sm transition">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path>
+              </svg>
+              <span>一斉URL配信</span>
+            </button>
+
+            <!-- URL規制一括変更 -->
+            <button onclick="openFilterModal()" class="flex items-center space-x-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold px-3.5 py-2 rounded-lg shadow-sm transition">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
+              </svg>
+              <span>URL規制変更</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 児童端末一覧テーブル -->
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden">
+        <div class="overflow-x-auto">
+          <table class="min-w-full divide-y divide-slate-200 text-left text-sm">
+            <thead class="bg-slate-100/90 text-slate-700 text-xs font-bold uppercase tracking-wider">
+              <tr>
+                <th scope="col" class="p-3.5 w-4 text-center">
+                  <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll(this.checked)" class="w-4 h-4 text-indigo-600 bg-white border-slate-300 rounded focus:ring-indigo-500">
+                </th>
+                <th scope="col" class="px-4 py-3.5">児童情報（Googleアカウント・氏名）</th>
+                <th scope="col" class="px-3 py-3.5">接続状態</th>
+                <th scope="col" class="px-3 py-3.5">画面ロック</th>
+                <th scope="col" class="px-3 py-3.5">URL規制</th>
+                <th scope="col" class="px-4 py-3.5">現在閲覧中のURL</th>
+                <th scope="col" class="px-3 py-3.5">最終通信</th>
+                <th scope="col" class="px-4 py-3.5 text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody id="deviceTableBody" class="divide-y divide-slate-100">
+              <tr>
+                <td colspan="8" class="text-center py-12 text-slate-400">
+                  <div class="flex flex-col items-center justify-center space-y-3">
+                    <svg class="w-8 h-8 animate-spin text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                    </svg>
+                    <span class="text-sm font-medium text-slate-600">端末データを読み込み中...</span>
+                    <span class="text-xs text-slate-400">スプレッドシートから児童端末の最新状態を取得しています</span>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- トースト通知コンテナ -->
+  <div id="toastContainer" class="fixed bottom-5 right-5 z-50 space-y-2 pointer-events-none"></div>
+
+  <!-- モーダル: 児童情報編集（Googleアカウントに氏名・クラス・学校を紐付け） -->
+  <div id="editStudentModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-md w-full p-6 space-y-4">
+      <div class="flex items-center justify-between border-b pb-3">
+        <h3 class="text-base font-bold text-slate-800 flex items-center space-x-2">
+          <span class="p-1.5 bg-indigo-100 text-indigo-600 rounded-lg">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+          </span>
+          <span>児童情報の編集・紐付け</span>
+        </h3>
+        <button onclick="closeModal('editStudentModal')" class="text-slate-400 hover:text-slate-600">✕</button>
+      </div>
+      <div class="space-y-3.5 text-xs">
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">児童Googleアカウント (児童ID)</label>
+          <div class="flex items-center space-x-2 bg-slate-100 p-2.5 rounded-lg border border-slate-200">
+            <svg class="w-4 h-4 text-indigo-600 shrink-0" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12.545,10.239v3.821h5.445c-0.712,2.315-2.647,3.972-5.445,3.972c-3.332,0-6.033-2.701-6.033-6.032s2.701-6.032,6.033-6.032c1.498,0,2.866,0.549,3.921,1.453l2.814-2.814C17.503,2.988,15.139,2,12.545,2C7.021,2,2.543,6.477,2.543,12s4.478,10,10.002,10c8.396,0,10.249-7.85,9.426-11.748L12.545,10.239z"/>
+            </svg>
+            <span id="editStudentIdDisplay" class="font-mono font-bold text-slate-800 text-xs break-all"></span>
+          </div>
+          <input type="hidden" id="editStudentId">
+        </div>
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">児童氏名</label>
+          <input type="text" id="editStudentName" placeholder="例: 山田 太郎" class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-indigo-500 focus:border-indigo-500">
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">所属学校</label>
+            <select id="editStudentSchool" class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs font-medium focus:ring-indigo-500 focus:border-indigo-500">
+            </select>
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">クラス</label>
+            <input type="text" id="editStudentClass" placeholder="例: 5年1組" class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs focus:ring-indigo-500 focus:border-indigo-500">
+          </div>
+        </div>
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">備考 / メモ</label>
+          <input type="text" id="editStudentNotes" placeholder="管理用メモなど" class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs focus:ring-indigo-500 focus:border-indigo-500">
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-3 border-t">
+        <button onclick="closeModal('editStudentModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition">キャンセル</button>
+        <button id="saveStudentBtn" onclick="saveStudentEdit()" class="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg shadow-sm transition flex items-center space-x-1.5">
+          <span>保存する</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- モーダル: 一斉URL配信 -->
+  <div id="broadcastModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-lg w-full p-6 space-y-4">
+      <div class="flex items-center justify-between border-b pb-3">
+        <h3 class="text-lg font-bold text-slate-800 flex items-center space-x-2">
+          <span class="p-1.5 bg-blue-100 text-blue-600 rounded-lg">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path>
+            </svg>
+          </span>
+          <span>一斉URL配信</span>
+        </h3>
+        <button onclick="closeModal('broadcastModal')" class="text-slate-400 hover:text-slate-600">✕</button>
+      </div>
+      <div>
+        <p class="text-xs text-slate-600 mb-3">
+          選択された児童端末の画面で、指定したWebページを一斉に開かせます。
+        </p>
+        
+        <!-- 登録マイURL一覧 -->
+        <div id="broadcastMyUrlsSection" class="mb-3 bg-indigo-50/70 border border-indigo-100 p-2.5 rounded-xl">
+          <div class="flex items-center justify-between mb-1.5">
+            <span class="text-xs font-bold text-indigo-900 flex items-center space-x-1">
+              <svg class="w-3.5 h-3.5 text-indigo-600" fill="currentColor" viewBox="0 0 20 20">
+                <path d="M5 4a2 2 0 012-2h6a2 2 0 012 2v14l-5-2.5L5 18V4z"></path>
+              </svg>
+              <span>★ あなたの登録マイURL（クリックで自動入力）:</span>
+            </span>
+            <button type="button" onclick="openTeacherSettingsModal()" class="text-[10px] text-indigo-600 hover:underline">管理</button>
+          </div>
+          <div id="broadcastMyUrlList" class="flex flex-wrap gap-1.5">
+            <!-- 動的描画 -->
+          </div>
+        </div>
+
+        <label class="block text-xs font-semibold text-slate-700 mb-1">配信するURL</label>
+        <input type="url" id="broadcastInputUrl" placeholder="https://scratch.mit.edu" class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-blue-500 focus:border-blue-500 font-mono">
+        
+        <!-- マイURLへ保存チェックボックス -->
+        <div class="mt-2.5 bg-slate-50 border border-slate-200 rounded-lg p-2.5 space-y-1.5">
+          <label class="flex items-center space-x-2 text-xs font-semibold text-slate-700 cursor-pointer">
+            <input type="checkbox" id="saveBroadcastToMyUrls" onchange="toggleBroadcastTitleInput(this.checked)" class="w-4 h-4 rounded text-indigo-600 border-slate-300 focus:ring-indigo-500">
+            <span>このURLをアカウントのマイURLにも保存する</span>
+          </label>
+          <div id="broadcastSaveTitleContainer" class="hidden pl-6">
+            <input type="text" id="broadcastSaveTitle" placeholder="タイトル（例: Scratch 算数学習）" class="w-full bg-white border border-slate-300 rounded p-1.5 text-xs">
+          </div>
+        </div>
+
+        <div class="mt-3">
+          <span class="text-xs text-slate-500 block mb-1">標準プリセット:</span>
+          <div class="flex flex-wrap gap-1.5">
+            <button onclick="setBroadcastUrl('https://scratch.mit.edu')" class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded">Scratch</button>
+            <button onclick="setBroadcastUrl('https://www.nhk.or.jp/school/')" class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded">NHK for School</button>
+            <button onclick="setBroadcastUrl('https://classroom.google.com')" class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded">Classroom</button>
+          </div>
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-3 border-t">
+        <button onclick="closeModal('broadcastModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition">キャンセル</button>
+        <button onclick="executeBroadcastSubmit()" class="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg shadow-sm transition">今すぐ配信する</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- モーダル: URL規制モード設定 -->
+  <div id="filterModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-lg w-full p-6 space-y-4">
+      <div class="flex items-center justify-between border-b pb-3">
+        <h3 class="text-lg font-bold text-slate-800 flex items-center space-x-2">
+          <span class="p-1.5 bg-amber-100 text-amber-600 rounded-lg">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
+            </svg>
+          </span>
+          <span>URL規制モード設定</span>
+        </h3>
+        <button onclick="closeModal('filterModal')" class="text-slate-400 hover:text-slate-600">✕</button>
+      </div>
+      <div class="space-y-4 text-xs">
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">規制モード</label>
+          <select id="modalFilterMode" class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-amber-500 focus:border-amber-500">
+            <option value="OFF">規制なし (OFF)</option>
+            <option value="WHITELIST">ホワイトリスト (許可リストのみ閲覧可)</option>
+            <option value="BLACKLIST">ブラックリスト (規制リストのみ閲覧拒否)</option>
+          </select>
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <label class="font-semibold text-slate-700">許可URLリスト（カンマ区切り）</label>
+            <div class="flex items-center space-x-2">
+              <button type="button" onclick="resetToTeacherFilter('white')" class="text-[11px] text-slate-500 hover:text-slate-800">
+                ↺ マイ個別設定に戻す
+              </button>
+              <button type="button" onclick="appendMyUrlsToWhitelist()" class="text-[11px] text-indigo-600 hover:underline font-bold">
+                ＋ 登録マイURLを追加
+              </button>
+            </div>
+          </div>
+          <textarea id="modalWhitelist" rows="3" placeholder="nhk.or.jp, scratch.mit.edu, google.com" class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-sm font-mono"></textarea>
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <label class="font-semibold text-slate-700">規制URLリスト（カンマ区切り）</label>
+            <button type="button" onclick="resetToTeacherFilter('black')" class="text-[11px] text-slate-500 hover:text-slate-800">
+              ↺ マイ個別設定に戻す
+            </button>
+          </div>
+          <textarea id="modalBlacklist" rows="3" placeholder="youtube.com, twitter.com, tiktok.com, instagram.com" class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-sm font-mono"></textarea>
+        </div>
+
+        <!-- 個別設定保存チェックボックス -->
+        <div class="bg-amber-50 p-2.5 rounded-lg border border-amber-200 flex items-center space-x-2">
+          <input type="checkbox" id="saveAsTeacherPreferenceCheck" checked class="w-4 h-4 text-amber-600 rounded">
+          <label for="saveAsTeacherPreferenceCheck" class="text-xs text-amber-900 font-semibold cursor-pointer select-none">
+            この規制URLを先生の個別設定として保存する（次回以降も自動入力）
+          </label>
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-3 border-t">
+        <button onclick="closeModal('filterModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition">キャンセル</button>
+        <button onclick="executeFilterSubmit()" class="px-4 py-2 text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white rounded-lg shadow-sm transition">適用する</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== C. モーダル: 教員設定（対象クラス・登録URL情報・個別URL規制の管理） ==================== -->
+  <div id="teacherSettingsModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-xl w-full max-h-[90vh] flex flex-col overflow-hidden">
+      <!-- モーダルヘッダー -->
+      <div class="p-5 border-b flex items-center justify-between bg-slate-50">
+        <div class="flex items-center space-x-2.5">
+          <div class="p-2 bg-indigo-100 text-indigo-700 rounded-xl">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+            </svg>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-800">教員アカウント設定（対象クラス・個別URL・規制URL）</h3>
+            <p class="text-xs text-slate-500">先生のアカウント毎に担当クラス、個別URL規制、よく使うURL情報を保持します</p>
+          </div>
+        </div>
+        <button onclick="closeModal('teacherSettingsModal')" class="text-slate-400 hover:text-slate-600 p-1 rounded-lg">✕</button>
+      </div>
+
+      <!-- モーダル本文 -->
+      <div class="p-6 space-y-6 overflow-y-auto flex-1 text-xs">
+        
+        <!-- 1. 対象クラス設定 -->
+        <div class="space-y-3 bg-slate-50 p-4 rounded-xl border border-slate-200">
+          <div class="flex items-center justify-between">
+            <label class="block font-bold text-slate-800 text-sm">
+              🏫 担当・対象クラス
+            </label>
+            <span class="text-[11px] text-slate-400">ログイン時の自動選択に使用</span>
+          </div>
+          <p class="text-slate-500 text-[11px]">
+            担当するクラス（例: <code class="bg-white px-1.5 py-0.5 rounded border text-indigo-600 font-mono">5年1組</code>）を入力します。複数クラス（例: <code class="bg-white px-1.5 py-0.5 rounded border text-indigo-600 font-mono">5年1組, 5年2組</code>）もカンマ区切りで指定可能です。
+          </p>
+          <input type="text" id="settingTargetClass" placeholder="例: 5年1組" class="w-full bg-white border border-slate-300 rounded-lg p-2.5 text-sm font-semibold text-slate-800 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none">
+          
+          <!-- クイック候補タグ -->
+          <div id="classSuggestionArea" class="pt-1">
+            <span class="text-[11px] text-slate-500 block mb-1">現在の端末一覧から検出されたクラス（クリックで追加）:</span>
+            <div id="classSuggestionTags" class="flex flex-wrap gap-1.5">
+              <!-- 動的生成 -->
+            </div>
+          </div>
+        </div>
+
+        <!-- 2. 個別保持用 URL規制設定（ホワイトリスト & ブラックリスト） -->
+        <div class="space-y-3 bg-amber-50/60 p-4 rounded-xl border border-amber-200">
+          <div class="flex items-center justify-between">
+            <h4 class="font-bold text-amber-900 text-sm flex items-center space-x-1.5">
+              <svg class="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
+              <span>🛡️ 教員個別の規制URL設定（個人用デフォルト）</span>
+            </h4>
+            <span class="text-[11px] text-amber-700 bg-amber-100 px-2 py-0.5 rounded font-semibold">アカウント別保持</span>
+          </div>
+          <p class="text-amber-800 text-[11px]">
+            先生のアカウント専用にホワイトリストとブラックリストを保存します。規制適用モーダルを開いた際に自動でセットされます。
+          </p>
+          <div class="space-y-2">
+            <div>
+              <label class="block font-semibold text-slate-700 mb-1">個別ホワイトリスト（許可するURL・カンマ区切り）</label>
+              <textarea id="settingFilterWhitelist" rows="2" placeholder="nhk.or.jp, scratch.mit.edu, google.com" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-mono"></textarea>
+            </div>
+            <div>
+              <label class="block font-semibold text-slate-700 mb-1">個別ブラックリスト（規制するURL・カンマ区切り）</label>
+              <textarea id="settingFilterBlacklist" rows="2" placeholder="youtube.com, twitter.com, tiktok.com, instagram.com" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-mono"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3. 登録URL情報（マイURL） -->
+        <div class="space-y-3">
+          <div class="flex items-center justify-between">
+            <div>
+              <h4 class="font-bold text-slate-800 text-sm">🔗 よく使うURL情報（マイURL）</h4>
+              <p class="text-slate-500 text-[11px]">授業での一斉配信や規制設定でワンクリック利用できるURLリストです</p>
+            </div>
+            <span id="savedUrlCountBadge" class="bg-indigo-100 text-indigo-700 px-2.5 py-0.5 rounded-full text-[11px] font-bold">0件</span>
+          </div>
+
+          <!-- URL新規追加カード -->
+          <div class="bg-indigo-50/60 border border-indigo-100 p-3.5 rounded-xl space-y-2.5">
+            <div class="font-bold text-indigo-900 text-xs flex items-center space-x-1">
+              <svg class="w-3.5 h-3.5 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+              <span>新しいURLを登録</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <input type="text" id="newUrlTitle" placeholder="タイトル（例: NHK 理科）" class="bg-white border border-slate-300 rounded-lg p-2 text-xs focus:ring-indigo-500 focus:border-indigo-500 outline-none">
+              <input type="url" id="newUrlAddress" placeholder="https://..." class="sm:col-span-2 bg-white border border-slate-300 rounded-lg p-2 text-xs font-mono focus:ring-indigo-500 focus:border-indigo-500 outline-none">
+            </div>
+            <div class="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <!-- 推奨プリセット -->
+              <div class="flex items-center space-x-1 flex-wrap gap-y-1">
+                <span class="text-[11px] text-slate-500">おすすめ候補:</span>
+                <button type="button" onclick="presetAddUrl('Scratch', 'https://scratch.mit.edu')" class="text-[10px] bg-white border hover:bg-slate-100 text-slate-700 px-2 py-1 rounded">Scratch</button>
+                <button type="button" onclick="presetAddUrl('NHK for School', 'https://www.nhk.or.jp/school/')" class="text-[10px] bg-white border hover:bg-slate-100 text-slate-700 px-2 py-1 rounded">NHK</button>
+                <button type="button" onclick="presetAddUrl('Google Classroom', 'https://classroom.google.com')" class="text-[10px] bg-white border hover:bg-slate-100 text-slate-700 px-2 py-1 rounded">Classroom</button>
+              </div>
+              <button type="button" onclick="addNewTeacherUrl()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-3 py-1.5 rounded-lg text-xs transition shadow-sm">
+                ＋ リストに追加
+              </button>
+            </div>
+          </div>
+
+          <!-- 登録済みURL一覧 -->
+          <div class="border border-slate-200 rounded-xl overflow-hidden bg-white shadow-xs">
+            <div id="teacherUrlsContainer" class="divide-y divide-slate-100 max-h-56 overflow-y-auto">
+              <!-- 動的生成 -->
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- モーダルフッター -->
+      <div class="p-4 border-t bg-slate-50 flex items-center justify-between">
+        <span id="saveSettingsStatus" class="text-xs text-slate-500 font-medium"></span>
+        <div class="flex space-x-2">
+          <button onclick="closeModal('teacherSettingsModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-200 rounded-xl transition">
+            キャンセル
+          </button>
+          <button id="saveTeacherSettingsBtn" onclick="saveTeacherSettingsSubmit()" class="flex items-center space-x-1.5 px-5 py-2 text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl shadow-md shadow-indigo-600/20 transition">
+            <svg id="saveSettingsSpinner" class="w-3.5 h-3.5 animate-spin hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+            </svg>
+            <span id="saveBtnText">スプレッドシートに保存</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- JavaScript ロジック -->
+  <script>
+    // 14校の固定リスト
+    const SCHOOLS = [
+      '英田小学校', '大原小学校', '江見小学校', '勝田小学校', '勝田東小学校',
+      '第一小学校', '北小学校', '土居小学校', '英田中学校', '大原中学校',
+      '作東中学校', '勝田中学校', '美作中学校', '樸学園'
+    ];
+
+    let currentTeacher = null;
+    let authToken = null;
+    let devicesData = [];
+    let selectedStudentIds = new Set();
+    let autoRefreshTimer = null;
+    let targetSingleStudentId = null;
+    let tempTeacherUrls = [];
+
+    // API エンドポイントURLの解決
+    function getApiUrl() {
+      // 1. ローカルストレージに手動保存されたURL
+      const stored = localStorage.getItem('edu_gas_api_url');
+      if (stored) return stored;
+
+      // 2. GASテンプレートから注入されたURL
+      if (typeof EMBEDDED_WEB_APP_URL === 'string' && EMBEDDED_WEB_APP_URL.startsWith('http')) {
+        return EMBEDDED_WEB_APP_URL;
+      }
+
+      // 3. 現在のURLが script.google.com ならそのURL
+      if (window.location.hostname.includes('script.google.com')) {
+        return window.location.href.split('?')[0];
+      }
+
+      return '';
+    }
+
+    // 環境状態の表示更新
+    function updateEnvironmentIndicator() {
+      const dot = document.getElementById('envIndicatorDot');
+      const text = document.getElementById('envIndicatorText');
+      const manualInput = document.getElementById('manualApiUrl');
+
+      const isGasNative = (typeof google !== 'undefined' && google.script && google.script.run);
+      const url = getApiUrl();
+      if (manualInput) manualInput.value = url;
+
+      if (isGasNative) {
+        dot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse-subtle';
+        text.textContent = '接続環境: GASネイティブ実行 (接続良好)';
+      } else if (url) {
+        dot.className = 'w-2 h-2 rounded-full bg-blue-500';
+        text.textContent = '接続環境: 外部Web経由 (API設定済み)';
+      } else {
+        dot.className = 'w-2 h-2 rounded-full bg-amber-500';
+        text.textContent = '接続環境: 外部Web経由 (API URL未設定)';
+      }
+    }
+
+    function toggleApiUrlForm() {
+      const container = document.getElementById('apiUrlFormContainer');
+      container.classList.toggle('hidden');
+    }
+
+    function saveManualApiUrl() {
+      const input = document.getElementById('manualApiUrl');
+      const val = (input.value || '').trim();
+      if (val) {
+        localStorage.setItem('edu_gas_api_url', val);
+        showToast('API URLを保存しました', 'success');
+      } else {
+        localStorage.removeItem('edu_gas_api_url');
+        showToast('API URL設定を消去しました', 'info');
+      }
+      updateEnvironmentIndicator();
+      document.getElementById('apiUrlFormContainer').classList.add('hidden');
+    }
+
+    window.addEventListener('DOMContentLoaded', async () => {
+      initSchoolOptions();
+      updateEnvironmentIndicator();
+      await checkExistingSession();
+    });
+
+    // 学校セレクトボックスの初期化
+    function initSchoolOptions() {
+      const select = document.getElementById('schoolFilter');
+      if (select) {
+        SCHOOLS.forEach(school => {
+          const opt = document.createElement('option');
+          opt.value = school;
+          opt.textContent = school;
+          select.appendChild(opt);
+        });
+      }
+      const editSelect = document.getElementById('editStudentSchool');
+      if (editSelect) {
+        editSelect.innerHTML = '<option value="未設定">未設定</option>';
+        SCHOOLS.forEach(school => {
+          const opt = document.createElement('option');
+          opt.value = school;
+          opt.textContent = school;
+          editSelect.appendChild(opt);
+        });
+      }
+    }
+
+    // 既存セッションの確認
+    async function checkExistingSession() {
+      const savedToken = localStorage.getItem('edu_teacher_token');
+      const savedTeacher = localStorage.getItem('edu_teacher_info');
+
+      if (savedToken && savedTeacher) {
+        authToken = savedToken;
+        try {
+          currentTeacher = JSON.parse(savedTeacher);
+          showDashboard();
+        } catch(e) {
+          showLoginView();
+        }
+      } else {
+        showLoginView();
+      }
+    }
+
+    function showLoginView() {
+      stopAutoRefresh();
+      document.getElementById('loginView').classList.remove('hidden');
+      document.getElementById('dashboardView').classList.add('hidden');
+      updateEnvironmentIndicator();
+    }
+
+    function showDashboard() {
+      document.getElementById('loginView').classList.add('hidden');
+      document.getElementById('dashboardView').classList.remove('hidden');
+
+      updateHeaderTeacherInfo();
+      renderQuickUrlBar();
+      renderBroadcastModalMyUrls();
+
+      const schoolSelect = document.getElementById('schoolFilter');
+      if (currentTeacher.school && currentTeacher.school !== '全校管理' && SCHOOLS.includes(currentTeacher.school)) {
+        schoolSelect.value = currentTeacher.school;
+      }
+
+      loadDevices();
+      setupAutoRefresh();
+    }
+
+    // ヘッダーの教員情報（氏名・所属校・担当クラス）を反映
+    function updateHeaderTeacherInfo() {
+      if (!currentTeacher) return;
+      document.getElementById('currentTeacherName').textContent = currentTeacher.name || currentTeacher.email;
+      document.getElementById('currentTeacherSchool').textContent = currentTeacher.school || '全校管理';
+
+      const classBadge = document.getElementById('currentTeacherClassBadge');
+      if (currentTeacher.target_class && currentTeacher.target_class.trim()) {
+        classBadge.textContent = '対象クラス: ' + currentTeacher.target_class.trim();
+        classBadge.className = 'bg-amber-400 text-slate-950 font-bold px-2 py-0.5 rounded text-[11px] shadow-xs';
+      } else {
+        classBadge.textContent = '対象クラス: 未設定';
+        classBadge.className = 'bg-indigo-900/90 border border-indigo-400/40 px-2 py-0.5 rounded text-[11px] font-semibold text-indigo-300';
+      }
+    }
+
+    // ログイン送信処理
+    async function handleLoginSubmit(e) {
+      e.preventDefault();
+      const email = document.getElementById('loginEmail').value.trim();
+      const password = document.getElementById('loginPassword').value.trim();
+      const errBox = document.getElementById('loginError');
+      const btnText = document.getElementById('loginBtnText');
+      const spinner = document.getElementById('loginBtnSpinner');
+
+      errBox.classList.add('hidden');
+      btnText.textContent = 'ログイン中...';
+      spinner.classList.remove('hidden');
+
+      try {
+        const res = await apiRequest({
+          action: 'login',
+          email: email,
+          password: password
+        });
+
+        if (res.success && res.token) {
+          authToken = res.token;
+          currentTeacher = res.teacher;
+          localStorage.setItem('edu_teacher_token', authToken);
+          localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
+          showToast(`ようこそ、${currentTeacher.name} 先生`, 'success');
+          showDashboard();
+        } else {
+          errBox.textContent = res.error || 'ログインに失敗しました';
+          errBox.classList.remove('hidden');
+        }
+      } catch (err) {
+        errBox.textContent = '通信エラーが発生しました: ' + err.message;
+        errBox.classList.remove('hidden');
+        // もしAPI URL未設定エラーなら入力欄を展開
+        if (err.message.includes('APIエンドポイント')) {
+          document.getElementById('apiUrlFormContainer').classList.remove('hidden');
+        }
+      } finally {
+        btnText.textContent = 'ログイン';
+        spinner.classList.add('hidden');
+      }
+    }
+
+    // ログアウト処理
+    function logout() {
+      if (confirm('ログアウトしますか？')) {
+        localStorage.removeItem('edu_teacher_token');
+        localStorage.removeItem('edu_teacher_info');
+        authToken = null;
+        currentTeacher = null;
+        showLoginView();
+      }
+    }
+
+    // ==================== ハイブリッド API リクエスト ====================
+    async function apiRequest(payload, method = 'POST') {
+      // 1. GAS iframe ネイティブ環境 (google.script.run が使用可能な場合)
+      if (typeof google !== 'undefined' && google.script && google.script.run) {
+        return new Promise((resolve, reject) => {
+          const runner = google.script.run
+            .withSuccessHandler(res => {
+              if (typeof res === 'string') {
+                try { res = JSON.parse(res); } catch (e) {}
+              }
+              if (res && res.need_auth) {
+                logout();
+                reject(new Error('セッションの有効期限が切れました。再ログインしてください。'));
+                return;
+              }
+              if (res && res.success === false) {
+                reject(new Error(res.error || 'リクエストに失敗しました'));
+                return;
+              }
+              resolve(res);
+            })
+            .withFailureHandler(err => {
+              reject(new Error(err.message || err.toString()));
+            });
+
+          const act = payload.action;
+          if (act === 'login') {
+            runner.api_login(payload.email, payload.password);
+          } else if (act === 'get_all') {
+            runner.api_getAllDevices(authToken, payload.school_name, payload.include_unassigned);
+          } else if (act === 'bulk_lock') {
+            runner.api_bulkLock(authToken, payload.student_ids, payload.locked);
+          } else if (act === 'bulk_broadcast') {
+            runner.api_bulkBroadcast(authToken, payload.student_ids, payload.url);
+          } else if (act === 'bulk_filter') {
+            runner.api_bulkFilter(authToken, payload.student_ids, payload.filter_mode, payload.whitelist_urls, payload.blacklist_urls);
+          } else if (act === 'update_single') {
+            runner.api_updateSingle(authToken, payload.student_id, payload.data);
+          } else if (act === 'save_teacher_settings' || act === 'update_teacher_settings') {
+            runner.api_saveTeacherSettings(authToken, payload.settings || payload);
+          } else if (act === 'get_teacher_settings') {
+            runner.api_getTeacherSettings(authToken);
+          } else {
+            reject(new Error('未対応のアクション: ' + act));
+          }
+        });
+      }
+
+      // 2. 外部Webブラウザ / ローカルからの fetch 通信の場合
+      const apiUrl = getApiUrl();
+      if (!apiUrl) {
+        throw new Error('GAS APIエンドポイントが取得できません。ログイン画面の「API接続先変更」からWebアプリのURL（https://script.google.com/macros/s/.../exec）を設定してください。');
+      }
+
+      if (authToken) {
+        payload.token = authToken;
+      }
+
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        redirect: 'follow'
+      });
+      const data = await res.json();
+
+      if (data && data.need_auth) {
+        logout();
+        throw new Error('セッションの有効期限が切れました。再ログインしてください。');
+      }
+      if (data && data.success === false) {
+        throw new Error(data.error || 'リクエスト処理に失敗しました');
+      }
+
+      return data;
+    }
+
+    // 自動更新の制御
+    function setupAutoRefresh() {
+      const toggle = document.getElementById('autoRefreshToggle');
+      toggle.addEventListener('change', () => {
+        if (toggle.checked) startAutoRefresh();
+        else stopAutoRefresh();
+      });
+      startAutoRefresh();
+    }
+
+    function startAutoRefresh() {
+      stopAutoRefresh();
+      autoRefreshTimer = setInterval(() => {
+        loadDevices(true);
+      }, 5000);
+    }
+
+    function stopAutoRefresh() {
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+      }
+    }
+
+    // 端末データの取得
+    async function loadDevices(isSilent = false) {
+      const spinner = document.getElementById('refreshSpinner');
+      if (!isSilent && spinner) spinner.classList.add('animate-spin');
+
+      try {
+        const schoolFilter = document.getElementById('schoolFilter')?.value || 'ALL';
+        const includeUnassigned = document.getElementById('includeUnassignedCheckbox')?.checked ?? true;
+
+        const res = await apiRequest({
+          action: 'get_all',
+          school_name: schoolFilter,
+          include_unassigned: includeUnassigned
+        });
+
+        if (res && Array.isArray(res.data)) {
+          devicesData = res.data;
+          updateClassFilterOptions();
+          renderDevices();
+          updateStatistics();
+        } else {
+          throw new Error((res && res.error) || '端末データを受信できませんでした');
+        }
+      } catch (err) {
+        console.error('loadDevices error:', err);
+        if (devicesData.length === 0) {
+          // 初回取得失敗時、テーブルに明確なエラーUIを表示して読み込み中フリーズを防止
+          renderErrorState(err.message);
+        }
+        if (!isSilent) {
+          showToast('データ取得エラー: ' + err.message, 'error');
+        }
+      } finally {
+        if (!isSilent && spinner) spinner.classList.remove('animate-spin');
+      }
+    }
+
+    // エラー時のテーブル描画（ローディングフリーズ完全解消）
+    function renderErrorState(errorMessage) {
+      const tbody = document.getElementById('deviceTableBody');
+      if (!tbody) return;
+
+      tbody.innerHTML = `
+        <tr>
+          <td colspan="8" class="text-center py-10 px-4 bg-slate-50/50">
+            <div class="max-w-md mx-auto flex flex-col items-center justify-center space-y-3">
+              <div class="w-12 h-12 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center shadow-inner">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                </svg>
+              </div>
+              <div class="text-base font-bold text-slate-800">端末データの読み込みに失敗しました</div>
+              <p class="text-xs text-slate-500 leading-relaxed">
+                ${escapeHtml(errorMessage || '通信に失敗したか、セッションの有効期限が切れています。')}
+              </p>
+              <div class="flex items-center space-x-2 pt-2">
+                <button onclick="loadDevices()" class="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold px-4 py-2 rounded-lg shadow-sm transition">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                  <span>今すぐ再試行</span>
+                </button>
+                <button onclick="logout()" class="px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-200 rounded-lg transition">
+                  再ログイン
+                </button>
+              </div>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+
+    // 学校変更時
+    function onSchoolChange() {
+      selectedStudentIds.clear();
+      loadDevices();
+    }
+
+    // クラス選択肢の更新
+    function updateClassFilterOptions() {
+      const select = document.getElementById('classFilter');
+      if (!select) return;
+      const currentVal = select.value;
+      const classes = new Set();
+
+      devicesData.forEach(d => {
+        if (d.class_name && d.class_name !== '未設定') classes.add(d.class_name);
+      });
+
+      select.innerHTML = '';
+
+      // 教員に対象クラスが設定されている場合、先頭に「★ 担当クラス (5年1組)」の特別選択肢を追加
+      const targetClassStr = (currentTeacher?.target_class || '').trim();
+      if (targetClassStr) {
+        const optTarget = document.createElement('option');
+        optTarget.value = 'MY_TARGET';
+        optTarget.textContent = `★ 担当クラス (${targetClassStr})`;
+        optTarget.className = 'font-bold text-indigo-700 bg-indigo-50';
+        select.appendChild(optTarget);
+      }
+
+      const optAll = document.createElement('option');
+      optAll.value = 'ALL';
+      optAll.textContent = 'すべてのクラス';
+      select.appendChild(optAll);
+
+      Array.from(classes).sort().forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = c;
+        select.appendChild(opt);
+      });
+
+      // 値の復元または初期化
+      if (currentVal && (currentVal === 'MY_TARGET' || currentVal === 'ALL' || classes.has(currentVal))) {
+        select.value = currentVal;
+      } else if (targetClassStr) {
+        select.value = 'MY_TARGET';
+      } else {
+        select.value = 'ALL';
+      }
+    }
+
+    // 統計サマリーの更新
+    function updateStatistics() {
+      const total = devicesData.length;
+      const online = devicesData.filter(d => d.is_online).length;
+      const locked = devicesData.filter(d => d.screen_lock).length;
+      const filtered = devicesData.filter(d => d.filter_mode && d.filter_mode !== 'OFF').length;
+
+      document.getElementById('statTotal').textContent = total;
+      document.getElementById('statOnline').textContent = online;
+      document.getElementById('statLocked').textContent = locked;
+      document.getElementById('statFiltered').textContent = filtered;
+    }
+
+    // 相対時間フォーマット（例: たった今、15秒前、2分前）
+    function formatRelativeTime(dateStr) {
+      if (!dateStr) return '-';
+      const dt = new Date(dateStr);
+      if (isNaN(dt.getTime())) return dateStr;
+
+      const now = new Date().getTime();
+      const diffSec = Math.floor((now - dt.getTime()) / 1000);
+
+      if (diffSec < 10) return 'たった今';
+      if (diffSec < 60) return `${diffSec}秒前`;
+      const diffMin = Math.floor(diffSec / 60);
+      if (diffMin < 60) return `${diffMin}分前`;
+      const diffHour = Math.floor(diffMin / 60);
+      if (diffHour < 24) return `${diffHour}時間前`;
+
+      const m = dt.getMonth() + 1;
+      const d = dt.getDate();
+      const h = String(dt.getHours()).padStart(2, '0');
+      const min = String(dt.getMinutes()).padStart(2, '0');
+      return `${m}/${d} ${h}:${min}`;
+    }
+
+    // 端末テーブルの描画（児童Googleアカウント優先表示 & 検索機能対応）
+    function renderDevices() {
+      const filterClass = document.getElementById('classFilter')?.value || 'ALL';
+      const searchText = (document.getElementById('deviceSearchInput')?.value || '').trim().toLowerCase();
+      const tbody = document.getElementById('deviceTableBody');
+      if (!tbody) return;
+
+      // 担当クラスのリスト（カンマ区切り対応）
+      const teacherTargetClasses = (currentTeacher?.target_class || '')
+        .split(/[,、]+/)
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean);
+
+      const filtered = devicesData.filter(d => {
+        // 1. クラス絞り込み
+        if (filterClass === 'MY_TARGET') {
+          if (teacherTargetClasses.length > 0) {
+            const devClass = (d.class_name || '').trim().toLowerCase();
+            const matched = teacherTargetClasses.some(tc => devClass === tc || devClass.includes(tc));
+            if (!matched) return false;
+          }
+        } else if (filterClass !== 'ALL') {
+          if (d.class_name !== filterClass) return false;
+        }
+
+        // 2. 検索フィルター（Googleアカウント、氏名、クラス、学校）
+        if (searchText) {
+          const id = (d.student_id || '').toLowerCase();
+          const name = (d.student_name || '').toLowerCase();
+          const cls = (d.class_name || '').toLowerCase();
+          const sch = (d.school_name || '').toLowerCase();
+          if (!id.includes(searchText) && !name.includes(searchText) && !cls.includes(searchText) && !sch.includes(searchText)) {
+            return false;
+          }
+        }
+
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="8" class="text-center py-10 px-4 bg-slate-50/40">
+              <div class="flex flex-col items-center justify-center space-y-2">
+                <svg class="w-10 h-10 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path>
+                </svg>
+                <span class="text-sm font-semibold text-slate-600">表示対象の児童端末がありません</span>
+                <span class="text-xs text-slate-400">
+                  ${searchText ? '検索条件を変更してください。' : '児童がChromebookでGoogleアカウントにログインすると自動で一覧に表示されます。'}
+                </span>
+              </div>
+            </td>
+          </tr>
+        `;
+        return;
+      }
+
+      let html = '';
+      filtered.forEach(d => {
+        const isChecked = selectedStudentIds.has(d.student_id);
+        const isGoogleAccount = d.student_id && d.student_id.includes('@');
+
+        // オンラインバッジ
+        const onlineBadge = d.is_online
+          ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
+               <span class="w-2 h-2 mr-1.5 rounded-full bg-emerald-500 animate-pulse"></span> オンライン
+             </span>`
+          : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-500 border border-slate-200">
+               <span class="w-1.5 h-1.5 mr-1.5 rounded-full bg-slate-400"></span> オフライン
+             </span>`;
+
+        // 画面ロックボタン
+        const lockToggle = `
+          <button onclick="toggleSingleLock('${escapeHtml(d.student_id)}', ${!d.screen_lock})"
+            class="px-2.5 py-1 rounded-lg text-xs font-bold transition shadow-xs ${
+              d.screen_lock 
+                ? 'bg-rose-100 text-rose-700 hover:bg-rose-200 border border-rose-300' 
+                : 'bg-slate-100 text-slate-600 hover:bg-slate-200 border border-slate-300'
+            }">
+            ${d.screen_lock ? '🔒 ロック中' : '🔓 解除中'}
+          </button>
+        `;
+
+        // URL規制バッジ
+        let filterBadge = '';
+        if (d.filter_mode === 'WHITELIST') filterBadge = '<span class="px-2 py-0.5 rounded-md text-[11px] font-bold bg-blue-100 text-blue-800 border border-blue-200">許可のみ</span>';
+        else if (d.filter_mode === 'BLACKLIST') filterBadge = '<span class="px-2 py-0.5 rounded-md text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-200">規制拒否</span>';
+        else filterBadge = '<span class="px-2 py-0.5 rounded-md text-[11px] font-medium bg-slate-100 text-slate-500">OFF</span>';
+
+        // 閲覧中URL表示
+        const currentUrlDisplay = d.current_url 
+          ? `<a href="${escapeHtml(d.current_url)}" target="_blank" class="text-indigo-600 hover:text-indigo-800 hover:underline max-w-[200px] truncate block text-xs" title="${escapeHtml(d.current_url)}">${escapeHtml(d.current_url)}</a>`
+          : '<span class="text-slate-400 text-xs">-</span>';
+
+        // 相対時間
+        const relativeTime = formatRelativeTime(d.last_seen);
+
+        // 学校・クラスバッジ
+        const isUnassignedSchool = !d.school_name || d.school_name === '未設定';
+        const schoolBadge = isUnassignedSchool
+          ? `<span class="bg-amber-100 text-amber-800 border border-amber-300 font-bold px-1.5 py-0.5 rounded text-[10px]">学校未設定</span>`
+          : `<span class="bg-indigo-50 text-indigo-700 border border-indigo-200 font-bold px-1.5 py-0.5 rounded text-[10px]">${escapeHtml(d.school_name)}</span>`;
+
+        const classBadge = (!d.class_name || d.class_name === '未設定')
+          ? `<span class="text-slate-400 text-[11px]">クラス未設定</span>`
+          : `<span class="text-slate-700 font-semibold text-[11px]">${escapeHtml(d.class_name)}</span>`;
+
+        html += `
+          <tr class="hover:bg-slate-50/80 transition ${isChecked ? 'bg-indigo-50/40' : ''}">
+            <td class="p-3.5 w-4 text-center">
+              <input type="checkbox" onchange="toggleSelectDevice('${escapeHtml(d.student_id)}', this.checked)" ${isChecked ? 'checked' : ''} class="w-4 h-4 text-indigo-600 bg-white border-slate-300 rounded focus:ring-indigo-500">
+            </td>
+            <td class="px-4 py-3">
+              <!-- 児童のGoogleアカウント（最前面にハイライト表示） -->
+              <div class="flex items-center space-x-1.5 mb-1 flex-wrap gap-y-1">
+                ${isGoogleAccount
+                  ? `<span class="inline-flex items-center bg-blue-50/90 text-blue-900 border border-blue-200 px-2 py-0.5 rounded-md text-xs font-bold" title="ChromebookログインGoogleアカウント">
+                       <svg class="w-3.5 h-3.5 mr-1 text-blue-600 shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                         <path d="M12.545,10.239v3.821h5.445c-0.712,2.315-2.647,3.972-5.445,3.972c-3.332,0-6.033-2.701-6.033-6.032s2.701-6.032,6.033-6.032c1.498,0,2.866,0.549,3.921,1.453l2.814-2.814C17.503,2.988,15.139,2,12.545,2C7.021,2,2.543,6.477,2.543,12s4.478,10,10.002,10c8.396,0,10.249-7.85,9.426-11.748L12.545,10.239z"/>
+                       </svg>
+                       ${escapeHtml(d.student_id)}
+                     </span>`
+                  : `<span class="font-mono text-xs font-bold text-slate-700 bg-slate-100 px-1.5 py-0.5 rounded">${escapeHtml(d.student_id)}</span>`
+                }
+                ${schoolBadge}
+              </div>
+              <div class="flex items-center space-x-2 text-xs">
+                <span class="font-bold text-slate-800 text-sm">${escapeHtml(d.student_name || '氏名未設定')}</span>
+                <span class="text-slate-300">•</span>
+                ${classBadge}
+                ${d.notes ? `<span class="text-[10px] text-slate-400 truncate max-w-xs">(${escapeHtml(d.notes)})</span>` : ''}
+              </div>
+            </td>
+            <td class="px-3 py-3">${onlineBadge}</td>
+            <td class="px-3 py-3">${lockToggle}</td>
+            <td class="px-3 py-3">${filterBadge}</td>
+            <td class="px-4 py-3">${currentUrlDisplay}</td>
+            <td class="px-3 py-3 text-xs text-slate-500 font-mono" title="${escapeHtml(d.last_seen || '')}">${escapeHtml(relativeTime)}</td>
+            <td class="px-4 py-3 text-right">
+              <div class="flex items-center justify-end space-x-1">
+                <!-- 個別URL配信 -->
+                <button onclick="openSingleBroadcastModal('${escapeHtml(d.student_id)}')" title="この児童に個別URL配信" class="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition border border-transparent hover:border-blue-200">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
+                </button>
+                <!-- 児童情報編集（Googleアカウントに紐付け） -->
+                <button onclick="openEditStudentModal('${escapeHtml(d.student_id)}')" title="児童情報（氏名・クラス・学校）の編集" class="p-1.5 text-indigo-600 hover:bg-indigo-50 rounded-lg transition border border-transparent hover:border-indigo-200">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                </button>
+              </div>
+            </td>
+          </tr>
+        `;
+      });
+
+      tbody.innerHTML = html;
+      updateSelectedCountBadge();
+    }
+
+    // 児童情報編集モーダルを開く
+    function openEditStudentModal(studentId) {
+      const dev = devicesData.find(d => d.student_id === studentId);
+      if (!dev) return;
+
+      document.getElementById('editStudentId').value = dev.student_id;
+      document.getElementById('editStudentIdDisplay').textContent = dev.student_id;
+      document.getElementById('editStudentName').value = dev.student_name || '';
+      document.getElementById('editStudentClass').value = dev.class_name || '';
+      document.getElementById('editStudentNotes').value = dev.notes || '';
+
+      // 学校選択肢をセット
+      const schoolSelect = document.getElementById('editStudentSchool');
+      schoolSelect.innerHTML = '<option value="未設定">未設定</option>';
+      SCHOOLS.forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s;
+        opt.textContent = s;
+        schoolSelect.appendChild(opt);
+      });
+      schoolSelect.value = dev.school_name && SCHOOLS.includes(dev.school_name) ? dev.school_name : '未設定';
+
+      openModal('editStudentModal');
+    }
+
+    // 児童情報編集の保存
+    async function saveStudentEdit() {
+      const studentId = document.getElementById('editStudentId').value;
+      const studentName = document.getElementById('editStudentName').value.trim();
+      const schoolName = document.getElementById('editStudentSchool').value;
+      const className = document.getElementById('editStudentClass').value.trim();
+      const notes = document.getElementById('editStudentNotes').value.trim();
+      const saveBtn = document.getElementById('saveStudentBtn');
+
+      if (!studentId) return;
+
+      try {
+        saveBtn.disabled = true;
+        saveBtn.textContent = '保存中...';
+
+        await apiRequest({
+          action: 'update_single',
+          student_id: studentId,
+          data: {
+            student_name: studentName,
+            school_name: schoolName,
+            class_name: className,
+            notes: notes
+          }
+        });
+
+        // ローカルキャッシュも即座に更新
+        const dev = devicesData.find(d => d.student_id === studentId);
+        if (dev) {
+          dev.student_name = studentName;
+          dev.school_name = schoolName;
+          dev.class_name = className;
+          dev.notes = notes;
+        }
+
+        closeModal('editStudentModal');
+        showToast(`児童 [${studentId}] の情報を更新しました`, 'success');
+        updateClassFilterOptions();
+        renderDevices();
+      } catch (err) {
+        showToast('保存エラー: ' + err.message, 'error');
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = '保存する';
+      }
+    }
+
+    function toggleSelectDevice(id, checked) {
+      if (checked) selectedStudentIds.add(id);
+      else selectedStudentIds.delete(id);
+      updateSelectedCountBadge();
+    }
+
+    function toggleSelectAll(checked) {
+      const filterClass = document.getElementById('classFilter')?.value || 'ALL';
+      const visible = devicesData.filter(d => filterClass === 'ALL' || d.class_name === filterClass);
+
+      if (checked) visible.forEach(d => selectedStudentIds.add(d.student_id));
+      else visible.forEach(d => selectedStudentIds.delete(d.student_id));
+      renderDevices();
+    }
+
+    function updateSelectedCountBadge() {
+      const badge = document.getElementById('selectedCountBadge');
+      if (!badge) return;
+      badge.textContent = `${selectedStudentIds.size} 台選択中`;
+      const selectAll = document.getElementById('selectAllCheckbox');
+      const filterClass = document.getElementById('classFilter')?.value || 'ALL';
+      const visible = devicesData.filter(d => filterClass === 'ALL' || d.class_name === filterClass);
+
+      if (!selectAll) return;
+      if (visible.length > 0 && visible.every(d => selectedStudentIds.has(d.student_id))) {
+        selectAll.checked = true;
+        selectAll.indeterminate = false;
+      } else if (visible.some(d => selectedStudentIds.has(d.student_id))) {
+        selectAll.checked = false;
+        selectAll.indeterminate = true;
+      } else {
+        selectAll.checked = false;
+        selectAll.indeterminate = false;
+      }
+    }
+
+    // 一括画面ロック
+    async function executeBulkLock(locked) {
+      const ids = selectedStudentIds.size > 0 ? Array.from(selectedStudentIds) : 'ALL';
+      const countLabel = ids === 'ALL' ? '現在表示中の全児童' : `${ids.length}名の児童`;
+
+      if (!confirm(`${countLabel}の画面ロックを ${locked ? 'ON' : 'OFF'} にしますか？`)) return;
+
+      try {
+        showToast('画面ロック更新中...', 'info');
+        await apiRequest({ action: 'bulk_lock', student_ids: ids, locked: locked });
+        showToast(`画面ロックを ${locked ? 'ON' : 'OFF'} にしました`, 'success');
+        await loadDevices();
+      } catch (err) {
+        showToast('エラー: ' + err.message, 'error');
+      }
+    }
+
+    // 個別画面ロック
+    async function toggleSingleLock(studentId, newLockState) {
+      try {
+        await apiRequest({
+          action: 'update_single',
+          student_id: studentId,
+          data: { screen_lock: newLockState }
+        });
+        showToast('画面ロック設定を更新しました', 'success');
+        await loadDevices();
+      } catch (err) {
+        showToast('更新失敗: ' + err.message, 'error');
+      }
+    }
+
+    // 一斉URL配信
+    function openBroadcastModal() {
+      targetSingleStudentId = null;
+      document.getElementById('broadcastModal').classList.remove('hidden');
+    }
+
+    function openSingleBroadcastModal(studentId) {
+      targetSingleStudentId = studentId;
+      document.getElementById('broadcastModal').classList.remove('hidden');
+    }
+
+    function setBroadcastUrl(url) {
+      document.getElementById('broadcastInputUrl').value = url;
+    }
+
+    async function executeBroadcastSubmit() {
+      const url = document.getElementById('broadcastInputUrl').value.trim();
+      if (!url) return alert('URLを入力してください');
+
+      const ids = targetSingleStudentId ? [targetSingleStudentId] : (selectedStudentIds.size > 0 ? Array.from(selectedStudentIds) : 'ALL');
+
+      try {
+        closeModal('broadcastModal');
+        showToast('URLを一斉配信中...', 'info');
+        await apiRequest({ action: 'bulk_broadcast', student_ids: ids, url: url });
+        showToast('URLを配信しました', 'success');
+        await loadDevices();
+      } catch (err) {
+        showToast('配信エラー: ' + err.message, 'error');
+      }
+    }
+
+    // ==================== 教員個別設定 & マイURL & 個別規制URL管理 ====================
+    let editingTeacherUrls = [];
+
+    // URL規制モーダルを開く（教員個別の保持設定を自動セット）
+    function openFilterModal() {
+      const defaultWhite = 'nhk.or.jp, scratch.mit.edu, google.com';
+      const defaultBlack = 'youtube.com, twitter.com, tiktok.com, instagram.com';
+
+      const whiteVal = (currentTeacher?.filter_whitelist && currentTeacher.filter_whitelist.trim()) 
+        ? currentTeacher.filter_whitelist 
+        : defaultWhite;
+      const blackVal = (currentTeacher?.filter_blacklist && currentTeacher.filter_blacklist.trim()) 
+        ? currentTeacher.filter_blacklist 
+        : defaultBlack;
+
+      document.getElementById('modalWhitelist').value = whiteVal;
+      document.getElementById('modalBlacklist').value = blackVal;
+      document.getElementById('saveAsTeacherPreferenceCheck').checked = true;
+      document.getElementById('filterModal').classList.remove('hidden');
+    }
+
+    // 教員個別設定にリセット
+    function resetToTeacherFilter(type) {
+      if (!currentTeacher) return;
+      if (type === 'white') {
+        document.getElementById('modalWhitelist').value = currentTeacher.filter_whitelist || 'nhk.or.jp, scratch.mit.edu, google.com';
+      } else if (type === 'black') {
+        document.getElementById('modalBlacklist').value = currentTeacher.filter_blacklist || 'youtube.com, twitter.com, tiktok.com, instagram.com';
+      }
+      showToast('教員の個別設定値を反映しました', 'info');
+    }
+
+    // マイURLをホワイトリストの末尾に追加
+    function appendMyUrlsToWhitelist() {
+      const urls = (currentTeacher?.urls && currentTeacher.urls.length > 0) ? currentTeacher.urls : [];
+      if (urls.length === 0) {
+        showToast('マイURLが登録されていません。教員設定から追加してください。', 'info');
+        return;
+      }
+
+      const domainList = urls.map(u => {
+        try {
+          return new URL(u.url).hostname.replace(/^www\./, '');
+        } catch(e) {
+          return u.url.trim();
+        }
+      }).filter(Boolean);
+
+      const textarea = document.getElementById('modalWhitelist');
+      const currentList = textarea.value.split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
+      const combined = Array.from(new Set([...currentList, ...domainList]));
+      textarea.value = combined.join(', ');
+      showToast(`${domainList.length} 件のマイURLドメインを追加しました`, 'success');
+    }
+
+    // URL規制の適用実行
+    async function executeFilterSubmit() {
+      const mode = document.getElementById('modalFilterMode').value;
+      const whitelist = document.getElementById('modalWhitelist').value.trim();
+      const blacklist = document.getElementById('modalBlacklist').value.trim();
+      const saveAsPref = document.getElementById('saveAsTeacherPreferenceCheck').checked;
+      const ids = selectedStudentIds.size > 0 ? Array.from(selectedStudentIds) : 'ALL';
+
+      try {
+        closeModal('filterModal');
+        showToast('URL規制を更新中...', 'info');
+
+        await apiRequest({
+          action: 'bulk_filter',
+          student_ids: ids,
+          filter_mode: mode,
+          whitelist_urls: whitelist,
+          blacklist_urls: blacklist
+        });
+
+        // 教員個別設定として保持
+        if (saveAsPref && currentTeacher) {
+          currentTeacher.filter_whitelist = whitelist;
+          currentTeacher.filter_blacklist = blacklist;
+          localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
+        }
+
+        showToast(`URL規制を ${mode} に更新しました（教員個別設定も保持）`, 'success');
+        await loadDevices();
+      } catch (err) {
+        showToast('設定エラー: ' + err.message, 'error');
+      }
+    }
+
+    // 教員設定モーダルを開く
+    function openTeacherSettingsModal() {
+      if (!currentTeacher) return;
+      document.getElementById('settingTargetClass').value = currentTeacher.target_class || '';
+      document.getElementById('settingFilterWhitelist').value = currentTeacher.filter_whitelist || 'nhk.or.jp, scratch.mit.edu, google.com';
+      document.getElementById('settingFilterBlacklist').value = currentTeacher.filter_blacklist || 'youtube.com, twitter.com, tiktok.com, instagram.com';
+      document.getElementById('newUrlTitle').value = '';
+      document.getElementById('newUrlAddress').value = '';
+      document.getElementById('saveSettingsStatus').textContent = '';
+
+      editingTeacherUrls = JSON.parse(JSON.stringify(currentTeacher.urls || []));
+      renderClassSuggestions();
+      renderTeacherUrls();
+
+      document.getElementById('teacherSettingsModal').classList.remove('hidden');
+    }
+
+    // クラス候補タグの描画
+    function renderClassSuggestions() {
+      const container = document.getElementById('classSuggestionTags');
+      if (!container) return;
+
+      const classes = new Set();
+      devicesData.forEach(d => {
+        if (d.class_name && d.class_name !== '未設定') {
+          classes.add(d.class_name);
+        }
+      });
+
+      if (classes.size === 0) {
+        container.innerHTML = '<span class="text-slate-400 text-[10px]">端末一覧からクラスが未検出です</span>';
+        return;
+      }
+
+      let html = '';
+      classes.forEach(c => {
+        html += `
+          <button type="button" onclick="addClassToSetting('${escapeHtml(c)}')" class="bg-white border border-slate-300 hover:border-indigo-500 hover:text-indigo-600 px-2 py-0.5 rounded text-[11px] font-medium transition shadow-xs">
+            ＋ ${escapeHtml(c)}
+          </button>
+        `;
+      });
+      container.innerHTML = html;
+    }
+
+    function addClassToSetting(className) {
+      const input = document.getElementById('settingTargetClass');
+      const current = input.value.split(/[,、]+/).map(s => s.trim()).filter(Boolean);
+      if (!current.includes(className)) {
+        current.push(className);
+        input.value = current.join(', ');
+      }
+    }
+
+    // マイURLの描画
+    function renderTeacherUrls() {
+      const container = document.getElementById('teacherUrlsContainer');
+      const badge = document.getElementById('savedUrlCountBadge');
+      if (badge) badge.textContent = `${editingTeacherUrls.length}件`;
+      if (!container) return;
+
+      if (editingTeacherUrls.length === 0) {
+        container.innerHTML = `
+          <div class="p-4 text-center text-slate-400 text-xs">
+            登録されたマイURLはありません。上の入力欄から追加してください。
+          </div>
+        `;
+        return;
+      }
+
+      let html = '';
+      editingTeacherUrls.forEach((item, idx) => {
+        html += `
+          <div class="p-2.5 flex items-center justify-between hover:bg-slate-50 transition gap-2">
+            <div class="min-w-0 flex-1">
+              <div class="font-bold text-slate-800 truncate">${escapeHtml(item.title || 'URL')}</div>
+              <a href="${escapeHtml(item.url)}" target="_blank" class="text-[11px] text-indigo-600 hover:underline font-mono truncate block">${escapeHtml(item.url)}</a>
+            </div>
+            <div class="flex items-center space-x-1 shrink-0">
+              <button type="button" onclick="deleteTeacherUrl(${idx})" title="削除" class="text-rose-500 hover:text-rose-700 hover:bg-rose-50 p-1.5 rounded">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+              </button>
+            </div>
+          </div>
+        `;
+      });
+      container.innerHTML = html;
+    }
+
+    function addNewTeacherUrl() {
+      const titleInput = document.getElementById('newUrlTitle');
+      const urlInput = document.getElementById('newUrlAddress');
+      const title = titleInput.value.trim();
+      let url = urlInput.value.trim();
+
+      if (!url) {
+        alert('URLを入力してください');
+        return;
+      }
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'https://' + url;
+      }
+
+      editingTeacherUrls.push({
+        title: title || url,
+        url: url
+      });
+
+      titleInput.value = '';
+      urlInput.value = '';
+      renderTeacherUrls();
+    }
+
+    function presetAddUrl(title, url) {
+      document.getElementById('newUrlTitle').value = title;
+      document.getElementById('newUrlAddress').value = url;
+    }
+
+    function deleteTeacherUrl(index) {
+      editingTeacherUrls.splice(index, 1);
+      renderTeacherUrls();
+    }
+
+    // 教員設定の保存実行
+    async function saveTeacherSettingsSubmit() {
+      if (!currentTeacher) return;
+
+      const targetClass = document.getElementById('settingTargetClass').value.trim();
+      const filterWhite = document.getElementById('settingFilterWhitelist').value.trim();
+      const filterBlack = document.getElementById('settingFilterBlacklist').value.trim();
+      const btn = document.getElementById('saveTeacherSettingsBtn');
+      const spinner = document.getElementById('saveSettingsSpinner');
+      const btnText = document.getElementById('saveBtnText');
+      const statusEl = document.getElementById('saveSettingsStatus');
+
+      btn.disabled = true;
+      spinner.classList.remove('hidden');
+      btnText.textContent = '保存中...';
+
+      try {
+        const payload = {
+          action: 'save_teacher_settings',
+          settings: {
+            target_class: targetClass,
+            urls: editingTeacherUrls,
+            filter_whitelist: filterWhite,
+            filter_blacklist: filterBlack
+          }
+        };
+
+        const res = await apiRequest(payload);
+        if (res.success && res.teacher) {
+          currentTeacher = res.teacher;
+          localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
+
+          // ヘッダーの対象クラスバッジを更新
+          const classBadge = document.getElementById('currentTeacherClassBadge');
+          if (currentTeacher.target_class && currentTeacher.target_class.trim()) {
+            classBadge.textContent = '対象クラス: ' + currentTeacher.target_class.trim();
+          } else {
+            classBadge.textContent = '対象: 全クラス';
+          }
+
+          showToast('教員設定（クラス・個別URL・規制URL）を保存しました', 'success');
+          closeModal('teacherSettingsModal');
+          renderDevices(); // クラスフィルタ再評価
+        } else {
+          throw new Error(res.error || '保存に失敗しました');
+        }
+      } catch (err) {
+        statusEl.textContent = 'エラー: ' + err.message;
+        statusEl.className = 'text-xs text-rose-600 font-semibold';
+        showToast('保存エラー: ' + err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        spinner.classList.add('hidden');
+        btnText.textContent = 'スプレッドシートに保存';
+      }
+    }
+
+    function closeModal(id) {
+      document.getElementById(id).classList.add('hidden');
+    }
+
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      const colors = {
+        success: 'bg-emerald-600 text-white',
+        error: 'bg-rose-600 text-white',
+        info: 'bg-slate-800 text-white'
+      };
+
+      toast.className = `p-3.5 rounded-lg shadow-lg text-xs font-semibold flex items-center space-x-2 pointer-events-auto transform transition duration-300 ease-out translate-y-2 opacity-0 ${colors[type] || colors.info}`;
+      toast.innerHTML = `<span>${escapeHtml(message)}</span>`;
+      container.appendChild(toast);
+
+      requestAnimationFrame(() => toast.classList.remove('translate-y-2', 'opacity-0'));
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-2');
+        setTimeout(() => toast.remove(), 300);
+      }, 3500);
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+    }
+  </script>
+</body>
+</html>

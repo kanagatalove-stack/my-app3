@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'>
+  <!-- 
+    appid: 手元のPCのChromeでパッケージ化した際に表示される32文字の拡張機能IDに書き換えてください
+    codebase: extension.crx を配置した公開URLに書き換えてください
+  -->
+  <app appid='YOUR_EXTENSION_ID_HERE'>
+    <updatecheck codebase='https://YOUR_DOMAIN_OR_GITHUB_PAGES/extension.crx' version='1.0.0' />
+  </app>
+</gupdate>

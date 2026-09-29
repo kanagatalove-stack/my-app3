@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>画面ロック中 - 端末管理クライアント</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-white min-h-screen flex items-center justify-center p-4 font-sans select-none overflow-hidden">
+  <div class="bg-slate-800/90 border border-slate-700 shadow-2xl rounded-3xl p-10 max-w-lg w-full text-center space-y-6 backdrop-blur-md">
+    
+    <div class="w-20 h-20 mx-auto bg-rose-500/20 border-2 border-rose-500/50 rounded-full flex items-center justify-center text-rose-500 animate-pulse">
+      <svg class="w-10 h-10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+      </svg>
+    </div>
+
+    <div class="space-y-2">
+      <h1 class="text-3xl font-extrabold text-slate-100 tracking-tight">画面ロック中</h1>
+      <p class="text-base font-medium text-slate-300">先生の話をよく聞きましょう</p>
+    </div>
+
+    <div class="w-16 h-1 bg-indigo-500 rounded-full mx-auto"></div>
+
+    <p class="text-xs text-slate-400">
+      ※ 授業の指示があるまで端末の操作はできません。<br>
+      ロックが解除されると、自動的に元の画面に戻ります。
+    </p>
+
+    <div class="text-[11px] text-slate-500 flex items-center justify-center space-x-2 pt-2">
+      <span class="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+      <span id="accountLabel">児童アカウント連携中...</span>
+    </div>
+  </div>
+
+  <script>
+    // 児童アカウント表示
+    chrome.storage.local.get(['student_id', 'student_name'], (data) => {
+      const label = document.getElementById('accountLabel');
+      if (data && data.student_id) {
+        label.textContent = `${data.student_name ? data.student_name + ' | ' : ''}${data.student_id}`;
+      }
+    });
+
+    // ロック解除の自動監視（解除されたら自動で閉じる、または履歴バック）
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && 'screen_lock' in changes) {
+        if (!changes.screen_lock.newValue) {
+          restoreScreen();
+        }
+      }
+    });
+
+    // 定期確認フェイルセーフ
+    setInterval(async () => {
+      const data = await chrome.storage.local.get(['screen_lock']);
+      if (!data.screen_lock) {
+        restoreScreen();
+      }
+    }, 2000);
+
+    function restoreScreen() {
+      if (window.history.length > 1) {
+        window.history.back();
+      } else {
+        window.close();
+      }
+    }
+  </script>
+</body>
+</html>
