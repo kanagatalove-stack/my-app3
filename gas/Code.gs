@@ -302,24 +302,36 @@ function doPost(e) {
       return jsonResponse({ success: true, data: data });
     }
 
-    // E. 一括画面ロック
+    // E. 一括画面ロック（教員の所属学校スコープを適用）
     if (action === 'bulk_lock') {
-      bulkUpdateScreenLock(payload.student_ids, Boolean(payload.locked));
+      const scoped = scopeStudentIdsForTeacher(payload.student_ids, auth.teacher);
+      if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
+        return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
+      }
+      bulkUpdateScreenLock(scoped.ids, Boolean(payload.locked));
       return jsonResponse({ success: true, message: `画面ロックを ${payload.locked ? 'ON' : 'OFF'} に更新しました` });
     }
 
-    // F. 一斉URL配信
+    // F. 一斉URL配信（教員の所属学校スコープを適用）
     if (action === 'bulk_broadcast') {
       const targetUrl = payload.url;
       if (!targetUrl) return jsonResponse({ success: false, error: '配信URLが空です' });
+      const scoped = scopeStudentIdsForTeacher(payload.student_ids, auth.teacher);
+      if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
+        return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
+      }
       const broadcastId = 'bc_' + new Date().getTime();
-      bulkUpdateBroadcastUrl(payload.student_ids, targetUrl, broadcastId);
+      bulkUpdateBroadcastUrl(scoped.ids, targetUrl, broadcastId);
       return jsonResponse({ success: true, message: '一斉URLを配信しました', broadcast_id: broadcastId });
     }
 
-    // G. URL規制一括変更
+    // G. URL規制一括変更（教員の所属学校スコープを適用）
     if (action === 'bulk_filter') {
-      bulkUpdateFilterMode(payload.student_ids, payload.filter_mode, payload.whitelist_urls, payload.blacklist_urls);
+      const scoped = scopeStudentIdsForTeacher(payload.student_ids, auth.teacher);
+      if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
+        return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
+      }
+      bulkUpdateFilterMode(scoped.ids, payload.filter_mode, payload.whitelist_urls, payload.blacklist_urls);
       // 教員アカウントの個別設定としても保持
       if (auth && auth.teacher && auth.teacher.email) {
         try {
@@ -334,8 +346,15 @@ function doPost(e) {
       return jsonResponse({ success: true, message: `URL規制モードを ${payload.filter_mode} に更新しました` });
     }
 
-    // H. 単一児童端末の更新
+    // H. 単一児童端末の更新（他校の児童は更新不可）
     if (action === 'update_single') {
+      const targetStudent = getDeviceByStudentId(payload.student_id);
+      if (!targetStudent) {
+        return jsonResponse({ success: false, error: '児童IDが見つかりません: ' + payload.student_id });
+      }
+      if (!isDeviceInTeacherScope(targetStudent.school_name, auth.teacher)) {
+        return jsonResponse({ success: false, error: '他校の児童は操作できません' });
+      }
       updateSingleDevice(payload.student_id, payload.data || {});
       return jsonResponse({ success: true, message: '設定を更新しました' });
     }
@@ -350,6 +369,29 @@ function doPost(e) {
     if (action === 'get_teacher_settings') {
       const teacher = getTeacherSettings(auth.teacher.email);
       return jsonResponse({ success: true, teacher: teacher });
+    }
+
+    // K. 教員アカウント一覧（管理者のみ）
+    if (action === 'get_teachers') {
+      return jsonResponse({ success: true, teachers: getAllTeachers(auth.teacher), schools: CONFIG.SCHOOL_LIST });
+    }
+
+    // L. 教員アカウントの新規登録（管理者のみ）
+    if (action === 'add_teacher') {
+      const t = addTeacher(auth.teacher, payload.data || payload);
+      return jsonResponse({ success: true, message: '教員を登録しました', teacher: t });
+    }
+
+    // M. 教員アカウントの更新（管理者のみ）
+    if (action === 'update_teacher') {
+      const t = updateTeacherRecord(auth.teacher, payload.data || payload);
+      return jsonResponse({ success: true, message: '教員情報を更新しました', teacher: t });
+    }
+
+    // N. 児童アカウントの新規登録（管理者のみ）
+    if (action === 'add_student') {
+      const s = addStudentRecord(auth.teacher, payload.data || payload);
+      return jsonResponse({ success: true, message: '児童を登録しました', student: s });
     }
 
     return jsonResponse({ success: false, error: 'Unknown action: ' + action });
@@ -609,6 +651,128 @@ function saveTeacherSettings(email, updateData) {
 }
 
 /**
+ * ==================== 管理者(ADMIN)専用：アカウント管理 ====================
+ */
+
+// 教員マスタの全件取得（管理者専用）
+function getAllTeachers(teacher) {
+  if (!isAdminTeacher(teacher)) {
+    throw new Error('教員アカウントの管理は管理者のみ可能です');
+  }
+  const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
+  ensureTeacherHeaders(sheet);
+  const headerMap = getHeaderMap(sheet, CONFIG.TEACHER_COLUMNS);
+  const data = sheet.getDataRange().getValues();
+  const results = [];
+  for (let i = 1; i < data.length; i++) {
+    const email = String(data[i][headerMap['教員ID(メールアドレス)'] - 1] || '').trim();
+    if (!email) continue;
+    results.push({
+      email: email,
+      name: String(data[i][headerMap['氏名'] - 1] || ''),
+      school: String(data[i][headerMap['所属学校'] - 1] || ''),
+      role: String(data[i][headerMap['権限'] - 1] || 'TEACHER'),
+      target_class: String(data[i][headerMap['対象クラス'] - 1] || ''),
+      last_login: headerMap['最終ログイン日時'] ? String(data[i][headerMap['最終ログイン日時'] - 1] || '') : ''
+    });
+  }
+  return results;
+}
+
+// 教員アカウントの新規登録（管理者専用）
+function addTeacher(teacher, payload) {
+  if (!isAdminTeacher(teacher)) {
+    throw new Error('教員アカウントの登録は管理者のみ可能です');
+  }
+  const email = String((payload && payload.email) || '').trim().toLowerCase();
+  const password = String((payload && payload.password) || '').trim();
+  const name = String((payload && payload.name) || '').trim();
+  const school = String((payload && payload.school) || '').trim();
+  const role = String((payload && payload.role) || 'TEACHER').trim().toUpperCase();
+  const targetClass = String((payload && payload.target_class) || '').trim();
+  if (!email) throw new Error('メールアドレスを入力してください');
+  if (!password) throw new Error('パスワードを入力してください');
+
+  const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
+  ensureTeacherHeaders(sheet);
+  const headerMap = getHeaderMap(sheet, CONFIG.TEACHER_COLUMNS);
+  const data = sheet.getDataRange().getValues();
+  const emailColIdx = headerMap['教員ID(メールアドレス)'] - 1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][emailColIdx] || '').trim().toLowerCase() === email) {
+      throw new Error('このメールアドレスは既に登録されています: ' + email);
+    }
+  }
+  const newRow = new Array(CONFIG.TEACHER_COLUMNS.length).fill('');
+  newRow[headerMap['教員ID(メールアドレス)'] - 1] = email;
+  newRow[headerMap['パスワード'] - 1] = password;
+  newRow[headerMap['氏名'] - 1] = name || '教員';
+  newRow[headerMap['所属学校'] - 1] = school || '全校管理';
+  newRow[headerMap['権限'] - 1] = role || 'TEACHER';
+  newRow[headerMap['対象クラス'] - 1] = targetClass;
+  sheet.appendRow(newRow);
+  return getTeacherSettings(email);
+}
+
+// 教員アカウントの更新（管理者専用）
+function updateTeacherRecord(teacher, payload) {
+  if (!isAdminTeacher(teacher)) {
+    throw new Error('教員アカウントの編集は管理者のみ可能です');
+  }
+  const email = String((payload && payload.email) || '').trim().toLowerCase();
+  if (!email) throw new Error('メールアドレスが必要です');
+  const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
+  ensureTeacherHeaders(sheet);
+  const headerMap = getHeaderMap(sheet, CONFIG.TEACHER_COLUMNS);
+  const data = sheet.getDataRange().getValues();
+  const emailColIdx = headerMap['教員ID(メールアドレス)'] - 1;
+  let targetRow = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][emailColIdx] || '').trim().toLowerCase() === email) { targetRow = i + 1; break; }
+  }
+  if (targetRow === -1) throw new Error('教員が見つかりません: ' + email);
+  if (payload.password !== undefined && payload.password !== null && String(payload.password).trim() !== '' && headerMap['パスワード']) {
+    sheet.getRange(targetRow, headerMap['パスワード']).setValue(String(payload.password).trim());
+  }
+  if (payload.name !== undefined && headerMap['氏名']) sheet.getRange(targetRow, headerMap['氏名']).setValue(String(payload.name).trim());
+  if (payload.school !== undefined && headerMap['所属学校']) sheet.getRange(targetRow, headerMap['所属学校']).setValue(String(payload.school).trim());
+  if (payload.role !== undefined && headerMap['権限']) sheet.getRange(targetRow, headerMap['権限']).setValue(String(payload.role).trim().toUpperCase());
+  if (payload.target_class !== undefined && headerMap['対象クラス']) sheet.getRange(targetRow, headerMap['対象クラス']).setValue(String(payload.target_class).trim());
+  return getTeacherSettings(email);
+}
+
+// 児童アカウントの新規登録（管理者専用：手動追加）
+function addStudentRecord(teacher, payload) {
+  if (!isAdminTeacher(teacher)) {
+    throw new Error('児童アカウントの登録は管理者のみ可能です');
+  }
+  const studentId = String((payload && payload.student_id) || '').trim();
+  if (!studentId) throw new Error('児童ID（Googleアカウント）を入力してください');
+  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+  const data = sheet.getDataRange().getValues();
+  const idColIdx = headerMap['児童ID'] - 1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][idColIdx] || '').trim() === studentId) {
+      throw new Error('この児童IDは既に登録されています: ' + studentId);
+    }
+  }
+  const nowStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+  const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
+  newRow[headerMap['児童ID'] - 1] = studentId;
+  newRow[headerMap['学校名'] - 1] = String((payload && payload.school_name) || '').trim() || '未設定';
+  newRow[headerMap['氏名'] - 1] = String((payload && payload.student_name) || '').trim() || '未登録児童';
+  newRow[headerMap['クラス'] - 1] = String((payload && payload.class_name) || '').trim() || '未設定';
+  newRow[headerMap['画面ロック'] - 1] = false;
+  newRow[headerMap['URL規制モード'] - 1] = 'OFF';
+  newRow[headerMap['許可URLリスト'] - 1] = 'nhk.or.jp, scratch.mit.edu, google.com';
+  newRow[headerMap['規制URLリスト'] - 1] = 'youtube.com, twitter.com, tiktok.com, instagram.com';
+  newRow[headerMap['最終同期日時'] - 1] = nowStr;
+  sheet.appendRow(newRow);
+  return { student_id: studentId, school_name: newRow[headerMap['学校名'] - 1], student_name: newRow[headerMap['氏名'] - 1] };
+}
+
+/**
  * 児童端末からのハートビート処理
  */
 function processHeartbeat(studentId, currentUrl) {
@@ -689,7 +853,249 @@ function processHeartbeat(studentId, currentUrl) {
 }
 
 /**
- * 全端末一覧取得（学校フィルター対応）
+ * 教員が管理者(ADMIN)かどうかを判定
+ * 管理者は全校の児童を閲覧・操作できる。それ以外の教員は所属学校のみに限定される。
+ */
+function isAdminTeacher(teacher) {
+  if (!teacher) return false;
+  const role = String(teacher.role || '').trim().toUpperCase();
+  return role === 'ADMIN' || role === 'SUPERADMIN' || role === 'SYSTEM_ADMIN';
+}
+
+/**
+ * 学校名の表記ゆれ（前後空白・全角スペース・全角/半角カッコ・全角英数字・
+ * 市立/市名等の接頭辞）を吸収して比較するための正規化
+ */
+function normalizeSchoolName(name) {
+  let s = String(name || '')
+    .replace(/[\u3000\s]+/g, '')          // 半角/全角スペース・タブ・改行を除去
+    .replace(/[（）()]/g, '')              // 括弧を除去
+    .replace(/[０-９]/g, function (c) {     // 全角数字 → 半角
+      return String.fromCharCode(c.charCodeAt(0) - 0xFEE0);
+    })
+    .replace(/[Ａ-Ｚａ-ｚ]/g, function (c) { // 全角英字 → 半角
+      return String.fromCharCode(c.charCodeAt(0) - 0xFEE0);
+    })
+    .toUpperCase()
+    .trim();
+  // 「美作市立第一小学校」「美作市 第一小学校」「市立第一小学校」等を「第一小学校」に寄せる
+  s = s.replace(/^美作市立/, '').replace(/^美作市/, '').replace(/^市立/, '').replace(/^公立/, '');
+  return s;
+}
+
+/**
+ * 学校名が同一校を指すかどうかの比較（正規化＋部分一致フォールバック）
+ * 例: 「第一小学校」「美作市立第一小学校」「第一小」を同一視する。
+ * 一般教員が自校の児童を取りこぼさないための頑健化。
+ */
+function schoolNamesMatch(a, b) {
+  const na = normalizeSchoolName(a);
+  const nb = normalizeSchoolName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  // 短い方の長さが3以上の場合のみ部分一致を許容（「小」等の1文字での誤一致を防止）
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer = na.length <= nb.length ? nb : na;
+  if (shorter.length >= 3 && longer.indexOf(shorter) !== -1) return true;
+  return false;
+}
+
+// 学校名の略称エイリアス（「第一小」→「第一小学校」等）。
+// 教員マスタや児童データに略称が入力されている場合でも同一校として扱えるようにする。
+const SCHOOL_ALIASES = {
+  '第一小': '第一小学校',
+  '英田小': '英田小学校',
+  '大原小': '大原小学校',
+  '江見小': '江見小学校',
+  '勝田小': '勝田小学校',
+  '勝田東小': '勝田東小学校',
+  '北小': '北小学校',
+  '土居小': '土居小学校',
+  '英田中': '英田中学校',
+  '大原中': '大原中学校',
+  '作東中': '作東中学校',
+  '勝田中': '勝田中学校',
+  '美作中': '美作中学校'
+};
+
+/**
+ * 学校名を「14校のいずれか」に正規化して解決する。
+ * 完全一致 → 略称エイリアス → 部分一致（双方向）の順に判定し、
+ * 一致した場合は canonical（SCHOOL_LIST の表記）を返す。
+ * 一致しない場合は '' を返す（未設定・未知の学校名）。
+ */
+function resolveCanonicalSchool(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return '';
+  const n = normalizeSchoolName(raw);
+  if (!n) return '';
+
+  // 1. 完全一致
+  for (let i = 0; i < CONFIG.SCHOOL_LIST.length; i++) {
+    if (normalizeSchoolName(CONFIG.SCHOOL_LIST[i]) === n) return CONFIG.SCHOOL_LIST[i];
+  }
+  // 2. 略称エイリアス
+  for (const alias in SCHOOL_ALIASES) {
+    if (normalizeSchoolName(alias) === n) {
+      const canon = SCHOOL_ALIASES[alias];
+      if (CONFIG.SCHOOL_LIST.indexOf(canon) !== -1) return canon;
+    }
+  }
+  // 3. 部分一致（双方向）
+  for (let i = 0; i < CONFIG.SCHOOL_LIST.length; i++) {
+    const cn = normalizeSchoolName(CONFIG.SCHOOL_LIST[i]);
+    if (cn && (n.indexOf(cn) !== -1 || cn.indexOf(n) !== -1)) return CONFIG.SCHOOL_LIST[i];
+  }
+  return '';
+}
+
+/**
+ * 教員が指定した学校名を「スコープ対象の canonical 校名」に解決する。
+ * canonical に解決できればその校名のみを対象とし（＝自校判定を確実にする）、
+ * 解決できない場合は「未設定でも全校でもない未知の学校名」として
+ * 生の値を返す（呼び出し側で schoolNamesMatch による比較にフォールバック）。
+ */
+function resolveTeacherScopeSchoolName(schoolName) {
+  const resolved = resolveCanonicalSchool(schoolName);
+  if (resolved) return resolved;
+  const raw = String(schoolName || '').trim();
+  return raw;
+}
+
+/**
+ * 教員の所属校スコープを表すオブジェクトを返す。
+ * - admin: 管理者（全校）
+ * - all:   所属が「全校管理」等（全校）
+ * - none:  所属が空（全校扱い）
+ * - school: 特定校のみ
+ */
+function getTeacherScopeInfo(teacher) {
+  if (isAdminTeacher(teacher)) return { type: 'admin' };
+  const raw = String((teacher && teacher.school) || '').trim();
+  if (!raw) return { type: 'none' };
+  if (isAllSchoolsName(raw)) return { type: 'all' };
+  const canonical = resolveCanonicalSchool(raw);
+  if (canonical) return { type: 'school', school: canonical };
+  return { type: 'unknown', school: raw };
+}
+
+/**
+ * 「全校」を意味する学校名かどうか（未設定・全校管理・全学校・ALL）
+ */
+function isAllSchoolsName(name) {
+  const n = normalizeSchoolName(name);
+  return !n || n === '全校管理' || n === '全学校' || n.toUpperCase() === 'ALL';
+}
+
+/**
+ * 端末レコードが教員のアクセス権限範囲内かどうかを判定
+ * - 管理者: すべての学校にアクセス可能
+ * - 一般教員: 所属学校の児童 + 学校未設定（新規登録直後の児童）にアクセス可能
+ *   ※ 児童は初回ログイン時に「学校未設定」で自動登録されるため、所属校へ紐付ける前に
+ *      まず一覧へ表示されなければならない。未設定児童は全教員が閲覧・紐付け可能とする。
+ * - 「全校管理」等の管理用所属は全校扱い
+ */
+function isDeviceInTeacherScope(schoolName, teacher) {
+  if (isAdminTeacher(teacher)) return true;
+
+  const scope = getTeacherScopeInfo(teacher);
+  // 所属が未設定 / 全校管理系の場合は制限しない（管理者相当の運用を許可）
+  if (scope.type === 'admin' || scope.type === 'all' || scope.type === 'none') {
+    return true;
+  }
+
+  const sName = String(schoolName || '').trim();
+  // 学校未設定（新規登録直後の児童）は自校への紐付け前のため許可
+  if (!sName || sName === '未設定') return true;
+
+  // 所属校が canonical に解決できた場合は、児童の学校名も canonical に解決して比較する。
+  // 「第一小」「美作市立第一小学校」「第一小学校」等の表記ゆれ・略称を同一視する。
+  const devCanonical = resolveCanonicalSchool(sName);
+  if (devCanonical) {
+    return devCanonical === scope.school;
+  }
+  return schoolNamesMatch(sName, scope.school);
+}
+
+/**
+ * 教員のアクセス範囲（所属学校）を一括操作の対象IDリストに反映する。
+ * 一般教員が他校の児童IDを指定しても操作できないよう、IDリストを自校のみに絞り込む。
+ * 'ALL' 指定時は自校のみを意味する配列に変換する（管理者は 'ALL' のまま＝全校）。
+ * 戻り値: { ids: 'ALL' | string[], denied: number } / ids が空配列の場合は対象なし
+ */
+function scopeStudentIdsForTeacher(studentIds, teacher) {
+  if (isAdminTeacher(teacher)) {
+    return { ids: studentIds, denied: 0 };
+  }
+
+  const scope = getTeacherScopeInfo(teacher);
+  if (scope.type === 'admin' || scope.type === 'all' || scope.type === 'none') {
+    return { ids: studentIds, denied: 0 };
+  }
+  const teacherSchool = scope.school;
+
+  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+  const data = sheet.getDataRange().getValues();
+  const idColIdx = headerMap['児童ID'] - 1;
+  const schoolColIdx = headerMap['学校名'] - 1;
+
+  // 自校に所属する児童ID + 学校未設定（新規登録児童）のセット
+  const ownSchoolIds = {};
+  for (let i = 1; i < data.length; i++) {
+    const id = String(data[i][idColIdx] || '').trim();
+    if (!id) continue;
+    const sName = String(data[i][schoolColIdx] || '').trim();
+    // 自校の児童、および学校未設定（新規登録直後）の児童を対象に含める
+    // ※ canonical 解決 → 表記ゆれ比較の順で判定し、略称・接頭辞付き表記も同一視する
+    const devCanonical = resolveCanonicalSchool(sName);
+    const isOwn = !sName || sName === '未設定' ||
+      (devCanonical ? devCanonical === teacherSchool : schoolNamesMatch(sName, teacherSchool));
+    if (isOwn) {
+      ownSchoolIds[id] = true;
+    }
+  }
+
+  if (studentIds === 'ALL' || !Array.isArray(studentIds)) {
+    return { ids: Object.keys(ownSchoolIds), denied: 0 };
+  }
+
+  const allowed = [];
+  let denied = 0;
+  studentIds.forEach(id => {
+    const key = String(id).trim();
+    if (ownSchoolIds[key]) allowed.push(key);
+    else denied++;
+  });
+
+  return { ids: allowed, denied: denied };
+}
+
+/**
+ * 児童IDから端末レコード（学校名など）を取得
+ */
+function getDeviceByStudentId(studentId) {
+  if (!studentId) return null;
+  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+  const data = sheet.getDataRange().getValues();
+  const idColIdx = headerMap['児童ID'] - 1;
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][idColIdx] || '').trim() === String(studentId).trim()) {
+      return {
+        student_id: String(data[i][idColIdx] || '').trim(),
+        school_name: String(data[i][headerMap['学校名'] - 1] || '').trim(),
+        student_name: String(data[i][headerMap['氏名'] - 1] || ''),
+        class_name: String(data[i][headerMap['クラス'] - 1] || '')
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * 全端末一覧取得（学校フィルター対応 & 教員の所属学校スコープ適用）
  */
 function getAllDevices(filterSchool, teacher, includeUnassigned) {
   const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
@@ -701,6 +1107,11 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
   const results = [];
   const now = new Date().getTime();
 
+  // 教員の所属学校スコープ（管理者は全校）
+  const scopeInfo = getTeacherScopeInfo(teacher);
+  const restrictToOwnSchool = scopeInfo.type === 'school' || scopeInfo.type === 'unknown';
+  const teacherSchool = scopeInfo.school || '';
+
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
     const studentId = String(row[headerMap['児童ID'] - 1] || '').trim();
@@ -708,14 +1119,25 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
 
     const schoolName = String(row[headerMap['学校名'] - 1] || '').trim();
 
+    // 0. 所属学校スコープ: 一般教員は自校の児童 + 学校未設定（新規登録児童）のみ
+    //    他の学校に所属する児童は一切返さない。
+    //    ※ 児童は初回ログイン時に「学校未設定」で登録されるため、所属校へ紐付ける前に
+    //      まず一覧へ表示する必要がある。
+    //    ※ canonical 解決（「第一小」「美作市立第一小学校」等）→ 表記ゆれ比較の順で判定
+    if (restrictToOwnSchool && schoolName && schoolName !== '未設定') {
+      const devCanonical = resolveCanonicalSchool(schoolName);
+      const isOwn = devCanonical ? (devCanonical === teacherSchool) : schoolNamesMatch(schoolName, teacherSchool);
+      if (!isOwn) continue;
+    }
+
     // 学校絞り込み
     if (filterSchool && filterSchool !== 'ALL') {
       if (filterSchool === 'UNASSIGNED') {
         if (schoolName && schoolName !== '未設定') continue;
       } else if (includeUnassigned) {
-        if (schoolName !== filterSchool && schoolName !== '未設定' && schoolName !== '') continue;
+        if (schoolName !== '未設定' && schoolName !== '' && !schoolNamesMatch(schoolName, filterSchool)) continue;
       } else {
-        if (schoolName !== filterSchool) continue;
+        if (!schoolNamesMatch(schoolName, filterSchool)) continue;
       }
     }
 
@@ -905,7 +1327,11 @@ function api_bulkLock(token, studentIds, locked) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    bulkUpdateScreenLock(studentIds, Boolean(locked));
+    const scoped = scopeStudentIdsForTeacher(studentIds, auth.teacher);
+    if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
+      return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
+    }
+    bulkUpdateScreenLock(scoped.ids, Boolean(locked));
     return { success: true, message: `画面ロックを ${locked ? 'ON' : 'OFF'} に更新しました` };
   } catch (err) {
     return { success: false, error: err.toString() };
@@ -917,8 +1343,12 @@ function api_bulkBroadcast(token, studentIds, url) {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     if (!url) return { success: false, error: 'URLが空です' };
+    const scoped = scopeStudentIdsForTeacher(studentIds, auth.teacher);
+    if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
+      return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
+    }
     const bcId = 'bc_' + new Date().getTime();
-    bulkUpdateBroadcastUrl(studentIds, url, bcId);
+    bulkUpdateBroadcastUrl(scoped.ids, url, bcId);
     return { success: true, broadcast_id: bcId };
   } catch (err) {
     return { success: false, error: err.toString() };
@@ -929,7 +1359,11 @@ function api_bulkFilter(token, studentIds, mode, whitelist, blacklist) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    bulkUpdateFilterMode(studentIds, mode, whitelist, blacklist);
+    const scoped = scopeStudentIdsForTeacher(studentIds, auth.teacher);
+    if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
+      return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
+    }
+    bulkUpdateFilterMode(scoped.ids, mode, whitelist, blacklist);
     try {
       saveTeacherSettings(auth.teacher.email, {
         filter_whitelist: whitelist,
@@ -948,6 +1382,11 @@ function api_updateSingle(token, studentId, data) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const targetStudent = getDeviceByStudentId(studentId);
+    if (!targetStudent) return { success: false, error: '児童IDが見つかりません: ' + studentId };
+    if (!isDeviceInTeacherScope(targetStudent.school_name, auth.teacher)) {
+      return { success: false, error: '他校の児童は操作できません' };
+    }
     updateSingleDevice(studentId, data || {});
     return { success: true, message: '設定を更新しました' };
   } catch (err) {
@@ -972,6 +1411,47 @@ function api_getTeacherSettings(token) {
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     const teacher = getTeacherSettings(auth.teacher.email);
     return { success: true, teacher: teacher };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+// ---- 管理者(ADMIN)専用：アカウント管理 API ----
+function api_getTeachers(token) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    return { success: true, teachers: getAllTeachers(auth.teacher), schools: CONFIG.SCHOOL_LIST };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_addTeacher(token, data) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    return { success: true, message: '教員を登録しました', teacher: addTeacher(auth.teacher, data || {}) };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_updateTeacher(token, data) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    return { success: true, message: '教員情報を更新しました', teacher: updateTeacherRecord(auth.teacher, data || {}) };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_addStudent(token, data) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    return { success: true, message: '児童を登録しました', student: addStudentRecord(auth.teacher, data || {}) };
   } catch (err) {
     return { success: false, error: err.toString() };
   }

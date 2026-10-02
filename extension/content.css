@@ -8,6 +8,31 @@
   pointer-events: none !important;
 }
 
+/**
+ * Gemini保護：ロック中はGoogle生成AI関連UI（Geminiに相談 / Gemini in Chrome 等）を
+ * 完全に無効化する。edu-lock-no-gemini クラス付与時に発動。
+ */
+.edu-lock-no-gemini [data-test-id*="gemini" i],
+.edu-lock-no-gemini [data-testid*="gemini" i],
+.edu-lock-no-gemini [id*="gemini" i],
+.edu-lock-no-gemini [class*="gemini" i],
+.edu-lock-no-gemini [aria-label*="Gemini" i],
+.edu-lock-no-gemini [aria-label*="ジェミニ"],
+.edu-lock-no-gemini [aria-label*="AI モード"],
+.edu-lock-no-gemini [aria-label*="AIモード"],
+.edu-lock-no-gemini [title*="Gemini" i],
+.edu-lock-no-gemini gemini-app,
+.edu-lock-no-gemini ai-mode-button,
+.edu-lock-no-gemini [jsname*="gemini" i],
+.edu-lock-no-gemini [jsname*="aimode" i],
+.edu-lock-no-gemini [data-test-id*="ai-mode" i],
+.edu-lock-no-gemini [data-testid*="ai-mode" i] {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+  opacity: 0 !important;
+}
+
 #edu-screen-lock-overlay {
   position: fixed !important;
   top: 0 !important;
@@ -91,6 +116,35 @@
 .edu-lock-notice {
   font-size: 13px !important;
   color: #94a3b8 !important;
+  margin: 0 !important;
+}
+
+.edu-lock-instructions {
+  margin: 22px 0 0 0 !important;
+  padding: 16px 18px !important;
+  background: rgba(15, 23, 42, 0.55) !important;
+  border: 1px solid rgba(148, 163, 184, 0.22) !important;
+  border-radius: 14px !important;
+  text-align: left !important;
+}
+
+.edu-lock-instructions-title {
+  font-size: 12px !important;
+  font-weight: 700 !important;
+  color: #cbd5e1 !important;
+  margin: 0 0 8px 0 !important;
+  letter-spacing: 0.04em !important;
+}
+
+.edu-lock-instructions ul {
+  margin: 0 !important;
+  padding-left: 20px !important;
+  color: #94a3b8 !important;
+  font-size: 13px !important;
+  line-height: 1.9 !important;
+}
+
+.edu-lock-instructions li {
   margin: 0 !important;
 }
 
