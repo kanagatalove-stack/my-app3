@@ -296,15 +296,20 @@ function doPost(e) {
       return jsonResponse({ success: false, error: '認証セッションが無効です。再ログインしてください。', need_auth: true });
     }
 
+    // トークン内の教員情報は発行時点のスナップショットのため、
+    // 教員マスタの最新レコード（所属学校・権限）で解決し直す。
+    // 管理者が所属学校/権限を後から変更しても、直ちに正しいスコープで判定する。
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+
     // D. 端末一覧取得
     if (action === 'get_all') {
-      const data = getAllDevices(payload.school_name, auth.teacher, Boolean(payload.include_unassigned));
+      const data = getAllDevices(payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
       return jsonResponse({ success: true, data: data });
     }
 
     // E. 一括画面ロック（教員の所属学校スコープを適用）
     if (action === 'bulk_lock') {
-      const scoped = scopeStudentIdsForTeacher(payload.student_ids, auth.teacher);
+      const scoped = scopeStudentIdsForTeacher(payload.student_ids, currentTeacher);
       if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
@@ -316,7 +321,7 @@ function doPost(e) {
     if (action === 'bulk_broadcast') {
       const targetUrl = payload.url;
       if (!targetUrl) return jsonResponse({ success: false, error: '配信URLが空です' });
-      const scoped = scopeStudentIdsForTeacher(payload.student_ids, auth.teacher);
+      const scoped = scopeStudentIdsForTeacher(payload.student_ids, currentTeacher);
       if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
@@ -327,15 +332,15 @@ function doPost(e) {
 
     // G. URL規制一括変更（教員の所属学校スコープを適用）
     if (action === 'bulk_filter') {
-      const scoped = scopeStudentIdsForTeacher(payload.student_ids, auth.teacher);
+      const scoped = scopeStudentIdsForTeacher(payload.student_ids, currentTeacher);
       if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
       bulkUpdateFilterMode(scoped.ids, payload.filter_mode, payload.whitelist_urls, payload.blacklist_urls);
       // 教員アカウントの個別設定としても保持
-      if (auth && auth.teacher && auth.teacher.email) {
+      if (currentTeacher && currentTeacher.email) {
         try {
-          saveTeacherSettings(auth.teacher.email, {
+          saveTeacherSettings(currentTeacher.email, {
             filter_whitelist: payload.whitelist_urls,
             filter_blacklist: payload.blacklist_urls
           });
@@ -352,7 +357,7 @@ function doPost(e) {
       if (!targetStudent) {
         return jsonResponse({ success: false, error: '児童IDが見つかりません: ' + payload.student_id });
       }
-      if (!isDeviceInTeacherScope(targetStudent.school_name, auth.teacher)) {
+      if (!isDeviceInTeacherScope(targetStudent.school_name, currentTeacher)) {
         return jsonResponse({ success: false, error: '他校の児童は操作できません' });
       }
       updateSingleDevice(payload.student_id, payload.data || {});
@@ -361,36 +366,36 @@ function doPost(e) {
 
     // I. 教員アカウント設定の保存（対象クラス・登録URL情報・個別規制URLの更新）
     if (action === 'save_teacher_settings' || action === 'update_teacher_settings') {
-      const updatedTeacher = saveTeacherSettings(auth.teacher.email, payload.settings || payload);
+      const updatedTeacher = saveTeacherSettings(currentTeacher.email, payload.settings || payload);
       return jsonResponse({ success: true, message: '教員設定を保存しました', teacher: updatedTeacher });
     }
 
     // J. 教員アカウント設定の取得
     if (action === 'get_teacher_settings') {
-      const teacher = getTeacherSettings(auth.teacher.email);
+      const teacher = getTeacherSettings(currentTeacher.email);
       return jsonResponse({ success: true, teacher: teacher });
     }
 
     // K. 教員アカウント一覧（管理者のみ）
     if (action === 'get_teachers') {
-      return jsonResponse({ success: true, teachers: getAllTeachers(auth.teacher), schools: CONFIG.SCHOOL_LIST });
+      return jsonResponse({ success: true, teachers: getAllTeachers(currentTeacher), schools: CONFIG.SCHOOL_LIST });
     }
 
     // L. 教員アカウントの新規登録（管理者のみ）
     if (action === 'add_teacher') {
-      const t = addTeacher(auth.teacher, payload.data || payload);
+      const t = addTeacher(currentTeacher, payload.data || payload);
       return jsonResponse({ success: true, message: '教員を登録しました', teacher: t });
     }
 
     // M. 教員アカウントの更新（管理者のみ）
     if (action === 'update_teacher') {
-      const t = updateTeacherRecord(auth.teacher, payload.data || payload);
+      const t = updateTeacherRecord(currentTeacher, payload.data || payload);
       return jsonResponse({ success: true, message: '教員情報を更新しました', teacher: t });
     }
 
     // N. 児童アカウントの新規登録（管理者のみ）
     if (action === 'add_student') {
-      const s = addStudentRecord(auth.teacher, payload.data || payload);
+      const s = addStudentRecord(currentTeacher, payload.data || payload);
       return jsonResponse({ success: true, message: '児童を登録しました', student: s });
     }
 
@@ -600,6 +605,31 @@ function getTeacherSettings(email) {
     }
   }
   throw new Error('教員アカウントが見つかりません: ' + email);
+}
+
+/**
+ * 認証トークン内の教員情報（24時間有効・発行時点のスナップショット）を、
+ * 教員マスタシートの「最新レコード」で解決し直す。
+ *
+ * 背景: トークンは発行時に school / role / target_class を埋め込むため、
+ *      管理者が教員の所属学校や権限を後から変更しても、トークンが失効するまで
+ *      古い情報でスコープ判定が行われてしまう。特に一般教員(TEACHER)で
+ *      「自校の児童が表示されない」不具合の主因となる。
+ *      → 各操作の都度シートから最新の所属学校・権限を読み直して判定する。
+ *
+ * トークンに email が無い / シートに該当が無い 等の場合は、
+ * トークンの情報にフォールバックして致命的なエラーにしない。
+ */
+function resolveCurrentTeacher(authTeacher) {
+  if (!authTeacher || !authTeacher.email) return authTeacher;
+  try {
+    const fresh = getTeacherSettings(authTeacher.email);
+    // トークン側の情報よりシートの最新情報を優先（admin 判定に必要）
+    return Object.assign({}, authTeacher, fresh);
+  } catch (e) {
+    Logger.log('教員情報の最新化に失敗（トークン情報を使用）: ' + e);
+    return authTeacher;
+  }
 }
 
 /**
@@ -1312,11 +1342,28 @@ function api_login(email, password) {
   }
 }
 
+/**
+ * セッション検証 & 最新の教員情報の取得（google.script.run 用）。
+ * ローカルに保存された教員情報（所属学校・権限）が古い場合でも、
+ * 教員マスタの最新レコードを返すことでフロントのスコープ判定を正しく保つ。
+ */
+function api_verifySession(token) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    return { success: true, teacher: currentTeacher };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
 function api_getAllDevices(token, schoolName, includeUnassigned) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const data = getAllDevices(schoolName, auth.teacher, Boolean(includeUnassigned));
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const data = getAllDevices(schoolName, currentTeacher, Boolean(includeUnassigned));
     return { success: true, data: data };
   } catch (err) {
     return { success: false, error: err.toString() };
@@ -1327,7 +1374,8 @@ function api_bulkLock(token, studentIds, locked) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const scoped = scopeStudentIdsForTeacher(studentIds, auth.teacher);
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
     if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
@@ -1343,7 +1391,8 @@ function api_bulkBroadcast(token, studentIds, url) {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     if (!url) return { success: false, error: 'URLが空です' };
-    const scoped = scopeStudentIdsForTeacher(studentIds, auth.teacher);
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
     if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
@@ -1359,13 +1408,14 @@ function api_bulkFilter(token, studentIds, mode, whitelist, blacklist) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const scoped = scopeStudentIdsForTeacher(studentIds, auth.teacher);
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
     if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
     bulkUpdateFilterMode(scoped.ids, mode, whitelist, blacklist);
     try {
-      saveTeacherSettings(auth.teacher.email, {
+      saveTeacherSettings(currentTeacher.email, {
         filter_whitelist: whitelist,
         filter_blacklist: blacklist
       });
@@ -1382,9 +1432,10 @@ function api_updateSingle(token, studentId, data) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
     const targetStudent = getDeviceByStudentId(studentId);
     if (!targetStudent) return { success: false, error: '児童IDが見つかりません: ' + studentId };
-    if (!isDeviceInTeacherScope(targetStudent.school_name, auth.teacher)) {
+    if (!isDeviceInTeacherScope(targetStudent.school_name, currentTeacher)) {
       return { success: false, error: '他校の児童は操作できません' };
     }
     updateSingleDevice(studentId, data || {});
@@ -1398,7 +1449,8 @@ function api_saveTeacherSettings(token, settings) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const updatedTeacher = saveTeacherSettings(auth.teacher.email, settings || {});
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const updatedTeacher = saveTeacherSettings(currentTeacher.email, settings || {});
     return { success: true, message: '教員設定を保存しました', teacher: updatedTeacher };
   } catch (err) {
     return { success: false, error: err.toString() };

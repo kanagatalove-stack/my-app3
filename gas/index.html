@@ -100,9 +100,9 @@
 
       <!-- 初期設定ヒント -->
       <div class="text-[11px] text-slate-500 space-y-1 bg-slate-50 p-3 rounded-xl border border-slate-100">
-        <div class="font-bold text-slate-700">【初期アカウント情報】</div>
-        <div>管理者: <code class="text-indigo-600 font-mono">admin@school.ed.jp</code> / PW: <code class="font-mono">Admin1234!</code></div>
-        <div>教員例: <code class="text-indigo-600 font-mono">teacher.daiichi@school.ed.jp</code> / PW: <code class="font-mono">Teacher1234!</code></div>
+        <div class="font-bold text-slate-700">【ログインについて】</div>
+        <div>教員マスタに登録済みのメールアドレスとパスワードを入力してください。</div>
+        <div class="text-slate-400">初期アカウントはシステム管理者から配布された案内をご確認ください。</div>
       </div>
     </div>
   </div>
@@ -1145,12 +1145,34 @@
         authToken = savedToken;
         try {
           currentTeacher = JSON.parse(savedTeacher);
-          showDashboard();
         } catch(e) {
           showLoginView();
+          return;
         }
+        // 保存済みの教員情報（所属学校・権限）は最大24時間前のスナップショットであり、
+        // 管理者が所属学校/権限を変更した後に古いスコープで表示してしまうのを防ぐため、
+        // サーバから最新の教員情報を取得して上書きする。
+        await refreshCurrentTeacher();
+        showDashboard();
       } else {
         showLoginView();
+      }
+    }
+
+    // サーバから最新の教員情報を取得して currentTeacher / localStorage を更新する。
+    // 失敗時はローカル保存値にフォールバックしてログイン状態は維持する。
+    async function refreshCurrentTeacher() {
+      if (!authToken) return;
+      try {
+        const res = await apiRequest({ action: 'verify_session' });
+        if (res && res.success && res.teacher) {
+          currentTeacher = res.teacher;
+          localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
+        }
+      } catch (e) {
+        // セッション失効などの場合は apiRequest 側で logout() されるか、
+        // 通信エラーのためローカル値で継続する。
+        console.warn('教員情報の最新化に失敗:', e && e.message);
       }
     }
 
@@ -1287,6 +1309,8 @@
           const act = payload.action;
           if (act === 'login') {
             runner.api_login(payload.email, payload.password);
+          } else if (act === 'verify_session') {
+            runner.api_verifySession(authToken);
           } else if (act === 'get_all') {
             runner.api_getAllDevices(authToken, payload.school_name, payload.include_unassigned);
           } else if (act === 'bulk_lock') {

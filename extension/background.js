@@ -252,7 +252,7 @@ async function applyPolicies(newPolicy, oldStorage) {
   if (newBcId && newBcId !== oldStorage.last_broadcast_id && newBcUrl) {
     console.log('[EduAgent] 新しい一斉表示URLを検出:', newBcUrl);
     await chrome.storage.local.set({ last_broadcast_id: newBcId });
-    openBroadcastUrl(newBcUrl);
+    openBroadcastUrl(newBcUrl, newBcId);
   }
 
   // 3. 現在開いているタブのURL規制チェック
@@ -302,6 +302,8 @@ async function checkSpecialTabsForLock() {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
       if (!tab.id) continue;
+      // 一斉配信直後のタブはロック画面へ差し替えない（新規タブで表示させるため）
+      if (isBroadcastGuardedTab(tab.id)) continue;
       const url = tab.url || '';
       if (isLockableUrl(url)) {
         redirectTabToLock(tab.id, url);
@@ -358,19 +360,49 @@ async function releaseLockedTabs() {
   } catch (e) {}
 }
 
+// 一斉配信直後のタブを、ロック処理（閉じる/ロック画面差し替え/URL規制）から保護する期限。
+// （配信はロック中でも確実に新規タブで表示される必要があるため）
+let broadcastGuardUntil = 0;
+let broadcastTabId = null;
+// 同一配信IDの二重オープン防止
+let lastBroadcastOpenedId = '';
+
+/**
+ * 一斉配信直後に保護すべきタブかどうかを判定する。
+ */
+function isBroadcastGuardedTab(tabId) {
+  if (Date.now() >= broadcastGuardUntil) return false;
+  if (broadcastTabId != null && tabId === broadcastTabId) return true;
+  return false;
+}
+
 /**
  * 一斉表示URLを新しいタブで開く
  * ※ 教員の「一斉URL配信」は、児童の現在の作業を中断させないよう
  *    必ず新しいタブで開く（既存タブを上書きしない）。
+ * ※ 画面ロック中であっても配信URLは新規タブで表示する。
+ *    直後に走るロック処理（タブ閉じ/ロック画面差し替え/URL規制）から配信タブを保護する。
  */
-async function openBroadcastUrl(url) {
+async function openBroadcastUrl(url, broadcastId) {
   try {
+    if (broadcastId && broadcastId === lastBroadcastOpenedId) {
+      return; // 同一配信の二重オープン防止
+    }
     let validUrl = url;
     if (!validUrl.startsWith('http://') && !validUrl.startsWith('https://')) {
       validUrl = 'https://' + validUrl;
     }
+    if (broadcastId) lastBroadcastOpenedId = broadcastId;
 
-    await chrome.tabs.create({ url: validUrl, active: true });
+    // 直後のロック/規制処理から保護する期間を設定
+    broadcastGuardUntil = Date.now() + 6000;
+    broadcastTabId = null;
+
+    const created = await chrome.tabs.create({ url: validUrl, active: true });
+    if (created && created.id) broadcastTabId = created.id;
+
+    // 保護期限後に参照が残らないようクリア
+    setTimeout(() => { broadcastTabId = null; }, 7000);
   } catch (err) {
     console.error('[EduAgent] 一斉URL表示エラー:', err);
   }
@@ -393,6 +425,8 @@ async function getActiveTabUrl() {
  */
 chrome.tabs.onCreated.addListener(async (tab) => {
   if (!tab.id) return;
+  // 一斉配信直後はロック中でも配信タブを閉じない/差し替えない（新規タブで表示するため）
+  if (Date.now() < broadcastGuardUntil) return;
   const data = await chrome.storage.local.get(['screen_lock']);
   if (!data.screen_lock) return;
   const url = tab.url || '';
@@ -428,6 +462,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     const url = changeInfo.url || tab.url;
     if (!url) return;
 
+    // 一斉配信直後のタブはロック/規制の対象外（新規タブで配信URLを表示させるため）
+    if (isBroadcastGuardedTab(tabId)) return;
+
     const data = await chrome.storage.local.get(['filter_mode', 'whitelist_urls', 'blacklist_urls', 'screen_lock']);
 
     // ロック中は、通常のWebページ・新規タブ・空白ページを一律ロック画面へ差し替える。
@@ -461,6 +498,8 @@ async function checkAllTabsFiltering(mode, whitelist, blacklist) {
 
     for (const tab of tabs) {
       if (!tab.id || !tab.url) continue;
+      // 一斉配信直後のタブはURL規制の対象外（新規タブで配信URLを表示させるため）
+      if (isBroadcastGuardedTab(tab.id)) continue;
 
       // A. すでにブロック画面を表示中のタブ → 規制解除済みなら元URLへ復帰
       if (tab.url.startsWith(blockPageBase)) {
