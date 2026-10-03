@@ -4,69 +4,161 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>画面ロック中 - 端末管理クライアント</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- 外部CDNは使用せず、すべて自己完結のスタイルで描画（拡張機能のCSP制約に対応） -->
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: #0f172a;
+      color: #ffffff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif;
+      -webkit-user-select: none;
+      user-select: none;
+      overflow: hidden;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      min-height: 100vh;
+    }
+    .lock-card {
+      background: rgba(30, 41, 59, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.55);
+      border-radius: 24px;
+      padding: 48px 56px;
+      text-align: center;
+      max-width: 560px;
+      width: 100%;
+      animation: lockFadeIn 0.3s ease-out;
+    }
+    .lock-icon-wrap {
+      width: 84px;
+      height: 84px;
+      margin: 0 auto 24px auto;
+      background: rgba(239, 68, 68, 0.15);
+      border: 2px solid rgba(239, 68, 68, 0.40);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: lockPulse 2s ease-in-out infinite;
+    }
+    .lock-icon-wrap svg { width: 42px; height: 42px; stroke: #ef4444; }
+    .lock-title {
+      font-size: 32px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin: 0 0 12px 0;
+      color: #f8fafc;
+    }
+    .lock-subtitle {
+      font-size: 18px;
+      font-weight: 600;
+      color: #cbd5e1;
+      margin: 0 0 24px 0;
+    }
+    .lock-bar {
+      width: 60px;
+      height: 4px;
+      background: #3b82f6;
+      border-radius: 2px;
+      margin: 0 auto 20px auto;
+    }
+    .lock-notice {
+      font-size: 13px;
+      line-height: 1.9;
+      color: #94a3b8;
+      margin: 0;
+    }
+    .lock-instructions {
+      margin: 22px 0 0 0;
+      padding: 16px 18px;
+      background: rgba(15, 23, 42, 0.55);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 14px;
+      text-align: left;
+    }
+    .lock-instructions-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #cbd5e1;
+      margin: 0 0 8px 0;
+      letter-spacing: 0.04em;
+    }
+    .lock-instructions ul {
+      margin: 0;
+      padding-left: 20px;
+      color: #94a3b8;
+      font-size: 13px;
+      line-height: 1.9;
+    }
+    .lock-instructions li { margin: 0; }
+    .lock-account {
+      margin-top: 22px;
+      font-size: 11px;
+      color: #64748b;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .lock-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      animation: lockPing 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+    @keyframes lockFadeIn {
+      from { opacity: 0; transform: scale(0.96); }
+      to   { opacity: 1; transform: scale(1); }
+    }
+    @keyframes lockPulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.55; }
+    }
+    @keyframes lockPing {
+      75%, 100% { transform: scale(2); opacity: 0; }
+    }
+  </style>
 </head>
-<body class="bg-slate-900 text-white min-h-screen flex items-center justify-center p-4 font-sans select-none overflow-hidden">
-  <div class="bg-slate-800/90 border border-slate-700 shadow-2xl rounded-3xl p-10 max-w-lg w-full text-center space-y-6 backdrop-blur-md">
-    
-    <div class="w-20 h-20 mx-auto bg-rose-500/20 border-2 border-rose-500/50 rounded-full flex items-center justify-center text-rose-500 animate-pulse">
-      <svg class="w-10 h-10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<body>
+  <div class="lock-card">
+    <div class="lock-icon-wrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
         <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
       </svg>
     </div>
 
-    <div class="space-y-2">
-      <h1 class="text-3xl font-extrabold text-slate-100 tracking-tight">画面ロック中</h1>
-      <p class="text-base font-medium text-slate-300">先生の話をよく聞きましょう</p>
+    <h1 class="lock-title">画面ロック中</h1>
+    <p class="lock-subtitle">先生の話をよく聞きましょう</p>
+
+    <div class="lock-bar"></div>
+
+    <p class="lock-notice">※ 授業の指示があるまで、端末の操作はできません。</p>
+
+    <div class="lock-instructions">
+      <div class="lock-instructions-title">先生からの指示</div>
+      <ul>
+        <li>先生の話を最後まで静かに聞きましょう。</li>
+        <li>キーボード・マウス・タッチ操作はできません。</li>
+        <li>先生がロックを解除すると、この画面は自動的に消えます。</li>
+      </ul>
     </div>
 
-    <div class="w-16 h-1 bg-indigo-500 rounded-full mx-auto"></div>
-
-    <p class="text-xs text-slate-400">
-      ※ 授業の指示があるまで端末の操作はできません。<br>
-      ロックが解除されると、自動的に元の画面に戻ります。
-    </p>
-
-    <div class="text-[11px] text-slate-500 flex items-center justify-center space-x-2 pt-2">
-      <span class="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+    <div class="lock-account">
+      <span class="lock-dot"></span>
       <span id="accountLabel">児童アカウント連携中...</span>
     </div>
   </div>
 
-  <script>
-    // 児童アカウント表示
-    chrome.storage.local.get(['student_id', 'student_name'], (data) => {
-      const label = document.getElementById('accountLabel');
-      if (data && data.student_id) {
-        label.textContent = `${data.student_name ? data.student_name + ' | ' : ''}${data.student_id}`;
-      }
-    });
-
-    // ロック解除の自動監視（解除されたら自動で閉じる、または履歴バック）
-    chrome.storage.onChanged.addListener((changes, area) => {
-      if (area === 'local' && 'screen_lock' in changes) {
-        if (!changes.screen_lock.newValue) {
-          restoreScreen();
-        }
-      }
-    });
-
-    // 定期確認フェイルセーフ
-    setInterval(async () => {
-      const data = await chrome.storage.local.get(['screen_lock']);
-      if (!data.screen_lock) {
-        restoreScreen();
-      }
-    }, 2000);
-
-    function restoreScreen() {
-      if (window.history.length > 1) {
-        window.history.back();
-      } else {
-        window.close();
-      }
-    }
-  </script>
+  <!-- インラインスクリプトは拡張機能CSPで禁止のため外部ファイル化 -->
+  <script src="lock.js"></script>
 </body>
 </html>

@@ -38,7 +38,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 // 高速定期タイマー（アクティブ時のハートビート）
-let syncInterval = 5000;
+// ※ 教員による画面ロック/ロック解除/URL規制の指示を児童端末へ素早く反映するため短周期化
+let syncInterval = 1500;
 setInterval(() => {
   syncWithGas();
 }, syncInterval);
@@ -251,33 +252,38 @@ async function applyPolicies(newPolicy, oldStorage) {
   if (newBcId && newBcId !== oldStorage.last_broadcast_id && newBcUrl) {
     console.log('[EduAgent] 新しい一斉表示URLを検出:', newBcUrl);
     await chrome.storage.local.set({ last_broadcast_id: newBcId });
-    openBroadcastUrl(newBcUrl);
+    openBroadcastUrl(newBcUrl, newBcId);
   }
 
   // 3. 現在開いているタブのURL規制チェック
-  if (updates.filter_mode !== 'OFF') {
-    checkAllTabsFiltering(updates.filter_mode, updates.whitelist_urls, updates.blacklist_urls);
-  }
+  //    規制がOFFに戻った場合でも、ブロック画面のタブを自動復帰させるため常に再検証する
+  checkAllTabsFiltering(updates.filter_mode, updates.whitelist_urls, updates.blacklist_urls);
 
-  // 4. 画面ロック中の特殊タブ（新規タブなど）の制御
+  // 4. 画面ロックの全タブ適用 / 解除時の復帰
+  //    すでに開いている通常ページ（スプレッドシート・YouTube・Gmail等のSPA）も、
+  //    ページ種別・CSPに依存せず確実にロック画面へ統一表示する（白画面化を防止）。
+  const wasLocked = Boolean(oldStorage.screen_lock);
   if (updates.screen_lock) {
     checkSpecialTabsForLock();
+  } else if (wasLocked) {
+    releaseLockedTabs();
   }
 }
 
 /**
  * 全タブに対して画面ロック状態を通知
+ * ※ ロック画面/規制画面（chrome-extension://）にも通知し、
+ *    ロック解除時にリロードなしで即座に元画面へ復帰させる。
  */
 async function notifyAllTabsLockState(locked) {
   try {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
-      if (tab.id && !tab.url?.startsWith('chrome-extension://')) {
-        chrome.tabs.sendMessage(tab.id, {
-          type: 'SET_LOCK_STATE',
-          locked: locked
-        }).catch(() => {});
-      }
+      if (!tab.id) continue;
+      chrome.tabs.sendMessage(tab.id, {
+        type: 'SET_LOCK_STATE',
+        locked: locked
+      }).catch(() => {});
     }
   } catch (err) {
     console.error('[EduAgent] タブへの通知エラー:', err);
@@ -285,36 +291,118 @@ async function notifyAllTabsLockState(locked) {
 }
 
 /**
- * 画面ロック中に新規タブ（chrome://newtab等）が開かれた場合の専用ロック画面への転送
+ * 画面ロック中、すべてのタブを専用ロック画面（lock.html）へ統一表示する。
+ * ・SPA（スプレッドシート・YouTube・Gmail等）はDOM上書きでは内容が透けて白画面化するため、
+ *   ページ自体をロック画面へ差し替える（＝重いページをアンロードする）。
+ * ・元のURLは lock.html の url パラメータに保持し、解除時に background 側で自動復帰させる。
+ * ・Webサイト側のCSP・リソース状況に依存せず、全ページ種別で同一デザインを保証する。
  */
 async function checkSpecialTabsForLock() {
   try {
     const tabs = await chrome.tabs.query({});
-    const lockPage = chrome.runtime.getURL('lock.html');
     for (const tab of tabs) {
-      if (tab.url && (tab.url.startsWith('chrome://newtab') || tab.url === 'about:blank')) {
-        chrome.tabs.update(tab.id, { url: lockPage });
+      if (!tab.id) continue;
+      // 一斉配信直後のタブはロック画面へ差し替えない（新規タブで表示させるため）
+      if (isBroadcastGuardedTab(tab.id)) continue;
+      const url = tab.url || '';
+      if (isLockableUrl(url)) {
+        redirectTabToLock(tab.id, url);
       }
     }
   } catch (e) {}
 }
 
 /**
- * 一斉表示URLをアクティブタブまたは新規タブで開く
+ * ロック画面へ差し替えるべきタブのURLかどうかを判定する。
+ * ・自分自身の拡張機能ページ（lock.html / blocked.html / popup等）は対象外
+ * ・chrome:// 系の内部ページは chrome.tabs.update で遷移できないため対象外
+ * ・新規タブ・空白ページ・通常のWebページ（http/https）は対象
  */
-async function openBroadcastUrl(url) {
+function isLockableUrl(url) {
+  if (!url) return true; // URL未確定の新規タブはロック画面へ
+  const self = chrome.runtime.getURL('');
+  if (url.startsWith(self)) return false;              // 拡張機能自身のページ
+  if (url.startsWith('chrome-extension://')) return false;
+  if (url.startsWith('chrome://') && !url.startsWith('chrome://newtab')) return false;
+  if (url.startsWith('about:') && url !== 'about:blank') return false;
+  return true;
+}
+
+/**
+ * タブをロック画面へ転送（元URLをクエリに保持して解除時に復帰できるようにする）
+ */
+function redirectTabToLock(tabId, originalUrl) {
+  const lockUrl = chrome.runtime.getURL('lock.html') +
+    `?url=${encodeURIComponent(originalUrl || '')}`;
+  chrome.tabs.update(tabId, { url: lockUrl });
+}
+
+/**
+ * 画面ロック解除時：ロック画面へ差し替えたタブを元のURLへ自動復帰させる
+ */
+async function releaseLockedTabs() {
   try {
+    const tabs = await chrome.tabs.query({});
+    const lockBase = chrome.runtime.getURL('lock.html');
+    for (const tab of tabs) {
+      if (!tab.id || !tab.url || !tab.url.startsWith(lockBase)) continue;
+      let originalUrl = '';
+      try {
+        originalUrl = new URL(tab.url).searchParams.get('url') || '';
+      } catch (e) {}
+      if (originalUrl && /^https?:\/\//i.test(originalUrl)) {
+        chrome.tabs.update(tab.id, { url: originalUrl });
+      } else {
+        // 元URLが保持されていない場合は新規タブ画面へ戻す
+        chrome.tabs.update(tab.id, { url: 'chrome://newtab' });
+      }
+    }
+  } catch (e) {}
+}
+
+// 一斉配信直後のタブを、ロック処理（閉じる/ロック画面差し替え/URL規制）から保護する期限。
+// （配信はロック中でも確実に新規タブで表示される必要があるため）
+let broadcastGuardUntil = 0;
+let broadcastTabId = null;
+// 同一配信IDの二重オープン防止
+let lastBroadcastOpenedId = '';
+
+/**
+ * 一斉配信直後に保護すべきタブかどうかを判定する。
+ */
+function isBroadcastGuardedTab(tabId) {
+  if (Date.now() >= broadcastGuardUntil) return false;
+  if (broadcastTabId != null && tabId === broadcastTabId) return true;
+  return false;
+}
+
+/**
+ * 一斉表示URLを新しいタブで開く
+ * ※ 教員の「一斉URL配信」は、児童の現在の作業を中断させないよう
+ *    必ず新しいタブで開く（既存タブを上書きしない）。
+ * ※ 画面ロック中であっても配信URLは新規タブで表示する。
+ *    直後に走るロック処理（タブ閉じ/ロック画面差し替え/URL規制）から配信タブを保護する。
+ */
+async function openBroadcastUrl(url, broadcastId) {
+  try {
+    if (broadcastId && broadcastId === lastBroadcastOpenedId) {
+      return; // 同一配信の二重オープン防止
+    }
     let validUrl = url;
     if (!validUrl.startsWith('http://') && !validUrl.startsWith('https://')) {
       validUrl = 'https://' + validUrl;
     }
+    if (broadcastId) lastBroadcastOpenedId = broadcastId;
 
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (activeTab && activeTab.id) {
-      chrome.tabs.update(activeTab.id, { url: validUrl, active: true });
-    } else {
-      chrome.tabs.create({ url: validUrl, active: true });
-    }
+    // 直後のロック/規制処理から保護する期間を設定
+    broadcastGuardUntil = Date.now() + 6000;
+    broadcastTabId = null;
+
+    const created = await chrome.tabs.create({ url: validUrl, active: true });
+    if (created && created.id) broadcastTabId = created.id;
+
+    // 保護期限後に参照が残らないようクリア
+    setTimeout(() => { broadcastTabId = null; }, 7000);
   } catch (err) {
     console.error('[EduAgent] 一斉URL表示エラー:', err);
   }
@@ -336,13 +424,34 @@ async function getActiveTabUrl() {
  * タブ作成イベントの監視（ロック中の新規タブをロック画面へ誘導）
  */
 chrome.tabs.onCreated.addListener(async (tab) => {
+  if (!tab.id) return;
+  // 一斉配信直後はロック中でも配信タブを閉じない/差し替えない（新規タブで表示するため）
+  if (Date.now() < broadcastGuardUntil) return;
   const data = await chrome.storage.local.get(['screen_lock']);
-  if (data.screen_lock) {
-    const lockPage = chrome.runtime.getURL('lock.html');
-    if (tab.id && (!tab.url || tab.url.startsWith('chrome://') || tab.url === 'about:blank')) {
-      chrome.tabs.update(tab.id, { url: lockPage });
+  if (!data.screen_lock) return;
+  const url = tab.url || '';
+  // 拡張機能自身のページ（lock.html等）は対象外。
+  if (url.startsWith(chrome.runtime.getURL(''))) return;
+
+  // ロック中は新しいタブを増やさない：
+  //  ・アクティブなロック画面(lock.html)を持つタブが既にあれば、開かれた新規タブは即座に閉じる
+  //  ・無ければ（＝全タブがロック画面でない特殊状況）新規タブをロック画面へ誘導する
+  try {
+    const lockBase = chrome.runtime.getURL('lock.html');
+    const tabs = await chrome.tabs.query({});
+    const existingLockTab = tabs.find(t => t.id !== tab.id && (t.url || '').startsWith(lockBase));
+    if (existingLockTab && existingLockTab.id) {
+      // 既にロック画面が開いているので、新しいタブは開かせない（増やさない）
+      chrome.tabs.remove(tab.id).catch(() => {});
+      if (existingLockTab.windowId != null) {
+        chrome.windows.update(existingLockTab.windowId, { focused: true }).catch(() => {});
+      }
+      chrome.tabs.update(existingLockTab.id, { active: true }).catch(() => {});
+      return;
     }
-  }
+  } catch (e) {}
+
+  redirectTabToLock(tab.id, /^https?:\/\//i.test(url) ? url : '');
 });
 
 /**
@@ -353,22 +462,16 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     const url = changeInfo.url || tab.url;
     if (!url) return;
 
+    // 一斉配信直後のタブはロック/規制の対象外（新規タブで配信URLを表示させるため）
+    if (isBroadcastGuardedTab(tabId)) return;
+
     const data = await chrome.storage.local.get(['filter_mode', 'whitelist_urls', 'blacklist_urls', 'screen_lock']);
 
-    // ロック中かつ新規タブ等の場合は専用ロック画面にリダイレクト
-    if (data.screen_lock) {
-      const lockPage = chrome.runtime.getURL('lock.html');
-      if (url.startsWith('chrome://newtab') || url === 'about:blank') {
-        chrome.tabs.update(tabId, { url: lockPage });
-        return;
-      }
-      // 通常ページ（Google検索画面含む）へは即座にロック通知
-      if (!url.startsWith('chrome-extension://')) {
-        chrome.tabs.sendMessage(tabId, {
-          type: 'SET_LOCK_STATE',
-          locked: true
-        }).catch(() => {});
-      }
+    // ロック中は、通常のWebページ・新規タブ・空白ページを一律ロック画面へ差し替える。
+    // すでにロック画面/規制画面/拡張機能ページのタブは対象外（無限リダイレクト防止）。
+    if (data.screen_lock && isLockableUrl(url)) {
+      redirectTabToLock(tabId, /^https?:\/\//i.test(url) ? url : '');
+      return;
     }
 
     // URL規制判定
@@ -384,15 +487,41 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
 /**
  * 全タブのURL規制を再検証
+ *  - 規制対象のURLを開いているタブはブロック画面へリダイレクト
+ *  - すでにブロック画面を表示しているタブは、規制が解除されていれば元のURLへ自動復帰
  */
 async function checkAllTabsFiltering(mode, whitelist, blacklist) {
   try {
     const tabs = await chrome.tabs.query({});
+    const blockPageBase = chrome.runtime.getURL('blocked.html');
+    const effectiveMode = (mode || 'OFF').toUpperCase();
+
     for (const tab of tabs) {
-      if (tab.id && tab.url) {
-        const isBlocked = evaluateUrlRestriction(tab.url, mode, whitelist, blacklist);
+      if (!tab.id || !tab.url) continue;
+      // 一斉配信直後のタブはURL規制の対象外（新規タブで配信URLを表示させるため）
+      if (isBroadcastGuardedTab(tab.id)) continue;
+
+      // A. すでにブロック画面を表示中のタブ → 規制解除済みなら元URLへ復帰
+      if (tab.url.startsWith(blockPageBase)) {
+        try {
+          const q = new URL(tab.url).searchParams;
+          const originalUrl = q.get('url') || '';
+          if (originalUrl) {
+            const stillBlocked = evaluateUrlRestriction(originalUrl, effectiveMode, whitelist || [], blacklist || []);
+            if (!stillBlocked) {
+              console.log('[EduAgent] URL規制が解除されたため元の画面へ復帰:', originalUrl);
+              chrome.tabs.update(tab.id, { url: originalUrl });
+            }
+          }
+        } catch (e) {}
+        continue;
+      }
+
+      // B. 通常のタブ → 規制対象ならブロック画面へ
+      if (effectiveMode !== 'OFF') {
+        const isBlocked = evaluateUrlRestriction(tab.url, effectiveMode, whitelist, blacklist);
         if (isBlocked) {
-          redirectToBlockedPage(tab.id, tab.url, mode);
+          redirectToBlockedPage(tab.id, tab.url, effectiveMode);
         }
       }
     }
