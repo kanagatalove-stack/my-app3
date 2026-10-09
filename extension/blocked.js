@@ -136,9 +136,25 @@
   checkAndRestore();
 
   // Service Worker キープアライブ
-  //  ブロック画面を表示している間も SW を起こし続け、規制解除の指示を数秒以内に受け取る。
-  //  ※ 教員コンソールにログイン中（keepalive_active=true）のときだけ送信する。
+  //  ブロック画面を表示している間も SW を起こし、規制解除の指示を数秒以内に受け取る。
+  //  ※ 教員コンソールが稼働中（keepalive_active=true）のときだけ送信する。
+  //    非稼働時は送信しない（管理アプリ未使用時の無駄な SW 起床・doPost を防ぐ）。
+  let kaActiveCache = false;
+  try {
+    chrome.storage.local.get(['keepalive_active'], (d) => {
+      if (chrome.runtime.lastError) return;
+      kaActiveCache = !!(d && d.keepalive_active);
+    });
+  } catch (e) {}
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && 'keepalive_active' in changes) {
+        kaActiveCache = !!changes.keepalive_active.newValue;
+      }
+    });
+  } catch (e) {}
   setInterval(() => {
+    if (!kaActiveCache) return; // 非稼働時は送信しない
     try {
       chrome.runtime.sendMessage({ type: 'KEEPALIVE_PING' }, () => { void chrome.runtime.lastError; });
     } catch (e) {}

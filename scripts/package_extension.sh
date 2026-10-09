@@ -24,7 +24,7 @@ cat << 'XMLEOF' > "$DIST_DIR/update.xml"
     codebase: extension.crx を配置した公開URLに書き換えてください
   -->
   <app appid='YOUR_EXTENSION_ID_HERE'>
-    <updatecheck codebase='https://YOUR_DOMAIN_OR_GITHUB_PAGES/extension.crx' version='1.5.2' />
+    <updatecheck codebase='https://YOUR_DOMAIN_OR_GITHUB_PAGES/extension.crx' version='1.6.0' />
   </app>
 </gupdate>
 XMLEOF

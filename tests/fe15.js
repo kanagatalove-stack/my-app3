@@ -72,7 +72,7 @@ check('コンソールに startExtensionKeepalive / stopExtensionKeepalive が�
 check('ログイン画面表示(showLoginView)で拡張を停止', /function showLoginView[\s\S]*?stopExtensionKeepalive\(\)/.test(html));
 check('ダッシュボード表示(showDashboard)で拡張を起動', /function showDashboard[\s\S]*?startExtensionKeepalive\(\)/.test(html));
 check('logout が showLoginView を呼ぶ（＝停止が連鎖）', /function logout[\s\S]*?showLoginView\(\)/.test(html));
-check('15秒ごとにコンソール稼働を再送して延命', /setInterval\(\(\)\s*=>\s*\{[\s\S]{0,120}?consoleTouch\(\)[\s\S]{0,120}?\},\s*15000\)/.test(html));
+check('15秒ごとにコンソール稼働を再送して延命', /setInterval\(\(\)\s*=>\s*\{[\s\S]{0,160}?consoleTouch\(eduKeepaliveSessionId\)[\s\S]{0,160}?\},\s*15000\)/.test(html));
 check('EDU_KEEPALIVE_START/STOP を postMessage で中継', /EDU_KEEPALIVE_START/.test(html) && /EDU_KEEPALIVE_STOP/.test(html));
 check('pagehide で STOP を送る（タブを閉じても停止）', /addEventListener\('pagehide'[\s\S]{0,80}stopExtensionKeepalive/.test(html));
 
@@ -83,8 +83,8 @@ check('background に KEEPALIVE_START / KEEPALIVE_STOP ハンドラがある',
   /message\.type === 'KEEPALIVE_START'/.test(bgJs) && /message\.type === 'KEEPALIVE_STOP'/.test(bgJs));
 check('GAS 連動の稼働フラグ（keepaliveActive）で管理', /keepaliveActive/.test(bgJs));
 check('GAS の ka_active を反映して同期周期を切替（applyRemoteKeepalive）', /applyRemoteKeepalive/.test(bgJs));
-check('keepalive_active を storage に保存', /chrome\.storage\.local\.set\(\{ keepalive_active/.test(bgJs));
-check('非稼働時は 15 秒レートで doPost を削減（IDLE_SYNC_MS）', /IDLE_SYNC_MS\s*=\s*15000/.test(bgJs) && /maybeSync/.test(bgJs));
+check('keepalive_active を storage に保存', /chrome\.storage\.local\.set\(\{[\s\S]{0,80}?keepalive_active:/.test(bgJs));
+check('非稼働時は定期ポーリングを停止して doPost を 0 にする（IDLE_SYNC_MS=0）', /IDLE_SYNC_MS\s*=\s*0/.test(bgJs) && /maybeSync/.test(bgJs));
 
 console.log('===== ④(動的) セッション開始/停止でアクティブが切替わる =====');
 check('開始前はセッションIDが無い', ctx.__kaId() === null, ctx.__kaId());

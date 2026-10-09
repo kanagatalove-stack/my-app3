@@ -16,7 +16,7 @@ node -e "JSON.parse(require('fs').readFileSync('extension/manifest.json','utf8')
 
 echo ""
 echo "=== 回帰テスト ==="
-for t in fe4 fe5 fe6 fe12 fe13 fe14 fe15 r15 gas_adv gas_heartbeat gas_r11 gas_r11_adv gas_r12 gas_r13 gas_screen bg_r12 bg_r13; do
+for t in fe4 fe5 fe6 fe12 fe13 fe14 fe15 r15 ka_multi gas_adv gas_heartbeat gas_r11 gas_r11_adv gas_r12 gas_r13 gas_screen bg_r12 bg_r13; do
   out="$(node "tests/$t.js" 2>&1)"
   code=$?
   last="$(echo "$out" | tail -1)"

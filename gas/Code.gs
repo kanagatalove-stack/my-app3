@@ -365,14 +365,15 @@ function doPost(e) {
       return jsonResponse(res);
     }
 
-    // A3. 教員コンソールの稼働通知（ログイン中は 30 秒ごとに touch、ログアウトで release）。
+    // A3. 教員コンソールの稼働通知（ログイン中は 15 秒ごとに touch、ログアウト/タブ閉じで release）。
     //     児童端末はハートビート応答の ka_active を見て同期周期を切り替える。
+    //     session_id を付けることで、複数アカウントのうち 1 つが終了しても他が稼働中なら維持される。
     //     ※ 認証不要（トークンを持たない経路もあるため）。稼働時刻を記録するだけの軽量処理。
     if (action === 'console_touch') {
-      return jsonResponse(touchTeacherConsole());
+      return jsonResponse(touchTeacherConsole(payload.session_id));
     }
     if (action === 'console_release') {
-      return jsonResponse(releaseTeacherConsole());
+      return jsonResponse(releaseTeacherConsole(payload.session_id));
     }
 
     // B. 教員ログイン認証
@@ -1297,41 +1298,129 @@ function shouldWriteSyncTime(studentId, nowMs) {
 // 課題: 児童端末が常時 1.5 秒間隔でハートビート（doPost）し、管理アプリを開いていなくても
 //       GAS 実行が数秒おきに走り続ける（通信負荷）。
 // 対策: 「いま教員コンソールがログインして稼働しているか」を GAS 側で一元管理する。
-//       ・教員コンソールはログイン中 30 秒ごとに touchTeacherConsole を呼ぶ。
-//       ・児童端末はハートビート応答の ka_active を見て、同期周期を
-//         稼働中=1.5 秒（速い）／非稼働=30 秒（省電力）に切り替える。
+//       ・児童端末はハートビート応答の ka_active を見て、同期周期を切り替える。
+//           稼働中（＝管理アプリを誰かが開いている）: 1.5 秒（速い）
+//           非稼働（＝管理アプリを誰も開いていない）: 同期しない（doPost = 0）
 //       ※ 児童端末は GAS としか通信できないため、GAS を介するのが唯一確実な方法。
-//       ・全アカウントがログアウト（touch が 90 秒途絶）すると自動で非稼働に戻る。
+//
+// 【v1.6.0 変更点】「管理アプリ未起動時の無駄な通信（doPost の数秒おき実行）」を完全に止める。
+//   ・旧: 稼働/非稼働いずれでも syncWithGas が動き続けた（非稼働時も 15 秒ごとに doPost）。
+//   ・新: 非稼働（ka_active=false）を確認したら児童端末側の同期を完全停止し、doPost を 0 にする。
+//   ・ただし「停止」したまま管理アプリが再度開かれても気付けなくなるため、児童端末は
+//     稼働→非稼働へ切り替わった直後だけ、ごく短い間（アイドル猶予）に限って低頻度で
+//     再確認する。この猶予が尽きたら完全停止し、以後は一切通信しない（管理アプリの再起動は
+//     端末側イベント＝タブ作成/URL更新/コンテンツPINGで即再開できる）。
+//
+// 【複数アカウント対応】
+//   ・教員コンソール（管理アプリ）は、ログイン中にセッションID付きで console_touch を送る。
+//   ・GAS は「現在生きているセッションID → 最終touch時刻」のマップで稼働を管理する。
+//   ・1人のログアウト/タブ閉じ/ブラウザ終了では console_release(そのID) で当該セッションだけを
+//     消し、**全セッションが消えたときだけ**非稼働（ka_active=false）になる。
 const KA_KEY = 'ka_console';
-const KA_PROP_KEY = 'KA_LAST_TOUCH'; // PropertiesService（永続）側のキー
-const KA_ACTIVE_WINDOW_MS = 120000;  // touch が 120 秒来なければ非稼働とみなす
+const KA_PROP_KEY = 'KA_LAST_TOUCH'; // PropertiesService（永続）側のキー（後方互換の残置）
+const KA_SESS_KEY = 'ka_sessions';   // 稼働セッションマップ（{sessionId: 最終touchエポックms}）のキャッシュキー
+const KA_SESS_PROP_KEY = 'KA_SESSIONS'; // 同マップの PropertiesService 側キー（永続）
+const KA_ACTIVE_WINDOW_MS = 120000;  // touch が 120 秒来なければそのセッションは失効とみなす
+const KA_MAX_SESSIONS = 200;         // セッションマップの安全上限（際限ない増加を防止）
+const KA_IDLE_DRIFT_SEC = 20;        // 稼働→非稼働に切替後、再開を確認するために低頻度(1秒)で再確認する猶予（秒）
+const ACTIVE_SYNC_INTERVAL_SEC = 1.5; // 稼働中（管理アプリを誰かが開いている）の児童端末の同期周期（秒）
+
+/**
+ * 稼働セッションマップ（{sessionId: 最終touchエポックms}）を CacheService→PropertiesService の
+ * 順で読み込む。片方しか無ければ他方で補完し、双方に反映する（キャッシュ失効による取りこぼし防止）。
+ */
+function readKaSessions() {
+  let map = {};
+  try {
+    const v = CacheService.getScriptCache().get(KA_SESS_KEY);
+    if (v) map = JSON.parse(v) || {};
+  } catch (e) { map = {}; }
+  if (!map || typeof map !== 'object' || Object.keys(map).length === 0) {
+    try {
+      const p = PropertiesService.getScriptProperties().getProperty(KA_SESS_PROP_KEY);
+      if (p) map = JSON.parse(p) || {};
+    } catch (e) {}
+  }
+  if (!map || typeof map !== 'object') map = {};
+  return map;
+}
+
+/** 稼働セッションマップを CacheService（一時）と PropertiesService（永続）の両方へ保存する。 */
+function writeKaSessions(map) {
+  const json = JSON.stringify(map || {});
+  try { CacheService.getScriptCache().put(KA_SESS_KEY, json, 240); } catch (e) {}
+  try { PropertiesService.getScriptProperties().setProperty(KA_SESS_PROP_KEY, json); } catch (e) {}
+}
+
+function pruneKaSessions(map, nowMs) {
+  const out = {};
+  let count = 0;
+  Object.keys(map || {}).forEach(function (id) {
+    const t = Number(map[id]) || 0;
+    if ((nowMs - t) < KA_ACTIVE_WINDOW_MS && count < KA_MAX_SESSIONS) {
+      out[id] = t;
+      count++;
+    }
+  });
+  return out;
+}
 
 /**
  * 教員コンソールの稼働を記録する（ログイン中に 15 秒ごとに呼ばれる）。
- * ※ CacheService は一時キャッシュで失効し得るため、PropertiesService（永続）にも
- *    時刻を保存して二重化する。これにより「コンソールが稼働中なのに ka_active=false」
- *    （＝児童端末が省電力周期のまま）という取りこぼしを防ぐ。
+ * sessionId をキーにしたマップで管理し、**複数アカウントが同時にログインしていても**
+ * 1つのセッションの終了では他の稼働を止めない（全セッションが消えたときだけ非稼働）。
+ * sessionId 未指定（後方互換）の場合は単一キーで記録する。
  */
-function touchTeacherConsole() {
-  const nowMs = String(new Date().getTime());
-  try { CacheService.getScriptCache().put(KA_KEY, nowMs, 240); } catch (e) {}
-  try { PropertiesService.getScriptProperties().setProperty(KA_PROP_KEY, nowMs); } catch (e) {}
+function touchTeacherConsole(sessionId) {
+  const nowMs = new Date().getTime();
+  const id = String(sessionId || '').trim();
+  try {
+    const map = pruneKaSessions(readKaSessions(), nowMs);
+    map[id || '__default__'] = nowMs;
+    writeKaSessions(map);
+  } catch (e) {}
+  // 後方互換（旧バージョンの判定・記録用）。sessionId 無しのときのみ更新する。
+  if (!id) {
+    try { CacheService.getScriptCache().put(KA_KEY, String(nowMs), 240); } catch (e) {}
+    try { PropertiesService.getScriptProperties().setProperty(KA_PROP_KEY, String(nowMs)); } catch (e) {}
+  }
   return { success: true, at: nowMs };
 }
 
-/** 教員コンソールの稼働を明示的に解除する（ログアウト時）。 */
-function releaseTeacherConsole() {
+/**
+ * 教員コンソールの稼働を解除する（ログアウト・タブ閉じ・ブラウザ終了時）。
+ * ・sessionId 指定時 … そのセッションだけをマップから削除（他アカウントの稼働は維持）
+ * ・未指定時         … 全セッションを解除（従来動作）
+ */
+function releaseTeacherConsole(sessionId) {
+  const nowMs = new Date().getTime();
+  const id = String(sessionId || '').trim();
+  try {
+    if (id) {
+      const map = pruneKaSessions(readKaSessions(), nowMs);
+      delete map[id];
+      writeKaSessions(map);
+    } else {
+      writeKaSessions({});
+    }
+  } catch (e) {}
   try { CacheService.getScriptCache().remove(KA_KEY); } catch (e) {}
   try { PropertiesService.getScriptProperties().deleteProperty(KA_PROP_KEY); } catch (e) {}
   return { success: true };
 }
 
 /**
- * 教員コンソールが稼働中かどうか（直近 KA_ACTIVE_WINDOW_MS 以内に touch があったか）。
- * CacheService → PropertiesService の順に確認する（どちらかに残っていれば稼働中）。
+ * 教員コンソールが稼働中かどうか。
+ * 稼働セッションマップに「直近 KA_ACTIVE_WINDOW_MS 以内に touch されたセッション」が残っていれば稼働中。
+ * 旧形式（単一キー）が残っている場合も後方互換で考慮する。
  */
 function isTeacherConsoleActive() {
   const nowMs = new Date().getTime();
+  try {
+    const map = pruneKaSessions(readKaSessions(), nowMs);
+    if (Object.keys(map).length > 0) return true;
+  } catch (e) {}
+  // 後方互換: 旧単一キー運用の残置値も見る
   try {
     const v = CacheService.getScriptCache().get(KA_KEY);
     if (v && (nowMs - Number(v)) < KA_ACTIVE_WINDOW_MS) return true;
@@ -1343,8 +1432,29 @@ function isTeacherConsoleActive() {
   return false;
 }
 
+/**
+ * 児童端末の同期周期（秒）を GAS から一元配布する。
+ *   ・稼働中（管理アプリを誰かが開いている）            : 1.5 秒（速い反映）
+ *   ・非稼働（誰も開いていない）                        : 0（同期しない＝doPost を発生させない）
+ *   ・稼働→非稼働へ切り替わってから KA_IDLE_DRIFT_SEC 秒以内: 1 秒（低頻度で再開を確認する猶予）
+ * これにより「管理アプリを起動していないときは通信しない」を GAS 主導で制御できる
+ * （GAS を更新すれば児童端末の拡張機能を再配布しなくても挙動を切り替えられる）。
+ */
+function computeKaInterval(res, nowMs) {
+  const sec = typeof res === 'number' ? res : Number(res);
+  const idleDriftUntil = nowMs + (KA_IDLE_DRIFT_SEC * 1000);
+  if (!isFinite(sec) || sec <= 0) {
+    return { ka_active: false, sync_interval_sec: 0, idle_drift_until: idleDriftUntil };
+  }
+  return { ka_active: true, sync_interval_sec: sec, idle_drift_until: 0 };
+}
+
 function processHeartbeat(studentId, currentUrl) {
-  const kaActive = (typeof isTeacherConsoleActive === 'function') ? isTeacherConsoleActive() : false;
+  // 教員コンソールの稼働有無に応じた児童端末の同期周期を配布する（非稼働=0＝同期しない）。
+  const kaInfo = (typeof computeKaInterval === 'function')
+    ? computeKaInterval(isTeacherConsoleActive() ? ACTIVE_SYNC_INTERVAL_SEC : 0, new Date().getTime())
+    : { ka_active: false, sync_interval_sec: 0, idle_drift_until: 0 };
+  const kaActive = kaInfo.ka_active;
   const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
   const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
   const data = sheet.getDataRange().getValues();
@@ -1405,7 +1515,8 @@ function processHeartbeat(studentId, currentUrl) {
       broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || '').trim(),
       screen_request_at: reqCol ? String(row[reqCol - 1] || '').trim() : '',
       screenshot_at: shotCol ? String(row[shotCol - 1] || '').trim() : '',
-      ka_active: kaActive, server_time: now
+      ka_active: kaActive, sync_interval_sec: kaInfo.sync_interval_sec,
+      idle_drift_until: kaInfo.idle_drift_until, server_time: now
     };
   } else {
     // 新規自動登録（児童Googleアカウント対応）。
@@ -1435,7 +1546,8 @@ function processHeartbeat(studentId, currentUrl) {
           broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || '').trim(),
           screen_request_at: reqCol2 ? String(row[reqCol2 - 1] || '').trim() : '',
           screenshot_at: shotCol2 ? String(row[shotCol2 - 1] || '').trim() : '',
-          ka_active: kaActive, server_time: now
+          ka_active: kaActive, sync_interval_sec: kaInfo.sync_interval_sec,
+      idle_drift_until: kaInfo.idle_drift_until, server_time: now
         };
       }
 
@@ -1472,7 +1584,8 @@ function processHeartbeat(studentId, currentUrl) {
         broadcast_id: '',
         screen_request_at: '',
         screenshot_at: '',
-        ka_active: kaActive, server_time: now
+        ka_active: kaActive, sync_interval_sec: kaInfo.sync_interval_sec,
+      idle_drift_until: kaInfo.idle_drift_until, server_time: now
       };
     });
   }
@@ -2361,12 +2474,12 @@ function jsonResponse(obj) {
 // ---- 教員コンソールの稼働通知 API (google.script.run 用) ----
 // GAS ネイティブ画面（script.google.com）からは content script へ postMessage が
 // 届かない場合があるため、確実に届く google.script.run 経由の経路を用意する。
-function api_consoleTouch() {
-  try { return touchTeacherConsole(); } catch (err) { return { success: false, error: err.toString() }; }
+function api_consoleTouch(sessionId) {
+  try { return touchTeacherConsole(sessionId); } catch (err) { return { success: false, error: err.toString() }; }
 }
 
-function api_consoleRelease() {
-  try { return releaseTeacherConsole(); } catch (err) { return { success: false, error: err.toString() }; }
+function api_consoleRelease(sessionId) {
+  try { return releaseTeacherConsole(sessionId); } catch (err) { return { success: false, error: err.toString() }; }
 }
 
 function api_login(email, password) {

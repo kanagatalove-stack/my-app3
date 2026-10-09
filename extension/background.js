@@ -35,11 +35,14 @@ chrome.runtime.onStartup.addListener(async () => {
   await initializeClient();
 });
 
-// 定期アラームの受信（Service Worker が停止していても確実に再開するためのバックストップ）
+// 定期アラームの受信
+//  ・syncAlarm      … 稼働中のバックストップ（30 秒）。教員コンソール稼働中のみ登録する。
+//  ・keepAliveAlarm … 旧名（後方互換）。
+//  ・idleDriftAlarm … 稼働→非稼働へ切り替わった直後の猶予期間だけ、再開を確認するための低頻度起床。
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'syncAlarm' || alarm.name === 'keepAliveAlarm') {
-    // 内容スクリプトが無い場合（全タブ閉じ等）でも 30 秒ごとに起床して同期する。
-    // 実際の間隔は稼働状態で maybeSync が決める（稼働中=1.5秒／非稼働=15秒）。
+    maybeSync();
+  } else if (alarm.name === 'idleDriftAlarm') {
     maybeSync();
   }
 });
@@ -47,54 +50,136 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // ==================== 教員コンソールの稼働に連動する同期周期 ====================
 // 課題: 児童端末が常時 1.5 秒間隔でハートビート（doPost）し、管理アプリを開いていなくても
 //       GAS 実行が数秒おきに走り続ける（通信負荷）。
-// 対策: 「いま教員コンソールが稼働しているか」を GAS 側で一元管理し（console_touch）、
-//       児童端末はハートビート応答の ka_active を見て同期周期を切り替える。
-//       ・稼働中: 1.5 秒間隔で速く反映（＋30秒アラームのバックストップ）
-//       ・非稼働: 1.5 秒タイマーを止め、30 秒アラームのみで省電力ポーリング
-//       ※ 30 秒アラームは常時維持する（止めると制御不能になるため）。
-//         非稼働時も 30 秒ごとに ka_active を確認し、教員ログイン時に数秒で追従する。
-//       ※ 児童端末は GAS としか通信できないため、GAS を介するのが唯一確実な方法。
+// v1.6.0: 「管理アプリを誰も起動していないときは通信しない」を徹底する。
+//   ・稼働中（ka_active=true）: 1.5 秒間隔で速く反映（＋30 秒アラームのバックストップ）。
+//   ・非稼働（ka_active=false）: **定期ポーリングを行わない（doPost = 0）**。
+//       ただし「稼働→非稼働」に切り替わった直後の猶予期間（GAS の idle_drift_until）だけ、
+//       管理アプリがすぐ再度開かれるケースに備えて低頻度（1 秒上限）で再確認する。
+//       猶予が尽きたらアラームを止め、完全に通信を停止する（＝無駄な通信ゼロ）。
+//   ・停止後に管理アプリが再度開かれた場合は、新しいタブの作成/更新（＝コンソールURL）を
+//     検知して即座に通常同期へ復帰する（resumeFromConsoleTab）。
+//   ※ 児童端末は GAS としか通信できないため、稼働判定は GAS（ka_active）を介する。
 let keepaliveActive = false; // GAS のハートビート応答 ka_active を反映
+let activeIntervalMs = 1500; // 稼働中の同期周期（GAS の sync_interval_sec で上書きされる）
+let idleDriftUntil = 0;      // 非稼働時、この時刻までは低頻度で再確認する（0=猶予なし）
 
-// GAS の応答（ka_active）を storage に保存し、同期ループへ反映する。
-// content/lock/blocked は storage の keepalive_active を見て ping を送る（稼働中のみ）。
-function applyRemoteKeepalive(active) {
-  const v = !!active;
-  if (v === keepaliveActive) return;
-  keepaliveActive = v;
-  try { chrome.storage.local.set({ keepalive_active: v }); } catch (e) {}
-  if (v) lastSyncMs = 0; // 稼働へ切替時は次回 ping で即同期し、素早く反映する
-  ensureSyncLoop();
+// GAS の応答（ka_active / sync_interval_sec / idle_drift_until）を storage と同期ループへ反映する。
+// 旧形式（真偽値のみ）でも受け付ける（後方互換）。
+function applyRemoteKeepalive(payload) {
+  let active, intervalSec, driftUntil;
+  if (payload && typeof payload === 'object') {
+    active = !!payload.ka_active;
+    intervalSec = Number(payload.sync_interval_sec);
+    driftUntil = Number(payload.idle_drift_until) || 0;
+  } else {
+    active = !!payload;
+    intervalSec = active ? 1.5 : 0;
+    driftUntil = active ? 0 : (Date.now() + 30000);
+  }
+  const changed = (active !== keepaliveActive);
+  keepaliveActive = active;
+  activeIntervalMs = (active && isFinite(intervalSec) && intervalSec > 0)
+    ? Math.round(intervalSec * 1000) : 1500;
+  idleDriftUntil = active ? 0 : (driftUntil || (Date.now() + 30000));
+
+  try {
+    chrome.storage.local.set({
+      keepalive_active: active,
+      keepalive_interval_sec: active ? (activeIntervalMs / 1000) : 0,
+      keepalive_drift_until: idleDriftUntil
+    });
+  } catch (e) {}
+
+  if (active) {
+    // 稼働中のバックストップ（30 秒アラーム）を確保し、猶予用アラームは不要なので止める。
+    if (changed) lastSyncMs = 0; // 稼働へ切替時は次回 ping で即同期し、素早く反映する
+    ensureSyncLoop();
+    clearIdleDriftAlarm();
+  } else {
+    // 非稼働: 30 秒アラームを止めて無駄な起床を止める。猶予期間だけ再開を確認する。
+    stopSyncLoop();
+    scheduleIdleDrift();
+  }
 }
 
 // ==================== 同期のレート制御 ====================
-// 「ネットワーク同期（doPost）の間隔」だけを稼働状態で切り替える。
-//  ・稼働中（教員コンソールがログイン中）: 1.5 秒 … 指示を 3 秒以内に反映
-//  ・非稼働（誰もログインしていない）      : 15 秒 … 通信負荷を大幅に削減
-// ※ 内容スクリプトからの KEEPALIVE_PING（ローカルIPCで軽い）で SW を起こし、
-//    ここでレート判定する。非稼働時は ping が来ても doPost しないため負荷は低い。
+//  ・稼働中（管理アプリが稼働中）      : 1.5 秒 … 指示を 3 秒以内に反映
+//  ・非稼働・猶予期間内               : 1 秒上限の低頻度で再確認（管理アプリの再起動を拾う）
+//  ・非稼働・猶予期間外               : 同期しない（doPost を出さない＝通信負荷ゼロ）
 const ACTIVE_SYNC_MS = 1500;
-const IDLE_SYNC_MS = 15000;
+const IDLE_SYNC_MS = 0;         // 非稼働時は定期ポーリングをしない（0＝常にスキップ）
+const IDLE_DRIFT_MS = 1000;     // 猶予期間中の再確認レート上限（1 秒）
+const IDLE_DRIFT_ALARM_MIN = 5 / 60; // 猶予期間中の再確認アラーム周期（5 秒）
 let lastSyncMs = 0;
 
 function maybeSync() {
   const now = Date.now();
-  const interval = keepaliveActive ? ACTIVE_SYNC_MS : IDLE_SYNC_MS;
+  let interval;
+  if (keepaliveActive) {
+    interval = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
+  } else if (idleDriftUntil && now < idleDriftUntil) {
+    interval = IDLE_DRIFT_MS; // 猶予期間のみ低頻度で再確認する
+  } else {
+    // 非稼働かつ猶予終了 → 同期しない。猶予用アラームが残っていれば止める。
+    clearIdleDriftAlarm();
+    return;
+  }
   if (now - lastSyncMs < interval) return;
   lastSyncMs = now;
   syncWithGas();
 }
 
 /**
- * 30 秒アラームのバックストップを常時登録する。
- * ・内容スクリプトが無い場合（全タブ閉じ等）でも、これで同期が継続する。
- * ・実際の同期間隔は maybeSync が稼働状態に応じて決める。
+ * 稼働中のバックストップ（30 秒アラーム）を登録する。
+ * ・稼働中のみ登録する（非稼働時は登録しない＝無駄な起床・doPost を防ぐ）。
+ * ・内容スクリプトが無い場合（全タブ閉じ等）でも、これによって同期が継続する。
  */
 function ensureSyncLoop() {
   try {
     chrome.alarms.create('syncAlarm', { periodInMinutes: 0.5 }); // 30秒（MV3の最小値）
   } catch (e) {}
 }
+
+/** 稼働が終わったらバックストップ（30 秒アラーム）を止める。 */
+function stopSyncLoop() {
+  try { chrome.alarms.clear('syncAlarm'); } catch (e) {}
+}
+
+/**
+ * 稼働→非稼働へ切り替わった直後の「猶予期間」だけ、低頻度で再開を確認するアラームを登録する。
+ * 猶予（GAS が idle_drift_until で指定）を過ぎたら自動的に止まるため、無駄な通信は残らない。
+ */
+function scheduleIdleDrift() {
+  const remaining = idleDriftUntil - Date.now();
+  if (remaining <= 0) { clearIdleDriftAlarm(); return; }
+  const periodMin = IDLE_DRIFT_ALARM_MIN;
+  try {
+    chrome.alarms.create('idleDriftAlarm', {
+      delayInMinutes: Math.min(periodMin, remaining / 60000),
+      periodInMinutes: periodMin
+    });
+  } catch (e) {}
+}
+
+/** 猶予期間用の再確認アラームを止める。 */
+function clearIdleDriftAlarm() {
+  try { chrome.alarms.clear('idleDriftAlarm'); } catch (e) {}
+}
+
+/**
+ * 停止後に管理アプリ（教員コンソール）が再度開かれた場合の復帰。
+ * コンソールは GAS の Web アプリ（script.google.com/macros/...）で開かれるため、
+ * そのタブ作成/更新を検知して一度だけ通常同期を走らせ、ka_active=true を確認できれば
+ * 稼働中の速い同期へ復帰する。＝停止中でもコンソールを開けば数秒以内に拡張が再稼働する。
+ */
+function resumeFromConsoleTab(url) {
+  if (keepaliveActive) return; // 既に稼働中なら何もしない
+  const u = String(url || '');
+  if (!/^https?:\/\/script\.google\.com\//i.test(u)) return;
+  lastSyncMs = 0;
+  syncWithGas();
+}
+
 
 /**
  * 教員コンソールの稼働を GAS に通知する（ログイン中に 30 秒ごとに呼ばれる）。
@@ -198,9 +283,9 @@ async function initializeClient() {
     // 学校に対応するGAS URLを解決（マッピング優先、無ければ gas_url）
     const initialGasUrl = resolveGasUrl(initialData);
 
-    // 同期ループ（短周期タイマー）＋30秒アラームのバックストップを登録
-    ensureSyncLoop();
-
+    // 稼働判定は GAS 応答（ka_active）で行う。初期同期を 1 回実行し、稼働中なら
+    // applyRemoteKeepalive が 30 秒アラームのバックストップを登録する
+    // （非稼働ならアラームを登録しない＝無駄な起床・doPost を防ぐ）。
     console.log(`[EduAgent] 児童端末セットアップ完了 (児童ID: ${studentId})`);
 
     // GAS URLが設定されていれば即座に自動同期を実行！
@@ -390,9 +475,15 @@ async function syncWithGas() {
     // 最新ポリシーの反映
     await applyPolicies(resJson, data);
 
-    // GAS が返す「教員コンソール稼働中か（ka_active）」を反映し、同期周期を切り替える。
-    // 稼働中=1.5秒の速い同期／非稼働=1.5秒タイマーを止めて30秒アラームのみ（省電力）。
-    applyRemoteKeepalive(resJson.ka_active);
+    // GAS が返す「教員コンソール稼働中か（ka_active）／同期周期（sync_interval_sec）／
+    // 非稼働時の再確認猶予（idle_drift_until）」を反映し、同期周期を切り替える。
+    //  ・稼働中        : 1.5 秒の速い同期
+    //  ・非稼働        : 定期ポーリングを停止（猶予期間のみ低頻度で再確認）
+    applyRemoteKeepalive({
+      ka_active: resJson.ka_active,
+      sync_interval_sec: resJson.sync_interval_sec,
+      idle_drift_until: resJson.idle_drift_until
+    });
 
   } catch (err) {
     console.error('[EduAgent] 通信エラー:', err);
@@ -735,6 +826,8 @@ async function getActiveTabUrl() {
  */
 chrome.tabs.onCreated.addListener(async (tab) => {
   if (!tab.id) return;
+  // 停止中に管理アプリ（教員コンソール）が再度開かれたら通常同期へ復帰する。
+  resumeFromConsoleTab(tab.url || (tab.pendingUrl || ''));
   // 一斉配信直後はロック中でも配信タブを閉じない/差し替えない（新規タブで表示するため）
   if (Date.now() < broadcastGuardUntil) return;
   const data = await chrome.storage.local.get(['screen_lock']);
@@ -771,6 +864,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.url || changeInfo.status === 'loading') {
     const url = changeInfo.url || tab.url;
     if (!url) return;
+
+    // 停止中に管理アプリ（教員コンソール）が開かれた/遷移したら通常同期へ復帰する。
+    resumeFromConsoleTab(url);
 
     // 一斉配信直後のタブはロック/規制の対象外（新規タブで配信URLを表示させるため）
     if (isBroadcastGuardedTab(tabId)) return;
@@ -913,12 +1009,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     consoleRelease().then(ok => sendResponse({ success: ok })).catch(() => sendResponse({ success: false }));
     return true;
   }
-  // 各タブからのハートビート。
-  // 稼働中（GAS が ka_active=true を返している間）のみ即時同期する。
-  // 非稼働時はタイマーを止め、30 秒アラームの省電力ポーリングに任せる。
+  // 各タブからのハートビート（ローカル IPC・ネットワーク通信ではない）。
+  // 稼働中（ka_active=true）は 1.5 秒レートで即時同期する。非稼働時は同期しない
+  // （＝doPost を出さない）。猶予期間内のみ maybeSync が低頻度で再確認する。
   if (message.type === 'KEEPALIVE_PING') {
-    // レート制御のうえで同期する（稼働中=1.5秒／非稼働=15秒）。
-    // 非稼働時に ping が来ても doPost は発生しない（通信負荷を最小化）。
     maybeSync();
     sendResponse({ success: true, active: keepaliveActive });
     return true;

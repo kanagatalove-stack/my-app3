@@ -37,16 +37,27 @@
   // 4. Service Worker キープアライブ（教員の指示を3秒以内に反映するための要）
   //    MV3 の Service Worker は約30秒の無操作で停止し、その間は教員の指示
   //    （画面ロック／ロック解除／URL規制／一斉配信）を受け取れない。
-  //    各タブの最上位フレームから短周期で ping を送り、SW を起こして同期させることで、
-  //    指示が「数十秒後」ではなく「数秒以内」に確実に反映される。
-  //    ※ 教員コンソールにログイン中（keepalive_active=true）のときだけ送信する。
-  //      ログアウト後は ping を止め、SW を無駄に起動しない（通信負担の低減）。
+  //    各タブの最上位フレームから ping を送り、SW を起こして同期させる。
+  //    ※ 送信するのは「教員コンソール（管理アプリ）が稼働中（keepalive_active=true）」のときだけ。
+  //      非稼働時は ping を一切送らない＝SW を起こさない＝管理アプリ未使用時の通信負荷はゼロ。
+  //      （管理アプリの再起動は SW 側のタブ作成/更新検知で即再開するため、常時 ping は不要）
   if (window.top === window) {
-    // ※ ping はローカルIPC（ネットワーク通信ではない）ため常時送る。
-    //    ネットワーク同期（doPost）の間隔は SW 側の maybeSync が
-    //    「稼働中=1.5秒／非稼働=15秒」で制御する（非稼働時は doPost しない）。
-    //    常時 ping にすることで、教員ログイン直後でも約1.5秒で稼働を検知できる。
+    let kaActiveCache = false;
+    try {
+      chrome.storage.local.get(['keepalive_active'], (d) => {
+        if (chrome.runtime.lastError) return;
+        kaActiveCache = !!(d && d.keepalive_active);
+      });
+    } catch (e) {}
+    try {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === 'local' && 'keepalive_active' in changes) {
+          kaActiveCache = !!changes.keepalive_active.newValue;
+        }
+      });
+    } catch (e) {}
     setInterval(() => {
+      if (!kaActiveCache) return; // 非稼働時は送信しない（無駄な SW 起床・doPost を防ぐ）
       try {
         chrome.runtime.sendMessage({ type: 'KEEPALIVE_PING' }, () => { void chrome.runtime.lastError; });
       } catch (e) {}

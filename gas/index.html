@@ -1495,67 +1495,98 @@
     // 児童端末は「教員コンソールが稼働中か」を GAS の ka_active で知り、1.5秒同期／30秒同期を切り替える。
     // 稼働を確実に伝えるため、次の 2 経路を併用する（GASネイティブ画面では postMessage が
     // content script に届かないことがあるため）:
-    //   ① google.script.run.api_consoleTouch() … GASネイティブでも確実に届く（15秒ごと）
+    //   ① google.script.run.api_consoleTouch(sessionId) … GASネイティブでも確実に届く（15秒ごと）
     //   ② window.postMessage(EDU_KEEPALIVE_START) … 通常Webページに拡張が居る場合の即時経路
-    // ログアウト時は console_release（＋EDU_KEEPALIVE_STOP）で停止する。
+    // ログアウト/タブ閉じ/ブラウザ終了時は console_release(sessionId)（＋EDU_KEEPALIVE_STOP）で停止。
+    //
+    // 【複数アカウント対応】session_id をセッションストレージに保持し、アカウント（タブ）ごとに
+    //   一意な ID を使う。GAS は全セッションが消えたときだけ非稼働に戻すため、1つのアカウントが
+    //   ログアウト/タブを閉じても、他のアカウントが稼働中なら児童端末は停止しない。
+    //
+    // 【即時停止】setInterval の 15 秒を待たずに止めるため、通常タブ（beforeunload が発火する）では
+    //   sendBeacon で即時に console_release を送る。GAS ネイティブ画面（バツで閉じる等）は
+    //   beforeunload が発火しないことがあるため、ページ離脱で送信が中断されにくい
+    //   fetch(keepalive:true) を併用し、さらに GAS 側の失効窓（120 秒）で最終的に自動失効する。
     let eduKeepaliveSessionId = null;
     let eduKeepaliveTimer = null;
     let eduConsoleTouched = false;
 
-    // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch）。
-    function consoleTouch() {
+    // アカウント（タブ）ごとのセッションIDを取得（同一タブ内では不変）。
+    function getKeepaliveSessionId() {
       try {
-        if (typeof google !== 'undefined' && google.script && google.script.run) {
-          google.script.run.api_consoleTouch();
-          return;
+        let sid = sessionStorage.getItem('edu_ka_session_id');
+        if (!sid) {
+          sid = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+          sessionStorage.setItem('edu_ka_session_id', sid);
         }
-      } catch (e) {}
+        return sid;
+      } catch (e) {
+        return 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+      }
+    }
+
+    // 送信用ボディ（session_id 付き）。console_touch/console_release 共通。
+    function keepaliveBody(action, sessionId) {
+      return JSON.stringify({ action: action, session_id: sessionId || '' });
+    }
+
+    // ページ離脱時でも送信が継続されやすいビーコン送信（sendBeacon 優先、無ければ fetch）。
+    function sendKeepaliveBeacon(action, sessionId) {
       try {
         const url = getApiUrl();
-        if (url) {
-          fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({ action: 'console_touch' }),
-            redirect: 'follow', keepalive: true
-          }).catch(() => {});
+        if (!url) return;
+        const body = keepaliveBody(action, sessionId);
+        if (typeof navigator !== 'undefined' && navigator && typeof navigator.sendBeacon === 'function') {
+          try {
+            const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
+            if (navigator.sendBeacon(url, blob)) return;
+          } catch (e) {}
         }
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: body,
+          redirect: 'follow', keepalive: true
+        }).catch(() => {});
       } catch (e) {}
     }
 
-    // GAS へ「コンソール停止」を通知。
-    function consoleRelease() {
+    // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
+    function consoleTouch(sessionId) {
+      const sid = sessionId || eduKeepaliveSessionId || getKeepaliveSessionId();
       try {
         if (typeof google !== 'undefined' && google.script && google.script.run) {
-          google.script.run.api_consoleRelease();
+          google.script.run.api_consoleTouch(sid);
           return;
         }
       } catch (e) {}
+      sendKeepaliveBeacon('console_touch', sid);
+    }
+
+    // GAS へ「コンソール停止（このセッションのみ）」を通知。
+    function consoleRelease(sessionId) {
+      const sid = sessionId || eduKeepaliveSessionId || getKeepaliveSessionId();
       try {
-        const url = getApiUrl();
-        if (url) {
-          fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({ action: 'console_release' }),
-            redirect: 'follow', keepalive: true
-          }).catch(() => {});
+        if (typeof google !== 'undefined' && google.script && google.script.run) {
+          google.script.run.api_consoleRelease(sid);
+          return;
         }
       } catch (e) {}
+      sendKeepaliveBeacon('console_release', sid);
     }
 
     function startExtensionKeepalive() {
       if (!eduConsoleTouched) {
         eduConsoleTouched = true;
-        eduKeepaliveSessionId = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        eduKeepaliveSessionId = getKeepaliveSessionId();
       }
       // 即時に稼働を通知（ログイン直後の児童端末を数秒以内に速い同期へ）
-      consoleTouch();
+      consoleTouch(eduKeepaliveSessionId);
       postKeepalive('EDU_KEEPALIVE_START');
       if (eduKeepaliveTimer) clearInterval(eduKeepaliveTimer);
       // 15 秒ごとに稼働を延命（GAS側の失効窓 120 秒より十分細かく再送する）
       eduKeepaliveTimer = setInterval(() => {
-        consoleTouch();
+        consoleTouch(eduKeepaliveSessionId);
         postKeepalive('EDU_KEEPALIVE_START');
       }, 15000);
     }
@@ -1563,7 +1594,7 @@
     function stopExtensionKeepalive() {
       if (eduKeepaliveTimer) { clearInterval(eduKeepaliveTimer); eduKeepaliveTimer = null; }
       if (eduConsoleTouched) {
-        consoleRelease();
+        consoleRelease(eduKeepaliveSessionId);
         eduKeepaliveSessionId = null;
         eduConsoleTouched = false;
       }
@@ -1575,10 +1606,18 @@
       } catch (e) {}
     }
 
-    // タブを閉じる/離れるときに STOP を送る（拡張側の60秒失効と二重の安全策）
+    // タブを閉じる/離れるときに即時 STOP を送る（15 秒を待たずに停止する）。
+    //  ・pagehide     … バツで閉じる/タブ切替/リロードで発火
+    //  ・beforeunload … 閉じる直前に sendBeacon（通常タブで確実）
     window.addEventListener('pagehide', () => { stopExtensionKeepalive(); });
     window.addEventListener('beforeunload', () => {
-      try { window.postMessage({ type: 'EDU_KEEPALIVE_STOP', session_id: eduKeepaliveSessionId || '' }, '*'); } catch (e) {}
+      try {
+        const sid = eduKeepaliveSessionId || getKeepaliveSessionId();
+        // setInterval の停止を待たず、このセッションの停止を即時に送る
+        sendKeepaliveBeacon('console_release', sid);
+        window.postMessage({ type: 'EDU_KEEPALIVE_STOP', session_id: sid || '' }, '*');
+      } catch (e) {}
+      stopExtensionKeepalive();
     });
 
     // ヘッダーの教員情報（氏名・所属校・担当クラス）を反映

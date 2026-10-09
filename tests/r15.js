@@ -69,32 +69,34 @@ check('doPost に console_touch 経路がある（認証不要）', /action === 
 check('doPost に console_release 経路がある', /action === 'console_release'/.test(codeGs));
 check('api_consoleTouch / api_consoleRelease がある（google.script.run 用）', /function api_consoleTouch/.test(codeGs) && /function api_consoleRelease/.test(codeGs));
 check('ハートビート応答に ka_active が含まれる', /ka_active:\s*kaActive/.test(codeGs));
-check('processHeartbeat が isTeacherConsoleActive を参照', /kaActive\s*=\s*\(typeof isTeacherConsoleActive/.test(codeGs));
+check('processHeartbeat が isTeacherConsoleActive を参照し周期を配布', /computeKaInterval\(isTeacherConsoleActive\(\) \? ACTIVE_SYNC_INTERVAL_SEC : 0/.test(codeGs));
 
 // ============ 課題A: コンソールが稼働を確実に配送 ============
 console.log('===== 課題A: コンソール→GAS の稼働配送（GASネイティブでも届く） =====');
-check('consoleTouch() が google.script.run.api_consoleTouch を呼ぶ',
-  /function consoleTouch\(\)[\s\S]*?google\.script\.run\.api_consoleTouch\(\)/.test(html));
-check('consoleTouch() に fetch フォールバックがある', /function consoleTouch\(\)[\s\S]*?fetch\(url/.test(html));
-check('consoleRelease() が api_consoleRelease を呼ぶ', /function consoleRelease\(\)[\s\S]*?google\.script\.run\.api_consoleRelease\(\)/.test(html));
-check('startExtensionKeepalive が consoleTouch を呼ぶ', /function startExtensionKeepalive\(\)[\s\S]*?consoleTouch\(\)/.test(html));
+check('consoleTouch(sessionId) が google.script.run.api_consoleTouch を呼ぶ',
+  /function consoleTouch\(sessionId\)[\s\S]*?google\.script\.run\.api_consoleTouch\(/.test(html));
+check('consoleTouch() に fetch フォールバックがある', /function sendKeepaliveBeacon[\s\S]*?fetch\(url/.test(html));
+check('consoleRelease(sessionId) が api_consoleRelease を呼ぶ', /function consoleRelease\(sessionId\)[\s\S]*?google\.script\.run\.api_consoleRelease\(/.test(html));
+check('startExtensionKeepalive が consoleTouch を呼ぶ', /function startExtensionKeepalive\(\)[\s\S]*?consoleTouch\(eduKeepaliveSessionId\)/.test(html));
 check('稼働を 15 秒ごとに再送する（GAS の失効窓 120 秒より十分細かい）',
-  /setInterval\(\(\)\s*=>\s*\{[\s\S]{0,160}?consoleTouch\(\)[\s\S]{0,160}?\},\s*15000\)/.test(html));
-check('stopExtensionKeepalive が consoleRelease を呼ぶ', /function stopExtensionKeepalive[\s\S]*?consoleRelease\(\)/.test(html));
+  /setInterval\(\(\)\s*=>\s*\{[\s\S]{0,160}?consoleTouch\(eduKeepaliveSessionId\)[\s\S]{0,160}?\},\s*15000\)/.test(html));
+check('stopExtensionKeepalive が consoleRelease を呼ぶ', /function stopExtensionKeepalive[\s\S]*?consoleRelease\(eduKeepaliveSessionId\)/.test(html));
+check('beforeunload で sendBeacon による即時 release（タブを閉じても即停止）', /beforeunload[\s\S]{0,400}?sendKeepaliveBeacon\('console_release'/.test(html));
+check('アカウントごとに一意なセッションID を保持（sessionStorage）', /sessionStorage\.getItem\('edu_ka_session_id'\)/.test(html));
 check('showDashboard（ログイン）で稼働開始', /function showDashboard[\s\S]*?startExtensionKeepalive\(\)/.test(html));
 check('showLoginView（ログアウト）で稼働停止', /function showLoginView[\s\S]*?stopExtensionKeepalive\(\)/.test(html));
 
 console.log('===== 課題A: 拡張側のレート制御（稼働中=1.5秒） =====');
 check('ACTIVE_SYNC_MS=1500（3秒以内反映の要）', /const ACTIVE_SYNC_MS = 1500;/.test(bgJs));
-check('IDLE_SYNC_MS=15000（非稼働時の負荷削減）', /const IDLE_SYNC_MS = 15000;/.test(bgJs));
-check('maybeSync が keepaliveActive で間隔を切替', /function maybeSync\(\)[\s\S]*?keepaliveActive \? ACTIVE_SYNC_MS : IDLE_SYNC_MS/.test(bgJs));
-check('稼働へ切替時に即同期（lastSyncMs=0）', /if \(v\) lastSyncMs = 0;/.test(bgJs));
+check('IDLE_SYNC_MS=0（非稼働時は定期ポーリングしない＝通信ゼロ）', /const IDLE_SYNC_MS = 0;/.test(bgJs));
+check('maybeSync が非稼働時（猶予終了）に同期しない', /function maybeSync\(\)[\s\S]*?clearIdleDriftAlarm\(\);[\s\S]*?return;/.test(bgJs));
+check('稼働へ切替時に即同期（lastSyncMs=0）', /if \(changed\) lastSyncMs = 0;/.test(bgJs));
 check('KEEPALIVE_PING が maybeSync を呼ぶ（非稼働時は doPost しない）', /message\.type === 'KEEPALIVE_PING'[\s\S]{0,200}?maybeSync\(\)/.test(bgJs));
-check('ping を常時送る（教員ログインを約1.5秒で検知）',
-  /window\.top === window[\s\S]{0,400}?setInterval\(\(\)\s*=>\s*\{[\s\S]{0,200}?KEEPALIVE_PING/.test(contentJs));
-check('content.js に kaActive ガードが残っていない（常時ping）', !/if \(!kaActive\) return;/.test(contentJs));
-check('lock.js も常時 ping（kaActive ガード無し）', !/if \(!kaActive\) return;/.test(lockJs) && /KEEPALIVE_PING/.test(lockJs));
-check('blocked.js も常時 ping（kaActive ガード無し）', !/if \(!kaActive\) return;/.test(blockedJs) && /KEEPALIVE_PING/.test(blockedJs));
+check('ping は稼働中のみ送る（keepalive_active ゲート）',
+  /kaActiveCache/.test(contentJs) && /if \(!kaActiveCache\) return;/.test(contentJs));
+check('content.js が非稼働時に送信しないゲートを持つ', /if \(!kaActiveCache\) return;/.test(contentJs));
+check('lock.js が非稼働時に送信しないゲートを持つ', /if \(!kaActiveCache\) return;/.test(lockJs) && /KEEPALIVE_PING/.test(lockJs));
+check('blocked.js が非稼働時に送信しないゲートを持つ', /if \(!kaActiveCache\) return;/.test(blockedJs) && /KEEPALIVE_PING/.test(blockedJs));
 
 // ============ 課題B: 画像をセル上限内に縮小して保存 ============
 console.log('===== 課題B: スプレッドシートのセル上限(50,000文字)対策 =====');
