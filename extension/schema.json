@@ -3,13 +3,18 @@
   "type": "object",
   "properties": {
     "gas_url": {
-      "title": "GAS WebアプリケーションURL",
-      "description": "Google Apps Script のデプロイURL (https://script.google.com/macros/s/.../exec)",
+      "title": "GAS WebアプリケーションURL（共通／単一校）",
+      "description": "Google Apps Script のデプロイURL (https://script.google.com/macros/s/.../exec)。全校で同一のGASを使う場合はここに設定します。学校ごとに別のGASを使う場合は gas_url_map を使用してください。",
       "type": "string"
     },
+    "gas_url_map": {
+      "title": "学校名 → GAS URL マッピング（複数校対応）",
+      "description": "1つの拡張機能で複数の学校（13校）それぞれのGAS（スプレッドシート）へ振り分けるための対応表。例: {\"英田小学校\": \"https://script.google.com/macros/s/AAA/exec\", \"大原小学校\": \"https://script.google.com/macros/s/BBB/exec\"}。端末の所属学校名（school_name）に一致するGAS URLへ自動で振り分けます。",
+      "type": "object"
+    },
     "school_name": {
-      "title": "所属学校名 (任意)",
-      "description": "英田小学校、第一小学校など。指定すると端末一覧で初期自動登録されます。",
+      "title": "所属学校名（推奨）",
+      "description": "英田小学校、第一小学校など。学校ごとの組織部門（OU）に設定すると、その学校のGASへ自動振り分けされ、端末一覧で初期自動登録されます。",
       "type": "string"
     },
     "student_id": {

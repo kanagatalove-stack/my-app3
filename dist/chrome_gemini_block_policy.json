@@ -1,0 +1,16 @@
+{
+  "_comment": "Google 管理コンソール > デバイス > Chrome > 設定 > ユーザーとブラウザ（児童生徒OU）に設定する Chrome ポリシーです。Chromebook 本体（ブラウザUI）の「Geminiに相談」「Gemini in Chrome」「AI モード」は、拡張機能からは無効化できません。ロック中も含めて Gemini を確実に使えなくするには、下記ポリシーを必ず設定してください。",
+  "policies": {
+    "GeminiSettings": 1,
+    "AIModeSettings": 1,
+    "GenAiDefaultSettings": 2,
+    "GeminiActOnWebSettings": 1
+  },
+  "_values": {
+    "GeminiSettings": "1 = Gemini の統合（Gemini in Chrome / Geminiに相談 等）を無効化し、ツールバーから削除",
+    "AIModeSettings": "1 = アドレスバー・新しいタブの検索ボックスの「AI モード」を無効化",
+    "GenAiDefaultSettings": "2 = 現在・将来の Chrome 生成AI機能をすべてブロック",
+    "GeminiActOnWebSettings": "1 = Gemini の自動操作（Auto Browse / Act on Web）を無効化"
+  },
+  "_verify": "児童端末の Chrome で chrome://policy を開き「ポリシーを再読み込み」→ GeminiSettings=1、AIModeSettings=1 を確認してください。"
+}

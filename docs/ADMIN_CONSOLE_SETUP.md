@@ -96,9 +96,54 @@ Chrome ブラウザを使って、拡張機能フォルダを `.crx` ファイ�
 
 本拡張機能は **Managed Storage（組織ポリシー）** に対応しており、児童端末に一切触れることなく GAS の Web アプリケーション URL を配信できます。
 
+> 💡 **1つの拡張機能で13校のGAS（スプレッドシート）に振り分け可能**:
+> 学校ごとに別のスプレッドシート／GAS を用意する場合（負荷分散）でも、**拡張機能は1つ**で運用できます。
+> `gas_url_map`（学校名 → GAS URL）を配布すると、各端末は自分の `school_name` に一致する GAS へ自動で接続します。
+> 学校ごとの組織部門（OU）に `school_name` を設定しておけば、児童は何も入力せずに正しい学校のGASへ繋がります。
+
 1. ステップ3で追加した拡張機能の一覧行をクリックし、右側に表示される **設定パネル** を開きます。
 2. **「拡張機能のポリシー」**（Managed Storage）欄を探します。
 3. 次の JSON を貼り付けて保存します（`YOUR_GAS_WEB_APP_URL` は実際のデプロイURLに置き換えてください。`dist/managed_policy.json` にもひな形があります）:
+
+**（A）各校でGASを分ける場合（推奨・負荷分散）**:
+
+`dist/managed_policy.json` に、`gas/Code.gs` の `CONFIG.SCHOOL_LIST`（美作市の全14校）を自動列挙したひな形が生成されます。
+`REPLACE_WITH_XX_GAS_ID` を各校の実際のデプロイURLに置き換えてから、下記に貼り付けてください。
+
+```json
+{
+  "gas_url_map": {
+    "Value": {
+      "英田小学校": "https://script.google.com/macros/s/＜英田小のGAS_ID＞/exec",
+      "大原小学校": "https://script.google.com/macros/s/＜大原小のGAS_ID＞/exec",
+      "江見小学校": "https://script.google.com/macros/s/＜江見小のGAS_ID＞/exec",
+      "勝田小学校": "https://script.google.com/macros/s/＜勝田小のGAS_ID＞/exec",
+      "勝田東小学校": "https://script.google.com/macros/s/＜勝田東小のGAS_ID＞/exec",
+      "第一小学校": "https://script.google.com/macros/s/＜第一小のGAS_ID＞/exec",
+      "北小学校": "https://script.google.com/macros/s/＜北小のGAS_ID＞/exec",
+      "土居小学校": "https://script.google.com/macros/s/＜土居小のGAS_ID＞/exec",
+      "英田中学校": "https://script.google.com/macros/s/＜英田中のGAS_ID＞/exec",
+      "大原中学校": "https://script.google.com/macros/s/＜大原中のGAS_ID＞/exec",
+      "作東中学校": "https://script.google.com/macros/s/＜作東中のGAS_ID＞/exec",
+      "勝田中学校": "https://script.google.com/macros/s/＜勝田中のGAS_ID＞/exec",
+      "美作中学校": "https://script.google.com/macros/s/＜美作中のGAS_ID＞/exec",
+      "樸学園": "https://script.google.com/macros/s/＜樸学園のGAS_ID＞/exec"
+    }
+  },
+  "school_name": {
+    "Value": ""
+  },
+  "student_id": {
+    "Value": "${USER_EMAIL}"
+  }
+}
+```
+
+> 📌 `gas_url_map` は「学校名 → その学校のGAS URL」の対応表です。**使用する全学校分**を列挙してください（上記は全14校の例）。
+> 学校名は `gas/Code.gs` の `CONFIG.SCHOOL_LIST` と同じ正式名称で記載します（`resolveGasUrl` が表記ゆれ「美作市立〜」「〜小」等を吸収します）。
+> `school_name` は**学校ごとのOUで**固定値を設定します（例: 英田小学校のOUには `"英田小学校"`）。トップレベル（全校共通）では空欄のままにします。空欄の場合は児童端末で「未設定」となり、教員画面から学校を紐付けた時点で対応するGASへ切り替わります。
+
+**（B）全校で同じGASを使う場合（単一）**:
 
 ```json
 {
@@ -115,11 +160,43 @@ Chrome ブラウザを使って、拡張機能フォルダを `.crx` ファイ�
 ```
 
 > 📌 **項目解説**:
-> - `gas_url`: 教員コンソールと通信する GAS Web アプリのデプロイURL（必須）。
+> - `gas_url_map`: 学校名 → GAS URL の対応表（複数校対応・推奨）。`school_name` に一致するGASへ自動振り分けします。表記ゆれ（「英田小」「美作市立英田小学校」等）も吸収します。
+> - `gas_url`: 全校共通の GAS Web アプリのデプロイURL。`gas_url_map` が無い場合に使用されます。
 > - `student_id`: **`"${USER_EMAIL}"` を指定します**。Google Workspace 管理コンソールのマクロ変数機能により、児童が Chromebook にログインすると自動的にその児童の Google アカウント（メールアドレス）に置き換わって拡張機能に渡されます（空欄でも `chrome.identity` により自動検出されます）。
-> - `school_name`: 特定の学校OUごとに学校名を固定したい場合に入力（空欄でも児童端末で「未設定」として自動登録され、教員画面から簡単に学校・クラス・氏名を紐付け可能です）。
+> - `school_name`: 学校OUごとに学校名を固定したい場合に入力。`gas_url_map` の振り分けキーになります。
 
 4. 画面右上の **「保存」** をクリックします。
+
+---
+
+## 🚫 ステップ 5: Gemini（生成AI）機能の無効化【重要】
+
+Chromebook のブラウザ（Chrome）本体に組み込まれた **「Geminiに相談」「Gemini in Chrome」「AI モード」** は、
+ブラウザのUI（ツールバー・アドレスバー・サイドパネル）として動作するため、**拡張機能からは完全に無効化できません**。
+拡張機能側では、ロック中にWebページ内に表示される Gemini / AIモード関連の要素を検出して非表示・クリック遮断しますが、
+ブラウザ本体のボタンは **Chrome の組織ポリシー（管理コンソール）で無効化する必要があります**。
+
+ロック中も含めて確実に Gemini を使えなくするには、Google 管理コンソールで以下を設定してください。
+
+1. 管理者アカウントで **[Google 管理コンソール](https://admin.google.com)** にログインします。
+2. **「デバイス」 > 「Chrome」 > 「設定」 > 「ユーザーとブラウザ」**（対象OU：児童生徒）を開きます。
+3. 検索ボックスで「Gemini」「AI」を検索し、次の値に設定します。
+
+   | ポリシー名 | 設定値 | 効果 |
+   | --- | --- | --- |
+   | **Gemini の統合設定（GeminiSettings）** | **1 = 無効** | ツールバーの Gemini サイドパネル・アイコンを完全に削除（「Gemini in Chrome」「Geminiに相談」を無効化） |
+   | **AI モードの設定（AIModeSettings）** | **1 = 無効** | アドレスバー・新規タブの検索ボックスの「AI モード」ボタンを無効化 |
+   | **生成AIの既定設定（GenAiDefaultSettings）** | **2 = すべてブロック** | 現在・将来の Chrome 生成AI機能をまとめてブロック（新機能が自動有効化されるのを防止） |
+   | **Gemini Act On Web の設定（GeminiActOnWebSettings）** | **1 = 無効** | Gemini の自動操作（Auto Browse）を無効化 |
+
+4. 画面右上の **「保存」** をクリックします。
+
+> 💡 **確認方法**: 児童端末の Chrome で `chrome://policy` を開き、「ポリシーを再読み込み」をクリックして
+> `GeminiSettings` が `1`、`AIModeSettings` が `1` になっていることを確認してください。
+
+> 📌 **補足**: Google Workspace 管理コンソールの「アプリ」>「追加サービス」からも Gemini アプリ自体
+> （Gemini Web / モバイル）を利用停止にできます。Chromebook 端末でブラウザのGeminiを完全に使わせない場合は
+> 上記ポリシーと合わせて設定してください。
 
 ---
 
@@ -153,3 +230,37 @@ Chromeウェブストアの有料デベロッパー登録（$5）を行わなく
 1. `manifest.json` の `"version"` をインクリメントします（例: `1.0.0` → `1.0.1`）。
 2. 初回に生成された秘密鍵 `extension.pem` を指定して再度「拡張機能のパッケージ化」を行います（同じ拡張機能IDが維持されます）。
 3. 生成された `extension.crx` と、バージョン番号を書き換えた `update.xml` をサーバーに上書きアップロードするだけで、全生徒の Chromebook に自動でバックグラウンド更新が配信されます。
+
+---
+
+## ✅ 13校展開 運用チェックリスト（1拡張機能 + 学校別GAS）
+
+本システムを**複数校（13校＋樸学園）**で運用する際の作業手順です。拡張機能は**1つ**、GAS／スプレッドシートは**学校ごと**に用意します。
+
+### 事前準備（管理者）
+- [ ] 各校の Google スプレッドシートを新規作成し、[SPREADSHEET_SETUP.md](SPREADSHEET_SETUP.md) の手順でシート（`端末一覧` / `教員マスタ`）とGASを設置
+- [ ] 各校のGASを **「ウェブアプリ」** としてデプロイし、`.../exec` URL を控える（実行ユーザー: 自分／アクセス: 全員 or 組織内）
+- [ ] 各校の**部署（OU）**を作成（例: `児童生徒/英田小学校`）＝ `school_name` をOU単位で配布するため
+
+### 拡張機能の配布（1回だけ）
+- [ ] `scripts/package_extension.sh` を実行 → `dist/extension.zip` / `dist/update.xml` / `dist/managed_policy.json` を生成
+- [ ] `dist/managed_policy.json` の `REPLACE_WITH_XX_GAS_ID` を各校の実デプロイURLに置換（学校名は `CONFIG.SCHOOL_LIST` の正式名称のまま）
+- [ ] ステップ1〜3の手順で `.crx` を作成し、管理コンソールから**1つの拡張機能**としてURL追加・強制インストール
+- [ ] 拡張機能のポリシー（Managed Storage）に `dist/managed_policy.json` の内容を貼り付け
+
+### 学校ごとのOU設定（各校分・繰り返し）
+- [ ] 各校OUの拡張機能ポリシーで `school_name` を**その学校の正式名称**に設定（例: 英田小学校のOU → `"英田小学校"`）
+  - ※ `gas_url_map` / `student_id`（`${USER_EMAIL}`）は共通のまま。`school_name` だけをOUごとに変える運用が最も簡単です
+- [ ] 対象OUの児童アカウントで Chromebook にログインし、拡張機能が自動インストールされることを確認
+- [ ] 児童端末の Chrome で `chrome://policy` → ポリシー再読み込み → `gas_url_map` / `school_name` が反映されていることを確認
+
+### 動作確認（学校ごと）
+- [ ] 児童端末の拡張機能ポップアップで「接続済み」になること（＝ `school_name` から解決した自校GASへ接続）
+- [ ] 教員コンソールを開き、自校の端末一覧のみが表示されること（学校スコープ）
+- [ ] 対象クラスを設定した教員が、その担当クラスの児童のみを操作できること（クラス境界）
+- [ ] 画面ロック / ロック解除 / URL規制 / 一斉URL配信 が自校の児童端末にのみ作用すること（他校へ波及しない）
+
+### よくあるつまずき
+- **接続できない（他校のGASに繋がる）**: `school_name` の綴りが `CONFIG.SCHOOL_LIST` と一致しているか、`gas_url_map` のキーと一致しているか確認（`resolveGasUrl` は前後空白・全角・「美作市立〜」等を吸収しますが、短縮名「英田小」は正式名に解決しません）
+- **未設定のまま**: `school_name` が空だと、教員画面から学校を紐付けるまで `gas_url`（無ければフォールバック）に接続します。学校OUには `school_name` を設定してください
+- **教員が対象クラスを変更できない**: 仕様です。対象クラスは権限の境界のため**管理者のみ**変更可能です（マイURL・個別規制URLは全教員が変更可）
