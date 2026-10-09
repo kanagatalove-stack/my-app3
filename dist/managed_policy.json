@@ -1,11 +1,26 @@
 {
-  "gas_url": {
-    "Value": "https://script.google.com/macros/s/AKfycb.../exec"
-  },
-  "student_id": {
-    "Value": "${USER_EMAIL}"
+  "gas_url_map": {
+    "Value": {
+      "英田小学校": "https://script.google.com/macros/s/REPLACE_WITH_01_GAS_ID/exec",
+      "大原小学校": "https://script.google.com/macros/s/REPLACE_WITH_02_GAS_ID/exec",
+      "江見小学校": "https://script.google.com/macros/s/REPLACE_WITH_03_GAS_ID/exec",
+      "勝田小学校": "https://script.google.com/macros/s/REPLACE_WITH_04_GAS_ID/exec",
+      "勝田東小学校": "https://script.google.com/macros/s/REPLACE_WITH_05_GAS_ID/exec",
+      "第一小学校": "https://script.google.com/macros/s/REPLACE_WITH_06_GAS_ID/exec",
+      "北小学校": "https://script.google.com/macros/s/REPLACE_WITH_07_GAS_ID/exec",
+      "土居小学校": "https://script.google.com/macros/s/REPLACE_WITH_08_GAS_ID/exec",
+      "英田中学校": "https://script.google.com/macros/s/REPLACE_WITH_09_GAS_ID/exec",
+      "大原中学校": "https://script.google.com/macros/s/REPLACE_WITH_10_GAS_ID/exec",
+      "作東中学校": "https://script.google.com/macros/s/REPLACE_WITH_11_GAS_ID/exec",
+      "勝田中学校": "https://script.google.com/macros/s/REPLACE_WITH_12_GAS_ID/exec",
+      "美作中学校": "https://script.google.com/macros/s/REPLACE_WITH_13_GAS_ID/exec",
+      "樸学園": "https://script.google.com/macros/s/REPLACE_WITH_14_GAS_ID/exec"
+    }
   },
   "school_name": {
+    "Value": ""
+  },
+  "student_id": {
     "Value": ""
   }
 }

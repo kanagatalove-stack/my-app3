@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chromebook 児童端末管理システム 導入のご提案 | 美作市教育委員会 様</title>
+<style>
+  :root{
+    --ink:#0f172a; --sub:#475569; --line:#e2e8f0; --navy:#1e3a8a; --blue:#2563eb;
+    --cyan:#0891b2; --green:#059669; --amber:#d97706; --red:#dc2626; --bg:#f8fafc;
+    --card:#ffffff;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    font-family:"Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans JP","Yu Gothic","Meiryo",system-ui,sans-serif;
+    color:var(--ink); background:var(--bg); line-height:1.75; font-size:14px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .page{
+    background:var(--card); width:210mm; min-height:297mm; margin:8mm auto; padding:16mm 15mm;
+    box-shadow:0 4px 24px rgba(15,23,42,.10); position:relative;
+  }
+  @media print{
+    body{background:#fff;}
+    .page{margin:0;box-shadow:none;width:auto;min-height:auto;padding:12mm;}
+    .no-print{display:none;}
+    @page{size:A4;margin:0;}
+  }
+  h1{font-size:26px;line-height:1.35;margin:0 0 6px;letter-spacing:.01em;}
+  h2{font-size:19px;margin:0 0 14px;padding:0 0 8px;border-bottom:3px solid var(--blue);color:var(--navy);}
+  h3{font-size:15.5px;margin:20px 0 8px;color:var(--navy);}
+  h4{font-size:13.5px;margin:14px 0 6px;color:var(--ink);}
+  p{margin:8px 0;}
+  ul,ol{margin:8px 0;padding-left:22px;}
+  li{margin:5px 0;}
+  small{color:var(--sub);}
+  .muted{color:var(--sub);}
+  .cover{display:flex;flex-direction:column;justify-content:space-between;}
+  .cover .kicker{letter-spacing:.28em;font-size:11px;color:var(--blue);font-weight:700;}
+  .cover h1{font-size:32px;margin-top:10px;}
+  .cover .lead{font-size:15px;color:var(--sub);margin-top:12px;max-width:145mm;}
+  .brandbar{height:8px;background:linear-gradient(90deg,var(--navy),var(--blue) 45%,var(--cyan));border-radius:4px;margin:0 0 20px;}
+  .meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 26px;margin-top:26px;font-size:13px;}
+  .meta-grid .k{color:var(--sub);}
+  .meta-grid .v{font-weight:700;}
+  .badge{display:inline-block;background:#eef2ff;color:var(--navy);border:1px solid #c7d2fe;border-radius:999px;padding:3px 12px;font-size:11.5px;font-weight:700;margin:0 6px 6px 0;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+  .card{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fff;}
+  .card.accent{border-left:5px solid var(--blue);}
+  .card.green{border-left:5px solid var(--green);}
+  .card.amber{border-left:5px solid var(--amber);}
+  .card h4{margin-top:0;}
+  table{border-collapse:collapse;width:100%;font-size:13px;margin:10px 0;}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top;}
+  th{background:#f1f5f9;color:var(--navy);font-weight:700;}
+  tbody tr:nth-child(even){background:#fafcff;}
+  .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;}
+  .center{text-align:center;}
+  .tag{font-size:11px;padding:2px 8px;border-radius:6px;font-weight:700;}
+  .tag.on{background:#dcfce7;color:#166534;}
+  .tag.best{background:#fef3c7;color:#92400e;}
+  .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0;}
+  .kpi .box{border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center;background:linear-gradient(180deg,#fff,#f7faff);}
+  .kpi .big{font-size:24px;font-weight:800;color:var(--blue);line-height:1.1;}
+  .kpi .lbl{font-size:11.5px;color:var(--sub);margin-top:6px;}
+  .callout{background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;padding:12px 14px;margin:12px 0;}
+  .callout.warn{background:#fffbeb;border-color:#fde68a;}
+  .callout.danger{background:#fef2f2;border-color:#fecaca;}
+  .flow{display:flex;align-items:stretch;gap:0;margin:14px 0;flex-wrap:wrap;}
+  .flow .step{flex:1;min-width:120px;border:1px solid var(--line);border-radius:10px;padding:10px;margin:4px;background:#fff;position:relative;}
+  .flow .step .n{width:22px;height:22px;border-radius:50%;background:var(--blue);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;margin-bottom:6px;}
+  .foot{position:absolute;bottom:8mm;left:15mm;right:15mm;border-top:1px solid var(--line);padding-top:6px;display:flex;justify-content:space-between;font-size:10.5px;color:var(--sub);}
+  .toc{font-size:13.5px;}
+  .toc li{margin:7px 0;}
+  .toc .pg{float:right;color:var(--sub);}
+  .hr{height:1px;background:var(--line);margin:18px 0;}
+  .price-hero{background:linear-gradient(135deg,var(--navy),var(--blue));color:#fff;border-radius:14px;padding:20px 22px;}
+  .price-hero .big{font-size:34px;font-weight:800;letter-spacing:.01em;}
+  .price-hero .sm{font-size:12.5px;opacity:.9;}
+  .pill{display:inline-block;background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:3px 11px;font-size:11px;margin:4px 6px 0 0;}
+  .legend{font-size:11.5px;color:var(--sub);margin-top:6px;}
+  .bar-row{display:flex;align-items:center;gap:10px;margin:6px 0;font-size:12.5px;}
+  .bar-row .name{width:120px;color:var(--sub);}
+  .bar{height:16px;border-radius:4px;background:var(--blue);}
+  .bar.grey{background:#cbd5e1;}
+  .bar.green{background:var(--green);}
+  .bar.amber{background:var(--amber);}
+  .avoid-break{break-inside:avoid;}
+  .pagebreak{break-before:page;}
+  .sign{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:20px;font-size:13px;}
+  .sign .box{border:1px solid var(--line);border-radius:10px;padding:14px;min-height:60px;}
+</style>
+</head>
+<body>
+
+<!-- ================= 表紙 ================= -->
+<section class="page cover">
+  <div>
+    <div class="brandbar"></div>
+    <div class="kicker">PROPOSAL&nbsp;/&nbsp;教育ICT導入のご提案</div>
+    <h1>Chromebook 児童端末管理システム<br>導入のご提案</h1>
+    <div class="lead">
+      GIGAスクール端末を「安全に・スピーディに・確実に」見守るための、
+      児童端末クライアント拡張機能 ＋ 教職員管理コンソール。<br>
+      全国学力・学習状況調査（CBT）にも対応する、低コスト・高効果の運用基盤です。
+    </div>
+    <div style="margin-top:18px;">
+      <span class="badge">画面ロック</span>
+      <span class="badge">URL規制（許可/禁止）</span>
+      <span class="badge">一斉URL配信</span>
+      <span class="badge">閲覧状況の見守り</span>
+      <span class="badge">3秒以内の反映</span>
+      <span class="badge">14校の一括運用</span>
+      <span class="badge">CBT（学力調査）対応</span>
+    </div>
+  </div>
+
+  <div>
+    <div class="kpi">
+      <div class="box"><div class="big">14<small>校</small></div><div class="lbl">市内全校を1つのシステムで</div></div>
+      <div class="box"><div class="big">&lt;3<small>秒</small></div><div class="lbl">指示が児童画面に反映</div></div>
+      <div class="box"><div class="big">0<small>円</small></div><div class="lbl">追加ソフト・MDM費用なし</div></div>
+      <div class="box"><div class="big">1/8</div><div class="lbl">商用製品比のご提案価格</div></div>
+    </div>
+
+    <div class="meta-grid">
+      <div><div class="k">提出先</div><div class="v">美作市教育委員会 御中</div></div>
+      <div><div class="k">対象</div><div class="v">市内 小学校・中学校・義務教育学校（全14校）</div></div>
+      <div><div class="k">ご提案者</div><div class="v">（個人事業主・開発者名を記載）</div></div>
+      <div><div class="k">作成日</div><div class="v">2026年10月7日</div></div>
+      <div><div class="k">文書</div><div class="v">導入のご提案書（機能説明・価格提案）</div></div>
+      <div><div class="k">版</div><div class="v">v1.3.0 準拠 / 提案書 Rev.1</div></div>
+    </div>
+    <p class="legend" style="margin-top:16px;">
+      ※ 本書の金額はすべて税別です。※ 「約3,300人」等の児童生徒数は公開統計に基づく推計値であり、正式な台数は発注時に確定します。
+    </p>
+  </div>
+
+  <div class="foot"><span>Chromebook 児童端末管理システム 導入のご提案</span><span>美作市教育委員会 御中</span></div>
+</section>
+
+<!-- ================= エグゼクティブサマリ / 目次 ================= -->
+<section class="page">
+  <h2>エグゼクティブ・サマリ</h2>
+
+  <div class="callout">
+    <b>結論：</b>本システムは、市内全14校・約3,300台のChromebookを、
+    <b>1つの管理画面</b>から「画面ロック」「URL規制」「一斉URL配信」「閲覧状況の見守り」まで
+    <b>3秒以内</b>に一括制御できる運用基盤です。商用MDM＋フィルタリング製品の初期・年間費用
+    （試算 約400万円/年）に対し、<b>本市向けご提案価格は年間48万円（税別）</b>。
+    <b>初期費用を含む初年度 68万円</b>で、<b>少額随意契約（役務100万円以下）の枠内</b>に収まるため、
+    個人事業主との契約でも<b>入札を経ずに導入</b>いただけます。
+  </div>
+
+  <div class="kpi">
+    <div class="box"><div class="big">3<small>秒以内</small></div><div class="lbl">指示→児童端末反映</div></div>
+    <div class="box"><div class="big">14<small>校</small></div><div class="lbl">1拡張機能で全校運用</div></div>
+    <div class="box"><div class="big">2<small>種</small></div><div class="lbl">CBT・通常授業に対応</div></div>
+    <div class="box"><div class="big">68<small>万円</small></div><div class="lbl">初年度総額（税別）</div></div>
+  </div>
+
+  <h3>本提案の3つの要点</h3>
+  <div class="grid3">
+    <div class="card accent">
+      <h4>① 「反応が遅い／ばらつく」を解消</h4>
+      <p>独自の<strong>常時同期（キープアライブ）方式</strong>により、教員の操作が
+      児童端末へ<strong>通常1.5〜3秒</strong>で反映。ロック解除もリロード不要で自動復帰します。</p>
+    </div>
+    <div class="card green">
+      <h4>② 小学校で効果大・中学校のCBTで真価</h4>
+      <p>小学校は授業中の集中管理で効果絶大。中学校はCBT（全国学力調査）実施時に
+      <strong>カンニング防止・他サイト遷移の抑制</strong>として活躍します。</p>
+    </div>
+    <div class="card amber">
+      <h4>③ 追加コストゼロの配布</h4>
+      <p>Google Workspace 管理コンソールの標準機能だけで全校へ一括配布。
+      <strong>有料MDM・フィルタリング製品は不要</strong>です（年間の固定費を大幅削減）。</p>
+    </div>
+  </div>
+
+  <div class="hr"></div>
+
+  <h3>目次</h3>
+  <ol class="toc">
+    <li>現状の課題と背景（GIGAスクール／CBT化）<span class="pg">P.3</span></li>
+    <li>システム概要と全体構成<span class="pg">P.4</span></li>
+    <li>機能説明（詳細）<span class="pg">P.5</span></li>
+    <li>導入効果 — 小学校・中学校・CBT<span class="pg">P.7</span></li>
+    <li>商用製品との比較<span class="pg">P.9</span></li>
+    <li>価格のご提案<span class="pg">P.10</span></li>
+    <li>導入スケジュール・運用体制<span class="pg">P.12</span></li>
+    <li>セキュリティ・個人情報保護<span class="pg">P.13</span></li>
+    <li>よくあるご質問<span class="pg">P.13</span></li>
+  </ol>
+
+  <div class="foot"><span>エグゼクティブ・サマリ</span><span>Chromebook 児童端末管理システム</span></div>
+</section>
+
+<!-- ================= 1. 課題 ================= -->
+<section class="page pagebreak">
+  <h2>1. 現状の課題と背景</h2>
+
+  <h3>1-1. GIGAスクール端末の「その後の運用」が課題</h3>
+  <p>1人1台端末の整備が完了した現在、教育現場の関心は「配る」から「<b>安全に使いこなす</b>」へ移っています。
+  しかし、現場では次のような声が少なくありません。</p>
+  <div class="grid2">
+    <div class="card amber"><h4>授業中の集中が途切れる</h4><p>児童が無関係な動画・ゲームサイトへ流れ、教員が一人ひとりの画面を巡回して注意するのは現実的ではありません。</p></div>
+    <div class="card amber"><h4>指示が「すぐ届かない」</h4><p>既存の管理ツールは反映に数十秒かかることがあり、ロックや配信のタイミングが授業のテンポに合いません。</p></div>
+    <div class="card amber"><h4>サイト巡回の負担</h4><p>「今どの子が何を見ているか」を把握できず、トラブルの早期発見が困難です。</p></div>
+    <div class="card amber"><h4>費用と運用の壁</h4><p>商用MDM＋フィルタリングは台数比例で高額になり、小規模自治体ほど負担が重くなります。</p></div>
+  </div>
+
+  <h3>1-2. 全国学力・学習状況調査（全国学力テスト）のCBT化</h3>
+  <p>文部科学省は全国学力・学習状況調査を<b>CBT（Computer Based Testing）</b>へ段階的に移行しています。
+  児童生徒質問調査はオンライン化が進み、教科調査も<b>令和7年度以降に順次CBT化、令和9年度には悉皆調査をCBTで実施</b>する方針が示されています。
+  これにより、<b>中学校でも端末を使う「試験」の機会</b>が確実に増えます。</p>
+
+  <div class="callout warn">
+    <b>CBT実施時の新たなリスク：</b>端末が「いつもの学習端末」である以上、
+    <b>テスト中に他サイトを閲覧できない状態（＝試験モード）</b>を担保する仕組みが不可欠です。
+    <ul style="margin-bottom:0;">
+      <li><b>カンニング防止</b> — 別タブでの検索・不正な参照を抑止</li>
+      <li><b>他サイト遷移の抑制</b> — 集中を妨げるサイト・通知・SNSへの離脱を防止</li>
+      <li><b>公平な実施環境の担保</b> — 全員の端末を同じ条件に揃える</li>
+    </ul>
+  </div>
+  <p class="muted">本システムは、この「試験モード」を<b>URL規制（許可リスト=ホワイトリスト方式）＋一斉URL配信＋画面ロック</b>の組み合わせで、既存の運用のまま実現します。</p>
+
+  <div class="foot"><span>1. 現状の課題と背景</span><span>美作市教育委員会 御中</span></div>
+</section>
+
+<!-- ================= 2. 概要・構成 ================= -->
+<section class="page pagebreak">
+  <h2>2. システム概要と全体構成</h2>
+  <p>本システムは、次の3つの要素で構成された、<b>低コスト・ゼロタッチ運用</b>の児童端末管理基盤です。</p>
+
+  <div class="grid3">
+    <div class="card accent">
+      <h4>① 児童端末クライアント</h4>
+      <p><b>Chrome拡張機能（Manifest V3）</b>を各Chromebookへ配布。画面ロックの表示／入力抑止、URLの監視と規制、教員からの指示の受信・反映を行います。</p>
+    </div>
+    <div class="card accent">
+      <h4>② 教職員管理コンソール</h4>
+      <p><b>Webアプリ（Google Apps Script）</b>。教員はブラウザからログインし、端末一覧の監視・一括操作・URL規制を行います。PC・タブレットどこからでも利用可。</p>
+    </div>
+    <div class="card accent">
+      <h4>③ データ基盤</h4>
+      <p><b>Googleスプレッドシート</b>をデータベースに採用。追加サーバー不要で、運用・保守・エクスポートが容易。障害時もデータが手元に残ります。</p>
+    </div>
+  </div>
+
+  <h3>全体アーキテクチャ</h3>
+  <div class="flow">
+    <div class="step"><div class="n">1</div><b>教員</b><br><small class="muted">管理コンソールで操作（例：6年1組を画面ロック）</small></div>
+    <div class="step"><div class="n">2</div><b>管理コンソール</b><br><small class="muted">対象校のGASへ指示を送信</small></div>
+    <div class="step"><div class="n">3</div><b>スプレッドシート</b><br><small class="muted">「端末一覧」に指示を反映＝DB</small></div>
+    <div class="step"><div class="n">4</div><b>児童端末</b><br><small class="muted">常時同期で取得し1.5〜3秒で反映</small></div>
+  </div>
+
+  <div class="callout">
+    <b>1つの拡張機能で14校に自動振り分け：</b>
+    学校ごとにスプレッドシート／GASを分けつつ、Chromebookへは<b>拡張機能を1つ配布するだけ</b>。
+    各端末は所属校の組織部門（OU）に設定された学校名を読み取り、自動的に自校のGASへ接続します。
+    → <b>配布・更新・保守の手間を1校分に集約</b>できます。
+  </div>
+
+  <h3>技術的特長（要点）</h3>
+  <table>
+    <thead><tr><th>項目</th><th>本システム</th><th>導入メリット</th></tr></thead>
+    <tbody>
+      <tr><td>配布方法</td><td>Google管理コンソール（Managed Storage）で一括強制インストール</td><td>児童は設定不要・削除不可。全校へ即時展開。</td></tr>
+      <tr><td>児童アカウント</td><td>Chromebookログイン中のGoogleアカウントを自動取得</td><td>児童IDの手入力・名簿突合が不要。</td></tr>
+      <tr><td>通信方式</td><td>常時同期（キープアライブ）＋定期ポーリング</td><td>指示が<b>3秒以内</b>に反映され、反応のばらつきを解消。</td></tr>
+      <tr><td>データ保管</td><td>Googleスプレッドシート（組織内）</td><td>追加サーバー費ゼロ。データは自治体の管理下。</td></tr>
+      <tr><td>権限管理</td><td>教員ログイン＋学校/クラスの参照スコープ</td><td>「自分の担当校・担当クラス」だけを操作。誤操作を防止。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="foot"><span>2. システム概要と全体構成</span><span>Chromebook 児童端末管理システム</span></div>
+</section>
+
+<!-- ================= 3. 機能説明 ================= -->
+<section class="page pagebreak">
+  <h2>3. 機能説明（詳細）</h2>
+
+  <div class="grid2">
+    <div class="card accent avoid-break">
+      <h4>🔒 画面ロック / ロック解除</h4>
+      <p>選択した児童の画面を「ロック中：先生の話を聞きましょう」で覆い、キーボード・マウス入力を抑止。
+      Google検索画面や新規タブも含めて確実にロックします。</p>
+      <ul>
+        <li><b>教室単位・クラス単位・全校単位</b>で一括実行</li>
+        <li>ロック解除は<b>リロード不要</b>で自動的に元の画面へ復帰</li>
+        <li>解除まで<b>3秒以内</b>（遅延・ばらつきなし）</li>
+      </ul>
+    </div>
+    <div class="card accent avoid-break">
+      <h4>🛡️ URL規制（許可リスト／禁止リスト）</h4>
+      <p>自由に切り替えられる<b>2モード</b>で、学習に不要なサイトへのアクセスを制御します。</p>
+      <ul>
+        <li><b>ホワイトリスト</b>：許可した学習サイト<b>だけ</b>を閲覧可（＝最も厳格／CBT向き）</li>
+        <li><b>ブラックリスト</b>：指定サイトのみ閲覧不可（通常授業向き）</li>
+        <li>規制された場合は専用の警告ページへ誘導</li>
+        <li>教員ごとの「マイURL」個別登録にも対応</li>
+      </ul>
+    </div>
+    <div class="card green avoid-break">
+      <h4>📣 一斉URL配信</h4>
+      <p>教員が指定したURLを、対象の児童端末で<b>自動的に開かせます</b>。</p>
+      <ul>
+        <li>「このページを開いて」の一斉指示が1クリック</li>
+        <li>NHK for School・Scratch等の学習サイト配布に最適</li>
+        <li>再配信検知用IDで<b>二重起動を防止</b></li>
+      </ul>
+    </div>
+    <div class="card green avoid-break">
+      <h4>👀 閲覧状況の見守り</h4>
+      <p>各児童が<b>今どのページを開いているか</b>をリアルタイムで一覧表示。</p>
+      <ul>
+        <li>「現在開いているURL」を常時把握</li>
+        <li>オンライン／オフライン状態を色で判別</li>
+        <li>トラブルの早期発見・指導に活用</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card amber avoid-break">
+      <h4>🏫 学校・クラスのスコープ管理</h4>
+      <p>教員アカウントごとに操作範囲を厳密に分離。</p>
+      <ul>
+        <li>一般教員：<b>自校＋担当クラスのみ</b>操作可</li>
+        <li>管理者（ADMIN）：全校を横断して操作可</li>
+        <li>他校・他クラスへの誤操作・波及を防止</li>
+      </ul>
+    </div>
+    <div class="card amber avoid-break">
+      <h4>📥 アカウント一括管理・年次更新</h4>
+      <p>毎年の入れ替えをExcel／CSVでまとめて処理（管理者のみ）。</p>
+      <ul>
+        <li><b>児童・教員名簿の一括インポート</b>（追加／更新／置換）</li>
+        <li><b>年次更新（卒業処理）</b>：卒業生を自動退避し卒業生シートへ保管</li>
+        <li>対象は学校＋卒業学年で自動抽出</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>機能一覧（サマリ）</h3>
+  <table>
+    <thead><tr><th style="width:26%">機能</th><th>内容</th><th style="width:22%">操作者</th></tr></thead>
+    <tbody>
+      <tr><td>画面ロック／解除</td><td>端末の全画面ロック・入力抑止・自動復帰</td><td>教員・管理者</td></tr>
+      <tr><td>URL規制モード</td><td>OFF／ホワイトリスト／ブラックリストの切替</td><td>教員・管理者</td></tr>
+      <tr><td>許可／規制URLリスト</td><td>学校・クラス単位でのURL登録（個別マイURLも可）</td><td>教員・管理者</td></tr>
+      <tr><td>一斉URL配信</td><td>対象端末で指定ページを自動的に開く</td><td>教員・管理者</td></tr>
+      <tr><td>閲覧状況の見守り</td><td>現在閲覧中URL・オンライン状態の一覧</td><td>教員・管理者</td></tr>
+      <tr><td>児童名簿の一括インポート</td><td>Excel／CSVで児童を追加・更新・置換</td><td>管理者のみ</td></tr>
+      <tr><td>教員名簿の一括インポート</td><td>Excel／CSVで教員アカウントを一括登録</td><td>管理者のみ</td></tr>
+      <tr><td>年次更新（卒業処理）</td><td>卒業生の退避・削除を自動実行</td><td>管理者のみ</td></tr>
+      <tr><td>卒業生アーカイブ</td><td>退避した卒業生データの閲覧</td><td>管理者のみ</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <b>「3秒以内」の仕組み（技術的裏付け）：</b>
+    MV3拡張機能は通常約30秒で休止し、これが「反応の遅さ・ばらつき」の原因になります。
+    本システムは、各端末の常駐コンテキストから<b>1.5秒ごとに同期信号</b>を送ることでサービスを起こし続け、
+    さらに<b>30秒のバックアップ同期</b>を併用します。加えてサーバー側の書込みを間引き・一括化し、
+    指示の衝突や遅延を大幅に低減しています。
+  </div>
+
+  <div class="foot"><span>3. 機能説明（詳細）</span><span>Chromebook 児童端末管理システム</span></div>
+</section>
+
+<!-- ================= 4. 導入効果 ================= -->
+<section class="page pagebreak">
+  <h2>4. 導入効果 — 小学校・中学校・CBT</h2>
+
+  <h3>4-1. 小学校：授業の集中管理で効果が最大</h3>
+  <p>小学校では端末を<b>ほぼ毎日・長時間</b>使うため、導入効果が最も大きくなります。</p>
+  <div class="grid3">
+    <div class="card green"><h4>授業の集中力向上</h4><p>画面ロックとURL規制で、学習に集中する環境を一括確保。教員が一軒ずつ見回る負担を解消。</p></div>
+    <div class="card green"><h4>教員の時間創出</h4><p>1クリックで一斉指示。授業準備・教材配布（一斉URL配信）の時短に直結。</p></div>
+    <div class="card green"><h4>安全な端末利用</h4><p>ホワイトリスト運用で、学習に不要なサイトへのアクセスを未然に防止。</p></div>
+  </div>
+
+  <h3>4-2. 中学校：CBT（全国学力テスト）実施時に真価</h3>
+  <p>中学校単体では通常時の使用頻度が相対的に低いものの、<b>全国学力・学習状況調査のCBT化</b>により、
+  「端末を使う試験」を安全に実施する需要が確実に生まれます。ここで本システムの価値が最大化します。</p>
+
+  <div class="callout danger">
+    <b>試験（CBT）実施モードの実現イメージ</b>
+    <div class="flow" style="margin-top:10px;">
+      <div class="step"><div class="n">1</div><b>試験前に一括設定</b><br><small class="muted">対象学年を選択し「ホワイトリスト」に切替＋受験用サイトのみ許可</small></div>
+      <div class="step"><div class="n">2</div><b>URL規制を強制</b><br><small class="muted">許可外サイト・別タブ検索・SNS・動画を遮断＝カンニング防止</small></div>
+      <div class="step"><div class="n">3</div><b>一斉に受験開始</b><br><small class="muted">一斉URL配信で全員を試験ページへ誘導</small></div>
+      <div class="step"><div class="n">4</div><b>見守り・終了</b><br><small class="muted">閲覧状況を監視し、終了後は一括解除</small></div>
+    </div>
+  </div>
+
+  <table>
+    <thead><tr><th style="width:30%">CBT時の課題</th><th>本システムによる対策</th></tr></thead>
+    <tbody>
+      <tr><td><b>カンニング</b>（別タブで検索・参照）</td><td>ホワイトリスト方式で許可外サイトを遮断。検索・SNS・生成AI等への離脱を防止。</td></tr>
+      <tr><td><b>他サイトへの遷移</b>（集中の途切れ）</td><td>URL規制モードを「OFF/許可/禁止」で即時切替。試験中は最も厳格な状態を維持。</td></tr>
+      <tr><td><b>指示が伝わらない</b>（開始の号令）</td><td>一斉URL配信＋画面ロックで、全員を同じ条件・同じページに揃える。</td></tr>
+      <tr><td><b>公平性・環境差</b></td><td>全端末へ同じ方針を3秒以内に配信し、条件を統一。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4-3. 教育委員会としての効果（定量イメージ）</h3>
+  <div class="grid2">
+    <div class="card accent">
+      <h4>費用対効果</h4>
+      <ul>
+        <li>商用MDM＋フィルタリングの<b>年間約400万円（試算）</b>に対し、本提案は<b>48万円</b>。</li>
+        <li>差分で<b>年間350万円以上</b>を、教材・研修・端末更新等へ再配分可能。</li>
+      </ul>
+    </div>
+    <div class="card accent">
+      <h4>事務負担の削減</h4>
+      <ul>
+        <li>年度替わりの名簿整備を<b>Excelで一括</b>処理（年次更新機能）。</li>
+        <li>各校の初期設定・バージョン更新を<b>1か所から配布</b>。</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="foot"><span>4. 導入効果 — 小学校・中学校・CBT</span><span>美作市教育委員会 御中</span></div>
+</section>
+
+<!-- ================= 5. 比較 ================= -->
+<section class="page pagebreak">
+  <h2>5. 商用製品との比較</h2>
+  <p>一般に、GIGAスクール端末の管理には <b>MDM（端末管理）</b> と <b>Webフィルタリング</b> の2つの製品を
+  組み合わせます。本システムは、この2機能を <b>1つの拡張機能＋1つの管理画面</b> に統合した点が最大の特長です。</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th style="width:17%">観点</th>
+        <th style="width:41.5%">一般的な商用構成<br><small class="muted">（MDM ＋ フィルタリング）</small></th>
+        <th style="width:41.5%">本システム</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><b>構成</b></td>
+        <td>MDM製品 ＋ フィルタリング製品（2ライセンス）</td>
+        <td class="center"><b>1つの拡張機能 ＋ 1管理画面</b></td>
+      </tr>
+      <tr>
+        <td><b>初期費用</b></td>
+        <td>導入支援・設定費が別途発生（数十万〜）</td>
+        <td class="center"><b>20万円</b>（設定・研修・初期構築を含む）</td>
+      </tr>
+      <tr>
+        <td><b>年間費用</b></td>
+        <td>台数比例（1台 年1,200〜2,500円）＋基本料</td>
+        <td class="center"><b>48万円</b>（全14校・全台数・定額）</td>
+      </tr>
+      <tr>
+        <td><b>台数増加時</b></td>
+        <td>増えるほど高額（生徒数の変動に脆弱）</td>
+        <td class="center"><b>定額</b>（台数増減の影響を抑える）</td>
+      </tr>
+      <tr>
+        <td><b>画面ロック</b></td>
+        <td>製品により対応（反映に時間がかかる場合あり）</td>
+        <td class="center"><b>3秒以内</b>・クラス/校/全校単位</td>
+      </tr>
+      <tr>
+        <td><b>一斉URL配信</b></td>
+        <td>別機能・別契約のことが多い</td>
+        <td class="center"><b>標準搭載</b>（1クリック）</td>
+      </tr>
+      <tr>
+        <td><b>閲覧状況の見守り</b></td>
+        <td>製品による／追加費用の場合あり</td>
+        <td class="center"><b>標準搭載</b>（リアルタイム一覧）</td>
+      </tr>
+      <tr>
+        <td><b>Excelによる年次更新</b></td>
+        <td>管理コンソールと名簿の突合が必要なことが多い</td>
+        <td class="center"><b>標準搭載</b>（一括インポート）</td>
+      </tr>
+      <tr>
+        <td><b>データの所在</b></td>
+        <td>ベンダーのクラウド</td>
+        <td class="center"><b>自治体のGoogle組織内</b>（スプレッドシート）</td>
+      </tr>
+      <tr>
+        <td><b>カスタマイズ</b></td>
+        <td>原則不可（要望はロードマップ待ち）</td>
+        <td class="center"><b>教育委員会の要望に応じて改修可能</b></td>
+      </tr>
+      <tr>
+        <td><b>年間費用の目安</b><br><small class="muted">全14校・約3,300台</small></td>
+        <td><b>約 400万円</b><small class="muted">（1,200円×3,300台で約396万円）</small></td>
+        <td class="center"><b>48万円</b></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>年間費用の比較（イメージ）</h3>
+  <div class="bar-row"><span class="name">商用構成</span><div class="bar amber" style="width:100%"></div><b>約400万円</b></div>
+  <div class="bar-row"><span class="name">本システム</span><div class="bar green" style="width:12%"></div><b>48万円</b></div>
+  <p class="legend">※ 台数・単価・含まれる機能により実際の価格は変動します。本比較は公開情報に基づく概算の目安です。</p>
+
+  <div class="callout">
+    <b>まとめ：</b>「MDM＋フィルタリング＋一斉配信＋見守り＋名簿運用」を1つに統合することで、
+    <b>製品費・ライセンス管理・ベンダー窓口を一本化</b>。小規模自治体にとって最も負担の少ない構成です。
+  </div>
+
+  <div class="foot"><span>5. 商用製品との比較</span><span>Chromebook 児童端末管理システム</span></div>
+</section>
+
+<!-- ================= 6. 価格 ================= -->
+<section class="page pagebreak">
+  <h2>6. 価格のご提案</h2>
+  <p>教育委員会様にご負担いただく価格は、<b>3つのモデル</b>からお選びいただけます。
+  いずれも <b>全14校・全台数定額</b>で、台数が増えても追加費用はかかりません（税別）。</p>
+
+  <div class="price-hero">
+    <div class="sm">ご推奨プラン（STANDARD）— 初年度</div>
+    <div class="big">¥680,000<small style="font-size:14px;">（税別）</small></div>
+    <div class="sm">初期費用 20万円 ＋ 年間費用 48万円 ／ 2年目以降は年間48万円のみ</div>
+    <div>
+      <span class="pill">全14校</span>
+      <span class="pill">全児童端末</span>
+      <span class="pill">設定・研修込み</span>
+      <span class="pill">保守・アップデート込み</span>
+      <span class="pill">少額随意契約の枠内</span>
+    </div>
+  </div>
+
+  <h3>料金モデル比較</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>項目</th>
+        <th class="center">BASIC<br><small class="muted">導入のみ</small></th>
+        <th class="center">STANDARD<br><small class="tag best">ご推奨</small></th>
+        <th class="center">PREMIUM<br><small class="muted">伴走支援</small></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>初期費用（構築・設定・研修）</td><td class="num">¥150,000</td><td class="num">¥200,000</td><td class="num">¥250,000</td></tr>
+      <tr><td>年間費用（保守・更新・サポート）</td><td class="num">¥360,000</td><td class="num">¥480,000</td><td class="num">¥600,000</td></tr>
+      <tr><td><b>初年度 合計</b></td><td class="num"><b>¥510,000</b></td><td class="num"><b>¥680,000</b></td><td class="num"><b>¥850,000</b></td></tr>
+      <tr><td>2年目以降（年額）</td><td class="num">¥360,000</td><td class="num">¥480,000</td><td class="num">¥600,000</td></tr>
+      <tr><td>初期設定・全校展開支援</td><td class="center">○</td><td class="center">○</td><td class="center">◎</td></tr>
+      <tr><td>管理職・担当者向け操作研修</td><td class="center">△（資料のみ）</td><td class="center">○（1回）</td><td class="center">◎（年2回）</td></tr>
+      <tr><td>運用問い合わせ対応</td><td class="center">メール</td><td class="center">メール・電話</td><td class="center">優先・随時</td></tr>
+      <tr><td>制度改定への改修対応</td><td class="center">都度見積</td><td class="center">年1回まで込</td><td class="center">都度優先対応</td></tr>
+      <tr><td>年次更新・名簿インポート支援</td><td class="center">△</td><td class="center">○</td><td class="center">◎</td></tr>
+    </tbody>
+  </table>
+
+  <h3>年間費用の根拠（妥当性）</h3>
+  <div class="grid2">
+    <div class="card accent">
+      <h4>① 商用製品との比較による妥当性</h4>
+      <ul>
+        <li>MDM＋フィルタリングの一般的な相場は<b>1台あたり年1,200〜2,500円</b>。</li>
+        <li>約3,300台では<b>年約400万円</b>。本システムは<b>約1/8の48万円</b>。</li>
+        <li>「同等以上の機能を、大幅に低い固定費で」提供します。</li>
+      </ul>
+    </div>
+    <div class="card accent">
+      <h4>② コスト積み上げによる妥当性</h4>
+      <ul>
+        <li>1台あたり換算で<b>年約145円</b>（48万円÷3,300台）。</li>
+        <li>児童1人あたり<b>月約12円</b>。教材1冊にも満たない水準。</li>
+        <li>開発・保守・サポート・制度改修対応を含む総額です。</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <b>会計上のポイント（調達しやすさ）：</b>
+    初年度 <b>68万円（税別）</b>は、多くの自治体で<b>少額随意契約（役務：100万円以下）</b>の範囲に収まります。
+    令和7年度の基準額引き上げにより上限は拡大しており、<b>個人事業主との契約でも入札を要さず</b>、
+    見積書1通で調達いただける可能性が高い構成です（※最終的には美作市の契約規則によります）。
+  </div>
+
+  <h3>ご契約単位・お支払い</h3>
+  <ul>
+    <li><b>契約単位</b>：教育委員会（市）単位の1契約で全14校をカバー。</li>
+    <li><b>契約期間</b>：1年ごとの自動更新（年度単位）。年度途中の解約も可（月割）。</li>
+    <li><b>支払</b>：初期費用は契約時、年間費用は年度初（または年2回分割）。</li>
+    <li><b>見積書・仕様書</b>：調達手続き用に別途ご用意します。</li>
+  </ul>
+
+  <div class="foot"><span>6. 価格のご提案</span><span>美作市教育委員会 御中</span></div>
+</section>
+
+<!-- ================= 7. スケジュール / 運用 ================= -->
+<section class="page pagebreak">
+  <h2>7. 導入スケジュール・運用体制</h2>
+
+  <h3>7-1. 導入スケジュール（標準：約1か月）</h3>
+  <table>
+    <thead><tr><th style="width:16%">時期</th><th style="width:22%">フェーズ</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>第1週</td><td>合意・設計</td><td>仕様確認、学校・OU構成のヒアリング、スプレッドシートの設計</td></tr>
+      <tr><td>第2週</td><td>構築</td><td>GAS/スプレッドシート設置、拡張機能のパッケージ化、<code>managed_policy.json</code> 作成</td></tr>
+      <tr><td>第3週</td><td>配布・設定</td><td>管理コンソールで拡張機能を全校OUへ強制インストール、学校別ポリシー配布</td></tr>
+      <tr><td>第4週</td><td>研修・検証</td><td>管理職・担当者研修、テスト校で動作確認、本番運用開始</td></tr>
+    </tbody>
+  </table>
+
+  <h3>7-2. 運用体制（導入後）</h3>
+  <div class="grid2">
+    <div class="card accent">
+      <h4>教育委員会（管理者）</h4>
+      <ul>
+        <li>全校の端末状況の把握・横断操作</li>
+        <li>教員アカウントの発行・年次更新</li>
+        <li>各校の学校名（OU）設定の管理</li>
+      </ul>
+    </div>
+    <div class="card accent">
+      <h4>各校（教員）</h4>
+      <ul>
+        <li>自校・担当クラスの児童端末を操作</li>
+        <li>授業での画面ロック・URL規制・一斉配信</li>
+        <li>CBT実施時の試験モード設定</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout">
+    <b>更新も安心：</b>機能追加・修正は新しいバージョンの拡張機能を配布するだけで、
+    全端末へ<b>自動的にバックグラウンド更新</b>されます（児童・教員の操作は不要）。
+    Windows/Macの場合は対象外ですが、Chromebook（Chrome）であればほぼ自動で適用されます。
+  </div>
+
+  <h3>7-3. 障害・サポート</h3>
+  <table>
+    <thead><tr><th style="width:26%">区分</th><th>対応</th></tr></thead>
+    <tbody>
+      <tr><td>平日日中</td><td>運用上の問い合わせ対応（メール／電話）</td></tr>
+      <tr><td>重大障害（全校停止等）</td><td>優先対応。復旧見込み・暫定回避策を速やかに提示</td></tr>
+      <tr><td>制度・運用変更</td><td>改修見積の提示、または年間改修枠内で対応（プランによる）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="foot"><span>7. 導入スケジュール・運用体制</span><span>Chromebook 児童端末管理システム</span></div>
+</section>
+
+<!-- ================= 8. セキュリティ + 9. FAQ ================= -->
+<section class="page pagebreak">
+  <h2>8. セキュリティ・個人情報保護</h2>
+  <div class="grid2">
+    <div class="card green">
+      <h4>データは自治体の管理下</h4>
+      <p>児童・教員データは<b>Googleスプレッドシート（組織内）</b>に保管され、
+      外部ベンダーのクラウドへは預けません。アクセス権も自治体のGoogle管理者が一元管理します。</p>
+    </div>
+    <div class="card green">
+      <h4>最小権限の原則</h4>
+      <p>教員は<b>自校・担当クラスのみ</b>を操作可能。名簿の一括インポートや年次更新などの強い権限は
+      <b>管理者（ADMIN）のみ</b>に限定しています。</p>
+    </div>
+    <div class="card green">
+      <h4>通信の保護</h4>
+      <p>拡張機能とGAS間のやり取りはHTTPSで暗号化。教員ログインには
+      <b>署名付きトークン（24時間で失効）</b>を用い、なりすましを防止します。</p>
+    </div>
+    <div class="card green">
+      <h4>個人情報の取り扱い</h4>
+      <p>収集するのは「児童ID（Googleアカウント）・氏名・所属・状態」など運用に必要な最小限。
+      保存先・閲覧範囲を自治体が完全に掌握できます。</p>
+    </div>
+  </div>
+
+  <div class="hr"></div>
+
+  <h2>9. よくあるご質問</h2>
+  <table>
+    <thead><tr><th style="width:38%">ご質問</th><th>回答</th></tr></thead>
+    <tbody>
+      <tr><td>追加の有料ソフトは必要ですか？</td><td>不要です。Google Workspace 管理コンソールの標準機能で全校配布できます。</td></tr>
+      <tr><td>児童が自分で拡張機能を外せますか？</td><td>「強制インストール」に設定すれば、児童は削除・無効化できません。</td></tr>
+      <tr><td>中学校でも使う意味がありますか？</td><td>通常時の頻度は相対的に低いものの、<b>CBT（全国学力テスト）の試験モード</b>でカンニング防止・遷移抑制に大きく貢献します。</td></tr>
+      <tr><td>受け答えが遅い／反応がばらつくことは？</td><td>専用の常時同期方式により、指示は<b>通常1.5〜3秒</b>で反映されます。</td></tr>
+      <tr><td>台数が増えると費用は上がりますか？</td><td>上がりません。全14校・全台数<b>定額</b>です。</td></tr>
+      <tr><td>卒業・入学の名簿整備は大変ですか？</td><td>年次更新機能と<b>Excel／CSVの一括インポート</b>で、数分で完了します。</td></tr>
+      <tr><td>カスタマイズは可能ですか？</td><td>可能です。教育委員会の運用に合わせた改修を別途ご相談ください。</td></tr>
+      <tr><td>実績はありますか？</td><td>美作市内14校構成（小8・中5・義務教育学校1）を前提に設計・検証済みです。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <b>次のステップ：</b>「見積書」「仕様書」「操作研修資料」は、ご要望に応じてすぐにご用意します。
+    まずは<b>1校でのパイロット導入（トライアル）</b>からでも承ります。お気軽にご相談ください。
+  </div>
+
+  <div class="sign">
+    <div class="box"><b>ご提案者</b><br><small class="muted">（個人事業主・屋号／氏名・連絡先を記載）</small></div>
+    <div class="box"><b>ご提出日</b><br><small class="muted">2026年10月7日</small></div>
+  </div>
+
+  <p class="legend" style="margin-top:18px;">
+    ※ 本資料は提案目的で作成されたものです。金額はすべて税別の概算であり、正式なお見積りはご要望の仕様に基づき別途発行します。
+    児童生徒数・台数・商用製品価格は公開情報に基づく推計を含みます。
+  </p>
+
+  <div class="foot"><span>8. セキュリティ・個人情報保護 ／ 9. よくあるご質問</span><span>美作市教育委員会 御中</span></div>
+</section>
+
+</body>
+</html>

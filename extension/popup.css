@@ -1,0 +1,127 @@
+/**
+ * ポップアップ 自己完結スタイル（外部CDN不使用）
+ * ※ Chrome拡張機能のCSP制約（リモートコード禁止）に対応するため、
+ *    Tailwind CDN を廃止し、使用していたユーティリティをここに内包する。
+ */
+
+/* ---- リセット / ベース ---- */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  width: 320px; /* w-80 */
+  padding: 16px; /* p-4 */
+  background: #f8fafc; /* bg-slate-50 */
+  color: #1e293b; /* text-slate-800 */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif;
+  font-size: 12px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button { font: inherit; cursor: pointer; }
+input { font: inherit; }
+
+/* ---- レイアウト ---- */
+.flex { display: flex; }
+.flex-1 { flex: 1 1 0%; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.block { display: block; }
+.hidden { display: none !important; }
+.space-x-2 > * + * { margin-left: 8px; }
+.space-y-2 > * + * { margin-top: 8px; }
+.space-y-3 > * + * { margin-top: 12px; }
+.space-y-4 > * + * { margin-top: 16px; }
+.w-full { width: 100%; }
+.w-4 { width: 16px; }
+.h-4 { height: 16px; }
+.max-w-\[160px\] { max-width: 160px; }
+
+/* ---- 余白 ---- */
+.p-1\.5 { padding: 6px; }
+.p-2 { padding: 8px; }
+.p-3 { padding: 12px; }
+.p-4 { padding: 16px; }
+.pb-2 { padding-bottom: 8px; }
+.pt-1 { padding-top: 4px; }
+.px-1\.5 { padding-left: 6px; padding-right: 6px; }
+.px-2 { padding-left: 8px; padding-right: 8px; }
+.px-3 { padding-left: 12px; padding-right: 12px; }
+.py-0\.2 { padding-top: 1px; padding-bottom: 1px; }
+.py-0\.5 { padding-top: 2px; padding-bottom: 2px; }
+.py-2 { padding-top: 8px; padding-bottom: 8px; }
+.mb-1 { margin-bottom: 4px; }
+
+/* ---- 枠線・角丸 ---- */
+.border { border: 1px solid #e2e8f0; }
+.border-b { border-bottom: 1px solid #e2e8f0; }
+.border-slate-200 { border-color: #e2e8f0; }
+.border-slate-300 { border-color: #cbd5e1; }
+.rounded { border-radius: 4px; }
+.rounded-lg { border-radius: 8px; }
+.rounded-xl { border-radius: 12px; }
+.rounded-full { border-radius: 9999px; }
+
+/* ---- 背景色 ---- */
+.bg-emerald-100 { background: #d1fae5; }
+.bg-indigo-50 { background: #eef2ff; }
+.bg-indigo-600 { background: #4f46e5; }
+.bg-slate-200 { background: #e2e8f0; }
+.bg-slate-50 { background: #f8fafc; }
+.bg-white { background: #ffffff; }
+
+/* ---- 文字色 ---- */
+.text-emerald-700 { color: #047857; }
+.text-indigo-700 { color: #4338ca; }
+.text-slate-500 { color: #64748b; }
+.text-slate-600 { color: #475569; }
+.text-slate-700 { color: #334155; }
+.text-slate-800 { color: #1e293b; }
+.text-white { color: #ffffff; }
+.text-center { text-align: center; }
+
+/* ---- 文字スタイル ---- */
+.font-bold { font-weight: 700; }
+.font-semibold { font-weight: 600; }
+.font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.font-sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif; }
+.text-sm { font-size: 14px; }
+.text-xs { font-size: 12px; }
+.text-\[9px\] { font-size: 9px; }
+.text-\[10px\] { font-size: 10px; }
+.text-\[11px\] { font-size: 11px; }
+
+/* ---- 効果 ---- */
+.shadow-sm { box-shadow: 0 1px 2px rgba(15, 23, 42, .08); }
+.transition { transition: background-color .15s ease, color .15s ease, border-color .15s ease; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.select-none { -webkit-user-select: none; user-select: none; }
+
+/* ---- 状態（hover / focus） ---- */
+.hover\:bg-indigo-700:hover { background: #4338ca; }
+.hover\:bg-slate-300:hover { background: #cbd5e1; }
+.focus\:border-indigo-500:focus { border-color: #6366f1; outline: none; }
+.focus\:ring-indigo-500:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, .35);
+}
+
+/* ---- アイコン（インラインSVG） ---- */
+.icon-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 6px; background: #4f46e5; color: #fff; border-radius: 8px;
+}
+.icon-badge svg { width: 16px; height: 16px; }
+
+/* ---- 自動設定バナー ---- */
+.banner {
+  border-radius: 8px; padding: 8px 10px; font-size: 11px; font-weight: 600;
+  line-height: 1.5; border: 1px solid transparent;
+}
+.banner.ok { background: #d1fae5; color: #065f46; border-color: #a7f3d0; }
+.banner.info { background: #eef2ff; color: #3730a3; border-color: #c7d2fe; }
+.adv-title {
+  font-size: 11px; font-weight: 700; color: #64748b;
+  margin: 4px 0 8px; padding-top: 8px; border-top: 1px dashed #e2e8f0;
+}

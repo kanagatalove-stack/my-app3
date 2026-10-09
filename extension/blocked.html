@@ -3,51 +3,165 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>アクセスが制限されています</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>アクセスが制限されています - 端末管理クライアント</title>
+  <!-- 外部CDNは使用せず、すべて自己完結のスタイルで描画（拡張機能のCSP制約に対応） -->
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: #0f172a;
+      color: #ffffff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif;
+      -webkit-user-select: none;
+      user-select: none;
+      overflow: hidden;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      min-height: 100vh;
+    }
+    .lock-card {
+      background: rgba(30, 41, 59, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.55);
+      border-radius: 24px;
+      padding: 48px 56px;
+      text-align: center;
+      max-width: 560px;
+      width: 100%;
+      animation: lockFadeIn 0.3s ease-out;
+    }
+    .lock-icon-wrap {
+      width: 84px;
+      height: 84px;
+      margin: 0 auto 24px auto;
+      background: rgba(239, 68, 68, 0.15);
+      border: 2px solid rgba(239, 68, 68, 0.40);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: lockPulse 2s ease-in-out infinite;
+    }
+    .lock-icon-wrap svg { width: 42px; height: 42px; stroke: #ef4444; }
+    .lock-title {
+      font-size: 30px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin: 0 0 12px 0;
+      color: #f8fafc;
+    }
+    .lock-subtitle {
+      font-size: 18px;
+      font-weight: 600;
+      color: #cbd5e1;
+      margin: 0 0 24px 0;
+    }
+    .lock-bar {
+      width: 60px;
+      height: 4px;
+      background: #3b82f6;
+      border-radius: 2px;
+      margin: 0 auto 20px auto;
+    }
+    .lock-notice {
+      font-size: 13px;
+      line-height: 1.9;
+      color: #94a3b8;
+      margin: 0;
+    }
+    .lock-detail {
+      margin: 18px 0 0 0;
+      padding: 14px 16px;
+      background: rgba(15, 23, 42, 0.55);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 14px;
+      text-align: left;
+    }
+    .lock-detail-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: #64748b;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin: 0 0 6px 0;
+    }
+    .lock-detail-url {
+      font-size: 12px;
+      color: #cbd5e1;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      word-break: break-all;
+      margin: 0;
+    }
+    .lock-detail-mode {
+      font-size: 11px;
+      color: #94a3b8;
+      margin: 8px 0 0 0;
+    }
+    .lock-detail-mode b { color: #e2e8f0; }
+    .lock-account {
+      margin-top: 22px;
+      font-size: 11px;
+      color: #64748b;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .lock-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      animation: lockPing 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+    @keyframes lockFadeIn {
+      from { opacity: 0; transform: scale(0.96); }
+      to   { opacity: 1; transform: scale(1); }
+    }
+    @keyframes lockPulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.55; }
+    }
+    @keyframes lockPing {
+      75%, 100% { transform: scale(2); opacity: 0; }
+    }
+  </style>
 </head>
-<body class="bg-slate-100 min-h-screen flex items-center justify-center p-4 font-sans text-slate-800">
-  <div class="bg-white rounded-3xl shadow-xl border border-slate-200 p-8 max-w-lg w-full text-center space-y-6">
-    <div class="w-20 h-20 mx-auto bg-amber-100 rounded-full flex items-center justify-center text-amber-600">
-      <svg class="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+<body>
+  <div class="lock-card">
+    <div class="lock-icon-wrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
       </svg>
     </div>
 
-    <div class="space-y-2">
-      <h1 class="text-2xl font-bold text-slate-800">アクセスが制限されています</h1>
-      <p class="text-sm text-slate-600">
-        授業中はこのWebサイトを開くことができません。<br>先生の指示に従って作業を進めてください。
-      </p>
+    <h1 class="lock-title">アクセスが制限されています</h1>
+    <p class="lock-subtitle">先生の指示に従って作業を進めましょう</p>
+
+    <div class="lock-bar"></div>
+
+    <p class="lock-notice">※ 授業中はこのWebサイトを開くことができません。<br>規制が解除されると、自動的に元の画面に戻ります。</p>
+
+    <div class="lock-detail">
+      <div class="lock-detail-label">ブロック対象URL</div>
+      <p id="blockedUrl" class="lock-detail-url">-</p>
+      <p class="lock-detail-mode">規制モード: <b id="filterMode">-</b></p>
     </div>
 
-    <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 text-left">
-      <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-1">ブロック対象URL</div>
-      <div id="blockedUrl" class="text-xs text-slate-700 font-mono break-all truncate">-</div>
-      <div class="mt-2 text-[11px] text-slate-400">
-        規制モード: <span id="filterMode" class="font-bold text-slate-600">-</span>
-      </div>
-    </div>
-
-    <div class="pt-2">
-      <button onclick="window.history.back()" class="w-full bg-slate-800 hover:bg-slate-900 text-white font-semibold py-3 px-6 rounded-xl transition text-sm shadow-sm">
-        前のページに戻る
-      </button>
+    <div class="lock-account">
+      <span class="lock-dot"></span>
+      <span id="accountLabel">児童アカウント連携中...</span>
     </div>
   </div>
 
-  <script>
-    const params = new URLSearchParams(window.location.search);
-    const url = params.get('url') || 'URL情報なし';
-    const mode = params.get('mode') || 'RESTRICTED';
-
-    document.getElementById('blockedUrl').textContent = url;
-    document.getElementById('blockedUrl').title = url;
-
-    let modeText = 'URL制限';
-    if (mode === 'WHITELIST') modeText = '許可リスト制限（指定外Webサイト）';
-    if (mode === 'BLACKLIST') modeText = '規制リスト制限（禁止Webサイト）';
-    document.getElementById('filterMode').textContent = modeText;
-  </script>
+  <!-- インラインスクリプトは拡張機能CSPで禁止のため外部ファイル化 -->
+  <script src="blocked.js"></script>
 </body>
 </html>
