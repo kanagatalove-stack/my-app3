@@ -66,13 +66,28 @@
 
   // 5. 教員コンソール（GAS管理画面）からのセッション通知を SW へ中継する。
   //    コンソールは拡張APIを直接呼べないため window.postMessage → content script → SW と中継する。
+  //    ※ 重要: 稼働判定は「教員コンソール（管理アプリ）が使われているか」のみを対象とする。
+  //      児童が開いている任意のページがこの postMessage を偽装して稼働状態にできてしまわないよう、
+  //      送信元オリジンが教員コンソール（GAS Web アプリ = script.google.com 系）であることを検証する。
+  //      これにより「児童アカウントがオンライン中でも、教員アカウントが管理アプリを使っていなければ
+  //      非稼働（＝通信停止）」が保証される。
+  function isTeacherConsoleOrigin(ev) {
+    try {
+      const origin = String((ev && ev.origin) || '');
+      return /^https:\/\/script\.google\.com$/.test(origin) ||
+             /^https:\/\/[a-z0-9-]+\.googleusercontent\.com$/.test(origin);
+    } catch (e) { return false; }
+  }
   try {
     window.addEventListener('message', (ev) => {
       const d = ev && ev.data;
       if (!d || typeof d !== 'object') return;
+      if (d.type !== 'EDU_KEEPALIVE_START' && d.type !== 'EDU_KEEPALIVE_STOP') return;
+      // 教員コンソール（GAS Web アプリ）以外からの信号は無視する（なりすまし防止）
+      if (!isTeacherConsoleOrigin(ev)) return;
       if (d.type === 'EDU_KEEPALIVE_START') {
         try { chrome.runtime.sendMessage({ type: 'KEEPALIVE_START', session_id: d.session_id || '' }, () => { void chrome.runtime.lastError; }); } catch (e) {}
-      } else if (d.type === 'EDU_KEEPALIVE_STOP') {
+      } else {
         try { chrome.runtime.sendMessage({ type: 'KEEPALIVE_STOP', session_id: d.session_id || '' }, () => { void chrome.runtime.lastError; }); } catch (e) {}
       }
     });

@@ -119,5 +119,14 @@ senderOk(blocked, 'blocked.js');
 check('content.js: トップフレームのみ ping（iframe 暴発防止）', /window\.top === window[\s\S]{0,1400}?KEEPALIVE_PING/.test(content));
 check('blocked.js: 既存の checkAndRestore(1500) を保持', /setInterval\(checkAndRestore,\s*1500\)/.test(blocked));
 
+console.log('===== 教員アカウント限定: コンソール信号のオリジン検証（なりすまし防止） =====');
+// 稼働判定は「教員コンソール（管理アプリ）が使われているか」のみ。児童が開く任意ページからの
+// EDU_KEEPALIVE_START 偽装で稼働状態にできないよう、content.js は送信元オリジンを検証する。
+check('content.js: コンソール信号のオリジン検証関数がある', /function isTeacherConsoleOrigin\(/.test(content));
+check('content.js: script.google.com / *.googleusercontent.com を許可',
+  /script\\\.google\\\.com/.test(content) && /googleusercontent\\\.com/.test(content));
+check('content.js: 検証に通らない信号は無視する（なりすまし防止）',
+  /if \(!isTeacherConsoleOrigin\(ev\)\) return;/.test(content));
+
 console.log(`\n===== 結果: PASS=${pass} FAIL=${fail} =====`);
 process.exit(fail?1:0);
