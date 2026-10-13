@@ -12,7 +12,7 @@
 
 ## 0. 事前に必要なもの
 
-- Google アカウント（開発者登録用。教育委員会の共用アカウントでも可）
+- Google アカウント（開発者登録用。開発者本人のアカウントを推奨）
 - 初回のみ **開発者登録料 5 USD**（買い切り）
   - <https://chrome.google.com/webstore/devconsole> → 規約同意 → 支払い
 - 配布用 ZIP: `dist/extension.zip`
@@ -52,11 +52,11 @@ Chromebook 児童端末管理クライアントは、教育委員会が管理す
 ■ データの取り扱い
 ・取得する情報：ログイン中の Google アカウント（メール）、現在開いているURL、名簿に基づく氏名・学校・クラス、教員が指示した場合の画面情報。
 ・利用目的：端末管理（画面ロック・URL規制・一斉配信・見守り）のみ。
-・保管：教育委員会の Google Workspace 組織内のスプレッドシートに保管し、第三者へ提供・販売しません。
+・保管：導入先（教育委員会・学校）の Google Workspace 組織内のスプレッドシートに保管し、第三者へ提供・販売しません。
 ・詳細はプライバシーポリシーをご覧ください。
 
 ■ 注意
-本拡張機能は教育委員会の管理下でのみ使用されます。管理者の許可なく個人がインストール・利用することはできません。
+本拡張機能は導入先（教育委員会・学校）の管理下でのみ使用されます。管理者の許可なく個人がインストール・利用することはできません。
 ```
 
 ### カテゴリ（Category）
@@ -75,9 +75,9 @@ Chromebook 児童端末管理クライアントは、教育委員会が管理す
 | 項目 | 設定値 |
 |---|---|
 | コンテンツレーティング（Mature content） | **OFF** |
-| 公式URL（Official URL） | 任意（教育委員会ドメインを Search Console で確認済みの場合） |
-| ホームページURL（Homepage URL） | 任意（教育委員会の案内ページ） |
-| サポートURL（Support URL） | 任意（教育委員会の問い合わせページ） |
+| 公式URL（Official URL） | 任意（自ドメインを Search Console で確認済みの場合のみ） |
+| ホームページURL（Homepage URL） | `https://kanagatalove-stack.github.io/my-app3/` |
+| サポートURL（Support URL） | `https://kanagatalove-stack.github.io/my-app3/privacy-policy.html`（連絡先を記載） |
 
 ---
 
@@ -127,7 +127,7 @@ No, I am not using remote code.（リモートコードは使用していませ�
   ```
   - 配信元ファイル: 本リポジトリ直下の **`privacy-policy.html`**（GitHub Pages・main:/ 配信）
   - ランディング: `https://kanagatalove-stack.github.io/my-app3/`（`index.html`）
-- ※ 連絡先は美作市教育委員会の公式情報（教育総務課 〒707-8501 岡山県美作市美来1番地／0868-72-2900）を反映済み。
+- ※ 連絡先は**開発・運営者（片岡 靖貴／noiringhost@gmail.com）**を記載。本拡張機能は導入先（教育委員会・学校）の管理下で運用されます。
 
 ---
 
