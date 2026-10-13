@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>プライバシーポリシー｜Chromebook 児童端末管理クライアント</title>
+<meta name="description" content="美作市教育委員会が提供する Chrome 拡張機能「Chromebook 児童端末管理クライアント」のプライバシーポリシーです。">
+<style>
+  :root { --ink:#1e293b; --sub:#64748b; --line:#e2e8f0; --brand:#4338ca; --bg:#f8fafc; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic","Meiryo",sans-serif;
+    line-height:1.9; }
+  header { background:linear-gradient(135deg,#4338ca,#1e293b); color:#fff; padding:40px 20px; }
+  header .wrap { max-width:820px; margin:0 auto; }
+  header h1 { margin:0 0 6px; font-size:22px; letter-spacing:-0.01em; }
+  header p { margin:0; color:#c7d2fe; font-size:13px; }
+  main { max-width:820px; margin:0 auto; padding:32px 20px 72px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:14px; padding:22px 24px; margin-bottom:16px; }
+  h2 { font-size:16px; margin:0 0 12px; color:var(--brand); border-left:4px solid var(--brand); padding-left:10px; }
+  p, li { font-size:14px; }
+  ul { margin:6px 0; padding-left:22px; }
+  .meta { font-size:12px; color:var(--sub); }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  th, td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#eef2ff; color:#3730a3; font-weight:700; white-space:nowrap; }
+  .note { background:#eef2ff; border:1px solid #c7d2fe; border-radius:10px; padding:12px 14px; font-size:13px; color:#3730a3; }
+  footer { max-width:820px; margin:0 auto; padding:0 20px 40px; color:var(--sub); font-size:12px; }
+  a { color:var(--brand); }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>プライバシーポリシー</h1>
+    <p>Chromebook 児童端末管理クライアント（Chrome 拡張機能）</p>
+  </div>
+</header>
+
+<main>
+  <section>
+    <p>本プライバシーポリシーは、美作市教育委員会（以下「当委員会」といいます）が、教育委員会の管理下にある児童生徒の Chromebook 端末の運用管理のために提供する Chrome 拡張機能「Chromebook 児童端末管理クライアント」（以下「本拡張機能」といいます）における、利用者情報の取扱いについて定めるものです。</p>
+    <p class="meta">本拡張機能は、当委員会が管理する Google Workspace for Education 環境において、当委員会の許可の下でのみ使用されます。児童生徒および一般の個人が、自らの判断で本拡張機能をインストール・利用することを想定していません。</p>
+  </section>
+
+  <section>
+    <h2>1. 取得する情報</h2>
+    <p>本拡張機能は、当委員会が端末を管理する目的の範囲内で、以下の情報を取得することがあります。</p>
+    <table>
+      <thead><tr><th>情報の種類</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>認証情報</td><td>端末にログインしている Google アカウントのメールアドレス（<code>chrome.identity</code> API により取得）</td></tr>
+        <tr><td>個人識別情報</td><td>当委員会が管理する名簿に基づく氏名・所属学校・クラス</td></tr>
+        <tr><td>Web 閲覧情報</td><td>端末で現在表示しているページの URL</td></tr>
+        <tr><td>Web サイトの内容</td><td>教員が画面確認を指示した場合の、現在表示している画面の画像（スクリーンショット）</td></tr>
+        <tr><td>利用状況</td><td>端末とサーバー間の最終通信日時などの同期情報</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>2. 利用目的</h2>
+    <p>取得した情報は、次の目的にのみ利用します。</p>
+    <ul>
+      <li>教員による画面ロックおよびロック解除</li>
+      <li>学習に適さない Web サイトへのアクセス制限（URL 規制：ホワイトリスト／ブラックリスト）</li>
+      <li>教員が指定した URL の一斉配信</li>
+      <li>児童生徒の閲覧状況の把握（見守り）および端末の稼働状況の確認</li>
+      <li>上記に付随する端末管理業務</li>
+    </ul>
+    <p>取得した情報を、上記の目的以外に利用することはありません。</p>
+  </section>
+
+  <section>
+    <h2>3. 保管および安全管理</h2>
+    <ul>
+      <li>取得した情報は、当委員会が管理する Google Workspace 組織内のスプレッドシートに保管します。</li>
+      <li>通信は HTTPS により暗号化されます。</li>
+      <li>情報へのアクセスは、当委員会が認めた教職員（管理者・担当教員）に限定されます。</li>
+      <li>保管期間は、当該児童生徒の在籍期間および当委員会が定める管理上必要な期間とし、その後は適切に削除します。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>4. 第三者への提供</h2>
+    <p>取得した情報を、外部の第三者へ提供・販売・譲渡することはありません。ただし、法令に基づく開示請求があった場合はこの限りではありません。</p>
+  </section>
+
+  <section>
+    <h2>5. 広告・解析ツール</h2>
+    <p>本拡張機能は、広告の表示、および第三者のアクセス解析ツールへの情報送信を行いません。</p>
+  </section>
+
+  <section>
+    <h2>6. 開示・訂正・削除の請求</h2>
+    <p>取得した情報の開示・訂正・削除を希望される場合は、下記のお問い合わせ先までご連絡ください。本人（または保護者）であることを確認のうえ、当委員会の定めるところにより対応します。</p>
+  </section>
+
+  <section>
+    <h2>7. お問い合わせ先</h2>
+    <p class="note">
+      美作市教育委員会　教育総務課<br>
+      〒707-8501　岡山県美作市美来1番地<br>
+      電話：0868-72-2900（代表：0868-72-1111）<br>
+      ファックス：0868-72-8646<br>
+      お問い合わせフォーム：<a href="https://apply.e-tumo.jp/city-mimasaka-okayama-u/offer/offerList_detail.action?tempSeq=5880">美作市 教育総務課 お問い合わせフォーム</a>
+    </p>
+    <p class="meta">本拡張機能による端末運用（学校での利用）に関するお問い合わせは、学校教育課（電話：0868-72-1162）でも承ります。</p>
+  </section>
+
+  <section>
+    <h2>8. 本ポリシーの改定</h2>
+    <p>本ポリシーの内容は、法令の改正や運用の変更等に応じて改定することがあります。改定した場合は、本ページに掲載します。</p>
+  </section>
+</main>
+
+<footer>
+  <p>制定日：2026年10月11日／最終改定日：2026年10月13日</p>
+  <p>Chromebook 児童端末管理クライアント — 美作市教育委員会</p>
+</footer>
+</body>
+</html>
