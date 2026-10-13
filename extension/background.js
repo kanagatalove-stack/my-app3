@@ -76,11 +76,32 @@ function applyRemoteKeepalive(payload) {
     intervalSec = active ? 1.5 : 0;
     driftUntil = active ? 0 : (Date.now() + 30000);
   }
-  const changed = (active !== keepaliveActive);
-  keepaliveActive = active;
-  activeIntervalMs = (active && isFinite(intervalSec) && intervalSec > 0)
+  const newIntervalMs = (active && isFinite(intervalSec) && intervalSec > 0)
     ? Math.round(intervalSec * 1000) : 1500;
-  idleDriftUntil = active ? 0 : (driftUntil || (Date.now() + 30000));
+  // 非稼働の猶予期限は「一度決めたら延長しない」。GAS は毎応答で now+猶予 を返すため、
+  // 毎回上書きすると猶予が終わらず（＝停止しない）・ストレージ書込みが増える。
+  // さらに端末と GAS の時計ずれで猶予が不当に延びないよう、猶予は最大 60 秒に丸める
+  // （＝「全教員ログアウト後、遅くとも約 60 秒以内に完全停止」を保証する）。
+  const IDLE_DRIFT_MAX_MS = 60000;
+  const driftCandidate = (idleDriftUntil > Date.now())
+    ? idleDriftUntil
+    : (driftUntil || (Date.now() + 30000));
+  const newDriftUntil = active
+    ? 0
+    : Math.min(driftCandidate, Date.now() + IDLE_DRIFT_MAX_MS);
+
+  const activeChanged = (active !== keepaliveActive);
+  const intervalChanged = (newIntervalMs !== activeIntervalMs);
+  const driftChanged = (newDriftUntil !== idleDriftUntil);
+
+  // 状態が変わっていなければ storage 書込み・アラーム再登録を行わない。
+  // 稼働中は約 1.5 秒ごとに ka_active=true が返るため、毎回書き込むと無駄な I/O と
+  // アラーム再設定が発生し、反映速度のゆらぎ・ログ肥大の原因になる。
+  if (!activeChanged && !intervalChanged && !driftChanged) return;
+
+  keepaliveActive = active;
+  activeIntervalMs = newIntervalMs;
+  idleDriftUntil = newDriftUntil;
 
   try {
     chrome.storage.local.set({
@@ -92,10 +113,12 @@ function applyRemoteKeepalive(payload) {
 
   if (active) {
     // 稼働中のバックストップ（30 秒アラーム）を確保し、猶予用アラームは不要なので止める。
-    if (changed) lastSyncMs = 0; // 稼働へ切替時は次回 ping で即同期し、素早く反映する
-    ensureSyncLoop();
-    clearIdleDriftAlarm();
-  } else {
+    if (activeChanged) {
+      lastSyncMs = 0;          // 稼働へ切替時は次回 ping で即同期し、素早く反映する
+      ensureSyncLoop();        // 稼働中のみアラームを登録（状態遷移時だけ）
+      clearIdleDriftAlarm();
+    }
+  } else if (activeChanged || driftChanged) {
     // 非稼働: 30 秒アラームを止めて無駄な起床を止める。猶予期間だけ再開を確認する。
     stopSyncLoop();
     scheduleIdleDrift();
@@ -384,6 +407,7 @@ function resolveGasUrl(data) {
 // ・古いリクエストの応答が新しい応答の後に到着すると、古い状態（例: ロック解除前）で
 //   上書きされ、ロック画面が「消えたり出たり」するちらつきの原因になる。
 // ・実行中はスキップし、常に1本だけ直列で走らせる。
+const SYNC_TIMEOUT_MS = 12000; // GAS 応答のタイムアウト。ハングで syncInFlight が立ったまま（＝反映停止）になるのを防ぐ。
 let syncInFlight = false;
 
 /**
@@ -452,14 +476,27 @@ async function syncWithGas() {
       current_url: currentUrl
     };
 
-    const response = await fetch(effectiveGasUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'text/plain;charset=utf-8' // GAS Web App のCORS制約対策
-      },
-      body: JSON.stringify(payload),
-      redirect: 'follow'
-    });
+    // タイムアウト付きで送信する（応答が返らない場合でも syncInFlight を解放し、
+    // 以後の同期が永久に止まらないようにする）。
+    const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    let timer = null;
+    if (controller) {
+      timer = setTimeout(() => { try { controller.abort(); } catch (e) {} }, SYNC_TIMEOUT_MS);
+    }
+    let response;
+    try {
+      response = await fetch(effectiveGasUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain;charset=utf-8' // GAS Web App のCORS制約対策
+        },
+        body: JSON.stringify(payload),
+        redirect: 'follow',
+        signal: controller ? controller.signal : undefined
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
 
     if (!response.ok) {
       console.warn('[EduAgent] GASレスポンスエラー:', response.status);
@@ -890,6 +927,23 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     }
   }
 });
+
+/**
+ * ウィンドウのフォーカス変化を監視（停止後も教員が端末を操作したら即復帰）。
+ * 児童が「ロック画面のみ」を表示している等で他タブが無い場合、教員がコンソールを開いても
+ * タブ作成/更新イベントが拾えないことがある。ウィンドウのフォーカス変化（＝人が端末を操作した）
+ * で SW が起きるため、ここでアクティブタブを確認して復帰判定する。
+ * ※ 稼働中は resumeFromConsoleTab が即 return するため負荷はない。停止中の起床も操作時のみ。
+ */
+if (chrome.windows && chrome.windows.onFocusChanged) {
+  chrome.windows.onFocusChanged.addListener(async () => {
+    try {
+      const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      const tab = tabs && tabs[0];
+      if (tab && tab.url) resumeFromConsoleTab(tab.url);
+    } catch (e) {}
+  });
+}
 
 /**
  * 全タブのURL規制を再検証

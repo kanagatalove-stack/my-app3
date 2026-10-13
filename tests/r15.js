@@ -90,7 +90,8 @@ console.log('===== 課題A: 拡張側のレート制御（稼働中=1.5秒） ==
 check('ACTIVE_SYNC_MS=1500（3秒以内反映の要）', /const ACTIVE_SYNC_MS = 1500;/.test(bgJs));
 check('IDLE_SYNC_MS=0（非稼働時は定期ポーリングしない＝通信ゼロ）', /const IDLE_SYNC_MS = 0;/.test(bgJs));
 check('maybeSync が非稼働時（猶予終了）に同期しない', /function maybeSync\(\)[\s\S]*?clearIdleDriftAlarm\(\);[\s\S]*?return;/.test(bgJs));
-check('稼働へ切替時に即同期（lastSyncMs=0）', /if \(changed\) lastSyncMs = 0;/.test(bgJs));
+check('稼働へ切替時に即同期（lastSyncMs=0）', /if \(activeChanged\) \{[\s\S]{0,80}?lastSyncMs = 0;/.test(bgJs));
+check('状態不変時は storage 書込み・アラーム再登録をしない（チャーン防止）', /if \(!activeChanged && !intervalChanged && !driftChanged\) return;/.test(bgJs));
 check('KEEPALIVE_PING が maybeSync を呼ぶ（非稼働時は doPost しない）', /message\.type === 'KEEPALIVE_PING'[\s\S]{0,200}?maybeSync\(\)/.test(bgJs));
 check('ping は稼働中のみ送る（keepalive_active ゲート）',
   /kaActiveCache/.test(contentJs) && /if \(!kaActiveCache\) return;/.test(contentJs));

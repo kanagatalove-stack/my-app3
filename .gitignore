@@ -1,0 +1,5 @@
+# ストア素材の作業用中間PNG（最終成果物は dist/store_assets/ に配置）
+build_assets/*.png
+
+# ストア提出物の書き出しバンドル（日付入り・再生成可能）
+dist/store_submission_bundle_*.zip
