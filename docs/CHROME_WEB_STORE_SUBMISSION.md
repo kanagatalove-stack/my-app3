@@ -121,9 +121,13 @@ No, I am not using remote code.（リモートコードは使用していませ�
 
 ### 2-5. プライバシーポリシーURL（必須）
 - 公開URLに設置したプライバシーポリシーの URL を貼ります。
-- 雛形: **`docs/privacy-policy.html`**（本リポジトリ同梱）。§7 の連絡先を実際の値に置換してから公開してください。
-- 公開例：GitHub Pages / 教育委員会サイト
-  - `https://<ユーザー名>.github.io/<リポジトリ名>/privacy-policy.html`
+- **公開済みURL（確定）**：
+  ```
+  https://kanagatalove-stack.github.io/my-app3/privacy-policy.html
+  ```
+  - 配信元ファイル: 本リポジトリ直下の **`privacy-policy.html`**（GitHub Pages・main:/ 配信）
+  - ランディング: `https://kanagatalove-stack.github.io/my-app3/`（`index.html`）
+- ※ 連絡先は美作市教育委員会の公式情報（教育総務課 〒707-8501 岡山県美作市美来1番地／0868-72-2900）を反映済み。
 
 ---
 
@@ -174,7 +178,7 @@ No, I am not using remote code.（リモートコードは使用していませ�
 - [x] スクリーンショット 1280×800 を 3 枚用意
 - [x] スモールプロモタイル 440×280 を用意
 - [x] プライバシーポリシー雛形を作成（`docs/privacy-policy.html`）
-- [ ] プライバシーポリシーの連絡先を実値に置換し、公開URLへ設置
+- [x] プライバシーポリシーを公開URLへ設置（https://kanagatalove-stack.github.io/my-app3/privacy-policy.html ）
 - [ ] `dist/extension.zip` をアップロード
 - [ ] §1〜§3 の文言を貼り付け
 - [ ] 配布タブで Unlisted を選択 → 審査のために送信
