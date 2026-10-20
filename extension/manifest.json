@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chromebook 児童端末管理クライアント",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "GoogleスプレッドシートおよびGASと連携し、Chromebook児童端末の画面ロック・URL規制・一斉URL配信を行うクライアント拡張機能です。",
   "icons": {
     "16": "icons/icon16.png",
@@ -9,8 +9,7 @@
     "128": "icons/icon128.png"
   },
   "action": {
-    "default_popup": "popup.html",
-    "default_title": "端末管理設定"
+    "default_title": "Chromebook 児童端末管理クライアント"
   },
   "permissions": [
     "storage",
