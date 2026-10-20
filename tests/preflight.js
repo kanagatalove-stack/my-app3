@@ -137,8 +137,14 @@ check('CP5 manifest に devtools_page / omnibox 等の露出面が無い',
   !('devtools_page' in manifest) && !('omnibox' in manifest) && !('options_page' in manifest));
 check('CP5 content script は console/詳細情報を一切表示しない（注入IDはロック関連のみ）',
   !/chrome\.runtime\.getManifest|id="chrome"|詳細情報/.test(content) && /edu-screen-lock-overlay/.test(content));
-check('CP5 児童向けにユーザー操作が不要である旨を案内（自動構成）', /自動構成/.test(fs.readFileSync('/home/user/webapp/extension/popup.html','utf8')));
-check('CP5 popup は手動設定を details 内に折りたたむ（児童に操作を求めない）', /<details id="manualSettings">/.test(fs.readFileSync('/home/user/webapp/extension/popup.html','utf8')));
+check('CP5 manifest に default_popup が無い（アイコンを押しても何も出ない）',
+  !(manifest.action && manifest.action.default_popup), manifest.action);
+check('CP5 manifest に options_ui / options_page が無い（児童が設定画面を開けない）',
+  !('options_ui' in manifest) && !('options_page' in manifest));
+check('CP5 popup は web_accessible_resources に含まれない（外部・児童から到達不可）',
+  !(manifest.web_accessible_resources || []).some(r => (r.resources || []).some(x => /popup/.test(x))));
+check('CP5 自動構成（管理ポリシー）で動作し、手動操作を要さない実装である',
+  /chrome\.storage\.managed/.test(bg) && /managed_schema/.test(fs.readFileSync('/home/user/webapp/extension/manifest.json','utf8')));
 
 // ============================================================
 console.log('========== CP6: 全教員ログアウトで児童画面が開いていても完全停止 ==========');
