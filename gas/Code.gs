@@ -1460,8 +1460,31 @@ function computeKaInterval(res, nowMs) {
 function canonicalizeIncomingSchool(raw) {
   const s = String(raw || '').trim();
   if (!s || s === '未設定') return '';
-  const canon = (typeof resolveCanonicalSchool === 'function') ? resolveCanonicalSchool(s) : '';
-  return canon || '';
+  if (typeof normalizeSchoolName !== 'function') return '';
+  if (!CONFIG || !Array.isArray(CONFIG.SCHOOL_LIST)) return '';
+
+  const n = normalizeSchoolName(s);
+  if (!n) return '';
+
+  // 1. 正式名称との完全一致（「美作市立〜」等の接頭辞は normalizeSchoolName が吸収する）
+  for (let i = 0; i < CONFIG.SCHOOL_LIST.length; i++) {
+    if (normalizeSchoolName(CONFIG.SCHOOL_LIST[i]) === n) return CONFIG.SCHOOL_LIST[i];
+  }
+
+  // 2. 明示的に定義した略称のみ許可（「英田小」「大原小」等）
+  if (typeof SCHOOL_ALIASES === 'object' && SCHOOL_ALIASES) {
+    for (const alias in SCHOOL_ALIASES) {
+      if (normalizeSchoolName(alias) === n) {
+        const canon = SCHOOL_ALIASES[alias];
+        if (CONFIG.SCHOOL_LIST.indexOf(canon) !== -1) return canon;
+      }
+    }
+  }
+
+  // 3. 部分一致は使わない。
+  //    resolveCanonicalSchool は「学校」「小」のような曖昧な入力でも先頭の学校に
+  //    一致させてしまうため、認証不要の heartbeat から受け取る値の検証には使わない。
+  return '';
 }
 
 function processHeartbeat(studentId, currentUrl, schoolNameRaw) {

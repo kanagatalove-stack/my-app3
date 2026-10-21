@@ -146,7 +146,26 @@ check('手動設定済みの学校名は上書きしない',
   findRow('kidA@school.ed.jp')[SCHOOL_COL] === '英田小学校',
   { row: findRow('kidA@school.ed.jp')[SCHOOL_COL] });
 
-// 6) 学校名を送らない端末（旧バージョン）でも壊れない
+// 6) 曖昧な入力は「一致なし」にする（学校スコープの詐称防止）
+//    resolveCanonicalSchool の部分一致は「学校」「小」等を先頭校に寄せてしまうため、
+//    認証不要の heartbeat では完全一致＋明示エイリアスのみを受け付ける。
+const ambiguous = ['小学校', '中学校', '小', '学校', '県', '校'];
+const leaked = [];
+for (let i = 0; i < ambiguous.length; i++) {
+  const got = ctx.canonicalizeIncomingSchool(ambiguous[i]);
+  if (got) leaked.push({ input: ambiguous[i], resolvedTo: got });
+}
+check('曖昧な学校名（「小学校」「小」等）は解決しない', leaked.length === 0, { leaked });
+
+// 7) 正式名称・明示エイリアス・接頭辞つきは解決する
+check('正式名称はそのまま解決', ctx.canonicalizeIncomingSchool('英田小学校') === '英田小学校',
+  { got: ctx.canonicalizeIncomingSchool('英田小学校') });
+check('明示エイリアス（英田小）は解決', ctx.canonicalizeIncomingSchool('英田小') === '英田小学校',
+  { got: ctx.canonicalizeIncomingSchool('英田小') });
+check('接頭辞つき（美作市立〜）は解決', ctx.canonicalizeIncomingSchool('美作市立第一小学校') === '第一小学校',
+  { got: ctx.canonicalizeIncomingSchool('美作市立第一小学校') });
+
+// 8) 学校名を送らない端末（旧バージョン）でも壊れない
 const rD = ctx.processHeartbeat('kidD@school.ed.jp', 'https://e/1');
 check('学校名が未指定でも従来どおり未設定で登録（後方互換）',
   findRow('kidD@school.ed.jp')[SCHOOL_COL] === '未設定', { row: findRow('kidD@school.ed.jp')[SCHOOL_COL] });
