@@ -294,7 +294,7 @@ function doGet(e) {
       const studentId = params.student_id;
       const currentUrl = params.current_url || '';
       if (!studentId) return jsonResponse({ success: false, error: 'student_id is required' });
-      return jsonResponse({ success: true, ...processHeartbeat(studentId, currentUrl) });
+      return jsonResponse({ success: true, ...processHeartbeat(studentId, currentUrl, params.school_name) });
     }
 
     // 2. 教員ダッシュボード向けリスト取得 (要認証トークン)
@@ -351,7 +351,7 @@ function doPost(e) {
       const studentId = payload.student_id;
       const currentUrl = payload.current_url || '';
       if (!studentId) return jsonResponse({ success: false, error: 'student_id is required' });
-      return jsonResponse({ success: true, ...processHeartbeat(studentId, currentUrl) });
+      return jsonResponse({ success: true, ...processHeartbeat(studentId, currentUrl, payload.school_name) });
     }
 
     // A2. 児童拡張機能からの画面情報（スクリーンショット）アップロード
@@ -1449,7 +1449,25 @@ function computeKaInterval(res, nowMs) {
   return { ka_active: true, sync_interval_sec: sec, idle_drift_until: 0 };
 }
 
-function processHeartbeat(studentId, currentUrl) {
+/**
+ * 端末から届いた学校名を、端末一覧に書いてよい正式名称へ解決する。
+ *
+ * heartbeat は認証不要のため、任意の文字列をそのままシートへ書き込むと
+ * 学校スコープ（教員が自校の児童だけを見る境界）を欺けてしまう。
+ * そこで CONFIG.SCHOOL_LIST に解決できた正式名称だけを受け付け、
+ * 解決できない値は「情報なし」として扱う（シートは従来どおり未設定のまま）。
+ */
+function canonicalizeIncomingSchool(raw) {
+  const s = String(raw || '').trim();
+  if (!s || s === '未設定') return '';
+  const canon = (typeof resolveCanonicalSchool === 'function') ? resolveCanonicalSchool(s) : '';
+  return canon || '';
+}
+
+function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
+  // 端末から届いた学校名（管理ポリシーの school_name）。正式名称に解決できた場合のみ使う。
+  const incomingSchool = canonicalizeIncomingSchool(schoolNameRaw);
+
   // 教員コンソールの稼働有無に応じた児童端末の同期周期を配布する（非稼働=0＝同期しない）。
   const kaInfo = (typeof computeKaInterval === 'function')
     ? computeKaInterval(isTeacherConsoleActive() ? ACTIVE_SYNC_INTERVAL_SEC : 0, new Date().getTime())
@@ -1484,6 +1502,17 @@ function processHeartbeat(studentId, currentUrl) {
     const nowMs = new Date().getTime();
     const urlChanged = urlCol && String(row[urlCol - 1] || '') !== String(currentUrl || '');
     const syncDue = syncCol ? shouldWriteSyncTime(studentId, nowMs) : false;
+
+    // 学校名が空／未設定の行だけを、端末から届いた正式名称で補完する。
+    // 教員が管理画面で設定済みの学校名は上書きしない（手動設定を優先）。
+    const schoolCol = headerMap['学校名'];
+    if (incomingSchool && schoolCol) {
+      const rowSchool = String(row[schoolCol - 1] || '').trim();
+      if (!rowSchool || rowSchool === '未設定') {
+        sheet.getRange(targetRow, schoolCol).setValue(incomingSchool);
+        row[schoolCol - 1] = incomingSchool;
+      }
+    }
 
     if (urlCol && syncCol && syncCol === urlCol + 1) {
       // 隣接2列（現在URL・最終同期）をまとめて1回で書き込む
@@ -1533,6 +1562,16 @@ function processHeartbeat(studentId, currentUrl) {
         const row = sheet.getRange(reRow, 1, 1, sheet.getLastColumn()).getValues()[0];
         const reqCol2 = headerMap['画面情報要求日時'];
         const shotCol2 = headerMap['画面情報更新日時'];
+
+        // 先に登録されていた行も、学校名が未設定なら補完する（書き込みロック内なので競合しない）。
+        const reSchoolCol = headerMap['学校名'];
+        if (incomingSchool && reSchoolCol) {
+          const reSchool = String(row[reSchoolCol - 1] || '').trim();
+          if (!reSchool || reSchool === '未設定') {
+            sheet.getRange(reRow, reSchoolCol).setValue(incomingSchool);
+            row[reSchoolCol - 1] = incomingSchool;
+          }
+        }
         return {
           student_id: studentId,
           school_name: row[headerMap['学校名'] - 1] || '',
@@ -1559,7 +1598,7 @@ function processHeartbeat(studentId, currentUrl) {
 
       const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
       newRow[headerMap['児童ID'] - 1] = studentId;
-      newRow[headerMap['学校名'] - 1] = '未設定';
+      newRow[headerMap['学校名'] - 1] = incomingSchool || '未設定';
       newRow[headerMap['氏名'] - 1] = initialName;
       newRow[headerMap['クラス'] - 1] = '未設定';
       newRow[headerMap['画面ロック'] - 1] = false;
@@ -1573,7 +1612,7 @@ function processHeartbeat(studentId, currentUrl) {
 
       return {
         student_id: studentId,
-        school_name: '未設定',
+        school_name: newRow[headerMap['学校名'] - 1],
         student_name: initialName,
         class_name: '未設定',
         screen_lock: false,

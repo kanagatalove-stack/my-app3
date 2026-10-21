@@ -38,7 +38,12 @@ const sheet = makeSheet(DEVICE_COLUMNS, [DEVICE_COLUMNS]);
 let lockDepth = 0, maxLockDepth = 0;
 const ctx = {
   console, JSON, Date, Math, String, Number, Array, Object, Boolean, isNaN, parseInt, parseFloat, Set, Map, RegExp, Error,
-  CONFIG: { DEVICE_COLUMNS, DEVICE_SHEET_NAME: '端末一覧' },
+  CONFIG: {
+    DEVICE_COLUMNS, DEVICE_SHEET_NAME: '端末一覧',
+    SCHOOL_LIST: ['英田小学校','大原小学校','江見小学校','勝田小学校','勝田東小学校',
+      '第一小学校','北小学校','土居小学校','英田中学校','大原中学校','作東中学校',
+      '勝田中学校','美作中学校','樸学園']
+  },
   LockService: { getScriptLock() { return { waitLock() { lockDepth++; if (lockDepth > maxLockDepth) maxLockDepth = lockDepth; }, releaseLock() { lockDepth--; } }; } },
   getTargetSheet() { return sheet; },
   Utilities: { formatDate() { return '2026/01/01 00:00:00'; } },
@@ -51,9 +56,26 @@ const ctx = {
   })(),
   Logger: { log(){} }
 };
+// const 宣言（SCHOOL_ALIASES 等）は extract() が関数専用のため、専用に切り出す
+function extractConst(name) {
+  const re = new RegExp('^const ' + name + '\\s*=', 'm');
+  const start = src.search(re);
+  if (start < 0) throw new Error('not found const: ' + name);
+  let i = src.indexOf('{', start), depth = 0, end = -1;
+  for (; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  return src.slice(start, end + 2) + ';';
+}
 const vm = require('vm');
 let code = '';
-['getHeaderMap','withWriteLock','parseBoolean','parseUrlList','shouldWriteSyncTime','processHeartbeat'].forEach(n => { code += extract(n) + '\n'; });
+[
+  'getHeaderMap','withWriteLock','parseBoolean','parseUrlList','shouldWriteSyncTime',
+  // 学校名の解決に必要なヘルパー群（processHeartbeat が school_name を検証するため）
+  'normalizeSchoolName','resolveCanonicalSchool','canonicalizeIncomingSchool','processHeartbeat'
+].forEach(n => { code += extract(n) + '\n'; });
+code += extractConst('SCHOOL_ALIASES') + '\n';
 vm.createContext(ctx);
 vm.runInContext(code, ctx);
 
@@ -79,6 +101,55 @@ check('2回目以降も現在URL/最終同期が更新される', sheet._rows[1]
 const before = sheet._rows.length;
 ctx.processHeartbeat('newkid@school.ed.jp', 'https://example.com/4');
 check('登録済み児童は新規行を追加しない', sheet._rows.length === before, { before, after: sheet._rows.length });
+
+// ============================================================
+console.log('\n===== 学校名の自動反映（管理ポリシーの school_name） =====');
+// シートの学校名列（DEVICE_COLUMNS の 2 列目）を引く
+const SCHOOL_COL = DEVICE_COLUMNS.indexOf('学校名');
+function findRow(id) {
+  for (let i = 1; i < sheet._rows.length; i++) {
+    if (String(sheet._rows[i][0] || '').trim() === id) return sheet._rows[i];
+  }
+  return null;
+}
+
+// 1) 新規登録時に端末の学校名がシートへ入る
+const rA = ctx.processHeartbeat('kidA@school.ed.jp', 'https://e/1', '英田小学校');
+check('新規登録時に端末の学校名がシートへ入る',
+  findRow('kidA@school.ed.jp')[SCHOOL_COL] === '英田小学校',
+  { row: findRow('kidA@school.ed.jp')[SCHOOL_COL] });
+check('応答にも学校名が入る（端末側の表示用）', rA.school_name === '英田小学校', { school_name: rA.school_name });
+
+// 2) 表記ゆれは正式名称へ寄せる
+const rB = ctx.processHeartbeat('kidB@school.ed.jp', 'https://e/1', '美作市立大原小学校');
+check('表記ゆれ（美作市立〜）を正式名称へ正規化',
+  findRow('kidB@school.ed.jp')[SCHOOL_COL] === '大原小学校', { row: findRow('kidB@school.ed.jp')[SCHOOL_COL] });
+check('略称（大原小）も正式名称へ解決', rB.school_name === '大原小学校', { school_name: rB.school_name });
+
+// 3) 未知の学校名は書き込まない（学校スコープの詐称を防ぐ）
+const rC = ctx.processHeartbeat('kidC@school.ed.jp', 'https://e/1', '存在しない学校');
+check('未知の学校名は未設定のまま（スコープ詐称を防ぐ）',
+  findRow('kidC@school.ed.jp')[SCHOOL_COL] === '未設定',
+  { row: findRow('kidC@school.ed.jp')[SCHOOL_COL] });
+
+// 4) 既存行の「未設定」は補完し、行は増やさない
+const rowsBeforeFix = sheet._rows.length;
+ctx.processHeartbeat('kidC@school.ed.jp', 'https://e/2', '第一小学校');
+check('既存行の未設定は端末の学校名で補完される',
+  findRow('kidC@school.ed.jp')[SCHOOL_COL] === '第一小学校',
+  { row: findRow('kidC@school.ed.jp')[SCHOOL_COL] });
+check('補完時に新しい行を増やさない', sheet._rows.length === rowsBeforeFix, { rows: sheet._rows.length });
+
+// 5) 手動で設定済みの学校名は上書きしない（管理者の設定を優先）
+ctx.processHeartbeat('kidA@school.ed.jp', 'https://e/3', '大原小学校');
+check('手動設定済みの学校名は上書きしない',
+  findRow('kidA@school.ed.jp')[SCHOOL_COL] === '英田小学校',
+  { row: findRow('kidA@school.ed.jp')[SCHOOL_COL] });
+
+// 6) 学校名を送らない端末（旧バージョン）でも壊れない
+const rD = ctx.processHeartbeat('kidD@school.ed.jp', 'https://e/1');
+check('学校名が未指定でも従来どおり未設定で登録（後方互換）',
+  findRow('kidD@school.ed.jp')[SCHOOL_COL] === '未設定', { row: findRow('kidD@school.ed.jp')[SCHOOL_COL] });
 
 console.log(`\n===== 結果: PASS=${pass} FAIL=${fail} =====`);
 process.exit(fail ? 1 : 0);

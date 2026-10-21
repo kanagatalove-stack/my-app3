@@ -297,8 +297,13 @@ async function initializeClient() {
       google_account: googleAccount || ''
     };
 
-    if (managed.school_name && !initialData.school_name) {
-      initialData.school_name = managed.school_name;
+    // 管理ポリシーの school_name は学校OUごとに配布されるため最優先。
+    // 保存済みが「未設定」のままでも、ポリシー値で上書きする。
+    const managedSchool = String(managed.school_name || '').trim();
+    if (managedSchool && managedSchool !== '未設定') {
+      initialData.school_name = managedSchool;
+    } else {
+      initialData.school_name = pickMeaningfulSchoolName(initialData.school_name);
     }
 
     await chrome.storage.local.set(initialData);
@@ -374,6 +379,22 @@ function normalizeSchoolKey(name) {
 }
 
 /**
+ * 端末に保存・送信する学校名を決める（複数候補から最初の「意味のある値」を採用）。
+ *
+ * GAS 側のスプレッドシートは、教員が管理画面で紐付けるまで学校名を「未設定」で返す。
+ * その「未設定」をそのまま採用すると、管理ポリシーで配布した school_name が
+ * 毎回上書きされて失われ、端末から GAS へ学校名を送れなくなる。
+ * そのため '' と '未設定' は「値なし」として読み飛ばす。
+ */
+function pickMeaningfulSchoolName() {
+  for (let i = 0; i < arguments.length; i++) {
+    const v = String(arguments[i] || '').trim();
+    if (v && v !== '未設定') return v;
+  }
+  return '未設定';
+}
+
+/**
  * 1つの拡張機能で複数校（13校）のGASへ振り分けるためのGAS URL解決。
  * 優先度:
  *   1. gas_url_map[学校名]  … 学校ごとに別のGAS（スプレッドシート）を使う場合（推奨）
@@ -433,11 +454,18 @@ async function syncWithGas() {
     // まず保存済みの school_name / gas_url_map から解決する。
     let effectiveGasUrl = resolveGasUrl(data);
 
+    // 端末の学校名も heartbeat で GAS へ送る。
+    // これが無いと GAS 側は端末一覧を「学校名 = 未設定」で登録してしまい、
+    // 管理ポリシーで school_name を配布してもシートに反映されない。
+    // （教員の学校スコープ判定はシートの学校名を使うため、未設定のままだと全校の教員から見える）
+    let schoolNameForGas = String(data.school_name || '').trim();
+    if (schoolNameForGas === '未設定') schoolNameForGas = '';
+
     // 解決できない場合（学校未確定・マップ未取得）は managed storage を再確認する。
     if (!effectiveGasUrl || !data.school_name || data.school_name === '未設定') {
       const managed = await getManagedPolicy();
       const merged = {
-        school_name: data.school_name || managed.school_name || '',
+        school_name: pickMeaningfulSchoolName(data.school_name, managed.school_name),
         gas_url_map: (data.gas_url_map && Object.keys(data.gas_url_map).length)
           ? data.gas_url_map
           : (managed.gas_url_map || {}),
@@ -446,13 +474,18 @@ async function syncWithGas() {
       const managedGasUrl = resolveGasUrl(merged);
       if (managedGasUrl) effectiveGasUrl = managedGasUrl;
 
+      if (!schoolNameForGas && merged.school_name && merged.school_name !== '未設定') {
+        schoolNameForGas = merged.school_name;
+      }
+
       // ポリシー由来の値が保存されていなければ補完保存する
       const persist = {};
       if (merged.gas_url_map && Object.keys(merged.gas_url_map).length &&
           (!data.gas_url_map || !Object.keys(data.gas_url_map).length)) {
         persist.gas_url_map = merged.gas_url_map;
       }
-      if (merged.school_name && merged.school_name !== data.school_name) {
+      if (merged.school_name && merged.school_name !== '未設定' &&
+          merged.school_name !== data.school_name) {
         persist.school_name = merged.school_name;
       }
       if (merged.gas_url && merged.gas_url !== data.gas_url) {
@@ -473,7 +506,9 @@ async function syncWithGas() {
     const payload = {
       action: 'heartbeat',
       student_id: studentId,
-      current_url: currentUrl
+      current_url: currentUrl,
+      // 端末の学校名（未確定なら空文字）。GAS はこれで端末一覧の学校名を補完する。
+      school_name: schoolNameForGas
     };
 
     // タイムアウト付きで送信する（応答が返らない場合でも syncInFlight を解放し、
@@ -535,7 +570,9 @@ async function syncWithGas() {
 async function applyPolicies(newPolicy, oldStorage) {
   const updates = {
     last_sync_time: new Date().toLocaleTimeString(),
-    school_name: newPolicy.school_name || oldStorage.school_name || '未設定',
+    // GAS は教員が紐付けるまで「未設定」を返すため、そのまま採用すると
+    // 管理ポリシーで配布した学校名が毎回失われる。意味のある値だけを採用する。
+    school_name: pickMeaningfulSchoolName(newPolicy.school_name, oldStorage.school_name),
     student_name: newPolicy.student_name || oldStorage.student_name || '',
     class_name: newPolicy.class_name || oldStorage.class_name || '',
     screen_lock: Boolean(newPolicy.screen_lock),
