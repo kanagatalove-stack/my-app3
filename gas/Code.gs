@@ -52,7 +52,15 @@ const CONFIG = {
     // 教員が「画面情報取得」を押すと要求日時が入り、児童端末がそれを検知して
     // スクリーンショットを撮影・アップロードする（結果は 画面情報 シートに保存）。
     '画面情報要求日時',
-    '画面情報更新日時'
+    '画面情報更新日時',
+    // AI監視（学習に関係のないサイトの検知）用の列。
+    // システム全体のON/OFF が管理者により切り替えられる。OFF のときは
+    // getAllDevices 側で「要注意=false」に伏せて返すため、管理画面の注意マークは消える。
+    // ※ 既存シートには ensureDeviceHeaders が末尾へ自動追加する（後方互換）。
+    '要注意',
+    '注意理由',
+    '要注意URL',
+    '注意検知日時'
   ],
 
   // 画面情報 シート列定義（スクリーンショット本体を保持）
@@ -410,6 +418,21 @@ function doPost(e) {
     if (action === 'get_all') {
       const data = getAllDevices(payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
       return jsonResponse({ success: true, data: data });
+    }
+
+    // D1. AI監視設定の取得（読み取りは全教員可。変更可否の判断材料として is_admin を返す）
+    if (action === 'get_monitor_settings') {
+      return jsonResponse({
+        success: true,
+        settings: getMonitoringSettings(),
+        is_admin: isAdminTeacher(currentTeacher)
+      });
+    }
+
+    // D1-2. AI監視設定の保存（システム全体・管理者のみ）
+    if (action === 'save_monitor_settings') {
+      const saved = saveMonitoringSettings(currentTeacher, payload.settings || {});
+      return jsonResponse({ success: true, message: '監視設定を保存しました', settings: saved });
     }
 
     // D2. 画面情報取得要求（押下時のみ）：対象児童に要求IDを書き込む
@@ -1487,6 +1510,263 @@ function canonicalizeIncomingSchool(raw) {
   return '';
 }
 
+// ==================== AI監視（学習に関係のないサイトの検知） ====================
+// 判定方式はハイブリッド:
+//   (a) あらかじめ用意したドメイン辞書（学習ドメイン / 非学習ドメイン）
+//   (b) 先生が登録するリスト（端末の「許可URLリスト」「規制URLリスト」）
+// 判定の優先順位（誤検知を避けるため「許可」を最優先にする）:
+//   1. 端末の許可URLリストに一致            -> 注意しない
+//   2. 学習ドメイン辞書に一致              -> 注意しない
+//   3. 端末の規制URLリストに一致            -> 要注意（明示的に規制されたサイト）
+//   4. 非学習ドメイン辞書に一致            -> 要注意（学習に関係のないサイト）
+//   5. どれにも一致しない                  -> 注意しない（未知サイトは黙認）
+// これにより、先生が許可URLリストへ追加すれば辞書より優先して誤検知を打ち消せる。
+//
+// システム全体のON/OFF は PropertiesService に保存し、管理者のみ変更できる。
+
+/** 監視設定の保存キー（PropertiesService のスクリプトプロパティ） */
+const MONITOR_PROP_KEY = 'MONITOR_SETTINGS_V1';
+
+/** 辞書に登録できるドメイン数の上限（異常に大きな設定でGASが重くならないように） */
+const MONITOR_MAX_DOMAINS = 500;
+
+/** 既定の学習ドメイン（= 注意マークを出さないサイト） */
+const MONITOR_DEFAULT_LEARNING_DOMAINS = [
+  'google.com', 'google.co.jp', 'gstatic.com', 'googleusercontent.com',
+  'classroom.google.com', 'docs.google.com', 'drive.google.com', 'sites.google.com',
+  'meet.google.com', 'forms.google.com', 'jamboard.google.com',
+  'microsoft.com', 'office.com', 'microsoftonline.com', 'live.com',
+  'apple.com', 'icloud.com',
+  'nhk.or.jp', 'nhk.jp',
+  'scratch.mit.edu', 'code.org', 'codehs.com', 'eboard.ch',
+  'tokyoshoseki.co.jp', 'gakken.co.jp', 'benesse.co.jp', 'z-kai.co.jp',
+  'monoxer.com', 'qwerty.jp', 'atama-plus.jp', 'loilo.tv',
+  'wikipedia.org', 'kotobank.jp', 'weblio.jp', 'jisho.org', 'britannica.com',
+  'geogebra.org', 'desmos.com', 'wolframalpha.com', 'phet.colorado.edu',
+  'typing.com', 'typingclub.com',
+  'canva.com', 'figma.com', 'miro.com', 'padlet.com', 'edpuzzle.com',
+  'kahoot.com', 'nearpod.com', 'seesaw.me', 'classdojo.com'
+];
+
+/** 既定の非学習ドメイン（= 開いていると注意マークを出すサイト） */
+const MONITOR_DEFAULT_BLOCKED_DOMAINS = [
+  // 動画・配信
+  'youtube.com', 'youtu.be', 'niconico.jp', 'nicovideo.jp', 'dailymotion.com',
+  'abema.tv', 'hulu.com', 'netflix.com', 'disneyplus.com', 'primevideo.com',
+  // SNS・掲示板
+  'tiktok.com', 'twitter.com', 'x.com', 'instagram.com', 'facebook.com',
+  'threads.net', 'snapchat.com', 'reddit.com', 'pinterest.com', 'tumblr.com',
+  'line.me', 'discord.com', 'twitch.tv',
+  // ゲーム
+  'roblox.com', 'minecraft.net', 'fortnite.com', 'epicgames.com',
+  'steampowered.com', 'riotgames.com', 'poki.com', 'coolmathgames.com',
+  'crazygames.com', 'kongregate.com', 'miniclip.com', 'y8.com', 'friv.com',
+  'addictinggames.com', 'silvergames.com',
+  // 音楽・通販
+  'spotify.com', 'soundcloud.com',
+  'amazon.co.jp', 'rakuten.co.jp', 'mercari.com'
+];
+
+/**
+ * URL からホスト名だけを取り出して正規化する。
+ * 例: https://www.YouTube.com/watch?v=x -> youtube.com
+ * GAS(V8) には WHATWG URL が無いため正規表現で処理する。
+ */
+function normalizeMonitorHost(rawUrl) {
+  let s = String(rawUrl || '').trim().toLowerCase();
+  if (!s) return '';
+  s = s.replace(/^[a-z][a-z0-9+.\-]*:\/\//, ''); // スキーム除去
+  s = s.replace(/^\/\//, '');                     // プロトコル相対
+  s = s.split(/[\/?#]/)[0];                       // パス・クエリ・ハッシュ除去
+  s = s.split('@').pop();                         // userinfo 除去
+  s = s.replace(/:\d+$/, '');                     // ポート除去
+  s = s.replace(/^www\./, '');                    // www. 除去
+  s = s.replace(/\.$/, '');                       // 末尾ドット除去
+  return s;
+}
+
+/**
+ * ホスト名がドメイン一覧のいずれかに一致するか。
+ * 完全一致に加え、サブドメイン一致（host が ".<domain>" で終わる）も許可する。
+ * 例: docs.google.com は google.com に一致する。
+ */
+function hostMatchesAnyDomain(host, domains) {
+  const h = String(host || '').trim().toLowerCase();
+  if (!h) return false;
+  if (!Array.isArray(domains)) return false;
+  for (let i = 0; i < domains.length; i++) {
+    const d = normalizeMonitorHost(domains[i]);
+    if (!d) continue;
+    if (h === d) return true;
+    if (h.length > d.length && h.slice(-(d.length + 1)) === '.' + d) return true;
+  }
+  return false;
+}
+
+/**
+ * 監視設定を取得する。未保存なら既定値（enabled=false）を返す。
+ * enabled の既定は false（明示的にONにしない限り注意マークは出さない）。
+ */
+function getMonitoringSettings() {
+  const defaults = {
+    enabled: false,
+    learning_domains: MONITOR_DEFAULT_LEARNING_DOMAINS.slice(),
+    blocked_domains: MONITOR_DEFAULT_BLOCKED_DOMAINS.slice(),
+    updated_at: '',
+    updated_by: ''
+  };
+  try {
+    if (typeof PropertiesService === 'undefined') return defaults;
+    const raw = PropertiesService.getScriptProperties().getProperty(MONITOR_PROP_KEY);
+    if (!raw) return defaults;
+    const o = JSON.parse(raw);
+    if (!o || typeof o !== 'object') return defaults;
+    return {
+      enabled: o.enabled === true,
+      learning_domains: Array.isArray(o.learning_domains)
+        ? o.learning_domains.map(function (v) { return String(v); })
+        : defaults.learning_domains,
+      blocked_domains: Array.isArray(o.blocked_domains)
+        ? o.blocked_domains.map(function (v) { return String(v); })
+        : defaults.blocked_domains,
+      updated_at: String(o.updated_at || ''),
+      updated_by: String(o.updated_by || '')
+    };
+  } catch (e) {
+    return defaults;
+  }
+}
+
+/**
+ * 管理者が送ってきたドメイン一覧を正規化・重複除去して安全な配列にする。
+ */
+function sanitizeMonitorDomainList(list) {
+  const out = [];
+  const seen = {};
+  if (!Array.isArray(list)) return out;
+  for (let i = 0; i < list.length && out.length < MONITOR_MAX_DOMAINS; i++) {
+    const d = normalizeMonitorHost(list[i]);
+    if (!d) continue;
+    // ホスト名として妥当な文字だけ許可（空白・山括弧等を弾く）
+    if (!/^[a-z0-9.\-]+$/.test(d)) continue;
+    if (seen[d]) continue;
+    seen[d] = true;
+    out.push(d);
+  }
+  return out;
+}
+
+/**
+ * 監視設定を保存する（管理者のみ）。システム全体に効く。
+ */
+function saveMonitoringSettings(teacher, incoming) {
+  if (!isAdminTeacher(teacher)) {
+    throw new Error('監視設定を変更できるのは管理者のみです');
+  }
+  const cur = getMonitoringSettings();
+  const src = incoming || {};
+
+  const next = {
+    enabled: (src.enabled !== undefined) ? (src.enabled === true) : cur.enabled,
+    learning_domains: Array.isArray(src.learning_domains)
+      ? sanitizeMonitorDomainList(src.learning_domains)
+      : cur.learning_domains,
+    blocked_domains: Array.isArray(src.blocked_domains)
+      ? sanitizeMonitorDomainList(src.blocked_domains)
+      : cur.blocked_domains,
+    updated_at: Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
+    updated_by: String((teacher && teacher.email) || '')
+  };
+
+  PropertiesService.getScriptProperties().setProperty(MONITOR_PROP_KEY, JSON.stringify(next));
+  // 一覧の読み取りキャッシュを捨てて、次の取得で新しい設定を反映させる
+  if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache();
+  return next;
+}
+
+/**
+ * 監視判定の対象になるURLか（http/https のみ対象）。
+ * chrome:// / chrome-extension:// / about: / file: / view-source: / devtools: 等は
+ * 学習に関係のないサイト判定の対象外とする（誤検知防止）。
+ * スキームが無い「裸のホスト名」（設定画面の手入力など）は http 相当として許可する。
+ */
+function isWebUrlForMonitoring(rawUrl) {
+  const s = String(rawUrl || '').trim().toLowerCase();
+  if (!s) return false;
+  // スキーム無し（例: youtube.com/watch）は許可
+  if (!/^[a-z][a-z0-9+.\-]*:/.test(s)) return true;
+  // http / https のみ許可
+  return /^https?:/.test(s);
+}
+
+/**
+ * URL を監視ルールで評価する。
+ * 戻り値: { flagged: boolean, reason: string, host: string }
+ */
+function evaluateUrlForMonitoring(rawUrl, whitelistUrls, blacklistUrls) {
+  const settings = getMonitoringSettings();
+  if (!settings.enabled) return { flagged: false, reason: '', host: '' };
+
+  // 内部ページ・拡張機能ページ・ローカルファイルは判定対象外。
+  // ※ ホスト名ではなく「元のURLのスキーム」で判定する。
+  //   chrome://settings/ はホスト名抽出後に 'settings' となり、
+  //   ホスト名だけを見る判定では内部ページを確実に弾けないため。
+  if (!isWebUrlForMonitoring(rawUrl)) {
+    return { flagged: false, reason: '', host: '' };
+  }
+
+  const host = normalizeMonitorHost(rawUrl);
+  if (!host) return { flagged: false, reason: '', host: '' };
+
+  // 1. 端末の許可URLリスト（先生が明示的に許可したサイト）が最優先
+  if (hostMatchesAnyDomain(host, parseUrlList(whitelistUrls))) {
+    return { flagged: false, reason: '', host: host };
+  }
+
+  // 2. 学習ドメイン辞書
+  if (hostMatchesAnyDomain(host, settings.learning_domains)) {
+    return { flagged: false, reason: '', host: host };
+  }
+
+  // 3. 端末の規制URLリスト（先生が明示的に規制したサイト）
+  if (hostMatchesAnyDomain(host, parseUrlList(blacklistUrls))) {
+    return { flagged: true, reason: '規制URLリストのサイト（' + host + '）', host: host };
+  }
+
+  // 4. 非学習ドメイン辞書（学習に関係のないサイト）
+  if (hostMatchesAnyDomain(host, settings.blocked_domains)) {
+    return { flagged: true, reason: '学習に関係のないサイト（' + host + '）', host: host };
+  }
+
+  // 5. 未知のサイトは注意しない（誤検知を避ける）
+  return { flagged: false, reason: '', host: host };
+}
+
+/**
+ * 監視がOFFのときは、シートに残っている注意フラグを伏せて返す。
+ * これにより管理画面の注意マークが即座に消える（データは保持したまま非表示）。
+ */
+function applyMonitorVisibility(devices) {
+  if (!Array.isArray(devices)) return devices;
+  let enabled = false;
+  try {
+    enabled = getMonitoringSettings().enabled === true;
+  } catch (e) {
+    enabled = false;
+  }
+  if (enabled) return devices;
+  for (let i = 0; i < devices.length; i++) {
+    if (devices[i] && typeof devices[i] === 'object') {
+      devices[i].monitor_flag = false;
+      devices[i].monitor_reason = '';
+      devices[i].monitor_url = '';
+      devices[i].monitor_at = '';
+    }
+  }
+  return devices;
+}
+
+
 function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   // 端末から届いた学校名（管理ポリシーの school_name）。正式名称に解決できた場合のみ使う。
   const incomingSchool = canonicalizeIncomingSchool(schoolNameRaw);
@@ -1550,6 +1830,43 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
       if (syncDue) sheet.getRange(targetRow, syncCol).setValue(now);
     }
 
+    // ---- AI監視（学習に関係のないサイトの検知）----
+    // 判定は「URLが変わったとき」だけ行う（毎回の同期で辞書照合しない＝GASを軽く保つ）。
+    // 監視がOFFのときは列に一切触らない（履歴を保持したまま、表示側で伏せる）。
+    const monFlagCol = headerMap['要注意'];
+    const monReasonCol = headerMap['注意理由'];
+    const monUrlCol = headerMap['要注意URL'];
+    const monAtCol = headerMap['注意検知日時'];
+    // 4列が連続している場合のみ、1回の getRange でまとめて書き込む
+    const monContiguous = monFlagCol && monReasonCol && monUrlCol && monAtCol &&
+      monReasonCol === monFlagCol + 1 && monUrlCol === monFlagCol + 2 && monAtCol === monFlagCol + 3;
+
+    if (urlChanged && monContiguous) {
+      let monSettings = null;
+      try { monSettings = getMonitoringSettings(); } catch (e) { monSettings = null; }
+      if (monSettings && monSettings.enabled) {
+        const mon = evaluateUrlForMonitoring(
+          currentUrl,
+          row[headerMap['許可URLリスト'] - 1],
+          row[headerMap['規制URLリスト'] - 1]
+        );
+        const prevFlag = parseBoolean(row[monFlagCol - 1]);
+        // 状態が変わったときだけ書き込む（シート書き込み回数を増やさない）
+        if (mon.flagged !== prevFlag) {
+          sheet.getRange(targetRow, monFlagCol, 1, 4).setValues([[
+            mon.flagged,
+            mon.flagged ? mon.reason : '',
+            mon.flagged ? (mon.host || '') : '',
+            mon.flagged ? now : ''
+          ]]);
+          row[monFlagCol - 1] = mon.flagged;
+          row[monReasonCol - 1] = mon.flagged ? mon.reason : '';
+          row[monUrlCol - 1] = mon.flagged ? (mon.host || '') : '';
+          row[monAtCol - 1] = mon.flagged ? now : '';
+        }
+      }
+    }
+
     // 画面情報要求日時／更新日時（画面一覧機能）。列が無い既存シートでも安全に '' を返す。
     const reqCol = headerMap['画面情報要求日時'];
     const shotCol = headerMap['画面情報更新日時'];
@@ -1567,6 +1884,8 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
       broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || '').trim(),
       screen_request_at: reqCol ? String(row[reqCol - 1] || '').trim() : '',
       screenshot_at: shotCol ? String(row[shotCol - 1] || '').trim() : '',
+      monitor_flag: (monFlagCol ? parseBoolean(row[monFlagCol - 1]) : false),
+      monitor_reason: (monReasonCol ? String(row[monReasonCol - 1] || '') : ''),
       ka_active: kaActive, sync_interval_sec: kaInfo.sync_interval_sec,
       idle_drift_until: kaInfo.idle_drift_until, server_time: now
     };
@@ -1630,6 +1949,22 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
       newRow[headerMap['規制URLリスト'] - 1] = 'youtube.com, twitter.com, tiktok.com, instagram.com';
       newRow[headerMap['現在開いているURL'] - 1] = currentUrl;
       newRow[headerMap['最終同期日時'] - 1] = now;
+
+      // AI監視: 初回登録時点のURLも判定する（監視OFFなら何もしない＝既定は空欄）。
+      let newMon = { flagged: false, reason: '', host: '' };
+      try {
+        newMon = evaluateUrlForMonitoring(
+          currentUrl,
+          newRow[headerMap['許可URLリスト'] - 1],
+          newRow[headerMap['規制URLリスト'] - 1]
+        );
+      } catch (e) {
+        newMon = { flagged: false, reason: '', host: '' };
+      }
+      if (headerMap['要注意']) newRow[headerMap['要注意'] - 1] = newMon.flagged;
+      if (headerMap['注意理由']) newRow[headerMap['注意理由'] - 1] = newMon.flagged ? newMon.reason : '';
+      if (headerMap['要注意URL']) newRow[headerMap['要注意URL'] - 1] = newMon.flagged ? (newMon.host || '') : '';
+      if (headerMap['注意検知日時']) newRow[headerMap['注意検知日時'] - 1] = newMon.flagged ? now : '';
 
       sheet.appendRow(newRow);
 
@@ -2045,6 +2380,11 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
     // 画面一覧用の制御列（列が無い既存シートでも安全に '' を返す）
     const reqColIdx = headerMap['画面情報要求日時'];
     const shotColIdx = headerMap['画面情報更新日時'];
+    // AI監視の列（既存シートでも ensureDeviceHeaders により末尾へ自動追加される）
+    const monFlagIdx = headerMap['要注意'];
+    const monReasonIdx = headerMap['注意理由'];
+    const monUrlIdx = headerMap['要注意URL'];
+    const monAtIdx = headerMap['注意検知日時'];
 
     results.push({
       student_id: studentId,
@@ -2062,16 +2402,23 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
       is_online: isOnline,
       notes: String(row[headerMap['備考'] - 1] || ''),
       screen_request_at: reqColIdx ? String(row[reqColIdx - 1] || '').trim() : '',
-      screenshot_at: shotColIdx ? String(row[shotColIdx - 1] || '').trim() : ''
+      screenshot_at: shotColIdx ? String(row[shotColIdx - 1] || '').trim() : '',
+      monitor_flag: monFlagIdx ? parseBoolean(row[monFlagIdx - 1]) : false,
+      monitor_reason: monReasonIdx ? String(row[monReasonIdx - 1] || '') : '',
+      monitor_url: monUrlIdx ? String(row[monUrlIdx - 1] || '') : '',
+      monitor_at: monAtIdx ? String(row[monAtIdx - 1] || '') : ''
     });
   }
 
   // 読み取りキャッシュへ保存（5秒）。書き込み時は invalidateDevicesCache() で無効化する。
+  // ※ 監視設定の変更時にも invalidateDevicesCache() を呼ぶため、OFFにした直後に
+  //    注意マークが残ることはない。
   if (devCache && devCacheKey) {
     try { devCache.put(devCacheKey, JSON.stringify(results), 5); } catch (e) {}
   }
 
-  return results;
+  // 監視がOFFのときは注意フラグを伏せて返す（シートのデータは保持したまま非表示）。
+  return applyMonitorVisibility(results);
 }
 
 /**
@@ -2789,6 +3136,35 @@ function api_getArchivedStudents(token) {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     return { success: true, data: getArchivedStudents(auth.teacher) };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+// ---- AI監視設定 API (google.script.run 用) ----
+
+function api_getMonitorSettings(token) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    return {
+      success: true,
+      settings: getMonitoringSettings(),
+      is_admin: isAdminTeacher(currentTeacher)
+    };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_saveMonitorSettings(token, settings) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const saved = saveMonitoringSettings(currentTeacher, settings || {});
+    return { success: true, message: '監視設定を保存しました', settings: saved };
   } catch (err) {
     return { success: false, error: err.toString() };
   }

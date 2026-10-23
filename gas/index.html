@@ -216,6 +216,15 @@
             <span id="teacherSettingsBtnLabel">設定 (クラス・URL)</span>
           </button>
 
+          <!-- AI監視設定ボタン（管理者のみ） -->
+          <button id="monitorSettingsBtn" onclick="openMonitoringModal()" title="学習に関係のないサイトの監視設定（管理者のみ）" class="hidden flex items-center space-x-1.5 bg-rose-700 hover:bg-rose-800 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-rose-500">
+            <svg class="w-4 h-4 text-rose-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+            </svg>
+            <span>監視設定</span>
+          </button>
+
           <!-- ログアウトボタン -->
           <button onclick="logout()" title="ログアウト" class="flex items-center space-x-1 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1084,6 +1093,81 @@
     </div>
   </div>
 
+  <!-- ==================== モーダル: AI監視設定（管理者のみ・システム全体） ==================== -->
+  <div id="monitorModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[65] hidden flex items-center justify-center p-3 sm:p-4">
+    <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden">
+      <div class="p-5 border-b flex items-center justify-between bg-slate-50 shrink-0">
+        <h3 class="text-lg font-bold text-slate-800 flex items-center space-x-2">
+          <span class="p-1.5 bg-rose-100 text-rose-600 rounded-lg">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+            </svg>
+          </span>
+          <span>AI監視設定（システム全体）</span>
+        </h3>
+        <button onclick="closeModal('monitorModal')" class="text-slate-400 hover:text-slate-600">✕</button>
+      </div>
+
+      <div class="p-5 space-y-4 text-xs overflow-y-auto flex-1">
+        <!-- システム全体のON/OFF -->
+        <div class="bg-rose-50 border border-rose-200 rounded-xl p-4 flex items-start space-x-3">
+          <input type="checkbox" id="monitorEnabledToggle" class="w-5 h-5 mt-0.5 text-rose-600 rounded shrink-0">
+          <label for="monitorEnabledToggle" class="cursor-pointer select-none">
+            <span class="block text-sm font-bold text-rose-900">AI監視を有効にする（システム全体）</span>
+            <span class="block text-[11px] text-rose-700 mt-1 leading-relaxed">
+              有効にすると、児童が学習に関係のないサイトを開いたときに、端末一覧の氏名の横へ
+              <span class="font-bold">⚠ 注意</span> マークが表示されます。<br>
+              無効にすると注意マークは全端末で即座に非表示になります（記録は保持されます）。
+            </span>
+          </label>
+        </div>
+
+        <!-- 非学習ドメイン辞書 -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <label class="font-semibold text-slate-700">非学習ドメイン辞書（開いたら注意マークを出す）</label>
+            <span class="text-[11px] text-slate-400">1行に1ドメイン</span>
+          </div>
+          <div class="text-[11px] text-slate-500 mb-1 leading-relaxed">
+            YouTube・SNS・ゲーム等のドメインを列挙します。<code class="bg-slate-100 px-1 rounded">youtube.com</code> のように
+            書くとサブドメイン（<code class="bg-slate-100 px-1 rounded">www.youtube.com</code>）も対象になります。
+          </div>
+          <textarea id="monitorBlockedDomains" rows="8" spellcheck="false"
+            class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs font-mono focus:ring-rose-500 focus:border-rose-500"
+            placeholder="youtube.com&#10;tiktok.com&#10;roblox.com"></textarea>
+        </div>
+
+        <!-- 学習ドメイン辞書 -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <label class="font-semibold text-slate-700">学習ドメイン辞書（注意マークを出さない）</label>
+            <span class="text-[11px] text-slate-400">1行に1ドメイン</span>
+          </div>
+          <div class="text-[11px] text-slate-500 mb-1 leading-relaxed">
+            授業で使うサイトを列挙します。ここに登録したサイトは非学習辞書より<strong>優先</strong>されます。
+            各端末の「許可URLリスト」はさらに優先されます（先生が明示的に許可したサイトは注意しません）。
+          </div>
+          <textarea id="monitorLearningDomains" rows="8" spellcheck="false"
+            class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs font-mono focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="google.com&#10;nhk.or.jp&#10;scratch.mit.edu"></textarea>
+        </div>
+
+        <div id="monitorUpdatedInfo" class="text-[11px] text-slate-400"></div>
+
+        <div class="bg-slate-50 border border-slate-200 rounded-lg p-3 text-[11px] text-slate-600 leading-relaxed">
+          <span class="font-bold text-slate-700">判定の優先順位</span><br>
+          ① 端末の許可URLリスト → ② 学習ドメイン辞書 → ③ 端末の規制URLリスト → ④ 非学習ドメイン辞書 → ⑤ 未知のサイト<br>
+          ⑤の未知のサイトは注意マークを出しません（誤検知を避けるため）。
+        </div>
+      </div>
+
+      <div class="flex justify-end space-x-2 p-4 border-t bg-slate-50 shrink-0">
+        <button onclick="closeModal('monitorModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition">閉じる</button>
+        <button onclick="saveMonitoringSettingsFromModal()" class="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white rounded-lg shadow-sm transition">保存する</button>
+      </div>
+    </div>
+  </div>
+
   <!-- モーダル: 注意喚起（確認ダイアログ） -->
   <div id="alertModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[60] hidden flex items-center justify-center p-4">
     <div class="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-sm w-full p-6 text-center space-y-4">
@@ -1641,6 +1725,10 @@
       const settingsLabel = document.getElementById('teacherSettingsBtnLabel');
       if (settingsLabel) settingsLabel.textContent = isAdminUser() ? '設定 (クラス・URL)' : '設定 (URL・規制)';
 
+      // AI監視設定は「システム全体」に効くため、管理者(ADMIN)のみに表示する。
+      const monitorBtn = document.getElementById('monitorSettingsBtn');
+      if (monitorBtn) monitorBtn.classList.toggle('hidden', !isAdminUser());
+
       const classBadge = document.getElementById('currentTeacherClassBadge');
       if (currentTeacher.target_class && currentTeacher.target_class.trim()) {
         classBadge.textContent = '対象クラス: ' + currentTeacher.target_class.trim();
@@ -1768,6 +1856,10 @@
             runner.api_runAnnualRollover(authToken, payload.data || payload);
           } else if (act === 'get_archived_students') {
             runner.api_getArchivedStudents(authToken);
+          } else if (act === 'get_monitor_settings') {
+            runner.api_getMonitorSettings(authToken);
+          } else if (act === 'save_monitor_settings') {
+            runner.api_saveMonitorSettings(authToken, payload.settings || {});
           } else {
             reject(new Error('未対応のアクション: ' + act));
           }
@@ -2539,6 +2631,16 @@
           ? `<span class="text-slate-400 text-[11px]">クラス未設定</span>`
           : `<span class="text-slate-700 font-semibold text-[11px]">${escapeHtml(d.class_name)}</span>`;
 
+        // AI監視: 学習に関係のないサイトを開いている児童の氏名の横に注意マークを出す。
+        // 監視がOFFのときは GAS 側が monitor_flag=false を返すため、ここには表示されない
+        // （＝システム全体のON/OFFがそのまま表示に反映される）。
+        const monitorBadge = d.monitor_flag
+          ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-300 cursor-help" title="${escapeHtml(d.monitor_reason || '学習に関係のないサイトを開いています')}">⚠ 注意</span>`
+          : '';
+        const monitorDetail = d.monitor_flag && d.monitor_at
+          ? `<span class="text-[10px] text-rose-500 font-mono">${escapeHtml(d.monitor_at)}</span>`
+          : '';
+
         html += `
           <tr class="hover:bg-slate-50/80 transition ${isChecked ? 'bg-indigo-50/40' : ''}">
             <td class="p-3.5 w-4 text-center">
@@ -2557,8 +2659,10 @@
                 }
                 ${schoolBadge}
               </div>
-              <div class="flex items-center space-x-2 text-xs">
+              <div class="flex items-center space-x-2 text-xs flex-wrap gap-y-1">
                 <span class="font-bold text-slate-800 text-sm">${escapeHtml(d.student_name || '氏名未設定')}</span>
+                ${monitorBadge}
+                ${monitorDetail}
                 <span class="text-slate-300">•</span>
                 ${classBadge}
                 ${d.notes ? `<span class="text-[10px] text-slate-400 truncate max-w-xs">(${escapeHtml(d.notes)})</span>` : ''}
@@ -3294,6 +3398,83 @@
       const container = document.getElementById('broadcastSaveTitleContainer');
       if (checked) container.classList.remove('hidden');
       else container.classList.add('hidden');
+    }
+
+    // ==================== AI監視設定（システム全体・管理者のみ） ====================
+    // 監視は「システム全体」の設定なので、ON/OFF とドメイン辞書は管理者だけが変更できる。
+    // 一般教員が呼び出してもサーバー側(saveMonitoringSettings)で拒否される（二重の防御）。
+
+    async function openMonitoringModal() {
+      if (!isAdminUser()) {
+        showAlertModal('権限がありません', '監視設定を変更できるのは管理者のみです。', 'error');
+        return;
+      }
+      openModal('monitorModal');
+
+      const infoEl = document.getElementById('monitorUpdatedInfo');
+      if (infoEl) infoEl.textContent = '読み込み中...';
+
+      try {
+        const res = await apiRequest({ action: 'get_monitor_settings' });
+        const s = (res && res.settings) || {};
+
+        const toggle = document.getElementById('monitorEnabledToggle');
+        const blockedEl = document.getElementById('monitorBlockedDomains');
+        const learningEl = document.getElementById('monitorLearningDomains');
+
+        if (toggle) toggle.checked = (s.enabled === true);
+        if (blockedEl) blockedEl.value = (Array.isArray(s.blocked_domains) ? s.blocked_domains : []).join('\n');
+        if (learningEl) learningEl.value = (Array.isArray(s.learning_domains) ? s.learning_domains : []).join('\n');
+
+        if (infoEl) {
+          infoEl.textContent = s.updated_at
+            ? `最終更新: ${s.updated_at}${s.updated_by ? '（' + s.updated_by + '）' : ''}`
+            : '初期設定のままです（未保存）';
+        }
+      } catch (err) {
+        if (infoEl) infoEl.textContent = '設定の取得に失敗しました: ' + err.message;
+        showToast('監視設定の取得に失敗しました: ' + err.message, 'error');
+      }
+    }
+
+    async function saveMonitoringSettingsFromModal() {
+      if (!isAdminUser()) {
+        showAlertModal('権限がありません', '監視設定を変更できるのは管理者のみです。', 'error');
+        return;
+      }
+
+      const toggle = document.getElementById('monitorEnabledToggle');
+      const blockedEl = document.getElementById('monitorBlockedDomains');
+      const learningEl = document.getElementById('monitorLearningDomains');
+
+      // 改行／カンマ区切りを配列へ（parseAddressList を再利用）
+      const blocked = parseAddressList(blockedEl ? blockedEl.value : '');
+      const learning = parseAddressList(learningEl ? learningEl.value : '');
+      const enabled = !!(toggle && toggle.checked);
+
+      if (enabled && blocked.length === 0) {
+        showAlertModal('設定を確認してください', 'AI監視を有効にするには、非学習ドメイン辞書に1件以上のドメインを登録してください。', 'warning');
+        return;
+      }
+
+      try {
+        showToast('監視設定を保存中...', 'info');
+        await apiRequest({
+          action: 'save_monitor_settings',
+          settings: {
+            enabled: enabled,
+            blocked_domains: blocked,
+            learning_domains: learning
+          }
+        });
+        showToast(enabled ? 'AI監視を有効にしました' : 'AI監視を無効にしました', 'success');
+        closeModal('monitorModal');
+        // 注意マークの表示／非表示を即座に反映する
+        refreshSuppressedUntil = 0;
+        await loadDevices();
+      } catch (err) {
+        showToast('監視設定の保存に失敗しました: ' + err.message, 'error');
+      }
     }
 
     // ユーティリティ関数
