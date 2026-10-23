@@ -2843,24 +2843,34 @@
       });
       return out;
     }
-
-    // 「すでに登録しているアドレス」の候補集合を作る
-    //  - 教員の個別設定（許可/規制）
-    //  - マイURL（ホスト名に正規化）
-    //  - 端末一覧に現在設定されている許可/規制リスト
-    function collectKnownAddresses() {
+    // 「すでに登録しているアドレス」の候補集合を作る。
+    // 許可リストと規制リストの情報源を1つの集合に混ぜると、両方のリストに
+    // 同じURLが並んでしまい「どちらが許可でどちらが規制か」が分からなくなる。
+    // そのため種別ごとに、その種別に属する情報源だけから候補を作る。
+    //   white（許可URLリスト）: 教員の個別許可設定 / マイURL / 端末の許可URLリスト
+    //   black（規制URLリスト）: 教員の個別規制設定 / 端末の規制URLリスト
+    function collectKnownAddresses(type) {
+      const isWhite = type === 'white';
       const set = new Set();
       const add = (v) => { const s = String(v || '').trim(); if (s) set.add(s); };
-      parseAddressList(currentTeacher?.filter_whitelist).forEach(add);
-      parseAddressList(currentTeacher?.filter_blacklist).forEach(add);
-      (currentTeacher?.urls || []).forEach(u => {
-        try { add(new URL(u.url).hostname.replace(/^www\./, '')); } catch (e) { add(u.url); }
-      });
-      devicesData.forEach(d => {
-        parseAddressList(d.whitelist_urls).forEach(add);
-        parseAddressList(d.blacklist_urls).forEach(add);
-      });
-      return Array.from(set);
+
+      if (isWhite) {
+        parseAddressList(currentTeacher?.filter_whitelist).forEach(add);
+        // マイURL（教員がよく使うURL）は「許可」の候補として扱う
+        (currentTeacher?.urls || []).forEach(u => {
+          try { add(new URL(u.url).hostname.replace(/^www\./, '')); } catch (e) { add(u.url); }
+        });
+        devicesData.forEach(d => parseAddressList(d.whitelist_urls).forEach(add));
+      } else {
+        parseAddressList(currentTeacher?.filter_blacklist).forEach(add);
+        devicesData.forEach(d => parseAddressList(d.blacklist_urls).forEach(add));
+      }
+
+      // 反対側のリストで選択済みのアドレスは候補から除外し、
+      // 同一URLが許可と規制の両方に現れないようにする。
+      const otherKey = isWhite ? 'black' : 'white';
+      const otherSelected = new Set(filterModalState[otherKey] || []);
+      return Array.from(set).filter(a => !otherSelected.has(a));
     }
 
     function renderFilterAddressList(type) {
@@ -2872,7 +2882,7 @@
 
       const selected = filterModalState[key];
       // 選択済みアドレスは必ず表示し、候補（登録済み）と統合する
-      const known = collectKnownAddresses();
+      const known = collectKnownAddresses(key);
       const all = Array.from(new Set([...known, ...selected])).sort();
 
       if (countEl) countEl.textContent = `${selected.length}件 選択中`;
