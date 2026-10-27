@@ -476,9 +476,10 @@ function doPost(e) {
 
     // D. 端末一覧取得
     if (action === 'get_all') {
-      const baseData = getAllDevices(payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
-      // 子GAS分散: 子の端末も同じ画面に並べる（教員は1画面のまま）
-      const data = shardMergeDevices(baseData, payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
+      // 子GAS分散: 子の端末も同じ画面に並べる（教員は1画面のまま）。
+      // 子GASへは並列（fetchAll）で問い合わせ、集約結果を数秒キャッシュする。
+      const data = getShardMergedDevices(
+        payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
       return jsonResponse({ success: true, data: data });
     }
 
@@ -3440,6 +3441,107 @@ function shardApplyFromParent(payload) {
 }
 
 /** 設定から子GASのURL一覧を取り出す（重複除去・既定URL含む）。 */
+const SHARD_LIST_CACHE_TTL = 4;   // 秒。集約結果のキャッシュ（3〜5秒の範囲）
+const SHARD_LIST_CACHE_PREFIX = 'shard_ls_';
+
+/** キャッシュキー用の短いハッシュ（CacheService のキー長・可読性のため）。 */
+function shardHash(str) {
+  const s = String(str || '');
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) & 0x7fffffff;
+  }
+  return h.toString(36);
+}
+
+/** 端末一覧の版数（親が書き込むと進む）。キャッシュキーに混ぜて古い一覧を配らない。 */
+function shardDevVersion() {
+  try {
+    if (typeof CacheService === 'undefined') return '0';
+    return String(CacheService.getScriptCache().get('dev_v') || '0');
+  } catch (e) {
+    return '0';
+  }
+}
+
+/**
+ * 複数リクエストを並列で送る。
+ * fetchAll が使える環境では 1 回分の待ち時間で全件を取得する（今回の主目的）。
+ * 使えない環境（テスト・古いランタイム）では直列 fetch へフォールバックし、挙動を変えない。
+ */
+function shardFetchMany(requests) {
+  const reqs = Array.isArray(requests) ? requests : [];
+  if (!reqs.length) return [];
+  try {
+    if (UrlFetchApp && typeof UrlFetchApp.fetchAll === 'function') {
+      const out = UrlFetchApp.fetchAll(reqs);
+      if (out && out.length === reqs.length) return out;
+    }
+  } catch (e) {
+    // 並列化に失敗しても取得自体は諦めない（直列へ）
+  }
+  const out = [];
+  for (let i = 0; i < reqs.length; i++) {
+    const params = {};
+    const keys = Object.keys(reqs[i] || {});
+    for (let k = 0; k < keys.length; k++) {
+      if (keys[k] !== 'url') params[keys[k]] = reqs[i][keys[k]];
+    }
+    try {
+      out.push(UrlFetchApp.fetch(reqs[i].url, params));
+    } catch (e2) {
+      out.push(null);
+    }
+  }
+  return out;
+}
+
+/**
+ * この教員のために問い合わせる必要がある子GASのURLを選ぶ。
+ *
+ * ・管理者 / 対象クラス未設定 … 全子GAS（全校・全学年の表示に対応）
+ * ・対象クラスあり（専科等） … そのクラスを担当する子GASのみ
+ *   ＝ 1 クラス分の通信で済む（並列化と合わせて最も効く経路）
+ * ・該当が無い場合は安全側で全件へフォールバック（設定不備で児童が消えないように）
+ */
+function shardUrlsForTeacher(cfg, teacher) {
+  const all = shardAllChildUrls(cfg);
+  if (!all.length) return all;
+
+  let targets = [];
+  try {
+    targets = (typeof getTeacherTargetClasses === 'function') ? getTeacherTargetClasses(teacher) : [];
+  } catch (e) {
+    targets = [];
+  }
+  if (!targets.length) return all;
+
+  const idx = shardMapIndexFromMap(cfg && cfg.map);
+  const want = {};
+  let wantCount = 0;
+  for (let i = 0; i < targets.length; i++) {
+    const k = normalizeShardClass(targets[i]);
+    if (k) { want[k] = true; wantCount++; }
+  }
+  if (!wantCount) return all;
+
+  const hit = {};
+  const keys = Object.keys(idx);
+  for (let i = 0; i < keys.length; i++) {
+    if (want[keys[i]]) hit[idx[keys[i]]] = true;
+  }
+
+  const out = [];
+  for (let i = 0; i < all.length; i++) {
+    if (hit[all[i]]) out.push(all[i]);
+  }
+  // 既定URL（クラス不明の児童の受け皿）は取りこぼさないよう常に含める。
+  const def = String((cfg && cfg.def) || '').trim();
+  if (def && all.indexOf(def) >= 0 && out.indexOf(def) < 0) out.push(def);
+
+  return out.length ? out : all;
+}
+
 function shardAllChildUrls(cfg) {
   const out = [];
   const seen = {};
@@ -3494,17 +3596,20 @@ function shardPropagateKaState(active) {
       student_ids: [],
       ka_active: !!active
     });
-    const results = [];
+    // 全校分あっても 1 回分の待ち時間で配信する（並列）。
+    const requests = [];
     for (let i = 0; i < urls.length; i++) {
-      try {
-        const res = UrlFetchApp.fetch(urls[i], {
-          method: 'post', contentType: 'application/json', payload: body,
-          muteHttpExceptions: true
-        });
-        results.push({ ok: true, status: res.getResponseCode() });
-      } catch (e) {
-        results.push({ ok: false, error: String(e) });
-      }
+      requests.push({
+        url: urls[i], method: 'post', contentType: 'application/json',
+        payload: body, muteHttpExceptions: true
+      });
+    }
+    const responses = shardFetchMany(requests);
+    const results = [];
+    for (let i = 0; i < responses.length; i++) {
+      const res = responses[i];
+      if (res) results.push({ ok: true, status: res.getResponseCode() });
+      else results.push({ ok: false, error: 'no_response' });
     }
     return { sent: results.length, active: !!active };
   } catch (e) {
@@ -3517,34 +3622,112 @@ function shardPropagateKaState(active) {
  * 子側は shard_list で「その子が持つ全端末（スコープ適用前）」を返す。
  * スコープ（学校・対象クラス）の適用は親が行う＝教員マスタの正は親にあるため。
  */
-function shardFetchChildDevices() {
+/**
+ * 教員コンソールの get_all 用: 親のシート + 子GASの端末を集約して返す。
+ *
+ * 分散が無効（SHARD_MODE=false）のときは getAllDevices をそのまま返す＝従来と完全同一。
+ * 有効なときは「集約後の全件レスポンス」を 3〜5 秒キャッシュする。
+ * キーに dev_v を混ぜているため、ロック/配信/規制などの書き込みで自動的に失効する
+ * （＝操作直後は必ず最新、自動更新や連続操作ではキャッシュに当たる）。
+ */
+function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
+  if (!isShardParent()) {
+    return getAllDevices(filterSchool, teacher, includeUnassigned);
+  }
+
+  const t = teacher || {};
+  const scopeKey = [
+    filterSchool || 'ALL',
+    includeUnassigned ? '1' : '0',
+    t.email || '', t.school || '', t.role || '', t.target_class || ''
+  ].join('|');
+  const cacheKey = 'shard_ga_' + shardHash(scopeKey) + '_' + shardDevVersion();
+
+  let cache = null;
+  try {
+    if (typeof CacheService !== 'undefined') {
+      cache = CacheService.getScriptCache();
+      const hit = cache.get(cacheKey);
+      if (hit) {
+        const arr = JSON.parse(hit);
+        if (Array.isArray(arr)) return arr;
+      }
+    }
+  } catch (e) {
+    cache = null;
+  }
+
+  const baseData = getAllDevices(filterSchool, teacher, includeUnassigned);
+  const data = shardMergeDevices(baseData, filterSchool, teacher, includeUnassigned);
+
+  if (cache) {
+    try { cache.put(cacheKey, JSON.stringify(data), SHARD_LIST_CACHE_TTL); } catch (e) {}
+  }
+  return data;
+}
+
+function shardFetchChildDevices(urlsOverride) {
   if (!isShardParent()) return [];
-  const out = [];
   try {
     const cfg = shardConfigCached();
-    const urls = shardAllChildUrls(cfg);
+    const urls = Array.isArray(urlsOverride) ? urlsOverride : shardAllChildUrls(cfg);
     if (!urls.length) return [];
+
+    // 集約結果の短時間キャッシュ（3〜5秒）。
+    // キーに dev_v を混ぜるため、教員がロック/配信/規制を行うと自動的に無効化される。
+    // ＝ 操作直後は必ず最新、自動更新や連続操作ではキャッシュに当たる。
+    const cacheKey = SHARD_LIST_CACHE_PREFIX + shardHash(urls.join(',') + '|' + shardDevVersion());
+    let cache = null;
+    try {
+      if (typeof CacheService !== 'undefined') {
+        cache = CacheService.getScriptCache();
+        const hit = cache.get(cacheKey);
+        if (hit) {
+          const arr = JSON.parse(hit);
+          if (Array.isArray(arr)) return arr;
+        }
+      }
+    } catch (e) {
+      cache = null;
+    }
+
     const body = JSON.stringify({ action: 'shard_list', shard_secret: cfg.sec });
+    const requests = [];
     for (let i = 0; i < urls.length; i++) {
+      requests.push({
+        url: urls[i], method: 'post', contentType: 'application/json',
+        payload: body, muteHttpExceptions: true
+      });
+    }
+
+    // 並列（一括）取得。12 クラスあっても 1 回分の待ち時間で揃う。
+    const responses = shardFetchMany(requests);
+
+    const out = [];
+    for (let i = 0; i < responses.length; i++) {
+      const res = responses[i];
+      if (!res) continue;
       try {
-        const res = UrlFetchApp.fetch(urls[i], {
-          method: 'post', contentType: 'application/json', payload: body,
-          muteHttpExceptions: true
-        });
         if (res.getResponseCode() !== 200) continue;
         const parsed = JSON.parse(res.getContentText() || '{}');
         const list = (parsed && parsed.data) || [];
-        if (Array.isArray(list)) {
-          for (let k = 0; k < list.length; k++) {
-            list[k]._shard_source = urls[i];
-            out.push(list[k]);
-          }
+        if (!Array.isArray(list)) continue;
+        for (let k = 0; k < list.length; k++) {
+          list[k]._shard_source = urls[i];
+          out.push(list[k]);
         }
       } catch (e) { /* 1台の子が落ちても他の子の結果は返す */ }
     }
-  } catch (e) { /* 分散が未設定なら空配列＝従来動作 */ }
-  return out;
+
+    if (cache) {
+      try { cache.put(cacheKey, JSON.stringify(out), SHARD_LIST_CACHE_TTL); } catch (e) {}
+    }
+    return out;
+  } catch (e) {
+    return []; // 分散が未設定・失敗なら空配列＝親の一覧だけを返す（従来動作）
+  }
 }
+
 
 /**
  * 子GAS側: 親へ返す端末一覧（スコープ適用前の生データ）。
@@ -3616,7 +3799,13 @@ function shardFilterMergedDevices(list, filterSchool, teacher, includeUnassigned
 function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
   if (!isShardParent()) return base;
   try {
-    const childList = shardFetchChildDevices();
+    const cfg = shardConfigCached();
+    // 専科教員（対象クラスあり）は該当する子GASだけへ問い合わせる。
+    // 管理者・全クラス担当は全校分（並列取得なので待ち時間は1回分）。
+    const urls = shardUrlsForTeacher(cfg, teacher);
+    if (!urls.length) return base;
+
+    const childList = shardFetchChildDevices(urls);
     if (!childList.length) return base;
 
     const merged = (Array.isArray(base) ? base.slice() : []);
@@ -3642,6 +3831,7 @@ function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
     return base; // マージに失敗しても親の一覧は必ず返す
   }
 }
+
 
 /**
  * 親GAS側: 子GASから届いたテレメトリ（在席状況・現在URL）を集約シートへ反映する。
@@ -3767,24 +3957,37 @@ function shardPropagatePolicy(studentIds, patch) {
       groupClasses[url][id] = rawClass;
     }
 
-    const results = [];
     const urls = Object.keys(groups);
+    // 全校一括ロック／一括URL配信でも、全子GASへ 1 回分の待ち時間で一斉に伝達する（並列）。
+    const requests = [];
     for (let i = 0; i < urls.length; i++) {
       const url = urls[i];
-      try {
-        const res = UrlFetchApp.fetch(url, {
-          method: 'post',
-          contentType: 'application/json',
-          payload: JSON.stringify({
-            action: 'shard_apply',
-            shard_secret: cfg.sec,
-            student_ids: groups[url],
+      requests.push({
+        url: url,
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'shard_apply',
+          shard_secret: cfg.sec,
+          student_ids: groups[url],
             // 子が行を作るときにクラスを埋められるよう、児童ID→クラス名を添える。
             class_map: groupClasses[url] || {},
             patch: patch
           }),
-          muteHttpExceptions: true
-        });
+        muteHttpExceptions: true
+      });
+    }
+
+    const responses = shardFetchMany(requests);
+    const results = [];
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      const res = responses[i];
+      if (!res) {
+        results.push({ url: url, count: groups[url].length, error: 'no_response' });
+        continue;
+      }
+      try {
         const code = res.getResponseCode();
         // 子が「行を用意できなかった」場合は一括操作が効いていない。握りつぶさず伝える。
         let childEnsure = null;

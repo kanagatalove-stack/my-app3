@@ -85,6 +85,7 @@ async function main() {
 
   const touchLog = [];
   const fetchLog = [];
+  const fetchAllLog = []; // 並列（fetchAll）が使われたかを検証する
   // モックは差し替えるため、状態は1段外側のオブジェクトに置く（コンテキストのプロパティ再代入に依存しない）
   const gstate = { props: makeProps({}), cache: makeCache(), sheet: null };
 
@@ -111,8 +112,21 @@ async function main() {
     CacheService: { getScriptCache() { return gstate.cache.getScriptCache(); } },
     UrlFetchApp: {
       fetch(url, opt) {
-        fetchLog.push({ url: url, payload: String((opt && opt.payload) || '') });
+        fetchLog.push({ url: url, payload: String((opt && opt.payload) || ''), mode: 'single' });
         return { getResponseCode() { return 200; }, getContentText() { return '{"success":true}'; } };
+      },
+      // 実機の UrlFetchApp.fetchAll と同じく「リクエスト配列 → 応答配列」を返す。
+      fetchAll(reqs) {
+        const arr = Array.isArray(reqs) ? reqs : [];
+        fetchAllLog.push({
+          count: arr.length,
+          urls: arr.map(function (r) { return r.url; }),
+          payloads: arr.map(function (r) { return String((r && r.payload) || ''); })
+        });
+        return arr.map(function (r) {
+          fetchLog.push({ url: r.url, payload: String((r && r.payload) || ''), mode: 'parallel' });
+          return { getResponseCode() { return 200; }, getContentText() { return '{"success":true}'; } };
+        });
       }
     },
     LockService: { getScriptLock() { return { waitLock() {}, releaseLock() {} }; } },
@@ -125,7 +139,18 @@ async function main() {
     bulkUpdateBroadcastUrl(ids, u) { touchLog.push({ type: 'bc', ids: ids, u: u, rowsAtCall: gstate.sheet ? gstate.sheet._rows.length : -1 }); },
     bulkUpdateFilterMode(ids, m, w, b) { touchLog.push({ type: 'filter', ids: ids, m: m, rowsAtCall: gstate.sheet ? gstate.sheet._rows.length : -1 }); },
     getTargetSheet() { return gstate.sheet; },
-    getHeaderMap() { return gstate.headerMap || {}; }
+    getHeaderMap() { return gstate.headerMap || {}; },
+    // shardUrlsForTeacher が参照する「対象クラス」。テストから差し替えられるよう外から与える。
+    getTeacherTargetClasses(teacher) { return (teacher && teacher.__targets) || []; },
+    // getShardMergedDevices のテスト用スタブ（親シート集計とマージを差し替え）
+    getAllDevices(filterSchool, teacher, includeUnassigned) {
+      gstate.getAllCalls = (gstate.getAllCalls || 0) + 1;
+      return [{ student_id: 'parent-1', class_name: '5年1組' }];
+    },
+    shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
+      gstate.mergeCalls = (gstate.mergeCalls || 0) + 1;
+      return (Array.isArray(base) ? base.slice() : []).concat([{ student_id: 'child-1', class_name: '5年1組' }]);
+    }
   };
 
   let gasBundle = '';
@@ -133,6 +158,8 @@ async function main() {
   gasBundle += lineConst(gasSrc, 'SHARD_DEFAULT_PROP') + '\n';
   gasBundle += lineConst(gasSrc, 'SHARD_SECRET_PROP') + '\n';
   gasBundle += lineConst(gasSrc, 'SHARD_CFG_CACHE') + '\n';
+  gasBundle += lineConst(gasSrc, 'SHARD_LIST_CACHE_TTL') + '\n';
+  gasBundle += lineConst(gasSrc, 'SHARD_LIST_CACHE_PREFIX') + '\n';
   [
     // shardEnsureDeviceRows / shardUpsert 系が使う排他制御（実物をそのまま使う）
     'withWriteLock',
@@ -140,7 +167,10 @@ async function main() {
     'readShardMapRaw','readShardDefaultUrl','getOrCreateShardSecret','shardSecretMatches',
     'shardConfigCached','invalidateShardConfig','shardMapIndexFromMap',
     'resolveShardForHeartbeat','shardApplyFromParent','shardEnsureDeviceRows',
-    'shardAllChildUrls','shardPropagateKaState'
+    'shardAllChildUrls','shardPropagateKaState',
+    // fetchAll 並列化・キャッシュ・教員スコープ絞り込み（今回の最適化）
+    'shardHash','shardDevVersion','shardFetchMany','shardUrlsForTeacher',
+    'shardFetchChildDevices','getShardMergedDevices','shardPropagatePolicy'
   ].forEach(n => { gasBundle += extract(gasSrc, n) + '\n'; });
 
   vm.createContext(ctx);
@@ -530,6 +560,151 @@ async function main() {
   check('クールダウン明けは再割り当てを受け入れる',
     bg.__store.assigned_gas_url === 'https://child-a/exec', bg.__store.assigned_gas_url);
   check('再割り当て時にクールダウンを解除する', bg.__store.shard_fallback_at === 0);
+
+  // =========================================================================
+  // §3  get_all 最適化（fetchAll 並列化・短時間キャッシュ・教員スコープ絞り込み）
+  // =========================================================================
+  console.log('===== [GAS] 子GAS取得の並列化（fetchAll） =====');
+
+  const SHARD_CACHE_KEY_CFG = 'shard_cfg3';
+  function resetShard(propsInit) {
+    gstate.props = makeProps(propsInit || {
+      SHARD_SECRET: 'sk_test12345678',
+      SHARD_MAP_V1: JSON.stringify({ '5年1組': 'https://child-a/exec', '6年1組': 'https://child-b/exec' })
+    });
+    gstate.cache = makeCache();
+    gstate.sheet = null;
+    gstate.headerMap = null;
+    gstate.getAllCalls = 0;
+    gstate.mergeCalls = 0;
+    fetchLog.length = 0;
+    fetchAllLog.length = 0;
+    ctx.invalidateShardConfig();
+  }
+
+  // --- §3-1 fetchAll が使える環境では並列1回で送る ---
+  resetShard();
+  const threeReqs = [
+    { url: 'https://c1/exec', method: 'post', payload: '{}', muteHttpExceptions: true },
+    { url: 'https://c2/exec', method: 'post', payload: '{}', muteHttpExceptions: true },
+    { url: 'https://c3/exec', method: 'post', payload: '{}', muteHttpExceptions: true }
+  ];
+  const many = ctx.shardFetchMany(threeReqs);
+  check('fetchAll を 1 回だけ呼ぶ（直列ループにしない）', fetchAllLog.length === 1, { fetchAllCalls: fetchAllLog.length });
+  check('全リクエストをまとめて渡す', fetchAllLog[0].count === 3, fetchAllLog[0]);
+  check('応答数はリクエスト数と一致する', many.length === 3, many.length);
+  check('直列 fetch は使わない（多重呼び出しなし）',
+    fetchLog.filter(f => f.mode === 'single').length === 0,
+    { single: fetchLog.filter(f => f.mode === 'single').length });
+
+  // --- §3-2 fetchAll が無い環境では直列へフォールバック（挙動を壊さない） ---
+  resetShard();
+  const savedFetchAll = ctx.UrlFetchApp.fetchAll;
+  delete ctx.UrlFetchApp.fetchAll;
+  const fallback = ctx.shardFetchMany(threeReqs);
+  check('fetchAll が無くても全件取得できる', fallback.length === 3, fallback.length);
+  check('フォールバック時は直列 fetch を使う',
+    fetchLog.filter(f => f.mode === 'single').length === 3,
+    { single: fetchLog.filter(f => f.mode === 'single').length });
+  ctx.UrlFetchApp.fetchAll = savedFetchAll;
+
+  // --- §3-3 空配列・未定義でも落ちない ---
+  check('空配列なら通信しない', ctx.shardFetchMany([]).length === 0);
+  check('undefined でも落ちない', ctx.shardFetchMany(undefined).length === 0);
+
+  // =========================================================================
+  console.log('===== [GAS] 教員スコープに応じた子GASの絞り込み =====');
+  resetShard();
+  const cfg0 = ctx.shardConfigCached();
+
+  // 管理者（対象クラスなし）→ 全子GAS
+  const adminUrls = ctx.shardUrlsForTeacher(cfg0, { role: 'ADMIN', __targets: [] });
+  check('管理者は全子GASを対象にする', adminUrls.length === 2, adminUrls);
+
+  // 専科教員（対象クラス1つ）→ 該当する子GASのみ
+  const specUrls = ctx.shardUrlsForTeacher(cfg0, { role: 'TEACHER', __targets: ['5年1組'] });
+  check('専科教員は該当クラスの子GASだけを対象にする（1クラス分の通信で済む）',
+    specUrls.length === 1 && specUrls[0] === 'https://child-a/exec', specUrls);
+
+  // 表記ゆれ（全角・記号違い）でも一致する
+  const specUrls2 = ctx.shardUrlsForTeacher(cfg0, { role: 'TEACHER', __targets: ['６年１組'] });
+  check('全角表記でも子GASを特定できる',
+    specUrls2.length === 1 && specUrls2[0] === 'https://child-b/exec', specUrls2);
+
+  // 複数クラス担当 → 該当する複数の子GAS
+  const multiUrls = ctx.shardUrlsForTeacher(cfg0, { role: 'TEACHER', __targets: ['5年1組', '6年1組'] });
+  check('複数クラス担当なら該当する子GASをすべて対象にする', multiUrls.length === 2, multiUrls);
+
+  // 一致なし → 安全側で全件へフォールバック（設定不備で児童が消えない）
+  const noMatch = ctx.shardUrlsForTeacher(cfg0, { role: 'TEACHER', __targets: ['3年2組'] });
+  check('該当が無ければ全件へフォールバックする（児童が消えない）', noMatch.length === 2, noMatch);
+
+  // 既定URLは常に含める（クラス不明の児童の受け皿）
+  resetShard({
+    SHARD_SECRET: 'sk_test12345678',
+    SHARD_MAP_V1: JSON.stringify({ '5年1組': 'https://child-a/exec' }),
+    SHARD_DEFAULT_URL: 'https://child-z/exec'
+  });
+  const cfgDef = ctx.shardConfigCached();
+  const withDef = ctx.shardUrlsForTeacher(cfgDef, { role: 'TEACHER', __targets: ['5年1組'] });
+  check('既定URLは絞り込み後も必ず含める（取りこぼし防止）',
+    withDef.indexOf('https://child-a/exec') >= 0 && withDef.indexOf('https://child-z/exec') >= 0, withDef);
+
+  // =========================================================================
+  console.log('===== [GAS] 子GAS取得の短時間キャッシュ（3〜5秒） =====');
+  resetShard();
+  ctx.shardFetchChildDevices();
+  const fetchAfterFirst = fetchAllLog.length;
+  ctx.shardFetchChildDevices();
+  check('2回目はキャッシュに当たり子GASへ再通信しない',
+    fetchAllLog.length === fetchAfterFirst, { first: fetchAfterFirst, after: fetchAllLog.length });
+
+  // dev_v が進む（＝教員がロック/配信/規制をした）と自動的に失効する
+  resetShard();
+  ctx.shardFetchChildDevices();
+  const beforeBump = fetchAllLog.length;
+  ctx.CacheService.getScriptCache().put('dev_v', '99');
+  ctx.shardFetchChildDevices();
+  check('dev_v が進むと再取得する（操作直後は必ず最新）',
+    fetchAllLog.length > beforeBump, { before: beforeBump, after: fetchAllLog.length });
+
+  // =========================================================================
+  console.log('===== [GAS] get_all 集約結果のキャッシュ =====');
+  // 分散が無効なら getAllDevices をそのまま返す（キャッシュ層を挟まない＝従来と同一）
+  resetShard();
+  CONFIG.SHARD_MODE = false;
+  ctx.invalidateShardConfig();
+  const legacy1 = ctx.getShardMergedDevices('ALL', { role: 'ADMIN' }, false);
+  const legacy2 = ctx.getShardMergedDevices('ALL', { role: 'ADMIN' }, false);
+  check('SHARD_MODE=false は従来どおり毎回 getAllDevices を呼ぶ',
+    gstate.getAllCalls === 2, { getAllCalls: gstate.getAllCalls });
+  check('SHARD_MODE=false は子GASへ問い合わせない', gstate.mergeCalls === 0, { mergeCalls: gstate.mergeCalls });
+  check('SHARD_MODE=false の戻り値は親のデータのみ', legacy1.length === 1 && legacy2.length === 1, legacy1.length);
+
+  // 分散が有効なら集約結果をキャッシュする
+  CONFIG.SHARD_MODE = true;
+  resetShard();
+  const m1 = ctx.getShardMergedDevices('ALL', { role: 'ADMIN' }, false);
+  const m2 = ctx.getShardMergedDevices('ALL', { role: 'ADMIN' }, false);
+  check('初回は親＋子を集約する', m1.length === 2 && gstate.mergeCalls === 1, { len: m1.length, mergeCalls: gstate.mergeCalls });
+  check('2回目はキャッシュに当たり集約処理を繰り返さない（連続操作・自動更新が速い）',
+    gstate.mergeCalls === 1, { mergeCalls: gstate.mergeCalls });
+  check('キャッシュからも同じ内容を返す', m2.length === 2, m2.length);
+
+  // スコープが違えば別キー（他校の教員に別スコープの結果を配らない）
+  ctx.getShardMergedDevices('英田小学校', { role: 'TEACHER', school: '英田小学校' }, false);
+  check('スコープが違えばキャッシュを共有しない', gstate.mergeCalls === 2, { mergeCalls: gstate.mergeCalls });
+
+  // dev_v が進めば失効する（一括操作の直後に古い一覧を配らない）
+  resetShard();
+  ctx.getShardMergedDevices('ALL', { role: 'ADMIN' }, false);
+  const beforeMergeBump = gstate.mergeCalls;
+  ctx.CacheService.getScriptCache().put('dev_v', '123');
+  ctx.getShardMergedDevices('ALL', { role: 'ADMIN' }, false);
+  check('dev_v が進むと集約キャッシュも失効する',
+    gstate.mergeCalls > beforeMergeBump, { before: beforeMergeBump, after: gstate.mergeCalls });
+
+  CONFIG.SHARD_MODE = true;
 
   console.log('');
   console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
