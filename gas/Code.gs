@@ -1845,6 +1845,260 @@ function applyMonitorVisibility(devices) {
 }
 
 
+// ==================== ハートビート用 端末行キャッシュ（CacheService） ====================
+// 【目的】
+//   1.5 秒周期の doPost から「シート全読み（getDataRange）」「ヘッダー行の読み取り」を排除し、
+//   1 リクエストの実行時間をミリ秒台（3〜5ms 目安）に落とす。
+//   GAS の実制約は「同時実行 30/ユーザー」であり、240 台 × 1.5 秒 ≒ 160 req/秒を
+//   1 実行 200ms で受けると 32 並列に達して上限を超える。
+//   1 実行を 3〜5ms にすれば並列は 1 未満に収まり、1 校 1 GAS のまま安全に運用できる。
+//
+// 【整合性の担保（厳守）】
+//   ・キャッシュには書き込み版 dev_v を刻む。教員の書き込み（withWriteLock）は
+//     invalidateDevicesCache() で dev_v を進めるため、版の古いキャッシュは自動的に無効になる。
+//   ・キャッシュヒット時も「現在URLの変化」「最終同期日時の 20 秒間引き」の判定は
+//     従来どおり行い、必要があるときだけシートへ書く（書込み回数は増やさない）。
+//   ・シートへ書いた後はキャッシュも同じ内容へ更新する（次回ヒットで古い値を返さない）。
+//   ・is_online の判定（最終同期日時 < 60 秒）はシートの値を正とし、従来仕様を維持する。
+//   ・CacheService が無い環境（テスト等）では全経路が従来動作へフォールバックする。
+const HB_ROW_CACHE_PREFIX = 'hbr2_';
+const HB_HEADER_CACHE_KEY = 'hbh2';
+const HB_CACHE_TTL_SEC = 21600; // 行キャッシュの保持（CacheService の上限＝6時間）
+const HB_HEADER_TTL_SEC = 1800; // ヘッダーは短め（列追加時の取りこぼしを防ぐ）
+
+function hbCacheReady() {
+  try {
+    return (typeof CacheService !== 'undefined') && !!CacheService.getScriptCache();
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 書き込み版（dev_v）を読む。取得できない場合は '' を返し、呼び出し側はキャッシュを使わない。 */
+function hbReadDevVersion() {
+  if (!hbCacheReady()) return '';
+  try {
+    const v = CacheService.getScriptCache().get('dev_v');
+    return String(v || '0');
+  } catch (e) {
+    return '';
+  }
+}
+
+function hbRowPrefix() {
+  return (typeof HB_ROW_CACHE_PREFIX === 'string') ? HB_ROW_CACHE_PREFIX : 'hbr2_';
+}
+function hbRowTtl() {
+  return (typeof HB_CACHE_TTL_SEC === 'number') ? HB_CACHE_TTL_SEC : 21600;
+}
+function hbHeaderKey() {
+  return (typeof HB_HEADER_CACHE_KEY === 'string') ? HB_HEADER_CACHE_KEY : 'hbh2';
+}
+function hbHeaderTtl() {
+  return (typeof HB_HEADER_TTL_SEC === 'number') ? HB_HEADER_TTL_SEC : 1800;
+}
+
+/** 端末一覧のヘッダーマップとして最低限必要な列が揃っているか。 */
+function hbHeaderKeysOk(headerMap) {
+  if (!headerMap || typeof headerMap !== 'object') return false;
+  const need = ['児童ID', '学校名', '氏名', 'クラス', '画面ロック', 'URL規制モード',
+    '許可URLリスト', '規制URLリスト', '一斉表示URL', '一斉表示実行ID',
+    '現在開いているURL', '最終同期日時'];
+  for (let i = 0; i < need.length; i++) {
+    const v = headerMap[need[i]];
+    if (!v || v < 1) return false;
+  }
+  return true;
+}
+
+function hbGetCachedHeaderMap(ver) {
+  if (!ver || !hbCacheReady()) return null;
+  try {
+    const raw = CacheService.getScriptCache().get(hbHeaderKey());
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || o.v !== ver || !hbHeaderKeysOk(o.m)) return null;
+    return o.m;
+  } catch (e) {
+    return null;
+  }
+}
+
+function hbPutCachedHeaderMap(headerMap, ver) {
+  if (!ver || !hbCacheReady() || !hbHeaderKeysOk(headerMap)) return;
+  try {
+    CacheService.getScriptCache().put(hbHeaderKey(),
+      JSON.stringify({ v: ver, m: headerMap }), hbHeaderTtl());
+  } catch (e) {}
+}
+
+/** 児童1人分の行をキャッシュから取得する。{ r: 行番号, d: 行配列 } を返す。 */
+function hbGetCachedRow(studentId, ver) {
+  if (!ver || !hbCacheReady()) return null;
+  try {
+    const raw = CacheService.getScriptCache().get(hbRowPrefix() + studentId);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || o.v !== ver || !o.d || !(o.r >= 2)) return null;
+    return o;
+  } catch (e) {
+    return null;
+  }
+}
+
+function hbPutCachedRow(studentId, rowNumber, rowArray, ver) {
+  if (!ver || !hbCacheReady() || !rowArray || !(rowNumber >= 2)) return;
+  try {
+    CacheService.getScriptCache().put(hbRowPrefix() + studentId,
+      JSON.stringify({ v: ver, r: rowNumber, d: rowArray }), hbRowTtl());
+  } catch (e) {}
+}
+
+/**
+ * ハートビート応答を1か所で組み立てる（3経路の重複を排除し、項目の欠けを防ぐ）。
+ */
+function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now) {
+  const reqCol = headerMap['画面情報要求日時'];
+  const shotCol = headerMap['画面情報更新日時'];
+  const monFlagCol = headerMap['要注意'];
+  const monReasonCol = headerMap['注意理由'];
+  return {
+    student_id: studentId,
+    school_name: String(row[headerMap['学校名'] - 1] || ''),
+    student_name: String(row[headerMap['氏名'] - 1] || ''),
+    class_name: String(row[headerMap['クラス'] - 1] || ''),
+    screen_lock: parseBoolean(row[headerMap['画面ロック'] - 1]),
+    filter_mode: String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase(),
+    whitelist_urls: parseUrlList(row[headerMap['許可URLリスト'] - 1]),
+    blacklist_urls: parseUrlList(row[headerMap['規制URLリスト'] - 1]),
+    broadcast_url: String(row[headerMap['一斉表示URL'] - 1] || '').trim(),
+    broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || '').trim(),
+    current_url: String(row[headerMap['現在開いているURL'] - 1] || ''),
+    screen_request_at: reqCol ? String(row[reqCol - 1] || '').trim() : '',
+    screenshot_at: shotCol ? String(row[shotCol - 1] || '').trim() : '',
+    monitor_flag: monFlagCol ? parseBoolean(row[monFlagCol - 1]) : false,
+    monitor_reason: monReasonCol ? String(row[monReasonCol - 1] || '') : '',
+    ka_active: kaActive,
+    sync_interval_sec: kaInfo.sync_interval_sec,
+    idle_drift_until: kaInfo.idle_drift_until,
+    server_time: now
+  };
+}
+
+/**
+ * AI監視（学習に関係のないサイトの検知）。
+ * URL が変わったときだけ呼ばれ、4列が連続している場合のみ 1 回の getRange でまとめて書く。
+ * 監視が OFF のときは列に一切触らない（履歴を保持したまま、表示側で伏せる）。
+ */
+function hbApplyMonitor(sheet, rowNum, row, headerMap, currentUrl, now) {
+  const monFlagCol = headerMap['要注意'];
+  const monReasonCol = headerMap['注意理由'];
+  const monUrlCol = headerMap['要注意URL'];
+  const monAtCol = headerMap['注意検知日時'];
+  const contiguous = monFlagCol && monReasonCol && monUrlCol && monAtCol &&
+    monReasonCol === monFlagCol + 1 && monUrlCol === monFlagCol + 2 && monAtCol === monFlagCol + 3;
+  if (!contiguous) return;
+
+  let monSettings = null;
+  try { monSettings = getMonitoringSettings(); } catch (e) { monSettings = null; }
+  if (!monSettings || !monSettings.enabled) return;
+
+  const mon = evaluateUrlForMonitoring(
+    currentUrl,
+    row[headerMap['許可URLリスト'] - 1],
+    row[headerMap['規制URLリスト'] - 1]
+  );
+  const prevFlag = parseBoolean(row[monFlagCol - 1]);
+  if (mon.flagged === prevFlag) return; // 状態が変わったときだけ書く
+
+  sheet.getRange(rowNum, monFlagCol, 1, 4).setValues([[
+    mon.flagged,
+    mon.flagged ? mon.reason : '',
+    mon.flagged ? (mon.host || '') : '',
+    mon.flagged ? now : ''
+  ]]);
+  row[monFlagCol - 1] = mon.flagged;
+  row[monReasonCol - 1] = mon.flagged ? mon.reason : '';
+  row[monUrlCol - 1] = mon.flagged ? (mon.host || '') : '';
+  row[monAtCol - 1] = mon.flagged ? now : '';
+}
+
+/**
+ * 新規自動登録（児童Googleアカウント対応）。
+ * 同一アカウントが複数端末から同時に、または連続してアクセスした場合に
+ * 重複行が作成されないよう、書き込みロック内で「再確認 → 登録」を行う。
+ */
+function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now) {
+  const devVer = hbReadDevVersion();
+  return withWriteLock(function () {
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    const data = sheet.getDataRange().getValues();
+    const idColIdx = headerMap['児童ID'] - 1;
+
+    let reRow = -1;
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][idColIdx]).trim() === String(studentId).trim()) { reRow = i + 1; break; }
+    }
+
+    if (reRow !== -1) {
+      // 先に登録されていた（同時アクセス）。学校名が未設定なら補完して返す。
+      const row = data[reRow - 1];
+      const reSchoolCol = headerMap['学校名'];
+      if (incomingSchool && reSchoolCol) {
+        const reSchool = String(row[reSchoolCol - 1] || '').trim();
+        if (!reSchool || reSchool === '未設定') {
+          sheet.getRange(reRow, reSchoolCol).setValue(incomingSchool);
+          row[reSchoolCol - 1] = incomingSchool;
+        }
+      }
+      hbPutCachedHeaderMap(headerMap, devVer);
+      hbPutCachedRow(studentId, reRow, row, devVer);
+      return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
+    }
+
+    let initialName = '未登録児童 (' + studentId + ')';
+    if (studentId.indexOf('@') !== -1) {
+      const userPart = studentId.split('@')[0];
+      initialName = userPart + ' (Googleアカウント)';
+    }
+
+    const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
+    newRow[headerMap['児童ID'] - 1] = studentId;
+    newRow[headerMap['学校名'] - 1] = incomingSchool || '未設定';
+    newRow[headerMap['氏名'] - 1] = initialName;
+    newRow[headerMap['クラス'] - 1] = '未設定';
+    newRow[headerMap['画面ロック'] - 1] = false;
+    newRow[headerMap['URL規制モード'] - 1] = 'OFF';
+    newRow[headerMap['許可URLリスト'] - 1] = 'nhk.or.jp, scratch.mit.edu, google.com';
+    newRow[headerMap['規制URLリスト'] - 1] = 'youtube.com, twitter.com, tiktok.com, instagram.com';
+    newRow[headerMap['現在開いているURL'] - 1] = currentUrl;
+    newRow[headerMap['最終同期日時'] - 1] = now;
+
+    // AI監視: 初回登録時点のURLも判定する（監視OFFなら何もしない＝既定は空欄）。
+    let newMon = { flagged: false, reason: '', host: '' };
+    try {
+      newMon = evaluateUrlForMonitoring(
+        currentUrl,
+        newRow[headerMap['許可URLリスト'] - 1],
+        newRow[headerMap['規制URLリスト'] - 1]
+      );
+    } catch (e) {
+      newMon = { flagged: false, reason: '', host: '' };
+    }
+    if (headerMap['要注意']) newRow[headerMap['要注意'] - 1] = newMon.flagged;
+    if (headerMap['注意理由']) newRow[headerMap['注意理由'] - 1] = newMon.flagged ? newMon.reason : '';
+    if (headerMap['要注意URL']) newRow[headerMap['要注意URL'] - 1] = newMon.flagged ? (newMon.host || '') : '';
+    if (headerMap['注意検知日時']) newRow[headerMap['注意検知日時'] - 1] = newMon.flagged ? now : '';
+
+    sheet.appendRow(newRow);
+    hbPutCachedHeaderMap(headerMap, devVer);
+    hbPutCachedRow(studentId, data.length + 1, newRow, devVer);
+
+    return buildHeartbeatResponse(newRow, headerMap, studentId, kaActive, kaInfo, now);
+  });
+}
+
 function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   // 端末から届いた学校名（管理ポリシーの school_name）。正式名称に解決できた場合のみ使う。
   const incomingSchool = canonicalizeIncomingSchool(schoolNameRaw);
@@ -1854,216 +2108,98 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
     ? computeKaInterval(isTeacherConsoleActive() ? ACTIVE_SYNC_INTERVAL_SEC : 0, new Date().getTime())
     : { ka_active: false, sync_interval_sec: 0, idle_drift_until: 0 };
   const kaActive = kaInfo.ka_active;
-  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
-  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
-  const data = sheet.getDataRange().getValues();
-
-  let targetRow = -1;
-  const idColIdx = headerMap['児童ID'] - 1;
-
-  for (let i = 1; i < data.length; i++) {
-    if (String(data[i][idColIdx]).trim() === String(studentId).trim()) {
-      targetRow = i + 1;
-      break;
-    }
-  }
 
   const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+  const nowMs = new Date().getTime();
 
-  if (targetRow !== -1) {
-    // 高速化のため、先頭で取得済みの行データを再利用する（getRange の往復を削減）。
-    const row = data[targetRow - 1];
-    const urlCol = headerMap['現在開いているURL'];
-    const syncCol = headerMap['最終同期日時'];
+  // 書き込み版は 1 回だけ読む（この値でキャッシュの有効性を判定する）。
+  const devVer = hbReadDevVersion();
 
-    // 書き込みを最小化して GAS／シートの競合を減らす。
-    // ・現在開いているURL … 「変化したときだけ」書き込む
-    // ・最終同期日時       … 約20秒間隔で書き込む（is_online の判定窓60秒より十分細かい）
-    //   → 児童端末が増えてもシート書き込みが増えず、反映遅延・ばらつきを防ぐ。
-    const nowMs = new Date().getTime();
-    const urlChanged = urlCol && String(row[urlCol - 1] || '') !== String(currentUrl || '');
-    const syncDue = syncCol ? shouldWriteSyncTime(studentId, nowMs) : false;
+  // ---- 1) キャッシュヒットを試す（ヒットすればシートを開かない＝高速化の本体） ----
+  let headerMap = hbGetCachedHeaderMap(devVer);
+  let row = null;
+  let rowNum = -1;
+  let sheet = null;
 
-    // 学校名が空／未設定の行だけを、端末から届いた正式名称で補完する。
-    // 教員が管理画面で設定済みの学校名は上書きしない（手動設定を優先）。
-    const schoolCol = headerMap['学校名'];
-    if (incomingSchool && schoolCol) {
-      const rowSchool = String(row[schoolCol - 1] || '').trim();
-      if (!rowSchool || rowSchool === '未設定') {
-        sheet.getRange(targetRow, schoolCol).setValue(incomingSchool);
-        row[schoolCol - 1] = incomingSchool;
-      }
-    }
-
-    if (urlCol && syncCol && syncCol === urlCol + 1) {
-      // 隣接2列（現在URL・最終同期）をまとめて1回で書き込む
-      if (urlChanged || syncDue) {
-        sheet.getRange(targetRow, urlCol, 1, 2).setValues([[
-          urlChanged ? currentUrl : row[urlCol - 1],
-          syncDue ? now : row[syncCol - 1]
-        ]]);
-      }
-    } else {
-      if (urlChanged) sheet.getRange(targetRow, urlCol).setValue(currentUrl);
-      if (syncDue) sheet.getRange(targetRow, syncCol).setValue(now);
-    }
-
-    // ---- AI監視（学習に関係のないサイトの検知）----
-    // 判定は「URLが変わったとき」だけ行う（毎回の同期で辞書照合しない＝GASを軽く保つ）。
-    // 監視がOFFのときは列に一切触らない（履歴を保持したまま、表示側で伏せる）。
-    const monFlagCol = headerMap['要注意'];
-    const monReasonCol = headerMap['注意理由'];
-    const monUrlCol = headerMap['要注意URL'];
-    const monAtCol = headerMap['注意検知日時'];
-    // 4列が連続している場合のみ、1回の getRange でまとめて書き込む
-    const monContiguous = monFlagCol && monReasonCol && monUrlCol && monAtCol &&
-      monReasonCol === monFlagCol + 1 && monUrlCol === monFlagCol + 2 && monAtCol === monFlagCol + 3;
-
-    if (urlChanged && monContiguous) {
-      let monSettings = null;
-      try { monSettings = getMonitoringSettings(); } catch (e) { monSettings = null; }
-      if (monSettings && monSettings.enabled) {
-        const mon = evaluateUrlForMonitoring(
-          currentUrl,
-          row[headerMap['許可URLリスト'] - 1],
-          row[headerMap['規制URLリスト'] - 1]
-        );
-        const prevFlag = parseBoolean(row[monFlagCol - 1]);
-        // 状態が変わったときだけ書き込む（シート書き込み回数を増やさない）
-        if (mon.flagged !== prevFlag) {
-          sheet.getRange(targetRow, monFlagCol, 1, 4).setValues([[
-            mon.flagged,
-            mon.flagged ? mon.reason : '',
-            mon.flagged ? (mon.host || '') : '',
-            mon.flagged ? now : ''
-          ]]);
-          row[monFlagCol - 1] = mon.flagged;
-          row[monReasonCol - 1] = mon.flagged ? mon.reason : '';
-          row[monUrlCol - 1] = mon.flagged ? (mon.host || '') : '';
-          row[monAtCol - 1] = mon.flagged ? now : '';
-        }
-      }
-    }
-
-    // 画面情報要求日時／更新日時（画面一覧機能）。列が無い既存シートでも安全に '' を返す。
-    const reqCol = headerMap['画面情報要求日時'];
-    const shotCol = headerMap['画面情報更新日時'];
-
-    return {
-      student_id: studentId,
-      school_name: row[headerMap['学校名'] - 1] || '',
-      student_name: row[headerMap['氏名'] - 1] || '',
-      class_name: row[headerMap['クラス'] - 1] || '',
-      screen_lock: parseBoolean(row[headerMap['画面ロック'] - 1]),
-      filter_mode: String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase(),
-      whitelist_urls: parseUrlList(row[headerMap['許可URLリスト'] - 1]),
-      blacklist_urls: parseUrlList(row[headerMap['規制URLリスト'] - 1]),
-      broadcast_url: String(row[headerMap['一斉表示URL'] - 1] || '').trim(),
-      broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || '').trim(),
-      screen_request_at: reqCol ? String(row[reqCol - 1] || '').trim() : '',
-      screenshot_at: shotCol ? String(row[shotCol - 1] || '').trim() : '',
-      monitor_flag: (monFlagCol ? parseBoolean(row[monFlagCol - 1]) : false),
-      monitor_reason: (monReasonCol ? String(row[monReasonCol - 1] || '') : ''),
-      ka_active: kaActive, sync_interval_sec: kaInfo.sync_interval_sec,
-      idle_drift_until: kaInfo.idle_drift_until, server_time: now
-    };
-  } else {
-    // 新規自動登録（児童Googleアカウント対応）。
-    // 同一アカウントが複数端末から同時に、または連続してアクセスした場合に
-    // 重複行が作成されないよう、書き込みロック内で「再確認 → 登録」を行う。
-    // （ロック取得後に再度存在確認し、他リクエストが先に登録していればそれを返す）
-    return withWriteLock(function () {
-      const reData = sheet.getDataRange().getValues();
-      let reRow = -1;
-      for (let i = 1; i < reData.length; i++) {
-        if (String(reData[i][idColIdx]).trim() === String(studentId).trim()) { reRow = i + 1; break; }
-      }
-      if (reRow !== -1) {
-        const row = sheet.getRange(reRow, 1, 1, sheet.getLastColumn()).getValues()[0];
-        const reqCol2 = headerMap['画面情報要求日時'];
-        const shotCol2 = headerMap['画面情報更新日時'];
-
-        // 先に登録されていた行も、学校名が未設定なら補完する（書き込みロック内なので競合しない）。
-        const reSchoolCol = headerMap['学校名'];
-        if (incomingSchool && reSchoolCol) {
-          const reSchool = String(row[reSchoolCol - 1] || '').trim();
-          if (!reSchool || reSchool === '未設定') {
-            sheet.getRange(reRow, reSchoolCol).setValue(incomingSchool);
-            row[reSchoolCol - 1] = incomingSchool;
-          }
-        }
-        return {
-          student_id: studentId,
-          school_name: row[headerMap['学校名'] - 1] || '',
-          student_name: row[headerMap['氏名'] - 1] || '',
-          class_name: row[headerMap['クラス'] - 1] || '',
-          screen_lock: parseBoolean(row[headerMap['画面ロック'] - 1]),
-          filter_mode: String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase(),
-          whitelist_urls: parseUrlList(row[headerMap['許可URLリスト'] - 1]),
-          blacklist_urls: parseUrlList(row[headerMap['規制URLリスト'] - 1]),
-          broadcast_url: String(row[headerMap['一斉表示URL'] - 1] || '').trim(),
-          broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || '').trim(),
-          screen_request_at: reqCol2 ? String(row[reqCol2 - 1] || '').trim() : '',
-          screenshot_at: shotCol2 ? String(row[shotCol2 - 1] || '').trim() : '',
-          ka_active: kaActive, sync_interval_sec: kaInfo.sync_interval_sec,
-      idle_drift_until: kaInfo.idle_drift_until, server_time: now
-        };
-      }
-
-      let initialName = '未登録児童 (' + studentId + ')';
-      if (studentId.includes('@')) {
-        const userPart = studentId.split('@')[0];
-        initialName = userPart + ' (Googleアカウント)';
-      }
-
-      const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
-      newRow[headerMap['児童ID'] - 1] = studentId;
-      newRow[headerMap['学校名'] - 1] = incomingSchool || '未設定';
-      newRow[headerMap['氏名'] - 1] = initialName;
-      newRow[headerMap['クラス'] - 1] = '未設定';
-      newRow[headerMap['画面ロック'] - 1] = false;
-      newRow[headerMap['URL規制モード'] - 1] = 'OFF';
-      newRow[headerMap['許可URLリスト'] - 1] = 'nhk.or.jp, scratch.mit.edu, google.com';
-      newRow[headerMap['規制URLリスト'] - 1] = 'youtube.com, twitter.com, tiktok.com, instagram.com';
-      newRow[headerMap['現在開いているURL'] - 1] = currentUrl;
-      newRow[headerMap['最終同期日時'] - 1] = now;
-
-      // AI監視: 初回登録時点のURLも判定する（監視OFFなら何もしない＝既定は空欄）。
-      let newMon = { flagged: false, reason: '', host: '' };
-      try {
-        newMon = evaluateUrlForMonitoring(
-          currentUrl,
-          newRow[headerMap['許可URLリスト'] - 1],
-          newRow[headerMap['規制URLリスト'] - 1]
-        );
-      } catch (e) {
-        newMon = { flagged: false, reason: '', host: '' };
-      }
-      if (headerMap['要注意']) newRow[headerMap['要注意'] - 1] = newMon.flagged;
-      if (headerMap['注意理由']) newRow[headerMap['注意理由'] - 1] = newMon.flagged ? newMon.reason : '';
-      if (headerMap['要注意URL']) newRow[headerMap['要注意URL'] - 1] = newMon.flagged ? (newMon.host || '') : '';
-      if (headerMap['注意検知日時']) newRow[headerMap['注意検知日時'] - 1] = newMon.flagged ? now : '';
-
-      sheet.appendRow(newRow);
-
-      return {
-        student_id: studentId,
-        school_name: newRow[headerMap['学校名'] - 1],
-        student_name: initialName,
-        class_name: '未設定',
-        screen_lock: false,
-        filter_mode: 'OFF',
-        whitelist_urls: ['nhk.or.jp', 'scratch.mit.edu', 'google.com'],
-        blacklist_urls: ['youtube.com', 'twitter.com', 'tiktok.com', 'instagram.com'],
-        broadcast_url: '',
-        broadcast_id: '',
-        screen_request_at: '',
-        screenshot_at: '',
-        ka_active: kaActive, sync_interval_sec: kaInfo.sync_interval_sec,
-      idle_drift_until: kaInfo.idle_drift_until, server_time: now
-      };
-    });
+  if (headerMap) {
+    const hit = hbGetCachedRow(studentId, devVer);
+    if (hit) { row = hit.d.slice(); rowNum = hit.r; }
   }
+
+  // ---- 2) ミス時は従来どおりシートを読む ----
+  if (!row) {
+    sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    hbPutCachedHeaderMap(headerMap, devVer);
+
+    const data = sheet.getDataRange().getValues();
+    const idColIdx = headerMap['児童ID'] - 1;
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][idColIdx]).trim() === String(studentId).trim()) {
+        rowNum = i + 1;
+        row = data[i];
+        break;
+      }
+    }
+    if (!row) {
+      // 未登録 → 新規自動登録へ（重複防止のため書き込みロック内で再確認する）
+      return hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now);
+    }
+    hbPutCachedRow(studentId, rowNum, row, devVer);
+  }
+
+  // ---- 3) 書き込みが必要かの判定（従来と同じ基準） ----
+  const urlCol = headerMap['現在開いているURL'];
+  const syncCol = headerMap['最終同期日時'];
+  const schoolCol = headerMap['学校名'];
+
+  const urlChanged = !!urlCol && String(row[urlCol - 1] || '') !== String(currentUrl || '');
+  const syncDue = !!syncCol && shouldWriteSyncTime(studentId, nowMs);
+
+  let schoolFill = false;
+  if (incomingSchool && schoolCol) {
+    const cur = String(row[schoolCol - 1] || '').trim();
+    if (!cur || cur === '未設定') schoolFill = true;
+  }
+
+  if (!urlChanged && !syncDue && !schoolFill) {
+    // 何も書かない → シートに一切触らない（キャッシュのみで応答）
+    return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
+  }
+
+  // ここから先は書き込みが必要。キャッシュヒット経由でも、この時点で初めてシートを開く。
+  if (!sheet) sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+
+  // 学校名の補完（未設定の行だけ。教員が設定済みの値は上書きしない）
+  if (schoolFill) {
+    sheet.getRange(rowNum, schoolCol).setValue(incomingSchool);
+    row[schoolCol - 1] = incomingSchool;
+  }
+
+  if (urlChanged && syncDue && urlCol && syncCol && syncCol === urlCol + 1) {
+    // 隣接2列ならまとめて1回で書く（GAS/シートの往復を削減）
+    sheet.getRange(rowNum, urlCol, 1, 2).setValues([[currentUrl, now]]);
+    row[urlCol - 1] = currentUrl;
+    row[syncCol - 1] = now;
+  } else {
+    // 片方だけのときは、その列だけを書く（触っていない値の書式を変えない）
+    if (urlChanged) {
+      sheet.getRange(rowNum, urlCol).setValue(currentUrl);
+      row[urlCol - 1] = currentUrl;
+    }
+    if (syncDue) {
+      sheet.getRange(rowNum, syncCol).setValue(now);
+      row[syncCol - 1] = now;
+    }
+  }
+
+  // ---- AI監視（URLが変わったときだけ判定。毎回の同期で辞書照合しない＝GASを軽く保つ） ----
+  if (urlChanged) hbApplyMonitor(sheet, rowNum, row, headerMap, currentUrl, now);
+
+  // 書いた内容をキャッシュへ反映（次回ヒットで古い値を返さない）
+  hbPutCachedRow(studentId, rowNum, row, devVer);
+
+  return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
 }
 
 /**

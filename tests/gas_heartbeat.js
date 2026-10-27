@@ -26,11 +26,14 @@ function makeSheet(cols, rows) {
   return {
     _cols: cols.slice(), _rows: rows.map(r => r.slice()),
     getLastColumn() { return this._cols.length; }, getLastRow() { return this._rows.length + 1; },
-    getRange(r, c, nr, nc) { const self = this; if (nr === undefined) nr = 1; if (nc === undefined) nc = 1;
+    getRange(r, c, nr, nc) { const self = this; this._rangeReads = (this._rangeReads || 0) + 1;
+      if (nr === undefined) nr = 1; if (nc === undefined) nc = 1;
       return { getValues() { const out = []; for (let i = 0; i < nr; i++) { const row = []; for (let j = 0; j < nc; j++) row.push((self._rows[r - 1 + i] || [])[c - 1 + j]); out.push(row); } return out; },
         setValue(v) { if (!self._rows[r - 1]) self._rows[r - 1] = []; self._rows[r - 1][c - 1] = v; return this; },
         setValues(vals) { vals.forEach((rowArr, i) => rowArr.forEach((v, j) => { if (!self._rows[r - 1 + i]) self._rows[r - 1 + i] = []; self._rows[r - 1 + i][c - 1 + j] = v; })); return this; } }; },
-    getDataRange() { const self = this; return { getValues() { return self._rows.map(r => r.slice()); } }; },
+    _dataReads: 0,
+    getDataRange() { const self = this; this._dataReads = (this._dataReads || 0) + 1;
+      return { getValues() { return self._rows.map(r => r.slice()); } }; },
     appendRow(row) { this._rows.push(row.slice()); }
   };
 }
@@ -73,11 +76,26 @@ let code = '';
 [
   'getHeaderMap','withWriteLock','parseBoolean','parseUrlList','shouldWriteSyncTime',
   // 学校名の解決に必要なヘルパー群（processHeartbeat が school_name を検証するため）
-  'normalizeSchoolName','resolveCanonicalSchool','canonicalizeIncomingSchool','processHeartbeat'
+  'normalizeSchoolName','resolveCanonicalSchool','canonicalizeIncomingSchool',
+  // ---- CacheService 化に伴うヘルパー群 ----
+  //  §1 キャッシュ基盤（版 dev_v・行/ヘッダーの出し入れ）
+  'hbCacheReady','hbReadDevVersion','hbRowPrefix','hbRowTtl','hbHeaderKey','hbHeaderTtl',
+  'hbHeaderKeysOk','hbGetCachedHeaderMap','hbPutCachedHeaderMap','hbGetCachedRow','hbPutCachedRow',
+  //  §2 応答組み立て・AI監視・新規登録（processHeartbeat から切り出した関数）
+  'buildHeartbeatResponse','hbApplyMonitor','hbRegisterDevice',
+  //  §3 本体
+  'processHeartbeat'
 ].forEach(n => { code += extract(n) + '\n'; });
 code += extractConst('SCHOOL_ALIASES') + '\n';
 vm.createContext(ctx);
 vm.runInContext(code, ctx);
+// 書き込み版（dev_v）の参照・更新をテストから行えるようにする。
+// withWriteLock の invalidateDevicesCache と同じく、教員の書き込み＝版が進む を再現する。
+vm.runInContext(
+  '__devVer=function(){return String((CacheService.getScriptCache().get("dev_v")||"0"));};' +
+  '__bumpDevVer=function(){var c=CacheService.getScriptCache();' +
+  'var v=Number(c.get("dev_v")||"0");c.put("dev_v",String(v+1));};',
+  ctx);
 
 let pass = 0, fail = 0;
 function check(n, c, e) { if (c) { console.log('PASS', n, e ? '=> ' + JSON.stringify(e) : ''); pass++; } else { console.log('FAIL', n, e ? '=> ' + JSON.stringify(e) : ''); fail++; } }
@@ -169,6 +187,47 @@ check('接頭辞つき（美作市立〜）は解決', ctx.canonicalizeIncomingS
 const rD = ctx.processHeartbeat('kidD@school.ed.jp', 'https://e/1');
 check('学校名が未指定でも従来どおり未設定で登録（後方互換）',
   findRow('kidD@school.ed.jp')[SCHOOL_COL] === '未設定', { row: findRow('kidD@school.ed.jp')[SCHOOL_COL] });
+
+// ============================================================
+console.log('\n===== CacheService 化（シート全読みの排除） =====');
+// ここまでの呼び出しで、行キャッシュ・ヘッダーキャッシュは温まっている。
+// URL も最終同期も変化しない呼び出しでは、シートへ一切触らないはず。
+const readsBefore = sheet._dataReads;
+const rangesBefore = sheet._rangeReads || 0;
+const rHit = ctx.processHeartbeat('kidA@school.ed.jp', 'https://e/3', '英田小学校');
+const readsDelta = sheet._dataReads - readsBefore;
+const rangesDelta = (sheet._rangeReads || 0) - rangesBefore;
+check('キャッシュヒット時は getDataRange を呼ばない（シート全読みなし）',
+  readsDelta === 0, { reads: readsDelta });
+check('キャッシュヒット時はシートのセル参照もしない',
+  rangesDelta === 0, { ranges: rangesDelta });
+check('キャッシュヒットでも応答内容は正しい（ロック/規制/URL）',
+  rHit.student_id === 'kidA@school.ed.jp' &&
+  rHit.school_name === '英田小学校' &&
+  rHit.current_url === 'https://e/3' &&
+  rHit.screen_lock === false &&
+  rHit.filter_mode === 'OFF',
+  { school: rHit.school_name, url: rHit.current_url });
+
+// 書き込みが起きたら、キャッシュも更新されて次回ヒットで新しい値が返ること。
+ctx.processHeartbeat('kidA@school.ed.jp', 'https://e/CHANGED');
+const rAfterWrite = ctx.processHeartbeat('kidA@school.ed.jp', 'https://e/CHANGED');
+check('書き込み後はキャッシュも更新され、新しいURLが返る',
+  rAfterWrite.current_url === 'https://e/CHANGED', { url: rAfterWrite.current_url });
+
+// dev_v（書き込み版）が進むとキャッシュが無効化され、シートから読み直すこと。
+// 教員のロック操作などを想定し、キャッシュを捨てたうえで最新値を返せるかを確認する。
+const verBefore = ctx.__devVer();
+ctx.__bumpDevVer();
+const verAfter = ctx.__devVer();
+const readsBeforeVer = sheet._dataReads;
+const rAfterVer = ctx.processHeartbeat('kidA@school.ed.jp', 'https://e/CHANGED');
+check('dev_v が進むとキャッシュが失効し、シートを読み直す',
+  verAfter !== verBefore && (sheet._dataReads - readsBeforeVer) >= 1,
+  { verBefore, verAfter, reads: sheet._dataReads - readsBeforeVer });
+check('失効後も応答が壊れない',
+  rAfterVer.student_id === 'kidA@school.ed.jp' && rAfterVer.school_name === '英田小学校',
+  { school: rAfterVer.school_name });
 
 console.log(`\n===== 結果: PASS=${pass} FAIL=${fail} =====`);
 process.exit(fail ? 1 : 0);
