@@ -305,6 +305,11 @@ function doGet(e) {
       return jsonResponse({ success: true, ...processHeartbeat(studentId, currentUrl, params.school_name) });
     }
 
+    // 1-b. 端末の起こし確認（GET・シート非接触の軽量応答）
+    if (api === 'wake_check') {
+      return jsonResponse(getWakeInfo());
+    }
+
     // 2. 教員ダッシュボード向けリスト取得 (要認証トークン)
     if (api === 'list') {
       const auth = verifyToken(params.token);
@@ -382,6 +387,17 @@ function doPost(e) {
     }
     if (action === 'console_release') {
       return jsonResponse(releaseTeacherConsole(payload.session_id));
+    }
+
+    // A4. 端末の「起こし確認」。シートに触らない軽量応答（通信負荷を増やさない）。
+    //     端末は wake_epoch の変化、または ka_active=true を見たら通常同期へ復帰する。
+    if (action === 'wake_check') {
+      return jsonResponse(getWakeInfo());
+    }
+    // A5. 管理アプリからの明示的な一斉叩き起こし（ログイン直後に呼ばれる）。
+    if (action === 'console_wake') {
+      bumpWakeEpoch();
+      return jsonResponse(getWakeInfo());
     }
 
     // B. 教員ログイン認証
@@ -1397,17 +1413,29 @@ function pruneKaSessions(map, nowMs) {
 function touchTeacherConsole(sessionId) {
   const nowMs = new Date().getTime();
   const id = String(sessionId || '').trim();
+
+  // 「誰も管理アプリを開いていない」状態からの最初のログインを検出する。
+  // この瞬間だけ緊急呼び出しフラグを更新し、眠っている端末を一斉に起こす。
+  // 稼働中の 15 秒ごとの touch ではフラグを更新しない（無駄な検知・保存を避ける）。
+  let wasActive = true;
+  try { wasActive = isTeacherConsoleActive(); } catch (e) { wasActive = true; }
+
   try {
     const map = pruneKaSessions(readKaSessions(), nowMs);
     map[id || '__default__'] = nowMs;
     writeKaSessions(map);
   } catch (e) {}
+
+  let wakeEpoch = 0;
+  if (!wasActive) {
+    try { wakeEpoch = bumpWakeEpoch(); } catch (e) { wakeEpoch = 0; }
+  }
   // 後方互換（旧バージョンの判定・記録用）。sessionId 無しのときのみ更新する。
   if (!id) {
     try { CacheService.getScriptCache().put(KA_KEY, String(nowMs), 240); } catch (e) {}
     try { PropertiesService.getScriptProperties().setProperty(KA_PROP_KEY, String(nowMs)); } catch (e) {}
   }
-  return { success: true, at: nowMs };
+  return { success: true, at: nowMs, wake_epoch: (wakeEpoch || readWakeEpoch()) };
 }
 
 /**
@@ -1453,6 +1481,56 @@ function isTeacherConsoleActive() {
     if (p && (nowMs - Number(p)) < KA_ACTIVE_WINDOW_MS) return true;
   } catch (e) {}
   return false;
+}
+
+// ==================== 緊急呼び出し（一斉叩き起こし） ====================
+// 課題: 非稼働になると児童端末は同期を完全停止する（通信負荷ゼロのため）。
+//       その状態で先生が再ログインしても、端末は眠ったままで復帰できない。
+//       「蓋を閉じて開いただけ」では onStartup もタブ生成も発生しないため、
+//       端末側に復帰のきっかけが存在しなかった。
+// 対策: 誰も稼働していない状態から教員がログインした瞬間に「緊急呼び出しフラグ」
+//       （wake_epoch）を更新する。端末は軽量な wake_check でこの値の変化を見て、
+//       変化があれば即座に通常のハートビート（詳細なオンライン通知）を送る。
+//       wake_check は CacheService / PropertiesService だけを読み、シートに触らない
+//       ＝1回あたりの GAS 実行が非常に軽い（通信負荷を増やさないための要）。
+const WAKE_CACHE_KEY = 'wake_epoch';
+const WAKE_PROP_KEY = 'WAKE_EPOCH_V1';
+
+/** 緊急呼び出しフラグの現在値を読む（0 = まだ一度も発行されていない）。 */
+function readWakeEpoch() {
+  try {
+    const v = CacheService.getScriptCache().get(WAKE_CACHE_KEY);
+    if (v) return Number(v) || 0;
+  } catch (e) {}
+  try {
+    const p = PropertiesService.getScriptProperties().getProperty(WAKE_PROP_KEY);
+    return Number(p) || 0;
+  } catch (e) { return 0; }
+}
+
+/** 緊急呼び出しフラグを更新する（この値の変化を端末が検知して起きる）。 */
+function bumpWakeEpoch() {
+  const nowMs = new Date().getTime();
+  try { CacheService.getScriptCache().put(WAKE_CACHE_KEY, String(nowMs), 21600); } catch (e) {}
+  try { PropertiesService.getScriptProperties().setProperty(WAKE_PROP_KEY, String(nowMs)); } catch (e) {}
+  return nowMs;
+}
+
+/**
+ * 端末の「起こし確認」用の軽量応答。シートを一切読まない。
+ * 端末はこの応答だけで「今すぐ詳細同期すべきか」を判断できる。
+ */
+function getWakeInfo() {
+  const nowMs = new Date().getTime();
+  const kaActive = isTeacherConsoleActive();
+  return {
+    success: true,
+    ka_active: kaActive,
+    wake_epoch: readWakeEpoch(),
+    sync_interval_sec: kaActive ? ACTIVE_SYNC_INTERVAL_SEC : 0,
+    idle_drift_until: kaActive ? 0 : (nowMs + (KA_IDLE_DRIFT_SEC * 1000)),
+    server_time: nowMs
+  };
 }
 
 /**

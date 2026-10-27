@@ -44,6 +44,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     maybeSync();
   } else if (alarm.name === 'idleDriftAlarm') {
     maybeSync();
+  } else if (alarm.name === 'wakeAlarm') {
+    // 非稼働中でも「先生が復帰したか」だけを軽く確認する（シート非接触の短い応答）。
+    probeWake();
   }
 });
 
@@ -118,10 +121,15 @@ function applyRemoteKeepalive(payload) {
       ensureSyncLoop();        // 稼働中のみアラームを登録（状態遷移時だけ）
       clearIdleDriftAlarm();
     }
+    // 稼働中は起こしプローブ不要（通常同期が走っているため）。止めて通信を増やさない。
+    clearWakeProbe();
   } else if (activeChanged || driftChanged) {
     // 非稼働: 30 秒アラームを止めて無駄な起床を止める。猶予期間だけ再開を確認する。
     stopSyncLoop();
     scheduleIdleDrift();
+    // 猶予が尽きた後も「先生が復帰したか」だけは拾えるようにする。
+    // 間隔は時間帯で切り替える（平日日中=1分固定／夜間・土日祝=10分）。
+    ensureWakeProbe();
   }
 }
 
@@ -188,6 +196,254 @@ function scheduleIdleDrift() {
 function clearIdleDriftAlarm() {
   try { chrome.alarms.clear('idleDriftAlarm'); } catch (e) {}
 }
+
+// ==================== 非稼働時の「起こしプローブ」 ====================
+// 課題: 非稼働になると端末は同期を完全に止めるため、先生が再ログインしても
+//       端末が眠ったままでオンラインにならず、ロック・URL配信も届かなかった。
+//       「蓋を閉じて開いただけ」では onStartup もタブ生成も起きないため復帰できない。
+// 方針: 通信負荷を増やさないことを最優先に、二段構えで復帰させる。
+//   ① イベント起床（通信ゼロ）… 蓋を開けた/操作再開（chrome.idle）で 1 回だけ同期。
+//   ② 時間帯で間隔を変えるプローブ … ①で拾えない場合に備え、シートに触らない
+//      軽量な wake_check だけを送る。間隔は「学校の稼働時間」に合わせて切り替える。
+//       ・平日 08:00〜17:00 … 1 分固定（バックオフしない＝ログイン後すぐ復帰）
+//       ・上記以外（17:00以降・土日・祝日）… 10 分（バッテリー保護・ログ削減）
+//      先生が復帰していれば（ka_active か wake_epoch の変化）即座に通常同期へ戻る。
+//
+// ※ 13 校は校ごとに Google アカウント／スプレッドシート／GAS を独立分離しているため、
+//    1 アカウントあたりの負荷余裕は大きい。日中の 1 分固定はその前提に基づく。
+const WAKE_ALARM_NAME = 'wakeAlarm';
+
+// ---- 時間帯の定義（日本時間で判定する。端末のタイムゾーン設定に依存させない）----
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000; // UTC+9
+const PROBE_DAY_START_HOUR = 8;   // 平日の開始時刻（この時刻から日中扱い）
+const PROBE_DAY_END_HOUR = 17;    // 平日の終了時刻（この時刻から夜間扱い）
+const PROBE_DAY_MIN = 1;          // 平日日中：1 分固定
+const PROBE_NIGHT_MIN = 10;       // 夜間・土日祝：10 分（0 にすると停止）
+
+/** その月の第 n 曜日の日付を返す（nth は 1 始まり）。 */
+function nthWeekdayOfMonth(year, month, weekday, nth) {
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const firstDow = first.getUTCDay();
+  return 1 + ((weekday - firstDow + 7) % 7) + (nth - 1) * 7;
+}
+
+/** 春分／秋分の日（近似式。1948〜2150 年で有効）。 */
+function equinoxDay(year, isSpring) {
+  const base = isSpring ? 20.8431 : 23.2488;
+  const v = base + 0.242194 * (year - 1980) - Math.floor((year - 1980) / 4);
+  return Math.floor(v);
+}
+
+/**
+ * その年の日本の祝日（振替休日・国民の休日を含む）を "月-日" の集合で返す。
+ * 祝日判定は端末内で完結させる（外部通信しない＝通信負荷ゼロ）。
+ */
+function japaneseHolidaySet(year) {
+  const set = {};
+  const add = (m, d) => { if (d >= 1 && d <= 31) set[m + '-' + d] = true; };
+
+  add(1, 1);                                            // 元日
+  add(1, nthWeekdayOfMonth(year, 1, 1, 2));             // 成人の日（第2月曜）
+  add(2, 11);                                           // 建国記念の日
+  add(2, 23);                                           // 天皇誕生日
+  add(3, equinoxDay(year, true));                       // 春分の日
+  add(4, 29);                                           // 昭和の日
+  add(5, 3); add(5, 4); add(5, 5);                      // 憲法記念日／みどりの日／こどもの日
+  add(7, nthWeekdayOfMonth(year, 7, 1, 3));             // 海の日（第3月曜）
+  add(8, 11);                                           // 山の日
+  add(9, nthWeekdayOfMonth(year, 9, 1, 3));             // 敬老の日（第3月曜）
+  add(9, equinoxDay(year, false));                      // 秋分の日
+  add(10, nthWeekdayOfMonth(year, 10, 1, 2));           // スポーツの日（第2月曜）
+  add(11, 3);                                           // 文化の日
+  add(11, 23);                                          // 勤労感謝の日
+
+  // 振替休日: 日曜に当たる祝日は、翌日以降で最初の「祝日でない日」が休日になる。
+  const base = {};
+  Object.keys(set).forEach(k => { base[k] = true; });
+  Object.keys(base).forEach(k => {
+    const p = k.split('-');
+    const m = Number(p[0]), d = Number(p[1]);
+    const dt = new Date(Date.UTC(year, m - 1, d));
+    if (dt.getUTCDay() !== 0) return;
+    let cur = new Date(Date.UTC(year, m - 1, d));
+    for (let i = 0; i < 10; i++) {
+      cur = new Date(cur.getTime() + 86400000);
+      const key = (cur.getUTCMonth() + 1) + '-' + cur.getUTCDate();
+      if (!base[key]) { set[key] = true; break; }
+    }
+  });
+
+  // 国民の休日: 祝日に挟まれた 1 日（例: 敬老の日と秋分の日に挟まれた 9/22）。
+  Object.keys(base).forEach(k => {
+    const p = k.split('-');
+    const m = Number(p[0]), d = Number(p[1]);
+    const mid = m + '-' + (d + 1);
+    const nxt = m + '-' + (d + 2);
+    if (base[mid] || set[mid]) return;
+    if (base[nxt] && d + 2 <= 31) set[mid] = true;
+  });
+
+  return set;
+}
+
+// 年の祝日集合は使い回す（毎回作り直すと無駄）。
+let holidayCacheYear = 0;
+let holidayCacheSet = null;
+
+/** 指定日が日本の祝日かどうか。 */
+function isJapaneseHoliday(year, month, day) {
+  if (holidayCacheYear !== year || !holidayCacheSet) {
+    holidayCacheSet = japaneseHolidaySet(year);
+    holidayCacheYear = year;
+  }
+  return !!holidayCacheSet[month + '-' + day];
+}
+
+/** 指定時刻（エポックms）が「日中（平日8:00-17:00）か」を日本時間で判定する。 */
+function probeBandState(nowMs) {
+  const j = new Date(nowMs + JST_OFFSET_MS);
+  const y = j.getUTCFullYear();
+  const mo = j.getUTCMonth() + 1;
+  const d = j.getUTCDate();
+  const h = j.getUTCHours();
+  const dow = j.getUTCDay();
+  const holiday = isJapaneseHoliday(y, mo, d);
+  const weekend = (dow === 0 || dow === 6);
+  const dayTime = (h >= PROBE_DAY_START_HOUR) && (h < PROBE_DAY_END_HOUR);
+  return { inDay: (!weekend && !holiday && dayTime), weekend: weekend, holiday: holiday };
+}
+
+/**
+ * 現在の時間帯から「プローブ間隔（分）」と「次の時間帯境界までの分」を求める。
+ * 戻り値: { inDay, weekend, holiday, minutes, minutesUntilChange }
+ */
+function getProbeBand(nowMs) {
+  const t = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+  const cur = probeBandState(t);
+
+  // 次の境界（inDay が反転する時刻）を 1 分刻みで探す。
+  // 日本には夏時間が無いため、1 分 = 60000ms で厳密に数えられる。
+  const MAX_STEPS = 60 * 24 * 8;
+  let step = 0;
+  while (step < MAX_STEPS) {
+    step++;
+    if (probeBandState(t + step * 60000).inDay !== cur.inDay) break;
+  }
+
+  return {
+    inDay: cur.inDay,
+    weekend: cur.weekend,
+    holiday: cur.holiday,
+    minutes: cur.inDay ? PROBE_DAY_MIN : PROBE_NIGHT_MIN,
+    minutesUntilChange: Math.max(0.5, step)
+  };
+}
+
+/**
+ * 起こしプローブを「現在の時間帯」の間隔で登録する。
+ * 次の時間帯境界が来る前に一度起きるよう delay を短くするので、
+ * 8:00 や 17:00 の切り替わりに最大でも境界時刻ちょうどで間隔が更新される。
+ */
+function ensureWakeProbe() {
+  const band = getProbeBand(Date.now());
+  if (!band.minutes || band.minutes <= 0) { clearWakeProbe(); return; } // 0 = 停止
+  const delay = Math.min(band.minutes, band.minutesUntilChange);
+  try {
+    chrome.alarms.create(WAKE_ALARM_NAME, {
+      delayInMinutes: delay,
+      periodInMinutes: band.minutes
+    });
+  } catch (e) {}
+}
+
+/** 起こしプローブを止める（稼働中は不要なため）。 */
+function clearWakeProbe() {
+  try { chrome.alarms.clear(WAKE_ALARM_NAME); } catch (e) {}
+}
+
+/**
+ * 「先生が復帰したか」だけを軽く確認する。
+ * シートに触らない wake_check を使うため、GAS 側の実行はごく短時間で終わる。
+ * 復帰を検知したら、その場で通常のハートビート（＝詳細なオンライン通知）を送り、
+ * 端末一覧に即座にオンラインとして現れるようにする。
+ */
+async function probeWake() {
+  if (keepaliveActive) { clearWakeProbe(); return; } // 既に稼働中なら何もしない
+  try {
+    const data = await chrome.storage.local.get(null);
+    const gasUrl = resolveGasUrl(data);
+    if (!gasUrl) return;
+
+    const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    let timer = null;
+    if (controller) {
+      timer = setTimeout(() => { try { controller.abort(); } catch (e) {} }, 8000);
+    }
+    let res;
+    try {
+      res = await fetch(gasUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'wake_check' }),
+        redirect: 'follow',
+        signal: controller ? controller.signal : undefined
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (!res || !res.ok) return;
+
+    const j = await res.json();
+    if (!j || !j.success) return;
+
+    const epoch = Number(j.wake_epoch) || 0;
+    const seen = Number(data.wake_epoch_seen) || 0;
+
+    // 「先生がログインしている」または「緊急呼び出しフラグが更新された」→ 起こす
+    if (j.ka_active || (epoch && epoch !== seen)) {
+      if (epoch) await chrome.storage.local.set({ wake_epoch_seen: epoch });
+      // 稼働状態へ切り替える（ensureSyncLoop が 30 秒アラームを張る）
+      applyRemoteKeepalive({
+        ka_active: !!j.ka_active,
+        sync_interval_sec: j.sync_interval_sec,
+        idle_drift_until: j.idle_drift_until
+      });
+      // 詳細なオンライン通知（doPost）。これが「最終同期日時」を更新し、
+      // 端末一覧にオンラインとして表示される。
+      lastSyncMs = 0;
+      syncWithGas();
+      return;
+    }
+
+    // 復帰していない → その時点の時間帯に応じた間隔で次回を待つ。
+    // （平日日中は 1 分、夜間・土日祝は 10 分。境界をまたぐと自動で切り替わる）
+    if (epoch) await chrome.storage.local.set({ wake_epoch_seen: epoch });
+    ensureWakeProbe();
+  } catch (e) {}
+}
+
+// ① イベント起床: 蓋を開けた／スリープから復帰して操作を再開した瞬間に 1 回だけ同期する。
+//    アラームと違い「実際に人が端末を使ったとき」しか動かないため、通信は増えない。
+//    （これが無いと、蓋の開閉だけでは SW が起きず復帰できなかった）
+try {
+  if (chrome.idle && chrome.idle.onStateChanged) {
+    chrome.idle.setDetectionInterval(60);
+    chrome.idle.onStateChanged.addListener((state) => {
+      if (state !== 'active') return;
+      lastSyncMs = 0;      // レート制限を無視して必ず 1 回同期する
+      syncWithGas();
+    });
+  }
+} catch (e) {}
+
+// SW が停止状態から復帰したとき（端末が眠ったまま SW だけ再起動した場合）に備え、
+// 非稼働なら起こしプローブを張り直す。これが無いとアラームが失われたまま復帰できない。
+try {
+  chrome.storage.local.get(['keepalive_active'], (d) => {
+    if (chrome.runtime.lastError) return;
+    if (!(d && d.keepalive_active)) ensureWakeProbe();
+  });
+} catch (e) {}
 
 /**
  * 停止後に管理アプリ（教員コンソール）が再度開かれた場合の復帰。
@@ -431,6 +687,59 @@ function resolveGasUrl(data) {
 const SYNC_TIMEOUT_MS = 12000; // GAS 応答のタイムアウト。ハングで syncInFlight が立ったまま（＝反映停止）になるのを防ぐ。
 let syncInFlight = false;
 
+// 同期結果の診断情報。
+//   直接読み込み版（検証用）のポップアップは chrome://extensions が使えない環境で
+//   「なぜ同期できないのか」を表示する唯一の窓口になるため、失敗理由を保持する。
+//   通信負荷を増やさないため、書き込みは「成功可否・理由が変わったときだけ」に限定する。
+let lastSyncDiag = { ok: null, code: '', message: '', at: '' };
+async function recordSyncDiag(ok, code, message) {
+  const at = new Date().toLocaleTimeString();
+  const changed = (lastSyncDiag.ok !== ok) || (lastSyncDiag.code !== code) ||
+                  (lastSyncDiag.message !== message);
+  lastSyncDiag = { ok: !!ok, code: String(code || ''), message: String(message || ''), at: at };
+  if (!changed) return; // 変化なし＝ストレージ書込みしない（I/O を増やさない）
+  try {
+    await chrome.storage.local.set({
+      sync_diag_ok: lastSyncDiag.ok,
+      sync_diag_code: lastSyncDiag.code,
+      sync_diag_message: lastSyncDiag.message,
+      sync_diag_at: lastSyncDiag.at
+    });
+  } catch (e) {}
+}
+
+// 疎通確認（手動実行のみ・通常運用では呼ばれない）。
+//   直接読み込み版の検証で「URL が正しいか」「Web アプリの公開範囲が正しいか」を
+//   切り分けるために使う。シートに触らない wake_check（GET）を 1 回だけ叩く。
+const TEST_TIMEOUT_MS = 8000;
+async function testGasConnection(urlOverride) {
+  const data = await chrome.storage.local.get(null);
+  const url = String(urlOverride || '').trim() || resolveGasUrl(data);
+  if (!url) return { ok: false, error: 'GAS WebアプリURLが未設定です' };
+  const started = Date.now();
+  const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  let timer = null;
+  if (controller) timer = setTimeout(() => { try { controller.abort(); } catch (e) {} }, TEST_TIMEOUT_MS);
+  try {
+    const sep = (url.indexOf('?') === -1) ? '?' : '&';
+    const res = await fetch(url + sep + 'api=wake_check&_t=' + started, {
+      method: 'GET', redirect: 'follow', cache: 'no-store',
+      signal: controller ? controller.signal : undefined
+    });
+    const ms = Date.now() - started;
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) { json = null; }
+    const ok = !!res.ok && !!json && json.success !== false;
+    return { ok: ok, status: res.status, ms: ms, json: json, head: text.slice(0, 300), url: url };
+  } catch (e) {
+    const detail = String((e && e.message) ? e.message : e);
+    return { ok: false, ms: Date.now() - started, error: detail, url: url };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * GASとのハートビート・ポリシー同期
  */
@@ -496,6 +805,9 @@ async function syncWithGas() {
 
     if (!effectiveGasUrl || !studentId) {
       // GAS URL または 児童ID が未設定の場合は同期不可
+      await recordSyncDiag(false, 'not_configured',
+        !effectiveGasUrl ? 'GAS WebアプリURLが未設定です'
+                         : '児童ID（Googleアカウント）が未設定です');
       return;
     }
 
@@ -535,12 +847,24 @@ async function syncWithGas() {
 
     if (!response.ok) {
       console.warn('[EduAgent] GASレスポンスエラー:', response.status);
+      await recordSyncDiag(false, 'http_' + response.status,
+        'GASが HTTP ' + response.status + ' を返しました（URLの誤り／デプロイ権限を確認）');
       return;
     }
 
-    const resJson = await response.json();
+    let resJson;
+    try {
+      resJson = await response.json();
+    } catch (e) {
+      // GAS がログイン画面（HTML）を返した場合などに該当する。
+      await recordSyncDiag(false, 'not_json',
+        'GASの応答がJSONではありません（Webアプリの「アクセスできるユーザー」を確認）');
+      return;
+    }
     if (!resJson.success) {
       console.warn('[EduAgent] 同期エラー:', resJson.error);
+      await recordSyncDiag(false, 'gas_error',
+        'GASがエラーを返しました: ' + String(resJson.error || '(詳細なし)'));
       return;
     }
 
@@ -557,8 +881,15 @@ async function syncWithGas() {
       idle_drift_until: resJson.idle_drift_until
     });
 
+    await recordSyncDiag(true, 'ok', '');
+
   } catch (err) {
     console.error('[EduAgent] 通信エラー:', err);
+    try {
+      const detail = String((err && err.message) ? err.message : err);
+      await recordSyncDiag(false, 'network',
+        'GASへ到達できません（URL・ネットワーク・公開範囲を確認）: ' + detail);
+    } catch (e2) {}
   } finally {
     syncInFlight = false;
   }
@@ -1115,10 +1446,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'TRIGGER_SYNC') {
+    // 診断（直接読み込み版のポップアップ表示用）。
+    // 同期の多重実行中は syncWithGas が即 return するため、その場合も直前の結果を返す。
     syncWithGas().then(() => {
-      chrome.storage.local.get(null).then(data => sendResponse({ success: true, data }));
+      chrome.storage.local.get(null).then(data => {
+        sendResponse({ success: true, data, diag: lastSyncDiag });
+      });
     }).catch(err => {
-      sendResponse({ success: false, error: err.toString() });
+      sendResponse({ success: false, error: err.toString(), diag: lastSyncDiag });
+    });
+    return true;
+  }
+  if (message.type === 'GET_SYNC_DIAG') {
+    sendResponse({ success: true, diag: lastSyncDiag });
+    return true;
+  }
+  // 疎通確認（直接読み込み版の設定画面から手動で実行される）。
+  if (message.type === 'TEST_CONNECTION') {
+    testGasConnection(message.url).then(function (r) { sendResponse(r); })
+      .catch(function (e) { sendResponse({ ok: false, error: String(e) }); });
+    return true;
+  }
+  // 通信状態の取得（直接読み込み版のポップアップ表示用・通信は発生しない）。
+  if (message.type === 'GET_STATUS_FULL') {
+    let probe = null;
+    try { probe = getProbeBand(Date.now()); } catch (e) { probe = null; }
+    sendResponse({
+      ok: true,
+      status: {
+        ka_active: !!keepaliveActive,
+        sync_interval_sec: keepaliveActive ? (activeIntervalMs / 1000) : 0,
+        idle_drift_until: idleDriftUntil || 0,
+        probe: probe
+      }
     });
     return true;
   }
