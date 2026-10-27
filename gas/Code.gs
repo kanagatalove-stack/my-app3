@@ -33,6 +33,24 @@ const CONFIG = {
     '樸学園'
   ],
 
+  // ==========================================================
+  // 子GAS分散（SHARD_MODE / ハブ＆スポーク）
+  //   1校240台 × 1.5秒周期 ≒ 160 req/秒 を 1 実行で受けると、GAS の
+  //   「同時実行 30/ユーザー」に達する。クラス単位で子GASへ分散して回避する。
+  //
+  //   SHARD_MODE       … このスクリプトが「親（ハブ）」として振る舞う
+  //   SHARD_CHILD_MODE … このスクリプトが「子（スポーク）」として振る舞う
+  //   両方 false（既定）… 従来の 1校1GAS と完全に同一動作（後方互換）
+  //
+  //   ※ 子GAS側のコードもこのファイル1つ。SHARD_CHILD_MODE=true にするだけ。
+  //   ※ 子GASはハートビートのみ担当し、ロック/規制/配信の正は親に置く。
+  //     親コンソールは親の端末一覧だけを見るため、教員は常に1画面のまま。
+  // ==========================================================
+  SHARD_MODE: false,
+  SHARD_CHILD_MODE: false,
+  // 子へポリシーを伝達したときの通信タイムアウト（ミリ秒）
+  SHARD_FETCH_TIMEOUT_MS: 8000,
+
   // 端末一覧 列定義
   DEVICE_COLUMNS: [
     '児童ID',
@@ -302,7 +320,8 @@ function doGet(e) {
       const studentId = params.student_id;
       const currentUrl = params.current_url || '';
       if (!studentId) return jsonResponse({ success: false, error: 'student_id is required' });
-      return jsonResponse({ success: true, ...processHeartbeat(studentId, currentUrl, params.school_name) });
+      const hbGet = processHeartbeat(studentId, currentUrl, params.school_name);
+      return jsonResponse({ success: true, ...hbGet, ...resolveShardForHeartbeat(studentId, hbGet.class_name) });
     }
 
     // 1-b. 端末の起こし確認（GET・シート非接触の軽量応答）
@@ -364,7 +383,10 @@ function doPost(e) {
       const studentId = payload.student_id;
       const currentUrl = payload.current_url || '';
       if (!studentId) return jsonResponse({ success: false, error: 'student_id is required' });
-      return jsonResponse({ success: true, ...processHeartbeat(studentId, currentUrl, payload.school_name) });
+      const hb = processHeartbeat(studentId, currentUrl, payload.school_name);
+      // 子GAS分散（SHARD_MODE）: 親は端末のクラスから「子GAS URL」を解決して返す。
+      // 親でない場合 resolveShardForHeartbeat は {} を返すため、応答は従来と完全に同一。
+      return jsonResponse({ success: true, ...hb, ...resolveShardForHeartbeat(studentId, hb.class_name) });
     }
 
     // A2. 児童拡張機能からの画面情報（スクリーンショット）アップロード
@@ -383,10 +405,17 @@ function doPost(e) {
     //     session_id を付けることで、複数アカウントのうち 1 つが終了しても他が稼働中なら維持される。
     //     ※ 認証不要（トークンを持たない経路もあるため）。稼働時刻を記録するだけの軽量処理。
     if (action === 'console_touch') {
-      return jsonResponse(touchTeacherConsole(payload.session_id));
+      const touchRes = touchTeacherConsole(payload.session_id);
+      // 子GAS分散: 子は親のコンソール稼働を知る手段が無いため、ここで配る。
+      // （配らないと子担当の端末が ka_active=false を受け取り同期を止める）
+      shardPropagateKaState(true);
+      return jsonResponse(touchRes);
     }
     if (action === 'console_release') {
-      return jsonResponse(releaseTeacherConsole(payload.session_id));
+      const releaseRes = releaseTeacherConsole(payload.session_id);
+      // 全セッションが消えた（＝非稼働）ときだけ子へ停止を伝える
+      try { if (!isTeacherConsoleActive()) shardPropagateKaState(false); } catch (e) {}
+      return jsonResponse(releaseRes);
     }
 
     // A4. 端末の「起こし確認」。シートに触らない軽量応答（通信負荷を増やさない）。
@@ -398,6 +427,21 @@ function doPost(e) {
     if (action === 'console_wake') {
       bumpWakeEpoch();
       return jsonResponse(getWakeInfo());
+    }
+
+    // A6. 子GAS分散（SHARD_MODE）: 親⇔子の通信。
+    //     教員トークンではなく共有シークレット（SHARD_SECRET）で認証する。
+    //     ・shard_apply … 子GASが親からポリシーを受け取る
+    //     ・shard_push  … 親GASが子GASからテレメトリを受け取る
+    if (action === 'shard_apply') {
+      return jsonResponse(shardApplyFromParent(payload));
+    }
+    if (action === 'shard_push') {
+      return jsonResponse(shardUpsertTelemetryFromChild(payload));
+    }
+    // 親が子の端末一覧を取りに来る（コンソールの1画面集約用）
+    if (action === 'shard_list') {
+      return jsonResponse(shardListForParent(payload));
     }
 
     // B. 教員ログイン認証
@@ -432,7 +476,9 @@ function doPost(e) {
 
     // D. 端末一覧取得
     if (action === 'get_all') {
-      const data = getAllDevices(payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
+      const baseData = getAllDevices(payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
+      // 子GAS分散: 子の端末も同じ画面に並べる（教員は1画面のまま）
+      const data = shardMergeDevices(baseData, payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
       return jsonResponse({ success: true, data: data });
     }
 
@@ -474,7 +520,9 @@ function doPost(e) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
       bulkUpdateScreenLock(scoped.ids, Boolean(payload.locked));
-      return jsonResponse({ success: true, message: `画面ロックを ${payload.locked ? 'ON' : 'OFF'} に更新しました` });
+      // 子GAS分散: 該当クラスの子GASへも同じロック状態を伝達する（SHARD_MODE=false なら何もしない）
+      const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: Boolean(payload.locked) });
+      return jsonResponse({ success: true, message: `画面ロックを ${payload.locked ? 'ON' : 'OFF'} に更新しました`, shard: shardLock });
     }
 
     // F. 一斉URL配信（教員の所属学校スコープを適用）
@@ -486,7 +534,8 @@ function doPost(e) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
       const broadcastId = bulkUpdateBroadcastUrl(scoped.ids, targetUrl, '');
-      return jsonResponse({ success: true, message: '一斉URLを配信しました', broadcast_id: broadcastId });
+      const shardBc = shardPropagatePolicy(scoped.ids, { broadcast_url: targetUrl });
+      return jsonResponse({ success: true, message: '一斉URLを配信しました', broadcast_id: broadcastId, shard: shardBc });
     }
 
     // G. URL規制一括変更（教員の所属学校スコープを適用）
@@ -496,6 +545,11 @@ function doPost(e) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
       bulkUpdateFilterMode(scoped.ids, payload.filter_mode, payload.whitelist_urls, payload.blacklist_urls);
+      const shardFilter = shardPropagatePolicy(scoped.ids, {
+        filter_mode: payload.filter_mode,
+        whitelist_urls: payload.whitelist_urls,
+        blacklist_urls: payload.blacklist_urls
+      });
       // 教員アカウントの個別設定としても保持
       if (currentTeacher && currentTeacher.email) {
         try {
@@ -507,7 +561,7 @@ function doPost(e) {
           Logger.log('教員規制設定保存スキップ: ' + saveErr);
         }
       }
-      return jsonResponse({ success: true, message: `URL規制モードを ${payload.filter_mode} に更新しました` });
+      return jsonResponse({ success: true, message: `URL規制モードを ${payload.filter_mode} に更新しました`, shard: shardFilter });
     }
 
     // H. 単一児童端末の更新（他校の児童は更新不可）
@@ -520,7 +574,16 @@ function doPost(e) {
         return jsonResponse({ success: false, error: '対象外の児童は操作できません（学校・対象クラスの範囲外）' });
       }
       updateSingleDevice(payload.student_id, payload.data || {});
-      return jsonResponse({ success: true, message: '設定を更新しました' });
+      const single = payload.data || {};
+      const shardPatch = {};
+      if (single.screen_lock !== undefined) shardPatch.screen_lock = Boolean(single.screen_lock);
+      if (single.filter_mode !== undefined) shardPatch.filter_mode = single.filter_mode;
+      if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
+      if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
+      if (single.broadcast_url) shardPatch.broadcast_url = single.broadcast_url;
+      const shardSingle = Object.keys(shardPatch).length
+        ? shardPropagatePolicy([payload.student_id], shardPatch) : { skipped: true };
+      return jsonResponse({ success: true, message: '設定を更新しました', shard: shardSingle });
     }
 
     // I. 教員アカウント設定の保存（登録URL情報・個別規制URL・対象クラスの更新）
@@ -585,6 +648,21 @@ function doPost(e) {
     if (action === 'get_archived_students') {
       const archived = getArchivedStudents(currentTeacher);
       return jsonResponse({ success: true, data: archived });
+    }
+
+    // S. 子GAS分散の設定（管理者のみ）
+    //    教員コンソールは「1画面」のまま。ここで子GASの割り当てを管理する。
+    if (action === 'get_shard_settings') {
+      return jsonResponse({ success: true, settings: getShardSettingsForAdmin(),
+        is_admin: isAdminTeacher(currentTeacher) });
+    }
+    if (action === 'save_shard_settings') {
+      try {
+        const saved = saveShardSettingsForAdmin(currentTeacher, payload.settings || payload);
+        return jsonResponse({ success: true, message: '子GASの割り当てを保存しました', settings: saved });
+      } catch (e) {
+        return jsonResponse({ success: false, error: String(e) });
+      }
     }
 
     return jsonResponse({ success: false, error: 'Unknown action: ' + action });
@@ -3087,6 +3165,709 @@ function parseUrlList(val) {
   return String(val).split(/[\r\n,]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
 }
 
+// ==================== 子GAS分散（SHARD_MODE / ハブ＆スポーク） ====================
+// 役割分担:
+//   親（ハブ）  … 教員コンソール。全校・全クラスの端末一覧を集約し、操作の「正」を持つ。
+//   子（スポーク）… 1クラス分のハートビートだけを受ける。ポリシーは親から受け取る。
+//
+// 端末の流れ:
+//   ① 端末 → 親（初回）: 児童ID と クラス から子GAS URL を解決し assigned_gas_url を返す
+//   ② 端末 → 子（以降）: 以後は子GASへ直接ハートビートする（1.5秒周期を維持）
+//   ③ 教員操作 → 親: 親のシートを更新し、該当する子へ shard_apply で伝達
+//
+// 認証:
+//   親⇔子の通信は教員トークンではなく「共有シークレット（SHARD_SECRET）」で認証する。
+//   シークレット未設定の子は shard_apply を一切受け付けない（安全側）。
+
+const SHARD_MAP_PROP = 'SHARD_MAP_V1';       // { "5年1組": "https://…/exec" }
+const SHARD_DEFAULT_PROP = 'SHARD_DEFAULT_URL'; // クラス不明時の既定の子GAS
+const SHARD_SECRET_PROP = 'SHARD_SECRET';    // 親⇔子の共有シークレット
+const SHARD_CFG_CACHE = 'shard_cfg3';        // 設定のキャッシュキー（5分）
+
+function isShardParent() {
+  return !!(CONFIG && CONFIG.SHARD_MODE === true);
+}
+
+function isShardChild() {
+  return !!(CONFIG && CONFIG.SHARD_CHILD_MODE === true);
+}
+
+/**
+ * クラス名を比較用の正規化キーへ寄せる。
+ *   「5年1組」「５年１組」「5-1」「5/1」「5組」→「5-1」
+ *   学年の数字と組の数字を「学年-組」に統一する（全角数字も吸収）。
+ */
+function normalizeShardClass(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  // 全角数字・全角英字を半角へ
+  s = s.replace(/[０-９]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
+  s = s.replace(/[Ａ-Ｚａ-ｚ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
+  // 空白（全角含む）を除去
+  s = s.replace(/[\s\u3000]+/g, '');
+  if (!s || s === '未設定') return '';
+  // 「5年1組」「5-1」「5/1」「5年1組」など
+  let m = s.match(/^(\d{1,2})\s*[年\-ー/／]\s*(\d{1,2})/);
+  if (m) return Number(m[1]) + '-' + Number(m[2]);
+  // 「5組」だけ → 5-1 とみなす
+  m = s.match(/^(\d{1,2})組?$/);
+  if (m) return Number(m[1]) + '-1';
+  return s;
+}
+
+function readShardMapRaw() {
+  try {
+    const raw = PropertiesService.getScriptProperties().getProperty(SHARD_MAP_PROP);
+    if (!raw) return {};
+    const o = JSON.parse(raw);
+    return (o && typeof o === 'object') ? o : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function readShardDefaultUrl() {
+  try {
+    return String(PropertiesService.getScriptProperties().getProperty(SHARD_DEFAULT_PROP) || '').trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+/** 親⇔子の共有シークレット。未生成なら生成して保存する（親のみ）。 */
+function getOrCreateShardSecret() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    let s = String(props.getProperty(SHARD_SECRET_PROP) || '').trim();
+    if (!s) {
+      s = 'sk_' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+      props.setProperty(SHARD_SECRET_PROP, s);
+    }
+    return s;
+  } catch (e) {
+    return '';
+  }
+}
+
+/** 受け取ったシークレットが正しいか。未設定なら常に false（安全側）。 */
+function shardSecretMatches(given) {
+  let expect = '';
+  try {
+    expect = String(PropertiesService.getScriptProperties().getProperty(SHARD_SECRET_PROP) || '').trim();
+  } catch (e) {
+    return false;
+  }
+  if (!expect) return false;
+  const g = String(given || '').trim();
+  if (!g) return false;
+  // 長さが違えば早期に false（比較は全文字走査）
+  if (g.length !== expect.length) return false;
+  let diff = 0;
+  for (let i = 0; i < g.length; i++) diff |= (g.charCodeAt(i) ^ expect.charCodeAt(i));
+  return diff === 0;
+}
+
+/**
+ * 分散設定（マップ・既定URL・シークレット）をキャッシュ経由で取得する。
+ * ハートビート毎の PropertiesService 読み取りを避ける（SHARD_MODE 有効時のみ使われる）。
+ */
+function shardConfigCached() {
+  try {
+    const cache = CacheService.getScriptCache();
+    const hit = cache.get(SHARD_CFG_CACHE);
+    if (hit) {
+      const o = JSON.parse(hit);
+      if (o && typeof o === 'object') return o;
+    }
+  } catch (e) { /* キャッシュ不可時は下へ */ }
+
+  const cfg = { map: readShardMapRaw(), def: readShardDefaultUrl(), sec: getOrCreateShardSecret() };
+  try {
+    CacheService.getScriptCache().put(SHARD_CFG_CACHE, JSON.stringify(cfg), 300);
+  } catch (e) {}
+  return cfg;
+}
+
+function invalidateShardConfig() {
+  try { CacheService.getScriptCache().remove(SHARD_CFG_CACHE); } catch (e) {}
+}
+
+/** { 生のクラス名: URL } → { 正規化キー: URL } の索引を作る。 */
+function shardMapIndexFromMap(map) {
+  const idx = {};
+  const src = (map && typeof map === 'object') ? map : {};
+  const keys = Object.keys(src);
+  for (let i = 0; i < keys.length; i++) {
+    const k = normalizeShardClass(keys[i]);
+    const v = String(src[keys[i]] || '').trim();
+    if (k && v) idx[k] = v;
+  }
+  return idx;
+}
+
+/**
+ * 端末に返す割り当て先を解決する（親のみ）。
+ * 親でない／子GASが未設定なら {} を返す＝応答に何も足さない（従来動作と同一）。
+ */
+function resolveShardForHeartbeat(studentId, classHint) {
+  if (!isShardParent()) return {};
+  try {
+    const cfg = shardConfigCached();
+    const idx = shardMapIndexFromMap(cfg.map);
+    const key = normalizeShardClass(classHint);
+    if (key && idx[key]) {
+      return { assigned_gas_url: idx[key], assigned_class: key, shard_mode: true };
+    }
+    const def = String(cfg.def || '').trim();
+    if (def) return { assigned_gas_url: def, assigned_class: '', shard_mode: true };
+  } catch (e) {
+    // 解決に失敗しても端末の通信は止めない（親に繋がったまま＝従来動作）
+  }
+  return {};
+}
+
+/**
+ * 子GAS側: 親から受け取ったポリシーを自分のシートへ適用する。
+ * ポリシーの「正」は親にあるため、子は受け取った内容をそのまま反映するだけ。
+ */
+/**
+ * 子GAS側: 親から指示された児童の行が無ければ作る。
+ *
+ * 子のシートには「その子へハートビートした端末」しか行が無い。
+ * bulkUpdateScreenLock 等は対象行が無いと無言で何もしないため、
+ * 指示より先に行を用意しておかないと一括操作が永久に効かなくなる。
+ *
+ * classMap（{ 児童ID: クラス名 }）は親が付ける。子の行が最初から
+ * 正しいクラスを持つようにして、子のシートが「未設定」で埋まるのを防ぐ。
+ */
+function shardEnsureDeviceRows(idList, classMap) {
+  if (!Array.isArray(idList) || !idList.length) return 0;
+  return withWriteLock(function () {
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    const data = sheet.getDataRange().getValues();
+    const idCol = headerMap['児童ID'] - 1;
+
+    const existing = {};
+    for (let i = 1; i < data.length; i++) {
+      const id = String(data[i][idCol] || '').trim();
+      if (id) existing[id] = true;
+    }
+
+    let created = 0;
+    for (let k = 0; k < idList.length; k++) {
+      const id = String(idList[k] || '').trim();
+      if (!id || existing[id]) continue;
+      const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
+      newRow[headerMap['児童ID'] - 1] = id;
+      newRow[headerMap['学校名'] - 1] = '未設定';
+      newRow[headerMap['氏名'] - 1] = '未登録児童 (' + id + ')';
+      newRow[headerMap['クラス'] - 1] = String((classMap && classMap[id]) || '未設定');
+      newRow[headerMap['画面ロック'] - 1] = false;
+      newRow[headerMap['URL規制モード'] - 1] = 'OFF';
+      sheet.appendRow(newRow);
+      existing[id] = true;
+      created++;
+    }
+    return created;
+  });
+}
+
+function shardApplyFromParent(payload) {
+  if (!isShardChild() && !isShardParent()) {
+    // 役割未設定のスクリプトが外部から操作されないようにする
+    return { success: false, error: '子GASとして構成されていません' };
+  }
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  // ① 教員稼働状態の同期（親コンソールにしかログインしないため、子は親から受け取る）。
+  //    子の既存の ka 機構（touchTeacherConsole / releaseTeacherConsole）をそのまま使う。
+  //    これにより子の isTeacherConsoleActive() が正しく true になり、端末が同期を続けられる。
+  let kaApplied = null;
+  if (payload && payload.ka_active !== undefined) {
+    try {
+      if (payload.ka_active) {
+        touchTeacherConsole('__shard_parent__');
+        kaApplied = true;
+      } else {
+        releaseTeacherConsole('__shard_parent__');
+        kaApplied = false;
+      }
+    } catch (e) {
+      kaApplied = null;
+    }
+  }
+
+  const ids = (payload && payload.student_ids) || [];
+  const patch = (payload && payload.patch) || {};
+  const idList = Array.isArray(ids) ? ids : [];
+  if (!idList.length) {
+    // ka 伝達だけの呼び出しは正常（ポリシー変更なし）
+    return { success: true, applied: 0, ka_active: kaApplied };
+  }
+
+  // 行の用意結果。try の外で宣言する（return が try の外にあるため、
+  // try 内で let 宣言すると参照できず ReferenceError になる）。
+  let ensureResult = { created: 0, error: '' };
+
+  try {
+    // 先に行を用意する。これが無いと、まだ子と通信していない児童への
+    // 一括操作が「成功」を返しながら実際には何も適用されない。
+    // ※ ここで失敗を握りつぶさない。行が作れない＝一括操作が効かない状態なので、
+    //   応答に残して親（＝コンソールの操作結果）から見えるようにする。
+    const classMap = (payload && payload.class_map) || null;
+    try {
+      ensureResult.created = shardEnsureDeviceRows(idList, classMap) || 0;
+    } catch (e) {
+      ensureResult.error = String((e && e.message) ? e.message : e);
+    }
+
+    if (patch.screen_lock !== undefined) {
+      bulkUpdateScreenLock(idList, Boolean(patch.screen_lock));
+    }
+    if (patch.broadcast_url) {
+      bulkUpdateBroadcastUrl(idList, String(patch.broadcast_url), '');
+    }
+    if (patch.filter_mode !== undefined) {
+      bulkUpdateFilterMode(idList, String(patch.filter_mode),
+        patch.whitelist_urls, patch.blacklist_urls);
+    }
+  } catch (e) {
+    return { success: false, error: String(e) };
+  }
+  return { success: true, applied: idList.length, ka_active: kaApplied, ensure: ensureResult };
+}
+
+/** 設定から子GASのURL一覧を取り出す（重複除去・既定URL含む）。 */
+function shardAllChildUrls(cfg) {
+  const out = [];
+  const seen = {};
+  const push = function (u) {
+    const s = String(u || '').trim();
+    if (!s || seen[s]) return;
+    seen[s] = true;
+    out.push(s);
+  };
+  const idx = shardMapIndexFromMap(cfg && cfg.map);
+  const keys = Object.keys(idx);
+  for (let i = 0; i < keys.length; i++) push(idx[keys[i]]);
+  push(cfg && cfg.def);
+  return out;
+}
+
+/**
+ * 親GAS側: 教員コンソールの稼働状態を子GASへ伝達する。
+ *
+ * 【なぜ必要か】
+ *   教員は親コンソールにしかログインしない。子GASの isTeacherConsoleActive() は
+ *   自分への touch が無いため永久に false になり、子が担当する端末は
+ *   ka_active=false を受け取って同期を停止してしまう（分散化した瞬間に全端末停止）。
+ *   そこで親が touch/release のたびに子へ稼働状態を配る。
+ *
+ * 【負荷】
+ *   active=true は 30 秒に 1 回へ間引く（子側の判定窓は 120 秒なので十分）。
+ *   release は即時。子は 6 クラス程度なので、追加通信は毎分 12 回程度に収まる。
+ */
+function shardPropagateKaState(active) {
+  if (!isShardParent()) return { skipped: true };
+  try {
+    const cfg = shardConfigCached();
+    const urls = shardAllChildUrls(cfg);
+    if (!urls.length) return { skipped: true, reason: 'no_child' };
+
+    if (active) {
+      // 30 秒に 1 回へ間引く（子の KA_ACTIVE_WINDOW_MS=120秒 に対して十分細かい）
+      try {
+        const cache = CacheService.getScriptCache();
+        const k = 'shard_ka_ts';
+        const last = Number(cache.get(k) || '0');
+        const nowMs = new Date().getTime();
+        if (last && (nowMs - last) < 30000) return { throttled: true };
+        cache.put(k, String(nowMs), 180);
+      } catch (e) { /* キャッシュ不可時は毎回送る */ }
+    }
+
+    const body = JSON.stringify({
+      action: 'shard_apply',
+      shard_secret: cfg.sec,
+      student_ids: [],
+      ka_active: !!active
+    });
+    const results = [];
+    for (let i = 0; i < urls.length; i++) {
+      try {
+        const res = UrlFetchApp.fetch(urls[i], {
+          method: 'post', contentType: 'application/json', payload: body,
+          muteHttpExceptions: true
+        });
+        results.push({ ok: true, status: res.getResponseCode() });
+      } catch (e) {
+        results.push({ ok: false, error: String(e) });
+      }
+    }
+    return { sent: results.length, active: !!active };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+/**
+ * 親GAS側: 子GASの端末一覧を取得してマージするための材料を集める。
+ * 子側は shard_list で「その子が持つ全端末（スコープ適用前）」を返す。
+ * スコープ（学校・対象クラス）の適用は親が行う＝教員マスタの正は親にあるため。
+ */
+function shardFetchChildDevices() {
+  if (!isShardParent()) return [];
+  const out = [];
+  try {
+    const cfg = shardConfigCached();
+    const urls = shardAllChildUrls(cfg);
+    if (!urls.length) return [];
+    const body = JSON.stringify({ action: 'shard_list', shard_secret: cfg.sec });
+    for (let i = 0; i < urls.length; i++) {
+      try {
+        const res = UrlFetchApp.fetch(urls[i], {
+          method: 'post', contentType: 'application/json', payload: body,
+          muteHttpExceptions: true
+        });
+        if (res.getResponseCode() !== 200) continue;
+        const parsed = JSON.parse(res.getContentText() || '{}');
+        const list = (parsed && parsed.data) || [];
+        if (Array.isArray(list)) {
+          for (let k = 0; k < list.length; k++) {
+            list[k]._shard_source = urls[i];
+            out.push(list[k]);
+          }
+        }
+      } catch (e) { /* 1台の子が落ちても他の子の結果は返す */ }
+    }
+  } catch (e) { /* 分散が未設定なら空配列＝従来動作 */ }
+  return out;
+}
+
+/**
+ * 子GAS側: 親へ返す端末一覧（スコープ適用前の生データ）。
+ * 共有シークレットで認証するため、外部からは取得できない。
+ */
+function shardListForParent(payload) {
+  if (!isShardChild() && !isShardParent()) {
+    return { success: false, error: '子GASとして構成されていません' };
+  }
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized' };
+  }
+  // 教員情報を渡さずに呼ぶ＝スコープ無効（全件）。親が改めてスコープを掛ける。
+  const list = getAllDevices('ALL', { role: 'ADMIN' }, true);
+  return { success: true, data: list };
+}
+
+/**
+ * 親GAS側: マージ後の端末一覧に教員スコープを適用する。
+ * 学校スコープ・対象クラス・学校絞り込みの 3 条件を、getAllDevices と同じ規則で適用する。
+ * 解決済みの既存ヘルパー（getTeacherScopeInfo / isClassInTeacherScope /
+ * resolveCanonicalSchool / schoolNamesMatch）を再利用し、判定の二重実装を避ける。
+ */
+function shardFilterMergedDevices(list, filterSchool, teacher, includeUnassigned) {
+  const src = Array.isArray(list) ? list : [];
+  const scopeInfo = getTeacherScopeInfo(teacher);
+  const restrictToOwnSchool = scopeInfo.type === 'school' || scopeInfo.type === 'unknown';
+  const teacherSchool = scopeInfo.school || '';
+  const classRestricted = getTeacherTargetClasses(teacher).length > 0;
+
+  const out = [];
+  for (let i = 0; i < src.length; i++) {
+    const d = src[i] || {};
+    const schoolName = String(d.school_name || '').trim();
+    const className = String(d.class_name || '').trim();
+
+    // 0. 所属学校スコープ（一般教員は自校＋学校未設定のみ）
+    if (restrictToOwnSchool && schoolName && schoolName !== '未設定') {
+      const devCanonical = resolveCanonicalSchool(schoolName);
+      const isOwn = devCanonical ? (devCanonical === teacherSchool)
+                                 : schoolNamesMatch(schoolName, teacherSchool);
+      if (!isOwn) continue;
+    }
+
+    // 0.5 対象クラススコープ（権限の境界）
+    if (classRestricted && !isClassInTeacherScope(className, teacher)) continue;
+
+    // 1. 学校絞り込み（画面のフィルタ）
+    if (filterSchool && filterSchool !== 'ALL') {
+      if (filterSchool === 'UNASSIGNED') {
+        if (schoolName && schoolName !== '未設定') continue;
+      } else if (includeUnassigned) {
+        if (schoolName !== '未設定' && schoolName !== '' &&
+            !schoolNamesMatch(schoolName, filterSchool)) continue;
+      } else {
+        if (!schoolNamesMatch(schoolName, filterSchool)) continue;
+      }
+    }
+
+    out.push(d);
+  }
+  return applyMonitorVisibility(out);
+}
+
+/**
+ * 親GAS側: 親の端末一覧に子GASの端末を足して返す（教員は1画面のまま）。
+ * SHARD_MODE=false なら base をそのまま返す（従来動作と完全に同一）。
+ */
+function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
+  if (!isShardParent()) return base;
+  try {
+    const childList = shardFetchChildDevices();
+    if (!childList.length) return base;
+
+    const merged = (Array.isArray(base) ? base.slice() : []);
+    const seen = {};
+    for (let i = 0; i < merged.length; i++) {
+      const id = String(merged[i] && merged[i].student_id || '').trim();
+      if (id) seen[id] = true;
+    }
+
+    const extra = [];
+    for (let i = 0; i < childList.length; i++) {
+      const id = String(childList[i] && childList[i].student_id || '').trim();
+      if (!id || seen[id]) continue; // 親が既に持っている児童は親を正とする
+      seen[id] = true;
+      extra.push(childList[i]);
+    }
+    if (!extra.length) return merged;
+
+    // 子から来た分だけスコープを適用してから連結する
+    const filtered = shardFilterMergedDevices(extra, filterSchool, teacher, includeUnassigned);
+    return merged.concat(filtered);
+  } catch (e) {
+    return base; // マージに失敗しても親の一覧は必ず返す
+  }
+}
+
+/**
+ * 親GAS側: 子GASから届いたテレメトリ（在席状況・現在URL）を集約シートへ反映する。
+ * ロック/規制/配信などのポリシー列には一切触らない（正は親が持つ）。
+ */
+function shardUpsertTelemetryFromChild(payload) {
+  if (!isShardParent()) {
+    return { success: false, error: '親GASとして構成されていません' };
+  }
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  const rows = (payload && payload.rows) || [];
+  if (!Array.isArray(rows) || !rows.length) {
+    return { success: true, updated: 0 };
+  }
+
+  return withWriteLock(function () {
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    const data = sheet.getDataRange().getValues();
+    const idCol = headerMap['児童ID'] - 1;
+
+    // 既存行を索引化（毎回の全走査を1回に限定）
+    const rowIndex = {};
+    for (let i = 1; i < data.length; i++) {
+      const id = String(data[i][idCol] || '').trim();
+      if (id) rowIndex[id] = i + 1;
+    }
+
+    let updated = 0;
+    let appended = 0;
+
+    for (let k = 0; k < rows.length; k++) {
+      const r = rows[k] || {};
+      const id = String(r.student_id || '').trim();
+      if (!id) continue;
+
+      let rowNum = rowIndex[id];
+      if (!rowNum) {
+        // 親がまだ知らない端末（子から先に登録された場合）→ 行を作る
+        const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
+        newRow[headerMap['児童ID'] - 1] = id;
+        newRow[headerMap['学校名'] - 1] = String(r.school_name || '未設定');
+        newRow[headerMap['氏名'] - 1] = String(r.student_name || ('未登録児童 (' + id + ')'));
+        newRow[headerMap['クラス'] - 1] = String(r.class_name || '未設定');
+        newRow[headerMap['画面ロック'] - 1] = false;
+        newRow[headerMap['URL規制モード'] - 1] = 'OFF';
+        newRow[headerMap['現在開いているURL'] - 1] = String(r.current_url || '');
+        newRow[headerMap['最終同期日時'] - 1] = String(r.last_seen || '');
+        sheet.appendRow(newRow);
+        rowIndex[id] = data.length + appended + 1;
+        appended++;
+        continue;
+      }
+
+      // テレメトリ列のみ更新（ポリシー列は触らない）
+      const cells = [];
+      const put = function (colName, value) {
+        const c = headerMap[colName];
+        if (c) cells.push({ c: c, v: value });
+      };
+      if (r.current_url !== undefined) put('現在開いているURL', String(r.current_url || ''));
+      if (r.last_seen !== undefined) put('最終同期日時', String(r.last_seen || ''));
+      if (r.student_name !== undefined) put('氏名', String(r.student_name || ''));
+      if (r.class_name !== undefined) put('クラス', String(r.class_name || ''));
+      // 学校名は「未設定」のときだけ補完する（教員の手動設定を上書きしない）
+      if (r.school_name) {
+        const sc = headerMap['学校名'];
+        if (sc) {
+          const cur = String(data[rowNum - 1][sc - 1] || '').trim();
+          if (!cur || cur === '未設定') put('学校名', String(r.school_name));
+        }
+      }
+
+      for (let c = 0; c < cells.length; c++) {
+        sheet.getRange(rowNum, cells[c].c).setValue(cells[c].v);
+      }
+      updated++;
+    }
+
+    invalidateDevicesCache();
+    return { success: true, updated: updated, appended: appended };
+  });
+}
+
+/**
+ * 親GAS側: 教員操作を該当する子GASへ伝達する。
+ * 対象児童をクラスで束ね、子GASごとに 1 リクエストへまとめる（通信回数を最小化）。
+ * SHARD_MODE が false なら即 return（従来動作に一切影響しない）。
+ */
+function shardPropagatePolicy(studentIds, patch) {
+  if (!isShardParent()) return { skipped: true };
+  try {
+    const cfg = shardConfigCached();
+    const idx = shardMapIndexFromMap(cfg.map);
+    const defUrl = String(cfg.def || '').trim();
+    if (!Object.keys(idx).length && !defUrl) return { skipped: true, reason: 'no_child' };
+
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    const data = sheet.getDataRange().getValues();
+    const idCol = headerMap['児童ID'] - 1;
+    const clsCol = headerMap['クラス'] - 1;
+
+    const isAll = (studentIds === 'ALL' || !Array.isArray(studentIds));
+    const idSet = Array.isArray(studentIds) ? new Set(studentIds) : null;
+
+    const groups = {}; // url -> [studentId]
+    const groupClasses = {}; // url -> { studentId: 元のクラス名 }
+    for (let i = 1; i < data.length; i++) {
+      const id = String(data[i][idCol] || '').trim();
+      if (!id) continue;
+      if (!isAll && !(idSet && idSet.has(id))) continue;
+      const rawClass = String(data[i][clsCol] || '').trim();
+      const cls = normalizeShardClass(rawClass);
+      const url = idx[cls] || defUrl;
+      if (!url) continue;
+      if (!groups[url]) groups[url] = [];
+      groups[url].push(id);
+      // 子のシートで行を作るときにクラスを埋めるため、元の表記のまま渡す。
+      if (!groupClasses[url]) groupClasses[url] = {};
+      groupClasses[url][id] = rawClass;
+    }
+
+    const results = [];
+    const urls = Object.keys(groups);
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      try {
+        const res = UrlFetchApp.fetch(url, {
+          method: 'post',
+          contentType: 'application/json',
+          payload: JSON.stringify({
+            action: 'shard_apply',
+            shard_secret: cfg.sec,
+            student_ids: groups[url],
+            // 子が行を作るときにクラスを埋められるよう、児童ID→クラス名を添える。
+            class_map: groupClasses[url] || {},
+            patch: patch
+          }),
+          muteHttpExceptions: true
+        });
+        const code = res.getResponseCode();
+        // 子が「行を用意できなかった」場合は一括操作が効いていない。握りつぶさず伝える。
+        let childEnsure = null;
+        try {
+          const parsed = JSON.parse(res.getContentText() || '{}');
+          childEnsure = (parsed && parsed.ensure) || null;
+          if (childEnsure && childEnsure.error) {
+            results.push({ url: url, count: groups[url].length, status: code, ensure_error: childEnsure.error });
+            continue;
+          }
+        } catch (e2) { /* 本文が読めなくてもステータスは残す */ }
+        results.push({ url: url, count: groups[url].length, status: code, ensure: childEnsure });
+      } catch (e) {
+        results.push({ url: url, count: groups[url].length, error: String(e) });
+      }
+    }
+    return { sent: results };
+  } catch (e) {
+    // 子への伝達に失敗しても、親のシート更新（＝コンソール表示）は成立させる
+    return { error: String(e) };
+  }
+}
+
+/** 管理画面向け: 子GAS分散の現在の設定を返す（シークレットは伏せる）。 */
+function getShardSettingsForAdmin() {
+  const map = readShardMapRaw();
+  const idx = shardMapIndexFromMap(map);
+  const classes = Object.keys(map).map(function (k) {
+    return { class_name: k, normalized: normalizeShardClass(k), url: String(map[k] || '').trim() };
+  });
+  return {
+    shard_mode: isShardParent(),
+    child_mode: isShardChild(),
+    classes: classes,
+    normalized_count: Object.keys(idx).length,
+    default_url: readShardDefaultUrl(),
+    secret_configured: !!String((function () {
+      try { return PropertiesService.getScriptProperties().getProperty(SHARD_SECRET_PROP) || ''; }
+      catch (e) { return ''; }
+    })()),
+    max_per_class: 40
+  };
+}
+
+/** 管理画面向け: 子GAS分散の設定を保存する（管理者のみ）。 */
+function saveShardSettingsForAdmin(teacher, incoming) {
+  if (!isAdminTeacher(teacher)) throw new Error('管理者のみ設定できます');
+  const data = incoming || {};
+  const props = PropertiesService.getScriptProperties();
+
+  if (data.classes !== undefined) {
+    const src = Array.isArray(data.classes) ? data.classes : [];
+    const map = {};
+    for (let i = 0; i < src.length; i++) {
+      const cls = String((src[i] && src[i].class_name) || '').trim();
+      const url = String((src[i] && src[i].url) || '').trim();
+      if (!cls) continue;
+      if (!url) continue;
+      if (!/^https?:\/\//.test(url)) {
+        throw new Error('子GASのURLは http(s):// で始めてください: ' + cls);
+      }
+      map[cls] = url;
+    }
+    props.setProperty(SHARD_MAP_PROP, JSON.stringify(map));
+  }
+
+  if (data.default_url !== undefined) {
+    const d = String(data.default_url || '').trim();
+    if (d && !/^https?:\/\//.test(d)) throw new Error('既定URLは http(s):// で始めてください');
+    if (d) props.setProperty(SHARD_DEFAULT_PROP, d);
+    else props.deleteProperty(SHARD_DEFAULT_PROP);
+  }
+
+  // シークレットは「再発行」指定時のみ作り直す（子GASへ配り直しが必要になるため）
+  if (data.rotate_secret === true) {
+    props.deleteProperty(SHARD_SECRET_PROP);
+    getOrCreateShardSecret();
+  }
+
+  invalidateShardConfig();
+  return getShardSettingsForAdmin();
+}
+
 function jsonResponse(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
@@ -3131,6 +3912,7 @@ function api_verifySession(token) {
 }
 
 function api_getAllDevices(token, schoolName, includeUnassigned) {
+  // ※ 子GAS分散時は shardMergeDevices が子の端末も連結する（1画面維持）。
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };

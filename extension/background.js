@@ -664,6 +664,11 @@ function resolveGasUrl(data) {
   const school = String((data && data.school_name) || '').trim();
   const direct = String((data && data.gas_url) || '').trim();
 
+  // 子GAS分散（SHARD_MODE）: 親から割り当てられた子GASがあれば、それを最優先で使う。
+  // これが無い場合（＝従来運用・SHARD_MODE 無効）は、以下の学校名ベースの解決に進む。
+  const assigned = String((data && data.assigned_gas_url) || '').trim();
+  if (assigned) return assigned;
+
   if (school && school !== '未設定') {
     // 完全一致
     if (map[school] && String(map[school]).trim()) return String(map[school]).trim();
@@ -677,6 +682,113 @@ function resolveGasUrl(data) {
     }
   }
   return direct;
+}
+
+// ==================== 子GAS分散（SHARD_MODE）: 動的ルーティング ====================
+// 1校240台 × 1.5秒周期 ≒ 160 req/秒 を 1 つの GAS で受けると、GAS の
+// 「同時実行 30/ユーザー」に達する。そこで親GASが端末のクラスから子GASを割り当て、
+// 端末は以後その子GASへ直接ハートビートする（親は割り当ての指示だけを出す）。
+//
+// 【端末側の状態】
+//   assigned_gas_url   … 割り当てられた子GASのURL（空＝親に繋ぐ）
+//   assigned_from      … 割り当てを出した親のURL（再確認・切り戻し先）
+//   assigned_at        … 割り当てを受けた時刻（エポックms）
+//   assigned_class     … 割り当ての根拠になったクラス（表示・診断用）
+//   assigned_fail_count… 子GASへの連続失敗回数（閾値で親へ戻す）
+const SHARD_RECHECK_MS = 6 * 60 * 60 * 1000; // 6時間ごとに親へ再確認（クラス変更に追従）
+const SHARD_FAIL_LIMIT = 3;                  // 子GASへ3回連続で失敗したら親へ戻す
+const SHARD_COOLDOWN_MS = 30 * 60 * 1000;    // 切り戻し後30分は再割り当てを受けない（失敗の無限往復を防ぐ）
+
+// 割り当て状態のメモリ上の写し。
+//   同期の先頭で storage.local.get(null) を 1 回読んでいるので、その値で初期化する。
+//   これにより 1.5 秒ごとの判定で余分なストレージ読み取りを行わない。
+let shardAssignedCache = '';
+let shardFailCount = 0;
+
+function shardAssignedUrl(data) {
+  return String((data && data.assigned_gas_url) || '').trim();
+}
+
+/** 同期の先頭で読み込んだ data から、割り当て状態のメモリ写しを作る。 */
+function shardSyncMemory(data) {
+  shardAssignedCache = shardAssignedUrl(data);
+  shardFailCount = Number((data && data.assigned_fail_count) || 0) || 0;
+}
+
+/**
+ * 親の応答に含まれる assigned_gas_url を保存し、次回以降の通信先を切り替える。
+ * 子GASは assigned_gas_url を返さないため、子と通信している間は割り当てが維持される。
+ * 親と通信していて assigned_gas_url が返らない場合は、分散が無効化されたとみなして
+ * 割り当てを捨てる（子GASを廃止したときに端末が取り残されないようにする）。
+ *
+ * ※ talkingToParent のときは、値が変わらなくても assigned_at を更新する。
+ *   これが無いと「6時間経過」の条件が永久に真になり、以後ずっと親へ送り続けてしまう。
+ */
+async function applyShardAssignment(resJson, data, usedUrl, talkingToParent) {
+  const next = String((resJson && resJson.assigned_gas_url) || '').trim();
+  const cur = shardAssignedUrl(data);
+  const patch = {};
+
+  if (next) {
+    // 切り戻し直後のクールダウン中は再割り当てを受けない。
+    const fbAt = Number((data && data.shard_fallback_at) || 0);
+    if (!cur && fbAt && (Date.now() - fbAt) < SHARD_COOLDOWN_MS) return;
+
+    if (next !== cur || talkingToParent) {
+      patch.assigned_gas_url = next;
+      patch.assigned_at = Date.now(); // 変更なしでも再確認時刻を更新（B1 の修正）
+      patch.assigned_class = String((resJson && resJson.assigned_class) || '');
+      patch.assigned_fail_count = 0;
+      if (talkingToParent) patch.assigned_from = String(usedUrl || '');
+      else if (!cur) patch.assigned_from = String((data && data.assigned_from) || '');
+      if (data && data.shard_fallback) patch.shard_fallback = false;
+      if (fbAt) patch.shard_fallback_at = 0;
+    }
+  } else if (talkingToParent && cur) {
+    // 親が割り当てを返さない＝SHARD_MODE 無効／マップ削除。親へ戻す。
+    patch.assigned_gas_url = '';
+    patch.assigned_at = 0;
+    patch.assigned_class = '';
+    patch.assigned_from = '';
+    patch.assigned_fail_count = 0;
+  }
+
+  if (Object.keys(patch).length) {
+    try { await chrome.storage.local.set(patch); } catch (e) {}
+    shardAssignedCache = String(patch.assigned_gas_url || '');
+    shardFailCount = 0;
+  }
+}
+
+/**
+ * 子GASへの同期結果を数え、連続失敗が閾値に達したら割り当てを捨てて親へ戻す。
+ * 子GASのURL誤り・デプロイ漏れ・共有シークレット相違などで端末が孤立するのを防ぐ。
+ *
+ * ※ 未割り当て（従来運用・SHARD_MODE 無効）のときは何もせず、ストレージも読まない。
+ */
+async function noteShardOutcome(ok) {
+  try {
+    if (!shardAssignedCache) return;
+    if (ok) {
+      if (shardFailCount !== 0) {
+        shardFailCount = 0;
+        await chrome.storage.local.set({ assigned_fail_count: 0 });
+      }
+      return;
+    }
+    shardFailCount += 1;
+    if (shardFailCount >= SHARD_FAIL_LIMIT) {
+      shardAssignedCache = '';
+      shardFailCount = 0;
+      await chrome.storage.local.set({
+        assigned_gas_url: '', assigned_at: 0, assigned_class: '',
+        assigned_from: '', assigned_fail_count: 0,
+        shard_fallback: true, shard_fallback_at: Date.now()
+      });
+    } else {
+      await chrome.storage.local.set({ assigned_fail_count: shardFailCount });
+    }
+  } catch (e) {}
 }
 
 // 同期の多重実行ガード。
@@ -697,6 +809,8 @@ async function recordSyncDiag(ok, code, message) {
   const changed = (lastSyncDiag.ok !== ok) || (lastSyncDiag.code !== code) ||
                   (lastSyncDiag.message !== message);
   lastSyncDiag = { ok: !!ok, code: String(code || ''), message: String(message || ''), at: at };
+  // 子GAS分散: 子へ連続失敗したら親へ戻す（変化の有無に関わらず毎回判定する）
+  try { await noteShardOutcome(!!ok); } catch (e) {}
   if (!changed) return; // 変化なし＝ストレージ書込みしない（I/O を増やさない）
   try {
     await chrome.storage.local.set({
@@ -748,6 +862,8 @@ async function syncWithGas() {
   syncInFlight = true;
   try {
     const data = await chrome.storage.local.get(null);
+    // 子GAS分散: 割り当て状態をメモリへ写す（以降の判定でストレージを読まない）
+    shardSyncMemory(data);
     let studentId = data.student_id;
 
     // もし student_id が未設定の場合、Googleアカウントの再検出を試みる
@@ -762,6 +878,17 @@ async function syncWithGas() {
     // 学校名 → GAS URL を解決（1つの拡張機能で13校のGASへ振り分け）。
     // まず保存済みの school_name / gas_url_map から解決する。
     let effectiveGasUrl = resolveGasUrl(data);
+
+    // 子GAS分散（SHARD_MODE）: 割り当て済みなら子GASへ直接送る（resolveGasUrl が最優先で返す）。
+    // ただし 6 時間ごとに親へ問い合わせ直し、クラス変更などで割り当てが変わった場合に追従する。
+    const assignedFromUrl = String((data && data.assigned_from) || '').trim();
+    const assignedAtMs = Number((data && data.assigned_at) || 0);
+    let talkingToParent = !shardAssignedUrl(data);
+    if (shardAssignedUrl(data) && assignedFromUrl && assignedAtMs &&
+        (Date.now() - assignedAtMs) > SHARD_RECHECK_MS) {
+      effectiveGasUrl = assignedFromUrl; // 今回は親へ（応答で新しい割り当てが返る）
+      talkingToParent = true;
+    }
 
     // 端末の学校名も heartbeat で GAS へ送る。
     // これが無いと GAS 側は端末一覧を「学校名 = 未設定」で登録してしまい、
@@ -867,6 +994,10 @@ async function syncWithGas() {
         'GASがエラーを返しました: ' + String(resJson.error || '(詳細なし)'));
       return;
     }
+
+    // 子GAS分散: 親からの割り当て（assigned_gas_url）を保存し、次回以降の通信先を切り替える。
+    // ※ applyPolicies より先に評価するため、data（更新前）と実使用URLを渡す。
+    await applyShardAssignment(resJson, data, effectiveGasUrl, talkingToParent);
 
     // 最新ポリシーの反映
     await applyPolicies(resJson, data);
