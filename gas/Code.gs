@@ -3250,6 +3250,43 @@ function getOrCreateShardSecret() {
   }
 }
 
+/**
+ * 【初期設定用】親GASの共有シークレットを生成して実行ログに出す。
+ * エディタ上部の関数選択から実行する（手順書 §4-1）。
+ * 生成は冪等。既に値があればそれを返す（変更しない）。
+ */
+function generateShardSecretForSetup() {
+  const s = getOrCreateShardSecret();
+  if (!s) {
+    Logger.log('SHARD_SECRET の生成に失敗しました。スクリプトプロパティへの書き込み権限を確認してください。');
+    return '';
+  }
+  Logger.log('SHARD_SECRET = ' + s);
+  Logger.log('この値を全子GASのスクリプトプロパティ SHARD_SECRET に同じ内容で設定してください。');
+  return s;
+}
+
+/**
+ * 【初期設定用】共有シークレットを再発行する（漏洩時のみ）。
+ * 実行後は全子GASに新しい値を設定し直すこと（手順書 §4-3）。
+ */
+function rotateShardSecretForSetup() {
+  try {
+    PropertiesService.getScriptProperties().deleteProperty(SHARD_SECRET_PROP);
+  } catch (e) {
+    Logger.log('既存 SHARD_SECRET の削除に失敗しました: ' + e);
+  }
+  const s = getOrCreateShardSecret();
+  invalidateShardConfig();
+  if (!s) {
+    Logger.log('SHARD_SECRET の再発行に失敗しました。');
+    return '';
+  }
+  Logger.log('新しい SHARD_SECRET = ' + s);
+  Logger.log('全子GASのスクリプトプロパティ SHARD_SECRET をこの値に更新してください。');
+  return s;
+}
+
 /** 受け取ったシークレットが正しいか。未設定なら常に false（安全側）。 */
 function shardSecretMatches(given) {
   let expect = '';
