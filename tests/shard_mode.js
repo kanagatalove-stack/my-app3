@@ -80,7 +80,12 @@ async function main() {
     DEVICE_COLUMNS: ['児童ID','学校名','氏名','クラス','画面ロック','URL規制モード','許可URLリスト','規制URLリスト','一斉表示URL','一斉表示実行ID','現在開いているURL','最終同期日時','備考'],
     DEVICE_SHEET_NAME: '端末一覧',
     SHARD_MODE: false,
-    SHARD_CHILD_MODE: false
+    SHARD_CHILD_MODE: false,
+    // プロパティ未設定時に使う既定値（本番 CONFIG と同じ役割）
+    SHARD_MAP: {},
+    SHARD_DEFAULT_URL: '',
+    SHARD_SECRET: '',
+    SPREADSHEET_ID: 'SS_TEST'
   };
 
   const touchLog = [];
@@ -160,9 +165,20 @@ async function main() {
   gasBundle += lineConst(gasSrc, 'SHARD_CFG_CACHE') + '\n';
   gasBundle += lineConst(gasSrc, 'SHARD_LIST_CACHE_TTL') + '\n';
   gasBundle += lineConst(gasSrc, 'SHARD_LIST_CACHE_PREFIX') + '\n';
+  // 動的解決（スクリプトプロパティ優先）用の定数
+  gasBundle += lineConst(gasSrc, 'PROP_SHARD_MODE') + '\n';
+  gasBundle += lineConst(gasSrc, 'PROP_SHARD_CHILD_MODE') + '\n';
+  gasBundle += lineConst(gasSrc, 'PROP_SPREADSHEET_ID') + '\n';
+  gasBundle += lineConst(gasSrc, 'SHARD_MODE_CACHE') + '\n';
+  gasBundle += lineConst(gasSrc, 'SHARD_SSID_CACHE') + '\n';
+  gasBundle += lineConst(gasSrc, 'SHARD_PARENT_PROP') + '\n';
+  gasBundle += lineConst(gasSrc, 'SHARD_LOOKUP_CACHE_PREFIX') + '\n';
   [
     // shardEnsureDeviceRows / shardUpsert 系が使う排他制御（実物をそのまま使う）
     'withWriteLock',
+    // 動的解決（スクリプトプロパティ優先・CONFIG フォールバック）
+    'cfgWarn','propRaw','propBool','propStr','shardModeFlags','shardWarnOnce',
+    'shardMapDefaultFromEmptyKey',
     'isShardParent','isShardChild','normalizeShardClass',
     'readShardMapRaw','readShardDefaultUrl','getOrCreateShardSecret','shardSecretMatches',
     'shardConfigCached','invalidateShardConfig','shardMapIndexFromMap',
@@ -170,7 +186,10 @@ async function main() {
     'shardAllChildUrls','shardPropagateKaState',
     // fetchAll 並列化・キャッシュ・教員スコープ絞り込み（今回の最適化）
     'shardHash','shardDevVersion','shardFetchMany','shardUrlsForTeacher',
-    'shardFetchChildDevices','getShardMergedDevices','shardPropagatePolicy'
+    'shardFetchChildDevices','getShardMergedDevices','shardPropagatePolicy',
+    // 児童ID照合と親名簿照会（クラス未取得の端末を救う経路）
+    'normalizeIdKey','findStudentById','shardLookupStudent','readShardParentUrl',
+    'shardLookupFromParent','hbChildIdentityLookup','hbApplyChildIdentity'
   ].forEach(n => { gasBundle += extract(gasSrc, n) + '\n'; });
 
   vm.createContext(ctx);
@@ -705,6 +724,148 @@ async function main() {
     gstate.mergeCalls > beforeMergeBump, { before: beforeMergeBump, after: gstate.mergeCalls });
 
   CONFIG.SHARD_MODE = true;
+
+  // =========================================================================
+  // §1-7 児童IDの照合（表記ゆれ吸収）— クラス未取得の根本原因に対処
+  // =========================================================================
+  console.log('===== [GAS] 児童IDの照合（表記ゆれ吸収） =====');
+  const nid = ctx.normalizeIdKey;
+  check('前後の空白を無視する',
+    nid('  a@b.ed.jp  ') === nid('a@b.ed.jp'), nid('  a@b.ed.jp  '));
+  check('大文字小文字を無視する',
+    nid('A@B.ED.JP') === nid('a@b.ed.jp'), nid('A@B.ED.JP'));
+  check('全角英数字を半角に寄せる',
+    nid('１６０７００２＠ＣＩＴＹ.ed.jp') === nid('1607002@city.ed.jp'),
+    nid('１６０７００２＠ＣＩＴＹ.ed.jp'));
+  check('途中の空白を除去する',
+    nid('1607002 @ city.ed.jp') === nid('1607002@city.ed.jp'), nid('1607002 @ city.ed.jp'));
+  check('空文字は空のまま', nid('') === '' , nid(''));
+  check('null / undefined でも落ちない', nid(null) === '' && nid(undefined) === '');
+
+  // =========================================================================
+  // §1-8 親の名簿（端末一覧）から氏名・クラスを引く／子が親へ照会する
+  // =========================================================================
+  console.log('===== [GAS] 名簿照会: 親が答える / 子が補完する =====');
+  const COLS2 = CONFIG.DEVICE_COLUMNS;
+  function headerMapOf(cols) {
+    const m = {};
+    cols.forEach(function (c, i) { m[c] = i + 1; });
+    return m;
+  }
+  const hmap = headerMapOf(COLS2);
+  function rowWith(id, school, name, cls) {
+    const r = new Array(COLS2.length).fill('');
+    r[hmap['児童ID'] - 1] = id;
+    r[hmap['学校名'] - 1] = school;
+    r[hmap['氏名'] - 1] = name;
+    r[hmap['クラス'] - 1] = cls;
+    return r;
+  }
+
+  gstate.props = makeProps({
+    SHARD_SECRET: 'sk_test12345678',
+    SHARD_MAP_V1: JSON.stringify({ '5年1組': 'https://child-a/exec' })
+  });
+  gstate.cache = makeCache();
+  gstate.headerMap = hmap;
+  gstate.sheet = makeSheet(COLS2, [
+    COLS2.slice(),
+    rowWith('1607002@city-mimasaka.ed.jp', '第一小学校', 'テスト太郎', '5年1組')
+  ]);
+  ctx.invalidateShardConfig();
+  CONFIG.SHARD_MODE = true;
+  CONFIG.SHARD_CHILD_MODE = false;
+
+  const found = ctx.findStudentById('1607002@city-mimasaka.ed.jp');
+  check('名簿から氏名を取得できる', !!found && found.student_name === 'テスト太郎', found);
+  check('名簿からクラスを取得できる', !!found && found.class_name === '5年1組', found);
+  check('行番号も返す（書き込み先の特定に使う）', !!found && found.row_number === 2, found);
+
+  const foundLoose = ctx.findStudentById(' 1607002@CITY-MIMASAKA.ed.jp ');
+  check('表記ゆれ（空白・大文字）でも同じ児童を引ける',
+    !!foundLoose && foundLoose.student_name === 'テスト太郎', foundLoose);
+
+  const foundFull = ctx.findStudentById('１６０７００２＠city-mimasaka.ed.jp');
+  check('全角の児童IDでも引ける', !!foundFull && foundFull.class_name === '5年1組', foundFull);
+
+  check('存在しない児童は null', ctx.findStudentById('nobody@x.ed.jp') === null);
+  check('空の児童IDは null', ctx.findStudentById('') === null);
+
+  // 親が子へ「誰か」を答える（クラス＋割り当て先を同時に返す）
+  const look = ctx.shardLookupStudent('1607002@city-mimasaka.ed.jp');
+  check('親の照会応答に found=true を立てる', look.found === true, look);
+  check('親の照会応答に氏名を含める', look.student_name === 'テスト太郎', look.student_name);
+  check('親の照会応答にクラスを含める', look.class_name === '5年1組', look.class_name);
+  check('親の照会応答に割り当て先GASを含める（これが無いと子へ切替できない）',
+    look.assigned_gas_url === 'https://child-a/exec', look.assigned_gas_url);
+  check('未知の児童は found=false を返す（例外にしない）',
+    ctx.shardLookupStudent('nobody@x.ed.jp').found === false);
+
+  // 子GAS: 子シートの A〜D 列が空なら親の名簿で補完する
+  CONFIG.SHARD_CHILD_MODE = true;
+  CONFIG.SHARD_MODE = false;
+  gstate.headerMap = hmap;
+  // 子のシート: 氏名が「〜(Googleアカウント)」・クラスが「未設定」＝実機で起きていた状態
+  gstate.sheet = makeSheet(COLS2, [
+    COLS2.slice(),
+    rowWith('1607002@city-mimasaka.ed.jp', '未設定', '1607002 (Googleアカウント)', '未設定')
+  ]);
+  gstate.props = makeProps({
+    SHARD_SECRET: 'sk_test12345678',
+    SHARD_PARENT_URL: 'https://parent/exec'
+  });
+  gstate.cache = makeCache();
+  ctx.invalidateShardConfig();
+  fetchLog.length = 0;
+  // 親への照会応答を差し替える（実機の shard_lookup 応答と同じ形）
+  const origFetch = ctx.UrlFetchApp.fetch;
+  ctx.UrlFetchApp.fetch = function (url, opt) {
+    fetchLog.push({ url: url, payload: String((opt && opt.payload) || '') });
+    return {
+      getResponseCode() { return 200; },
+      getContentText() {
+        return JSON.stringify({
+          success: true, found: true,
+          student_id: '1607002@city-mimasaka.ed.jp',
+          student_name: 'テスト太郎', school_name: '第一小学校', class_name: '5年1組',
+          assigned_gas_url: 'https://child-a/exec', assigned_class: '5-1'
+        });
+      }
+    };
+  };
+
+  const childRow = gstate.sheet._rows[1];
+  const filled = ctx.hbApplyChildIdentity(
+    gstate.sheet, 2, childRow, hmap, '1607002@city-mimasaka.ed.jp');
+  check('子シートのクラスが親の名簿で補完される',
+    gstate.sheet._rows[1][hmap['クラス'] - 1] === '5年1組',
+    gstate.sheet._rows[1][hmap['クラス'] - 1]);
+  check('子シートの氏名も本名へ補完される',
+    gstate.sheet._rows[1][hmap['氏名'] - 1] === 'テスト太郎',
+    gstate.sheet._rows[1][hmap['氏名'] - 1]);
+  check('子シートの学校名も補完される',
+    gstate.sheet._rows[1][hmap['学校名'] - 1] === '第一小学校',
+    gstate.sheet._rows[1][hmap['学校名'] - 1]);
+  check('補完したことを true で返す', filled === true, filled);
+  check('親へ shard_lookup を送っている（子が名簿を持たないため必須）',
+    fetchLog.length === 1 && /"action":"shard_lookup"/.test(fetchLog[0].payload), fetchLog);
+
+  // 既に正しい値が入っていれば親へ問い合わせない（無駄な通信をしない）
+  fetchLog.length = 0;
+  const noNeed = ctx.hbApplyChildIdentity(
+    gstate.sheet, 2, gstate.sheet._rows[1], hmap, '1607002@city-mimasaka.ed.jp');
+  check('補完済みなら子は親へ問い合わせない', noNeed === false && fetchLog.length === 0,
+    { ret: noNeed, fetches: fetchLog.length });
+
+  // 親URLが未設定なら照会しない（従来動作のまま安全に動く）
+  gstate.props = makeProps({ SHARD_SECRET: 'sk_test12345678' });
+  gstate.cache = makeCache();
+  ctx.invalidateShardConfig();
+  check('SHARD_PARENT_URL 未設定なら null（例外にしない）',
+    ctx.shardLookupFromParent('1607002@city-mimasaka.ed.jp') === null);
+  check('親URL未設定でも normalizeIdKey は動く', ctx.normalizeIdKey(' A@B ') === 'a@b');
+
+  ctx.UrlFetchApp.fetch = origFetch;
 
   console.log('');
   console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');

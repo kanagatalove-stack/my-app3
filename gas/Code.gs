@@ -50,6 +50,11 @@ const CONFIG = {
   SHARD_CHILD_MODE: false,
   // 子へポリシーを伝達したときの通信タイムアウト（ミリ秒）
   SHARD_FETCH_TIMEOUT_MS: 8000,
+  // スクリプトプロパティが未設定・不正なときに使う既定値（フォールバック）。
+  // ※ 通常運用ではスクリプトプロパティ側で設定する。ここは「最後の砦」。
+  //   SHARD_MAP の空キー "" は「クラスが特定できない端末の既定ルーティング先」。
+  SHARD_MAP: {},
+  SHARD_DEFAULT_URL: '',
 
   // 端末一覧 列定義
   DEVICE_COLUMNS: [
@@ -108,14 +113,16 @@ const CONFIG = {
  * シートオブジェクトを取得
  */
 function getTargetSheet(sheetName) {
+  // 書き込み先スプレッドシートIDはスクリプトプロパティ優先（子GASはここで子シートを指定）。
+  const spreadsheetId = getSpreadsheetId();
   let ss;
   try {
-    ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    ss = SpreadsheetApp.openById(spreadsheetId);
   } catch (err) {
     ss = SpreadsheetApp.getActiveSpreadsheet();
   }
   if (!ss) {
-    throw new Error('スプレッドシートを開けませんでした。ID: ' + CONFIG.SPREADSHEET_ID);
+    throw new Error('スプレッドシートを開けませんでした。ID: ' + spreadsheetId);
   }
 
   // シート名が未定義だと getSheetByName(undefined)→insertSheet(undefined) となり
@@ -443,6 +450,14 @@ function doPost(e) {
     if (action === 'shard_list') {
       return jsonResponse(shardListForParent(payload));
     }
+    // 子GASが「この児童は誰か（氏名・学校・クラス）」を親の名簿へ問い合わせる。
+    // 子は名簿を持たないため、これが無いとクラス未取得の端末が永久に直らない。
+    if (action === 'shard_lookup') {
+      if (!shardSecretMatches(payload && payload.shard_secret)) {
+        return jsonResponse({ success: false, found: false, error: 'unauthorized' });
+      }
+      return jsonResponse(shardLookupStudent(payload.student_id));
+    }
 
     // B. 教員ログイン認証
     if (action === 'login') {
@@ -741,7 +756,7 @@ function generateToken(teacher) {
   };
   const jsonStr = JSON.stringify(payload);
   const base64 = Utilities.base64EncodeWebSafe(jsonStr);
-  const signature = Utilities.computeHmacSha256Signature(base64, CONFIG.SPREADSHEET_ID);
+  const signature = Utilities.computeHmacSha256Signature(base64, getTokenSecret());
   const sigBase64 = Utilities.base64EncodeWebSafe(signature);
   return `${base64}.${sigBase64}`;
 }
@@ -758,7 +773,7 @@ function verifyToken(token) {
     const base64 = parts[0];
     const signature = parts[1];
 
-    const expectedSig = Utilities.computeHmacSha256Signature(base64, CONFIG.SPREADSHEET_ID);
+    const expectedSig = Utilities.computeHmacSha256Signature(base64, getTokenSecret());
     const expectedSigBase64 = Utilities.base64EncodeWebSafe(expectedSig);
 
     if (signature !== expectedSigBase64) return { valid: false };
@@ -2117,7 +2132,7 @@ function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActiv
 
     let reRow = -1;
     for (let i = 1; i < data.length; i++) {
-      if (String(data[i][idColIdx]).trim() === String(studentId).trim()) { reRow = i + 1; break; }
+      if (normalizeIdKey(data[i][idColIdx]) === normalizeIdKey(studentId)) { reRow = i + 1; break; }
     }
 
     if (reRow !== -1) {
@@ -2141,12 +2156,30 @@ function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActiv
       const userPart = studentId.split('@')[0];
       initialName = userPart + ' (Googleアカウント)';
     }
+    let initialClass = '未設定';
+    let initialSchool = incomingSchool || '未設定';
+
+    // 子GASの初回登録時: 親の名簿に載っていれば、最初から正しい氏名・クラスで作る。
+    // （後から補完するより、A〜D列が空の行を一瞬も作らない方が運用上きれい）
+    if (typeof hbChildIdentityLookup === 'function') {
+      try {
+        const info = hbChildIdentityLookup(studentId);
+        if (info && info.found) {
+          const n = String(info.student_name || '').trim();
+          const c = String(info.class_name || '').trim();
+          const s = String(info.school_name || '').trim();
+          if (n && n !== '未設定') initialName = n;
+          if (c && c !== '未設定') initialClass = c;
+          if (s && s !== '未設定') initialSchool = s;
+        }
+      } catch (e) { /* 名簿照会に失敗しても登録自体は続ける */ }
+    }
 
     const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
     newRow[headerMap['児童ID'] - 1] = studentId;
-    newRow[headerMap['学校名'] - 1] = incomingSchool || '未設定';
+    newRow[headerMap['学校名'] - 1] = initialSchool;
     newRow[headerMap['氏名'] - 1] = initialName;
-    newRow[headerMap['クラス'] - 1] = '未設定';
+    newRow[headerMap['クラス'] - 1] = initialClass;
     newRow[headerMap['画面ロック'] - 1] = false;
     newRow[headerMap['URL規制モード'] - 1] = 'OFF';
     newRow[headerMap['許可URLリスト'] - 1] = 'nhk.or.jp, scratch.mit.edu, google.com';
@@ -2213,8 +2246,10 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
 
     const data = sheet.getDataRange().getValues();
     const idColIdx = headerMap['児童ID'] - 1;
+    // 照合は正規化して行う（大文字小文字・全角半角・空白の揺れを吸収）
+    const wantId = normalizeIdKey(studentId);
     for (let i = 1; i < data.length; i++) {
-      if (String(data[i][idColIdx]).trim() === String(studentId).trim()) {
+      if (normalizeIdKey(data[i][idColIdx]) === wantId) {
         rowNum = i + 1;
         row = data[i];
         break;
@@ -2225,6 +2260,18 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
       return hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now);
     }
     hbPutCachedRow(studentId, rowNum, row, devVer);
+  }
+
+  // ---- 2.5) 子GAS: 氏名・学校名・クラスが未取得なら親の名簿で補完する ----
+  // 空キー既定のフォールバックで子へ直行した端末は、子に名簿が無いため
+  // クラス='未設定' のままになる。放置すると assigned_gas_url が永久に返らない。
+  if (typeof hbApplyChildIdentity === 'function') {
+    try {
+      if (hbApplyChildIdentity(sheet, rowNum, row, headerMap, studentId)) {
+        if (!sheet) sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+        hbPutCachedRow(studentId, rowNum, row, devVer);
+      }
+    } catch (e) { /* 補完失敗でも通常のハートビートは続ける */ }
   }
 
   // ---- 3) 書き込みが必要かの判定（従来と同じ基準） ----
@@ -3183,14 +3230,383 @@ function parseUrlList(val) {
 const SHARD_MAP_PROP = 'SHARD_MAP_V1';       // { "5年1組": "https://…/exec" }
 const SHARD_DEFAULT_PROP = 'SHARD_DEFAULT_URL'; // クラス不明時の既定の子GAS
 const SHARD_SECRET_PROP = 'SHARD_SECRET';    // 親⇔子の共有シークレット
+// 子GASが「親の名簿に問い合わせる先」＝親GASのデプロイURL（子にだけ設定する）
+const SHARD_PARENT_PROP = 'SHARD_PARENT_URL';
+const SHARD_LOOKUP_CACHE_PREFIX = 'shlk_';   // 名簿照会のキャッシュ
 const SHARD_CFG_CACHE = 'shard_cfg3';        // 設定のキャッシュキー（5分）
 
+// ==================== 設定値の動的解決（スクリプトプロパティ優先） ====================
+//
+// 【設計】
+//   コード内の CONFIG は「既定値」であり、実運用の値はスクリプトプロパティに置く。
+//   読み取り順は スクリプトプロパティ → CONFIG の順（プロパティ優先）。
+//   プロパティが未設定・空・型変換不能な場合は、警告を出したうえで CONFIG に戻す。
+//   これにより「クラス追加・子GAS追加のたびにコードを書き換えて再デプロイする」
+//   必要がなくなる（プロパティを変えるだけでよい）。
+//
+// 【性能】
+//   isShardParent() はハートビートのホットパスから呼ばれる。毎回 PropertiesService を
+//   読むと 3〜5ms の応答が崩れるため、真偽値は CacheService に 60 秒キャッシュする
+//   （管理画面で保存したときは invalidateShardConfig() が即時破棄する）。
+
+const PROP_SHARD_MODE = 'SHARD_MODE';
+const PROP_SHARD_CHILD_MODE = 'SHARD_CHILD_MODE';
+const PROP_SPREADSHEET_ID = 'SPREADSHEET_ID';
+const SHARD_MODE_CACHE = 'shard_mode1';   // 真偽値キャッシュ（60秒）
+const SHARD_SSID_CACHE = 'shard_ssid1';   // スプレッドシートIDキャッシュ（300秒）
+
+/** 設定の警告を実行ログへ出す（Logger が無い環境でも落ちない）。 */
+function cfgWarn(msg) {
+  try { Logger.log('[CONFIG] ' + msg); } catch (e) { /* ログ不可は無視 */ }
+}
+
+/** プロパティの生値を返す。未設定は null（空文字と区別する）。 */
+function propRaw(name) {
+  try {
+    const v = PropertiesService.getScriptProperties().getProperty(name);
+    if (v === null || v === undefined) return null;
+    return String(v);
+  } catch (e) {
+    return null;
+  }
+}
+
+/** プロパティを真偽値として読む。不正値・空は fallback へ戻す。 */
+function propBool(name, fallback) {
+  const fb = !!fallback;
+  const raw = propRaw(name);
+  if (raw === null) return fb;
+  const s = raw.trim().toLowerCase();
+  if (!s) {
+    cfgWarn(name + ' が空です。CONFIG の既定値（' + fb + '）を使用します。');
+    return fb;
+  }
+  if (s === 'true' || s === '1' || s === 'yes' || s === 'on') return true;
+  if (s === 'false' || s === '0' || s === 'no' || s === 'off') return false;
+  cfgWarn(name + ' の値「' + raw + '」は真偽値として解釈できません。CONFIG の既定値（' + fb + '）を使用します。');
+  return fb;
+}
+
+/** プロパティを文字列として読む。空は fallback へ戻す。 */
+function propStr(name, fallback) {
+  const fb = String(fallback === undefined || fallback === null ? '' : fallback);
+  const raw = propRaw(name);
+  if (raw === null) return fb;
+  const s = raw.trim();
+  if (!s) {
+    if (fb) cfgWarn(name + ' が空です。CONFIG の既定値を使用します。');
+    return fb;
+  }
+  return s;
+}
+
+/** SHARD_MODE / SHARD_CHILD_MODE をプロパティ優先で解決する（60秒キャッシュ）。 */
+function shardModeFlags() {
+  try {
+    const c = CacheService.getScriptCache();
+    const hit = c.get(SHARD_MODE_CACHE);
+    if (hit) {
+      const o = JSON.parse(hit);
+      if (o && typeof o === 'object' && typeof o.parent === 'boolean' && typeof o.child === 'boolean') return o;
+    }
+  } catch (e) { /* キャッシュ不可時は都度評価 */ }
+
+  const flags = {
+    parent: propBool(PROP_SHARD_MODE, !!(CONFIG && CONFIG.SHARD_MODE === true)),
+    child: propBool(PROP_SHARD_CHILD_MODE, !!(CONFIG && CONFIG.SHARD_CHILD_MODE === true))
+  };
+  try { CacheService.getScriptCache().put(SHARD_MODE_CACHE, JSON.stringify(flags), 60); } catch (e) {}
+  return flags;
+}
+
+/**
+ * 書き込み先スプレッドシートIDを解決する（プロパティ優先）。
+ * 親は親シート、子は子シートを指す。プロパティを変えるだけで切り替えられる。
+ */
+function getSpreadsheetId() {
+  const fallback = String((CONFIG && CONFIG.SPREADSHEET_ID) || '').trim();
+  try {
+    const c = CacheService.getScriptCache();
+    const hit = c.get(SHARD_SSID_CACHE);
+    if (hit) return hit;
+  } catch (e) { /* 無視 */ }
+
+  const id = propStr(PROP_SPREADSHEET_ID, fallback);
+  if (!id) {
+    cfgWarn('SPREADSHEET_ID を解決できませんでした（プロパティも CONFIG も空）。');
+  }
+  try { CacheService.getScriptCache().put(SHARD_SSID_CACHE, id, 300); } catch (e) {}
+  return id;
+}
+
+/**
+ * トークン署名鍵。SPREADSHEET_ID に依存させず、共有シークレットを最優先する。
+ *   SHARD_SECRET（プロパティ）→ CONFIG.SHARD_SECRET → SHARD_SECRET 自動生成 → SPREADSHEET_ID
+ * これにより子が自分のシートIDへ切り替えても、教員ログイン／トークン検証は壊れない。
+ */
+function getTokenSecret() {
+  const fromProp = propStr(SHARD_SECRET_PROP, '');
+  if (fromProp) return fromProp;
+  const fromCfg = String((CONFIG && CONFIG.SHARD_SECRET) || '').trim();
+  if (fromCfg) return fromCfg;
+  const generated = getOrCreateShardSecret();
+  if (generated) return generated;
+  return getSpreadsheetId();
+}
+
+/** どの設定がプロパティで上書きされているかを返す（管理画面・診断用）。 */
+function shardConfigSources() {
+  const out = {};
+  out.SHARD_MODE = (propRaw(PROP_SHARD_MODE) === null) ? 'CONFIG' : 'PROPERTY';
+  out.SHARD_CHILD_MODE = (propRaw(PROP_SHARD_CHILD_MODE) === null) ? 'CONFIG' : 'PROPERTY';
+  const ss = propRaw(PROP_SPREADSHEET_ID);
+  out.SPREADSHEET_ID = (ss === null || !String(ss).trim()) ? 'CONFIG' : 'PROPERTY';
+  const mp = propRaw(SHARD_MAP_PROP);
+  out.SHARD_MAP_V1 = (mp === null || !String(mp).trim()) ? 'CONFIG' : 'PROPERTY';
+  out.SHARD_DEFAULT_URL = (propRaw(SHARD_DEFAULT_PROP) === null) ? 'CONFIG' : 'PROPERTY';
+  const sk = propRaw(SHARD_SECRET_PROP);
+  out.SHARD_SECRET = (sk === null || !String(sk).trim()) ? 'CONFIG' : 'PROPERTY';
+  return out;
+}
+
+/**
+ * 同じ警告を300秒に1回だけ出す（ハートビート毎のログ氾濫を防ぐ）。
+ * キャッシュが使えない環境では都度出力する（取りこぼしより冗長を選ぶ）。
+ */
+function shardWarnOnce(key, msg) {
+  try {
+    const c = CacheService.getScriptCache();
+    const k = 'sw_' + shardHash(key);
+    if (c.get(k)) return;
+    c.put(k, '1', 300);
+  } catch (e) { /* キャッシュ不可時は都度出力 */ }
+  try { Logger.log('[SHARD] ' + msg); } catch (e) {}
+}
+
+// ==================== 児童IDの照合と名簿検索（表記ゆれ対策） ====================
+//
+// 児童IDは端末（Googleアカウントのメール）とシート（手入力・CSV取込）で
+// 表記が揺れる。大文字小文字・全角半角・前後/途中の空白を吸収して比較する。
+// 例: 「 1607002@City-Mimasaka.ED.jp 」と「１６０７００２＠city-mimasaka.ed.jp」は同一。
+
+function normalizeIdKey(value) {
+  let s = String(value === null || value === undefined ? '' : value);
+  s = s.trim();
+  if (!s) return '';
+  // 全角英数字 → 半角
+  s = s.replace(/[Ａ-Ｚａ-ｚ０-９]/g, function (c) {
+    return String.fromCharCode(c.charCodeAt(0) - 0xFEE0);
+  });
+  // 全角記号 → 半角（メールアドレスで使われ得るもの）
+  s = s.replace(/＠/g, '@').replace(/．/g, '.').replace(/＿/g, '_').replace(/[－ー]/g, '-');
+  // 空白（全角含む）は除去する
+  s = s.replace(/[\s\u3000]+/g, '');
+  return s.toLowerCase();
+}
+
+/**
+ * 児童IDから端末一覧の行を探す（親・子のどちらでも使える）。
+ * 見つかれば { row_number, student_id, school_name, student_name, class_name } を返す。
+ *
+ * 列位置は getHeaderMap で動的に解決する（列順が変わっても壊れない）。
+ * 返す値はシートの表示どおり（整形前）とし、比較だけを正規化して行う。
+ */
+function findStudentById(studentId) {
+  const want = normalizeIdKey(studentId);
+  if (!want) return null;
+
+  let sheet = null;
+  try { sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME); } catch (e) { return null; }
+  if (!sheet) return null;
+
+  let headerMap = null;
+  try { headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS); } catch (e) { return null; }
+  const idCol = headerMap && headerMap['児童ID'];
+  if (!idCol) return null;
+
+  let data = null;
+  try { data = sheet.getDataRange().getValues(); } catch (e) { return null; }
+  if (!data || !data.length) return null;
+
+  const cell = function (row, colName) {
+    const c = headerMap[colName];
+    if (!c) return '';
+    return String(row[c - 1] === null || row[c - 1] === undefined ? '' : row[c - 1]).trim();
+  };
+
+  for (let i = 1; i < data.length; i++) {
+    if (normalizeIdKey(data[i][idCol - 1]) !== want) continue;
+    return {
+      row_number: i + 1,
+      student_id: cell(data[i], '児童ID'),
+      school_name: cell(data[i], '学校名'),
+      student_name: cell(data[i], '氏名'),
+      class_name: cell(data[i], 'クラス')
+    };
+  }
+  return null;
+}
+
+/**
+ * 親GAS側: 子GASからの名簿照会に答える。
+ * 氏名・学校名・クラスに加え、その場で割り当て先（assigned_gas_url）も解決して返す。
+ * これにより子は「クラスが分からない端末」を正しい子GASへ送り直せる。
+ */
+function shardLookupStudent(studentId) {
+  const sid = String(studentId || '').trim();
+  if (!sid) return { success: true, found: false, student_id: '' };
+  const hit = findStudentById(sid);
+  if (!hit) {
+    return { success: true, found: false, student_id: sid };
+  }
+  const route = resolveShardForHeartbeat(hit.student_id, hit.class_name);
+  const out = {
+    success: true, found: true,
+    student_id: hit.student_id,
+    student_name: hit.student_name,
+    school_name: hit.school_name,
+    class_name: hit.class_name
+  };
+  const keys = Object.keys(route || {});
+  for (let i = 0; i < keys.length; i++) out[keys[i]] = route[keys[i]];
+  return out;
+}
+
+/** 子GASが問い合わせる親GASのURL（子にだけ設定する）。 */
+function readShardParentUrl() {
+  try {
+    return String(PropertiesService.getScriptProperties().getProperty(SHARD_PARENT_PROP) || '').trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * 子GAS側: 親へ名簿を問い合わせる（10分キャッシュ・失敗は1分キャッシュ）。
+ * 親URLが未設定、または通信できない場合は null を返す（呼び出し側は従来動作を続ける）。
+ */
+function shardLookupFromParent(studentId) {
+  const sid = String(studentId || '').trim();
+  if (!sid) return null;
+  const parent = readShardParentUrl();
+  if (!parent) return null;
+
+  const key = SHARD_LOOKUP_CACHE_PREFIX + shardHash(normalizeIdKey(sid) + '|' + parent);
+  try {
+    const c = CacheService.getScriptCache();
+    const cached = c.get(key);
+    if (cached) {
+      const o = JSON.parse(cached);
+      return (o && o.found) ? o : null;
+    }
+  } catch (e) { /* キャッシュ不可時は通信へ */ }
+
+  let result = null;
+  try {
+    if (typeof UrlFetchApp === 'undefined') return null;
+    const body = JSON.stringify({
+      action: 'shard_lookup',
+      shard_secret: getOrCreateShardSecret(),
+      student_id: sid
+    });
+    const res = UrlFetchApp.fetch(parent, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: body,
+      muteHttpExceptions: true
+    });
+    const code = res.getResponseCode();
+    if (code >= 200 && code < 300) {
+      const j = JSON.parse(res.getContentText());
+      if (j && j.found) result = j;
+    }
+  } catch (e) {
+    result = null;
+  }
+
+  try {
+    const c = CacheService.getScriptCache();
+    // 見つかった場合は長め（10分）、見つからない場合は短め（1分）に保持する
+    c.put(key, JSON.stringify(result || { found: false }), result ? 600 : 60);
+  } catch (e) {}
+
+  return result;
+}
+
+/** 子モードのときだけ親へ問い合わせる薄いラッパ（他テスト環境でも安全に null）。 */
+function hbChildIdentityLookup(studentId) {
+  try {
+    if (typeof isShardChild !== 'function' || !isShardChild()) return null;
+    if (typeof shardLookupFromParent !== 'function') return null;
+    return shardLookupFromParent(studentId);
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 子GAS側: 子シートの「氏名・学校名・クラス」が未取得なら、親の名簿で補完する。
+ * 補完した場合は row 配列を書き換え、シートにも書く（A〜D列が空のまま残らない）。
+ * 戻り値: 補完したら true。
+ */
+function hbApplyChildIdentity(sheet, rowNum, row, headerMap, studentId) {
+  try {
+    if (!headerMap || !row || !(rowNum >= 2)) return false;
+    const clsCol = headerMap['クラス'];
+    if (!clsCol) return false;
+
+    const curClass = String(row[clsCol - 1] === undefined ? '' : row[clsCol - 1]).trim();
+    const classMissing = (!curClass || curClass === '未設定');
+
+    const nameCol = headerMap['氏名'];
+    const curName = nameCol ? String(row[nameCol - 1] === undefined ? '' : row[nameCol - 1]).trim() : '';
+    const nameMissing = !curName || /^未登録児童/.test(curName) || /\(Googleアカウント\)/.test(curName);
+
+    const schoolCol = headerMap['学校名'];
+    const curSchool = schoolCol ? String(row[schoolCol - 1] === undefined ? '' : row[schoolCol - 1]).trim() : '';
+    const schoolMissing = !curSchool || curSchool === '未設定';
+
+    if (!classMissing && !nameMissing && !schoolMissing) return false;
+
+    const info = hbChildIdentityLookup(studentId);
+    if (!info || !info.found) return false;
+
+    const patch = {};
+    const newClass = String(info.class_name || '').trim();
+    if (classMissing && newClass && newClass !== '未設定') patch[clsCol] = newClass;
+    if (nameCol && nameMissing) {
+      const newName = String(info.student_name || '').trim();
+      if (newName && newName !== '未設定') patch[nameCol] = newName;
+    }
+    if (schoolCol && schoolMissing) {
+      const newSchool = String(info.school_name || '').trim();
+      if (newSchool && newSchool !== '未設定') patch[schoolCol] = newSchool;
+    }
+    const cols = Object.keys(patch);
+    if (!cols.length) return false;
+
+    let target = sheet;
+    if (!target) target = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    if (!target) return false;
+
+    for (let i = 0; i < cols.length; i++) {
+      const c = Number(cols[i]);
+      const v = patch[cols[i]];
+      target.getRange(rowNum, c).setValue(v);
+      row[c - 1] = v;
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function isShardParent() {
-  return !!(CONFIG && CONFIG.SHARD_MODE === true);
+  try { return shardModeFlags().parent === true; } catch (e) { return false; }
 }
 
 function isShardChild() {
-  return !!(CONFIG && CONFIG.SHARD_CHILD_MODE === true);
+  try { return shardModeFlags().child === true; } catch (e) { return false; }
 }
 
 /**
@@ -3216,23 +3632,77 @@ function normalizeShardClass(raw) {
   return s;
 }
 
+/**
+ * マッピング（{ クラス名: 子GASのURL }）を読む。プロパティ優先・CONFIG フォールバック。
+ *
+ * プロパティの JSON が壊れていても親の実行は止めない。
+ *   ・パース失敗／配列／非オブジェクト → 警告を出して CONFIG.SHARD_MAP を使う
+ *   ・空キー ""（または正規化して空になるキー）は「既定のルーティング先」として残す
+ */
 function readShardMapRaw() {
+  const cfgFallback = (CONFIG && CONFIG.SHARD_MAP && typeof CONFIG.SHARD_MAP === 'object' && !Array.isArray(CONFIG.SHARD_MAP))
+    ? CONFIG.SHARD_MAP : {};
+  const copyFallback = function () {
+    const out = {};
+    const ks = Object.keys(cfgFallback);
+    for (let i = 0; i < ks.length; i++) out[ks[i]] = cfgFallback[ks[i]];
+    return out;
+  };
+
+  let raw = null;
   try {
-    const raw = PropertiesService.getScriptProperties().getProperty(SHARD_MAP_PROP);
-    if (!raw) return {};
-    const o = JSON.parse(raw);
-    return (o && typeof o === 'object') ? o : {};
+    raw = PropertiesService.getScriptProperties().getProperty(SHARD_MAP_PROP);
   } catch (e) {
-    return {};
+    cfgWarn('SHARD_MAP_V1 を読み取れませんでした（' + String((e && e.message) || e) + '）。CONFIG の既定マップを使用します。');
+    return copyFallback();
   }
+  if (raw === null || raw === undefined || String(raw).trim() === '') {
+    return copyFallback();
+  }
+
+  let o = null;
+  try {
+    o = JSON.parse(String(raw));
+  } catch (e) {
+    cfgWarn('SHARD_MAP_V1 の JSON パースに失敗しました（' + String((e && e.message) || e) + '）。CONFIG の既定マップを使用します。');
+    return copyFallback();
+  }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) {
+    cfgWarn('SHARD_MAP_V1 がオブジェクトではありません。CONFIG の既定マップを使用します。');
+    return copyFallback();
+  }
+  return o;
 }
 
 function readShardDefaultUrl() {
+  const fallback = String((CONFIG && CONFIG.SHARD_DEFAULT_URL) || '').trim();
   try {
-    return String(PropertiesService.getScriptProperties().getProperty(SHARD_DEFAULT_PROP) || '').trim();
+    const raw = PropertiesService.getScriptProperties().getProperty(SHARD_DEFAULT_PROP);
+    if (raw === null || raw === undefined) return fallback;
+    const s = String(raw).trim();
+    return s || fallback;
   } catch (e) {
-    return '';
+    return fallback;
   }
+}
+
+/**
+ * 空キー（"" / 空白のみ / 「未設定」など正規化して空になるキー）で指定された
+ * 既定のルーティング先を返す。無ければ ''。
+ * SHARD_MAP_V1 の {"": "https://…/exec"} を「フォールバック指定」として扱う。
+ */
+function shardMapDefaultFromEmptyKey(map) {
+  const src = (map && typeof map === 'object') ? map : {};
+  const keys = Object.keys(src);
+  for (let i = 0; i < keys.length; i++) {
+    if (normalizeShardClass(keys[i]) !== '') continue;
+    const v = String(src[keys[i]] || '').trim();
+    if (v && /^https?:\/\//i.test(v)) return v;
+    if (v) {
+      shardWarnOnce('emptydflt-bad:' + i, 'SHARD_MAP_V1 の空キー既定URLが http(s):// で始まりません（' + v + '）。無視します。');
+    }
+  }
+  return '';
 }
 
 /** 親⇔子の共有シークレット。未生成なら生成して保存する（親のみ）。 */
@@ -3327,7 +3797,13 @@ function shardConfigCached() {
 }
 
 function invalidateShardConfig() {
-  try { CacheService.getScriptCache().remove(SHARD_CFG_CACHE); } catch (e) {}
+  try {
+    const c = CacheService.getScriptCache();
+    c.remove(SHARD_CFG_CACHE);
+    // プロパティを変えた直後に反映されるよう、動的解決のキャッシュも破棄する
+    c.remove(SHARD_MODE_CACHE);
+    c.remove(SHARD_SSID_CACHE);
+  } catch (e) {}
 }
 
 /** { 生のクラス名: URL } → { 正規化キー: URL } の索引を作る。 */
@@ -3336,9 +3812,28 @@ function shardMapIndexFromMap(map) {
   const src = (map && typeof map === 'object') ? map : {};
   const keys = Object.keys(src);
   for (let i = 0; i < keys.length; i++) {
-    const k = normalizeShardClass(keys[i]);
+    const rawKey = String(keys[i]);
     const v = String(src[keys[i]] || '').trim();
-    if (k && v) idx[k] = v;
+
+    // 値が無い項目は索引に入れない（設定ミスで端末がどこにも繋がらないのを防ぐ）
+    if (!v) {
+      shardWarnOnce('map-noval:' + rawKey, 'SHARD_MAP_V1 の「' + rawKey + '」に URL がありません。この項目は無視します。');
+      continue;
+    }
+    // URL として不正な値は捨てる（誤ったURLへ端末を飛ばさない）
+    if (!/^https?:\/\//i.test(v)) {
+      shardWarnOnce('map-badurl:' + rawKey, 'SHARD_MAP_V1 の「' + rawKey + '」の URL が http(s):// で始まりません（' + v + '）。この項目は無視します。');
+      continue;
+    }
+
+    const k = normalizeShardClass(rawKey);
+    if (!k) continue; // 空キーは既定URLとして shardMapDefaultFromEmptyKey が扱う
+
+    if (idx[k] && idx[k] !== v) {
+      shardWarnOnce('map-dup:' + k, 'SHARD_MAP_V1 でクラス「' + k + '」が重複しています。先に見つかった URL を使用します。');
+      continue;
+    }
+    idx[k] = v;
   }
   return idx;
 }
@@ -3353,13 +3848,33 @@ function resolveShardForHeartbeat(studentId, classHint) {
     const cfg = shardConfigCached();
     const idx = shardMapIndexFromMap(cfg.map);
     const key = normalizeShardClass(classHint);
+
+    // ① クラスが一致 → そのクラスの子GAS
     if (key && idx[key]) {
       return { assigned_gas_url: idx[key], assigned_class: key, shard_mode: true };
     }
+
+    // ② クラスが未取得・不一致 → SHARD_MAP_V1 の空キー（既定）→ SHARD_DEFAULT_URL の順
+    const emptyDefault = shardMapDefaultFromEmptyKey(cfg.map);
+    if (emptyDefault) {
+      shardWarnOnce('route-empty:' + String(classHint || '(none)'),
+        'クラス「' + String(classHint || '(未取得)') + '」はマップに無いため、SHARD_MAP_V1 の空キー既定URLへ割り当てました。');
+      return { assigned_gas_url: emptyDefault, assigned_class: '', shard_mode: true };
+    }
     const def = String(cfg.def || '').trim();
-    if (def) return { assigned_gas_url: def, assigned_class: '', shard_mode: true };
+    if (def) {
+      shardWarnOnce('route-def:' + String(classHint || '(none)'),
+        'クラス「' + String(classHint || '(未取得)') + '」はマップに無いため、SHARD_DEFAULT_URL へ割り当てました。');
+      return { assigned_gas_url: def, assigned_class: '', shard_mode: true };
+    }
+
+    // ③ どこにも繋げない → 親のまま動かす（端末を止めない）。原因究明用に警告を残す。
+    shardWarnOnce('route-none:' + String(classHint || '(none)'),
+      'クラス「' + String(classHint || '(未取得)') + '」に一致する子GASがありません。端末は親に接続したままです。'
+      + ' SHARD_MAP_V1 のキー（例: "5年1組"）と端末側のクラス名を確認してください。');
   } catch (e) {
     // 解決に失敗しても端末の通信は止めない（親に繋がったまま＝従来動作）
+    cfgWarn('resolveShardForHeartbeat で例外: ' + String((e && e.message) || e));
   }
   return {};
 }
@@ -3591,6 +4106,8 @@ function shardAllChildUrls(cfg) {
   const idx = shardMapIndexFromMap(cfg && cfg.map);
   const keys = Object.keys(idx);
   for (let i = 0; i < keys.length; i++) push(idx[keys[i]]);
+  // 空キー既定（SHARD_MAP_V1 の ""）も子GASの1台として数える
+  push(shardMapDefaultFromEmptyKey(cfg && cfg.map));
   push(cfg && cfg.def);
   return out;
 }
@@ -4065,6 +4582,10 @@ function getShardSettingsForAdmin() {
       try { return PropertiesService.getScriptProperties().getProperty(SHARD_SECRET_PROP) || ''; }
       catch (e) { return ''; }
     })()),
+    // どの設定がプロパティで上書きされているか（CONFIG / PROPERTY）
+    sources: shardConfigSources(),
+    // 空キー（""）で指定された既定ルーティング先
+    empty_key_default: shardMapDefaultFromEmptyKey(map),
     max_per_class: 40
   };
 }

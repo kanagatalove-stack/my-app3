@@ -164,11 +164,56 @@ function generateShardSecretForSetup() {
 
 各子GASの「プロジェクトの設定」→「スクリプト プロパティ」で:
 
-| プロパティ | 値 |
-|---|---|
-| `SHARD_SECRET` | `sk_xxxxxxxxxxxxxxxx`（親と同一） |
+| プロパティ | 値 | 必須 |
+|---|---|---|
+| `SHARD_SECRET` | `sk_xxxxxxxxxxxxxxxx`（親と同一） | **必須** |
+| `SHARD_CHILD_MODE` | `true` | **必須** |
+| `SHARD_PARENT_URL` | 親GASのデプロイURL（`.../exec`） | **必須**（下記 4-3） |
+| `SPREADSHEET_ID` | この子GASが書き込む子スプレッドシートのID | 推奨 |
 
-### 4-3. シークレット再発行（漏洩時のみ）
+> `SPREADSHEET_ID` を省くと、コード内の既定値（親のシートID）が使われます。
+> **子GASでは必ず設定してください。** 設定しないと親のシートへ書き込んでしまいます。
+
+### 4-3. 子が親へ「この児童は誰か」を聞く仕組み（`SHARD_PARENT_URL`）
+
+子GASは**名簿を持ちません**（子のシートには、その子へハートビートした端末の行しかない）。
+そのため、クラスが分からない端末が子GASへ来ると、次のような**鶏卵問題**が起きます。
+
+```
+端末 ──▶ 子GAS（クラス未取得のまま到着）
+          │  名簿が無いのでクラス＝「未設定」で登録
+          │  class_name が空 → assigned_gas_url を返せない
+          ▼
+        端末は通信先を切り替えられず、永久にクラスを学習できない
+```
+
+これを解消するため、子GASは `SHARD_PARENT_URL` の親へ **`shard_lookup`** を送り、
+氏名・学校名・**クラス**を教えてもらいます（結果は10分キャッシュ）。
+
+```
+端末 ──▶ 子GAS ──▶ 親GAS（shard_lookup / SHARD_SECRET 認証）
+                    │  端末一覧から児童IDで検索（表記ゆれ吸収）
+                    ▼  氏名・学校名・クラス＋assigned_gas_url を返す
+          ◀────────┘
+          │  子シートの A〜D 列を埋める
+          ▼
+        応答の class_name が「5年1組」になる
+          ▼
+        端末が assigned_gas_url を受け取り、正しい子GASへ切り替わる
+```
+
+| 項目 | 内容 |
+|---|---|
+| 送信元 | 子GAS |
+| 送信先 | `SHARD_PARENT_URL`（親GAS） |
+| 認証 | `SHARD_SECRET`（不一致は `unauthorized`） |
+| キャッシュ | 見つかった=10分／見つからない=1分 |
+| 親URL未設定時 | 照会しない（従来動作のまま。例外は出さない） |
+
+> **`SHARD_PARENT_URL` を設定しないと、この救済は働きません。**
+> `SHARD_MAP_V1` に空キー `""`（既定ルーティング）を入れている運用では**必須**です。
+
+### 4-4. シークレット再発行（漏洩時のみ）
 
 親GASで:
 
@@ -408,7 +453,42 @@ SHARD_MODE: true,
 - 子GASの数が多すぎないか（1校 6〜12 個が目安）
 - 子GAS側の `processHeartbeat` が 3〜5ms で応答しているか
 
-### 8-5. 元に戻したい（分散をやめる）
+### 8-5. 子シートのクラス・氏名が空（または「未設定」）になる
+
+**症状**: 子スプレッドシートの「端末一覧」で、A〜D列（児童ID・学校名・氏名・クラス）が
+空、または氏名が「1607002 (Googleアカウント)」・クラスが「未設定」のまま。
+その結果 `assigned_gas_url` が返らず、端末の通信先が親のまま固定される。
+
+**原因**: 子GASは名簿を持たないため、クラス未取得の端末が来ると
+「未設定」で登録してしまい、以後もクラスを学習できない（鶏卵問題）。
+
+**対処**:
+1. 各**子GAS**に `SHARD_PARENT_URL`（親の `/exec`）が入っているか確認する
+2. 各**子GAS**に `SHARD_SECRET`（親と同一）が入っているか確認する
+3. 子GASで次を実行し、`found=true` と `class_name` が返るか確認する
+
+```js
+function testChildLookup() {
+  const r = shardLookupFromParent('1607002@city-mimasaka.ed.jp');
+  Logger.log(JSON.stringify(r));
+}
+```
+
+4. `found=false` の場合は**親の端末一覧**にその児童IDが登録されているか確認する
+   （児童IDの照合は空白・大文字小文字・全角半角を吸収しますが、
+   そもそも行が無ければ見つかりません）
+5. 親側で確認する場合:
+
+```js
+function testParentLookup() {
+  Logger.log(JSON.stringify(findStudentById('1607002@city-mimasaka.ed.jp')));
+}
+```
+
+既に「未設定」で登録済みの行は、次回のハートビート時に自動で補完されます
+（`hbApplyChildIdentity` が不足している列だけを書きます。教員が手で直した値は上書きしません）。
+
+### 8-6. 元に戻したい（分散をやめる）
 
 1. 親GASの `SHARD_MODE` を `false` に戻す
 2. **既存デプロイを更新**（鉛筆アイコン → 新バージョン）
@@ -463,6 +543,22 @@ SHARD_MODE: true,
   「全員」または「組織内」にしてください（認証はシークレットで行います）。
 - シークレットを記載したメール・チャット・共有ドキュメントは残さないでください。
 - 異動等でICT担当が変わる場合は、シークレットを**再発行**してください。
+
+---
+
+### 10-2. 名簿照会・ID照合の関数
+
+| 関数 | 役割 | 動作する側 |
+|---|---|---|
+| `normalizeIdKey(v)` | 児童IDを比較用に正規化（trim・小文字・全角→半角・空白除去） | 共通 |
+| `findStudentById(id)` | 端末一覧から児童を1件引く（列位置は動的解決） | 共通 |
+| `shardLookupStudent(id)` | `shard_lookup` の応答を作る（氏名・学校・クラス＋割り当て先） | 親 |
+| `shardLookupFromParent(id)` | 親へ名簿を問い合わせる（10分キャッシュ） | 子 |
+| `hbChildIdentityLookup(id)` | 子モードのときだけ親へ問い合わせるラッパ | 子 |
+| `hbApplyChildIdentity(...)` | 子シートの不足列（氏名・学校・クラス）を補完する | 子 |
+
+> 児童IDの照合は `normalizeIdKey` を通すため、
+> 「` 1607002@City-Mimasaka.ED.jp `」と「`１６０７００２＠city-mimasaka.ed.jp`」は同一と判定されます。
 
 ---
 

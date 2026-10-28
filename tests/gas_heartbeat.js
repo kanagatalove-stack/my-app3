@@ -75,6 +75,8 @@ const vm = require('vm');
 let code = '';
 [
   'getHeaderMap','withWriteLock','parseBoolean','parseUrlList','shouldWriteSyncTime',
+  // 児童IDの照合を正規化する（processHeartbeat / hbRegisterDevice が無条件に呼ぶ）
+  'normalizeIdKey',
   // 学校名の解決に必要なヘルパー群（processHeartbeat が school_name を検証するため）
   'normalizeSchoolName','resolveCanonicalSchool','canonicalizeIncomingSchool',
   // ---- CacheService 化に伴うヘルパー群 ----
