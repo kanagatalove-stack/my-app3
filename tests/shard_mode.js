@@ -187,6 +187,8 @@ async function main() {
     // fetchAll 並列化・キャッシュ・教員スコープ絞り込み（今回の最適化）
     'shardHash','shardDevVersion','shardFetchMany','shardUrlsForTeacher',
     'shardFetchChildDevices','getShardMergedDevices','shardPropagatePolicy',
+    // 親子の突き合わせ統合（split-brain 解消の本体）
+    'shardMergeDeviceRow',
     // 児童ID照合と親名簿照会（クラス未取得の端末を救う経路）
     'normalizeIdKey','findStudentById','shardLookupStudent','readShardParentUrl',
     'shardLookupFromParent','hbChildIdentityLookup','hbApplyChildIdentity'
@@ -866,6 +868,282 @@ async function main() {
   check('親URL未設定でも normalizeIdKey は動く', ctx.normalizeIdKey(' A@B ') === 'a@b');
 
   ctx.UrlFetchApp.fetch = origFetch;
+
+  // =========================================================================
+  // §1-9 split-brain 解消: 親子の突き合わせ統合と、コンソール経路の一本化
+  //   実機症状:
+  //     ・「画面ロック」を押した瞬間にオフライン表示になる
+  //       → 親シートの止まった最終同期だけを見て is_online=false にしていた
+  //     ・「同期周期：停止 (猶予 20 秒)」のまま高頻度同期へ移行しない
+  //       → google.script.run 経路の api_consoleTouch が子へ ka_active を配っていなかった
+  //   既存の検証に影響を与えないよう、実物の関数だけを載せた独立コンテキストで確かめる。
+  // =========================================================================
+  console.log('===== [GAS] split-brain 解消: 突き合わせ統合・コンソール経路 =====');
+
+  const NOWMS = new Date().getTime();
+  const isoAt = (ms) => new Date(ms).toISOString();
+  const STALE = isoAt(NOWMS - 30 * 60 * 1000); // 30分前（＝親は切り替え時点で止まっている）
+  const FRESH = isoAt(NOWMS - 5 * 1000);        // 5秒前（＝子が受けている）
+
+  function mkCtx2(base) {
+    const g = {
+      mergeCalls: 0, getAllCalls: 0, kaCalls: [], touches: [],
+      teacherActive: false,
+      urls: ['https://child-a/exec'],
+      childList: []
+    };
+    const c2 = {
+      console, JSON, Date, Math, String, Number, Array, Object, Boolean,
+      isNaN, parseInt, parseFloat, Set, Map, RegExp, Error,
+      CONFIG: { SHARD_MODE: true, DEVICE_SHEET_NAME: '端末一覧' },
+      PropertiesService: { getScriptProperties() { return { getProperty() { return null; } }; } },
+      CacheService: { getScriptCache() { return { get() { return null; }, put() {} }; } },
+      UrlFetchApp: {
+        fetch() { return { getResponseCode() { return 200; }, getContentText() { return '{}'; } }; },
+        fetchAll(reqs) {
+          return (reqs || []).map(() => ({
+            getResponseCode() { return 200; }, getContentText() { return '{}'; }
+          }));
+        }
+      },
+      Logger: { log() {} },
+      g,
+      isShardParent() { return true; },
+      shardConfigCached() { return { map: {}, def: '', sec: 'sk_test' }; },
+      shardUrlsForTeacher() { return g.urls; },
+      shardFetchChildDevices() { return g.childList; },
+      shardFilterMergedDevices(list) { return list; },
+      getAllDevices() { g.getAllCalls++; return (base || []); },
+      // コンソール経路（google.script.run）用のスタブ
+      verifyToken() { return { valid: true, teacher: { role: 'ADMIN' } }; },
+      resolveCurrentTeacher(t) { return t; },
+      getShardMergedDevices() { g.mergeCalls++; return [{ student_id: 'agg-by-merged' }]; },
+      touchTeacherConsole(id) { g.touches.push({ type: 'touch', id: id }); return { success: true, touched: id }; },
+      releaseTeacherConsole(id) { g.touches.push({ type: 'release', id: id }); return { success: true, released: id }; },
+      isTeacherConsoleActive() { return g.teacherActive; },
+      shardPropagateKaState(v) { g.kaCalls.push(v); return { sent: [] }; }
+    };
+    vm.createContext(c2);
+    let b = '';
+    ['shardMergeDeviceRow', 'shardMergeDevices',
+      'api_getAllDevices', 'api_consoleTouch', 'api_consoleRelease']
+      .forEach(function (n) { b += extract(gasSrc, n) + '\n'; });
+    vm.runInContext(b, c2);
+    return c2;
+  }
+
+  const ctx2 = mkCtx2();
+
+  const pRow = {
+    student_id: 'child-1', school_name: '第一小学校', class_name: '5年1組',
+    student_name: 'テスト太郎', last_seen: STALE, is_online: false,
+    current_url: 'https://old.example/', screen_lock: true, filter_mode: 'none',
+    whitelist_urls: [], blacklist_urls: [], broadcast_url: '', broadcast_id: '', notes: ''
+  };
+  const cRow = {
+    student_id: 'child-1', school_name: '第一小学校', class_name: '5年1組',
+    student_name: 'テスト太郎', last_seen: FRESH, is_online: true,
+    current_url: 'https://new.example/', screen_lock: false, filter_mode: 'none',
+    whitelist_urls: [], blacklist_urls: [], broadcast_url: '', broadcast_id: '', notes: ''
+  };
+
+  // --- テレメトリは「新しい方」を採る（誤オフラインの本体） ---
+  const mFreshChild = ctx2.shardMergeDeviceRow(pRow, cRow);
+  check('子の最終同期が新しければオンラインになる（ロック直後の誤オフラインを解消）',
+    mFreshChild.is_online === true,
+    { is_online: mFreshChild.is_online, last_seen: mFreshChild.last_seen });
+  check('最終同期日時は新しい方（子）を採る', mFreshChild.last_seen === FRESH, mFreshChild.last_seen);
+  check('現在URLも新しい方（子）を採る',
+    mFreshChild.current_url === 'https://new.example/', mFreshChild.current_url);
+  check('コマンドは親を正とする（子の screen_lock=false に引きずられない）',
+    mFreshChild.screen_lock === true, mFreshChild.screen_lock);
+
+  // --- 親の方が新しいときは巻き戻さない ---
+  const mFreshParent = ctx2.shardMergeDeviceRow(
+    Object.assign({}, pRow, { last_seen: FRESH, current_url: 'https://p-new/', is_online: true }),
+    Object.assign({}, cRow, { last_seen: STALE, current_url: 'https://c-old/', is_online: false }));
+  check('親の方が新しければ子の古いテレメトリを採らない（巻き戻さない）',
+    mFreshParent.current_url === 'https://p-new/', mFreshParent.current_url);
+  check('親が新しくてもオンライン判定は統合後の日時から行う',
+    mFreshParent.is_online === true, mFreshParent.is_online);
+
+  // --- 両方古ければオフライン（誤ってオンラインにしない） ---
+  const mBothStale = ctx2.shardMergeDeviceRow(
+    Object.assign({}, pRow, { last_seen: STALE }),
+    Object.assign({}, cRow, { last_seen: STALE }));
+  check('両方とも古ければオフライン（誤ってオンラインにしない）',
+    mBothStale.is_online === false, mBothStale.is_online);
+
+  // --- 欠損値でも落ちない ---
+  const mEmpty = ctx2.shardMergeDeviceRow({}, {});
+  check('日時が空でも落ちずオフライン扱い', mEmpty.is_online === false, mEmpty.is_online);
+  const mUndef = ctx2.shardMergeDeviceRow(null, undefined);
+  check('引数が null / undefined でも落ちない',
+    !!mUndef && mUndef.is_online === false, mUndef && mUndef.is_online);
+
+  // --- 名簿: 親が正。親が無効値なら子で補う ---
+  const mRoster = ctx2.shardMergeDeviceRow(
+    Object.assign({}, pRow, { student_name: '1607002 (Googleアカウント)', class_name: '未設定' }),
+    Object.assign({}, cRow, { student_name: '本名 花子', class_name: '5年2組' }));
+  check('親の氏名が「(Googleアカウント)」なら子の本名で補う',
+    mRoster.student_name === '本名 花子', mRoster.student_name);
+  check('親のクラスが「未設定」なら子のクラスで補う',
+    mRoster.class_name === '5年2組', mRoster.class_name);
+  const mRosterParentWins = ctx2.shardMergeDeviceRow(
+    pRow, Object.assign({}, cRow, { class_name: '6年1組' }));
+  check('親の名簿が正常なら子で上書きしない（親が正）',
+    mRosterParentWins.class_name === '5年1組', mRosterParentWins.class_name);
+  const mRosterWarn = ctx2.shardMergeDeviceRow(
+    Object.assign({}, pRow, { student_name: '未登録児童 (x)' }),
+    Object.assign({}, cRow, { student_name: '本名 花子' }));
+  check('親の氏名が「未登録児童…」でも子の本名で補う',
+    mRosterWarn.student_name === '本名 花子', mRosterWarn.student_name);
+
+  // --- コマンド: 親が空なら子の値を消さない ---
+  const mCmd = ctx2.shardMergeDeviceRow(
+    Object.assign({}, pRow, { broadcast_url: '', broadcast_id: '' }),
+    Object.assign({}, cRow, { broadcast_url: 'https://bc.example/', broadcast_id: 'bc-1' }));
+  check('親のコマンドが空なら子に残っている値を消さない',
+    mCmd.broadcast_url === 'https://bc.example/', mCmd.broadcast_url);
+  const mCmdParent = ctx2.shardMergeDeviceRow(
+    Object.assign({}, pRow, { broadcast_url: 'https://parent-bc/' }),
+    Object.assign({}, cRow, { broadcast_url: 'https://child-bc/' }));
+  check('親にコマンドがあれば子で上書きさせない（親が正）',
+    mCmdParent.broadcast_url === 'https://parent-bc/', mCmdParent.broadcast_url);
+
+  // --- 突き合わせループ: 親にも居る端末を「捨てない」 ---
+  const loop = mkCtx2([pRow]);
+  loop.g.childList = [
+    cRow,
+    { student_id: 'child-only', class_name: '5年1組', last_seen: FRESH, is_online: true }
+  ];
+  const loopMerged = loop.shardMergeDevices([pRow], 'ALL', { role: 'ADMIN' }, false);
+  check('親にも居る端末は子の行と統合される（以前は捨てていた）',
+    loopMerged.length === 2, loopMerged.map(function (d) { return d.student_id; }));
+  const loopRow = loopMerged.filter(function (d) { return d.student_id === 'child-1'; })[0];
+  check('統合された行は子の最新テレメトリを持つ（＝オンライン表示）',
+    !!loopRow && loopRow.is_online === true && loopRow.last_seen === FRESH,
+    loopRow && { is_online: loopRow.is_online, last_seen: loopRow.last_seen });
+  check('統合された行のロック状態は親の値を保つ',
+    !!loopRow && loopRow.screen_lock === true, loopRow && loopRow.screen_lock);
+  check('親に無い端末は新規に追加される',
+    !!loopMerged.filter(function (d) { return d.student_id === 'child-only'; }).length);
+
+  // --- コンソール経路: api_getAllDevices が集約を通る ---
+  const api = mkCtx2();
+  const apiRes = api.api_getAllDevices('tok', 'ALL', false);
+  check('api_getAllDevices は集約（getShardMergedDevices）を通る',
+    api.g.mergeCalls === 1 && apiRes.success === true && api.g.getAllCalls === 0,
+    { mergeCalls: api.g.mergeCalls, getAllCalls: api.g.getAllCalls });
+  check('api_getAllDevices は集約結果をそのまま返す',
+    !!apiRes.data && apiRes.data[0].student_id === 'agg-by-merged', apiRes.data);
+
+  // --- コンソール経路: ka_active の伝達 ---
+  const apiT = api.api_consoleTouch('sess-1');
+  check('api_consoleTouch は稼働を子GASへ伝える（停止したままにならない）',
+    api.g.kaCalls.length === 1 && api.g.kaCalls[0] === true, api.g.kaCalls);
+  check('api_consoleTouch は元の戻り値をそのまま返す',
+    apiT.success === true && apiT.touched === 'sess-1', apiT);
+
+  api.g.teacherActive = false;
+  const apiR1 = api.api_consoleRelease('sess-1');
+  check('最後のセッションが消えたら子GASへ停止を伝える',
+    api.g.kaCalls.length === 2 && api.g.kaCalls[1] === false, api.g.kaCalls);
+  check('api_consoleRelease は元の戻り値をそのまま返す',
+    apiR1.success === true && apiR1.released === 'sess-1', apiR1);
+
+  api.g.teacherActive = true;
+  api.api_consoleRelease('sess-2');
+  check('他セッションが稼働中なら停止を配らない',
+    api.g.kaCalls.length === 2, api.g.kaCalls);
+
+  // =========================================================================
+  // §1-10 google.script.run 経由の操作も子GASへ届くか（症状2の残り半分）
+  //   api_bulkLock / api_bulkBroadcast / api_bulkFilter / api_updateSingle は
+  //   doPost の同名アクションと違い shardPropagatePolicy を呼んでいなかった。
+  //   index.html は google.script.run を優先するため、ロックが子へ届かなかった。
+  // =========================================================================
+  console.log('===== [GAS] google.script.run 経由の操作も子GASへ伝達する =====');
+
+  function mkCtx3(teacherActive) {
+    const g = { patches: [], bulk: [] };
+    const c3 = {
+      console, JSON, Date, Math, String, Number, Array, Object, Boolean,
+      isNaN, parseInt, parseFloat, Set, Map, RegExp, Error,
+      g,
+      CONFIG: { SHARD_MODE: true },
+      verifyToken() { return { valid: true, teacher: { email: 't@x.ed.jp', role: 'TEACHER' } }; },
+      resolveCurrentTeacher(t) { return t; },
+      scopeStudentIdsForTeacher(ids) { return { ids: Array.isArray(ids) ? ids : ['s1@x.ed.jp'] }; },
+      bulkUpdateScreenLock(ids, v) { g.bulk.push({ op: 'lock', ids: ids, v: v }); },
+      bulkUpdateBroadcastUrl(ids, u) { g.bulk.push({ op: 'bc', ids: ids, u: u }); return 'bc-id-1'; },
+      bulkUpdateFilterMode(ids, m, w, b) { g.bulk.push({ op: 'filter', ids: ids, m: m }); },
+      getDeviceByStudentId(id) { return { student_id: id, school_name: '第一小学校', class_name: '5年1組' }; },
+      isDeviceInTeacherScope() { return true; },
+      updateSingleDevice(id, d) { g.bulk.push({ op: 'single', id: id, d: d }); },
+      saveTeacherSettings() { return {}; },
+      Logger: { log() {} },
+      // 子GASへ何を渡したかを記録する
+      shardPropagatePolicy(ids, patch) { g.patches.push({ ids: ids, patch: patch }); return { sent: [] }; }
+    };
+    vm.createContext(c3);
+    let b = '';
+    ['api_bulkLock', 'api_bulkBroadcast', 'api_bulkFilter', 'api_updateSingle']
+      .forEach(function (n) { b += extract(gasSrc, n) + '\n'; });
+    vm.runInContext(b, c3);
+    return c3;
+  }
+
+  const cA = mkCtx3();
+  const lk = cA.api_bulkLock('tok', ['s1@x.ed.jp'], true);
+  check('api_bulkLock が子GASへロック指示を伝える（押しても届かない不具合の修正）',
+    cA.g.patches.length === 1 && cA.g.patches[0].patch.screen_lock === true,
+    cA.g.patches);
+  check('api_bulkLock は対象児童IDをそのまま渡す',
+    !!cA.g.patches[0] && cA.g.patches[0].ids[0] === 's1@x.ed.jp', cA.g.patches[0]);
+  check('api_bulkLock の戻り値は従来どおり success=true',
+    lk.success === true, lk);
+  check('api_bulkLock の戻り値に shard を添える（伝達結果を画面に出せる）',
+    'shard' in lk, Object.keys(lk));
+
+  const lkOff = cA.api_bulkLock('tok', ['s1@x.ed.jp'], false);
+  check('ロック解除も子GASへ伝える（false を送る）',
+    cA.g.patches.length === 2 && cA.g.patches[1].patch.screen_lock === false,
+    cA.g.patches[1]);
+  check('ロック解除の戻り値も success=true', lkOff.success === true, lkOff);
+
+  const cB = mkCtx3();
+  const bc = cB.api_bulkBroadcast('tok', ['s1@x.ed.jp'], 'https://bc.example/');
+  check('api_bulkBroadcast が子GASへ配信URLを伝える',
+    cB.g.patches.length === 1 && cB.g.patches[0].patch.broadcast_url === 'https://bc.example/',
+    cB.g.patches);
+  check('api_bulkBroadcast は従来どおり broadcast_id を返す',
+    bc.broadcast_id === 'bc-id-1', bc.broadcast_id);
+
+  const cC = mkCtx3();
+  const fl = cC.api_bulkFilter('tok', ['s1@x.ed.jp'], 'whitelist', ['https://ok/'], ['https://ng/']);
+  check('api_bulkFilter が子GASへ規制モードを伝える',
+    cC.g.patches.length === 1 && cC.g.patches[0].patch.filter_mode === 'whitelist',
+    cC.g.patches);
+  check('api_bulkFilter がホワイトリストも伝える',
+    !!cC.g.patches[0] && Array.isArray(cC.g.patches[0].patch.whitelist_urls) &&
+    cC.g.patches[0].patch.whitelist_urls[0] === 'https://ok/', cC.g.patches[0]);
+  check('api_bulkFilter がブラックリストも伝える',
+    !!cC.g.patches[0] && cC.g.patches[0].patch.blacklist_urls[0] === 'https://ng/', cC.g.patches[0]);
+  check('api_bulkFilter の戻り値も success=true', fl.success === true, fl);
+
+  const cD = mkCtx3();
+  const sg = cD.api_updateSingle('tok', 's1@x.ed.jp', { screen_lock: true, notes: 'メモ' });
+  check('api_updateSingle が子GASへ個別変更を伝える',
+    cD.g.patches.length === 1 && cD.g.patches[0].patch.screen_lock === true, cD.g.patches);
+  check('api_updateSingle は関係ないキー（備考）を子へ送らない',
+    !!cD.g.patches[0] && !('notes' in cD.g.patches[0].patch), cD.g.patches[0].patch);
+  check('api_updateSingle の戻り値も success=true', sg.success === true, sg);
+
+  const cE = mkCtx3();
+  cE.api_updateSingle('tok', 's1@x.ed.jp', { notes: 'メモだけ' });
+  check('伝える項目が無ければ子GASへ空リクエストを送らない',
+    cE.g.patches.length === 0, cE.g.patches);
 
   console.log('');
   console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');

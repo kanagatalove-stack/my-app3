@@ -4350,6 +4350,85 @@ function shardFilterMergedDevices(list, filterSchool, teacher, includeUnassigned
  * 親GAS側: 親の端末一覧に子GASの端末を足して返す（教員は1画面のまま）。
  * SHARD_MODE=false なら base をそのまま返す（従来動作と完全に同一）。
  */
+/**
+ * 親の行と子の行を1台分だけ突き合わせて統合する。
+ *
+ * 【なぜ必要か（split-brain）】
+ *   端末は割り当て後「子GAS」にしかハートビートしないため、子のシートだけが更新される。
+ *   親のシートの最終同期日時は切り替え時点で止まる。以前は「親が持っていれば子を捨てる」
+ *   だったので、親の古い日時だけを見て is_online=false（オフライン）になっていた。
+ *
+ * 【統合の規則】
+ *   ・名簿（氏名・学校・クラス）… 親が正。親が「未設定」「未登録児童…」なら子で補う
+ *   ・テレメトリ（最終同期・現在URL・監視・画面更新）… 最終同期が新しい方を採用
+ *   ・コマンド（ロック・規制・一斉表示・画面要求・備考）… 親が正。
+ *     親が空で子に入っていれば子を残す（伝達済みの値を消さない）
+ *   ・is_online … 統合後の最終同期から再計算する（親だけ見ると誤判定する）
+ */
+function shardMergeDeviceRow(parentDev, childDev) {
+  const p = parentDev || {};
+  const c = childDev || {};
+
+  const toMs = function (v) {
+    const s = String(v === null || v === undefined ? '' : v).trim();
+    if (!s) return 0;
+    const t = new Date(s).getTime();
+    return isNaN(t) ? 0 : t;
+  };
+  const pSeen = toMs(p.last_seen);
+  const cSeen = toMs(c.last_seen);
+  const childFresher = cSeen > pSeen;
+
+  // 親を土台にし、親に無いキーだけ子から足す
+  const out = {};
+  const pk = Object.keys(p);
+  for (let i = 0; i < pk.length; i++) out[pk[i]] = p[pk[i]];
+  const ck = Object.keys(c);
+  for (let i = 0; i < ck.length; i++) { if (!(ck[i] in out)) out[ck[i]] = c[ck[i]]; }
+
+  // ---- 名簿: 親が正。親が無効値なら子で補う ----
+  const roster = ['student_name', 'school_name', 'class_name'];
+  for (let i = 0; i < roster.length; i++) {
+    const k = roster[i];
+    const pv = String(p[k] === undefined || p[k] === null ? '' : p[k]).trim();
+    const cv = String(c[k] === undefined || c[k] === null ? '' : c[k]).trim();
+    const parentBad = !pv || pv === '未設定' ||
+      /^未登録児童/.test(pv) || /\(Googleアカウント\)/.test(pv);
+    if (parentBad && cv && cv !== '未設定') out[k] = c[k];
+  }
+
+  // ---- テレメトリ: 子の方が新しいときだけ子を採用 ----
+  if (childFresher) {
+    const telemetry = ['last_seen', 'current_url', 'screenshot_at',
+      'monitor_flag', 'monitor_reason', 'monitor_url', 'monitor_at'];
+    for (let i = 0; i < telemetry.length; i++) {
+      const k = telemetry[i];
+      if (k in c) out[k] = c[k];
+    }
+  }
+
+  // ---- 最終同期とオンライン判定（ここが症状の本体）----
+  const bestSeen = Math.max(pSeen, cSeen);
+  const bestStr = childFresher
+    ? String(c.last_seen || p.last_seen || '')
+    : String(p.last_seen || c.last_seen || '');
+  out.last_seen = bestStr;
+  out.is_online = bestSeen ? ((new Date().getTime() - bestSeen) < 60000) : false;
+
+  // ---- コマンド: 親が正。親が空なら子を残す ----
+  const commands = ['screen_lock', 'filter_mode', 'whitelist_urls', 'blacklist_urls',
+    'broadcast_url', 'broadcast_id', 'screen_request_at', 'notes'];
+  for (let i = 0; i < commands.length; i++) {
+    const k = commands[i];
+    const pv = p[k];
+    const parentEmpty = (pv === undefined || pv === null || pv === '' ||
+      (Array.isArray(pv) && pv.length === 0));
+    if (parentEmpty && (k in c)) out[k] = c[k];
+  }
+
+  return out;
+}
+
 function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
   if (!isShardParent()) return base;
   try {
@@ -4363,18 +4442,31 @@ function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
     if (!childList.length) return base;
 
     const merged = (Array.isArray(base) ? base.slice() : []);
-    const seen = {};
+    const rowOf = {};
     for (let i = 0; i < merged.length; i++) {
       const id = String(merged[i] && merged[i].student_id || '').trim();
-      if (id) seen[id] = true;
+      if (id) rowOf[id] = i;
     }
 
+    // 子の端末を1台ずつ処理する。
+    //   ・親にも居る → 突き合わせて統合（テレメトリは新しい方＝通常は子）
+    //   ・親に居ない → 新規として追加（スコープ適用の対象）
+    // 以前は「親に居れば子を捨てる」だったため、切り替え直後から親の古い日時で
+    // オフライン表示になっていた。ここが split-brain の修正点。
     const extra = [];
+    const newIds = {};
     for (let i = 0; i < childList.length; i++) {
-      const id = String(childList[i] && childList[i].student_id || '').trim();
-      if (!id || seen[id]) continue; // 親が既に持っている児童は親を正とする
-      seen[id] = true;
-      extra.push(childList[i]);
+      const child = childList[i] || {};
+      const id = String(child.student_id || '').trim();
+      if (!id) continue;
+
+      if (rowOf[id] !== undefined) {
+        merged[rowOf[id]] = shardMergeDeviceRow(merged[rowOf[id]], child);
+        continue;
+      }
+      if (newIds[id]) continue; // 複数の子GASが同じ児童を返した場合は先着を採る
+      newIds[id] = true;
+      extra.push(child);
     }
     if (!extra.length) return merged;
 
@@ -4483,7 +4575,10 @@ function shardPropagatePolicy(studentIds, patch) {
     const cfg = shardConfigCached();
     const idx = shardMapIndexFromMap(cfg.map);
     const defUrl = String(cfg.def || '').trim();
-    if (!Object.keys(idx).length && !defUrl) return { skipped: true, reason: 'no_child' };
+    // SHARD_MAP_V1 の空キー（""）で指定された既定の子GAS。
+    // これを見落とすと、クラス未設定の児童にコマンドが一切届かない。
+    const emptyDef = shardMapDefaultFromEmptyKey(cfg.map);
+    if (!Object.keys(idx).length && !defUrl && !emptyDef) return { skipped: true, reason: 'no_child' };
 
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
@@ -4502,7 +4597,8 @@ function shardPropagatePolicy(studentIds, patch) {
       if (!isAll && !(idSet && idSet.has(id))) continue;
       const rawClass = String(data[i][clsCol] || '').trim();
       const cls = normalizeShardClass(rawClass);
-      const url = idx[cls] || defUrl;
+      // クラス一致 → 空キー既定 → SHARD_DEFAULT_URL の順で解決する
+      const url = idx[cls] || emptyDef || defUrl;
       if (!url) continue;
       if (!groups[url]) groups[url] = [];
       groups[url].push(id);
@@ -4640,11 +4736,24 @@ function jsonResponse(obj) {
 // GAS ネイティブ画面（script.google.com）からは content script へ postMessage が
 // 届かない場合があるため、確実に届く google.script.run 経由の経路を用意する。
 function api_consoleTouch(sessionId) {
-  try { return touchTeacherConsole(sessionId); } catch (err) { return { success: false, error: err.toString() }; }
+  // 子GAS分散: 教員は親コンソールにしかログインしないため、子GASは自分の
+  // isTeacherConsoleActive() が永久に false になる。ここで稼働を配らないと、
+  // 子担当の端末が ka_active=false を受け取り「同期周期：停止」のまま止まる。
+  // （doPost の console_touch だけが配っていたため、google.script.run 経由では届かなかった）
+  let res = null;
+  try { res = touchTeacherConsole(sessionId); }
+  catch (err) { return { success: false, error: err.toString() }; }
+  try { shardPropagateKaState(true); } catch (e) { /* 配信失敗でも稼働記録は成立させる */ }
+  return res;
 }
 
 function api_consoleRelease(sessionId) {
-  try { return releaseTeacherConsole(sessionId); } catch (err) { return { success: false, error: err.toString() }; }
+  let res = null;
+  try { res = releaseTeacherConsole(sessionId); }
+  catch (err) { return { success: false, error: err.toString() }; }
+  // 全セッションが消えた（＝非稼働）ときだけ子へ停止を伝える（従来の doPost と同じ規則）
+  try { if (!isTeacherConsoleActive()) shardPropagateKaState(false); } catch (e) {}
+  return res;
 }
 
 function api_login(email, password) {
@@ -4673,12 +4782,16 @@ function api_verifySession(token) {
 }
 
 function api_getAllDevices(token, schoolName, includeUnassigned) {
-  // ※ 子GAS分散時は shardMergeDevices が子の端末も連結する（1画面維持）。
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
-    const data = getAllDevices(schoolName, currentTeacher, Boolean(includeUnassigned));
+    // 子GAS分散: 教員コンソールの経路は google.script.run（この関数）と
+    // doPost の get_all の2つがある。以前はここが getAllDevices を直接呼んでいたため、
+    // google.script.run 経由のときだけ子GASの端末が見えなかった（経路による差）。
+    // 集約（親＋子の統合）を通る getShardMergedDevices に統一する。
+    // SHARD_MODE=false のときは内部で getAllDevices をそのまま返す＝従来と完全同一。
+    const data = getShardMergedDevices(schoolName, currentTeacher, Boolean(includeUnassigned));
     return { success: true, data: data };
   } catch (err) {
     return { success: false, error: err.toString() };
@@ -4724,7 +4837,11 @@ function api_bulkLock(token, studentIds, locked) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
     bulkUpdateScreenLock(scoped.ids, Boolean(locked));
-    return { success: true, message: `画面ロックを ${locked ? 'ON' : 'OFF'} に更新しました` };
+    // 子GAS分散: 教員コンソールは google.script.run（この関数）を使うため、
+    // ここで伝達しないと子担当の端末にロック指示が届かない。
+    // doPost の bulk_lock と同じ内容を渡す（SHARD_MODE=false なら何もしない）。
+    const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: Boolean(locked) });
+    return { success: true, message: `画面ロックを ${locked ? 'ON' : 'OFF'} に更新しました`, shard: shardLock };
   } catch (err) {
     return { success: false, error: err.toString() };
   }
@@ -4741,7 +4858,9 @@ function api_bulkBroadcast(token, studentIds, url) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
     const bcId = bulkUpdateBroadcastUrl(scoped.ids, url, '');
-    return { success: true, broadcast_id: bcId };
+    // 子GAS分散: 一斉URL配信も子へ伝達する（届かないと端末側で配信されない）
+    const shardBc = shardPropagatePolicy(scoped.ids, { broadcast_url: url });
+    return { success: true, broadcast_id: bcId, shard: shardBc };
   } catch (err) {
     return { success: false, error: err.toString() };
   }
@@ -4757,6 +4876,12 @@ function api_bulkFilter(token, studentIds, mode, whitelist, blacklist) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
     bulkUpdateFilterMode(scoped.ids, mode, whitelist, blacklist);
+    // 子GAS分散: URL規制も子へ伝達する
+    const shardFilter = shardPropagatePolicy(scoped.ids, {
+      filter_mode: mode,
+      whitelist_urls: whitelist,
+      blacklist_urls: blacklist
+    });
     try {
       saveTeacherSettings(currentTeacher.email, {
         filter_whitelist: whitelist,
@@ -4765,7 +4890,7 @@ function api_bulkFilter(token, studentIds, mode, whitelist, blacklist) {
     } catch (e) {
       Logger.log('教員規制設定保存エラー: ' + e);
     }
-    return { success: true, message: `URL規制モードを ${mode} に更新しました` };
+    return { success: true, message: `URL規制モードを ${mode} に更新しました`, shard: shardFilter };
   } catch (err) {
     return { success: false, error: err.toString() };
   }
@@ -4782,7 +4907,17 @@ function api_updateSingle(token, studentId, data) {
       return { success: false, error: '対象外の児童は操作できません（学校・対象クラスの範囲外）' };
     }
     updateSingleDevice(studentId, data || {});
-    return { success: true, message: '設定を更新しました' };
+    // 子GAS分散: 個別更新も子へ伝達する（doPost の update_single と同じ組み立て）
+    const single = data || {};
+    const shardPatch = {};
+    if (single.screen_lock !== undefined) shardPatch.screen_lock = Boolean(single.screen_lock);
+    if (single.filter_mode !== undefined) shardPatch.filter_mode = single.filter_mode;
+    if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
+    if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
+    if (single.broadcast_url) shardPatch.broadcast_url = single.broadcast_url;
+    const shardSingle = Object.keys(shardPatch).length
+      ? shardPropagatePolicy([studentId], shardPatch) : { skipped: true };
+    return { success: true, message: '設定を更新しました', shard: shardSingle };
   } catch (err) {
     return { success: false, error: err.toString() };
   }
