@@ -1939,113 +1939,92 @@ function applyMonitorVisibility(devices) {
 }
 
 
-// ==================== ハートビート用 端末行キャッシュ（CacheService） ====================
-// 【目的】
-//   1.5 秒周期の doPost から「シート全読み（getDataRange）」「ヘッダー行の読み取り」を排除し、
-//   1 リクエストの実行時間をミリ秒台（3〜5ms 目安）に落とす。
-//   GAS の実制約は「同時実行 30/ユーザー」であり、240 台 × 1.5 秒 ≒ 160 req/秒を
-//   1 実行 200ms で受けると 32 並列に達して上限を超える。
-//   1 実行を 3〜5ms にすれば並列は 1 未満に収まり、1 校 1 GAS のまま安全に運用できる。
+// ==================== ハートビート用 行解決（キャッシュ廃止・毎回シートから引き直す） ====================
+// 【v1.6.5 変更点：行番号キャッシュの廃止】
+//   以前は児童ごとに「行番号」を CacheService へ最大6時間保持していた（旧 hbGetCachedRow）。
+//   しかし書き込み版 dev_v は「教員が管理画面から書き込んだとき」しか進まないため、
+//   スプレッドシート上で直接 行の削除・挿入・並べ替え を行うと、版は変わらないまま
+//   行番号だけがズレる。実機では 2 行目の児童が 3 行目（空行）に書かれ、
+//   A〜D列が空欄のまま K列/L列 だけが更新される事故になった（getLastRow() が 3 に）。
 //
-// 【整合性の担保（厳守）】
-//   ・キャッシュには書き込み版 dev_v を刻む。教員の書き込み（withWriteLock）は
-//     invalidateDevicesCache() で dev_v を進めるため、版の古いキャッシュは自動的に無効になる。
-//   ・キャッシュヒット時も「現在URLの変化」「最終同期日時の 20 秒間引き」の判定は
-//     従来どおり行い、必要があるときだけシートへ書く（書込み回数は増やさない）。
-//   ・シートへ書いた後はキャッシュも同じ内容へ更新する（次回ヒットで古い値を返さない）。
-//   ・is_online の判定（最終同期日時 < 60 秒）はシートの値を正とし、従来仕様を維持する。
-//   ・CacheService が無い環境（テスト等）では全経路が従来動作へフォールバックする。
-const HB_ROW_CACHE_PREFIX = 'hbr2_';
-const HB_HEADER_CACHE_KEY = 'hbh2';
-const HB_CACHE_TTL_SEC = 21600; // 行キャッシュの保持（CacheService の上限＝6時間）
-const HB_HEADER_TTL_SEC = 1800; // ヘッダーは短め（列追加時の取りこぼしを防ぐ）
+//   再発防止のため、行番号は一切キャッシュせず、毎回シートから児童IDで引き直す。
+//   ヘッダー位置も同様に毎回読む（列の挿入・削除でも壊れないようにする）。
+//   追加コストは 1 リクエストあたり getDataRange 1 回＋ヘッダー1行のみ。
+//   行検索は文字列比較の線形走査なので、数百行規模では体感差はない。
+//
+// 【実測用ログ】
+//   HB_DEBUG_LOG を true にすると、経路・探索結果・書き込み先の行番号を
+//   実行ログへ出す。原因調査が済んだら false に戻す（既定 false）。
+const HB_DEBUG_LOG = true; // ← 実測が終わったら false に戻してください
+const HB_LOG_PREFIX = '[HB]';
 
-function hbCacheReady() {
-  try {
-    return (typeof CacheService !== 'undefined') && !!CacheService.getScriptCache();
-  } catch (e) {
-    return false;
+/** 実測用ログ。HB_DEBUG_LOG=false のときは何もしない（本番の負荷を増やさない）。 */
+function hbLog(msg) {
+  if (!HB_DEBUG_LOG) return;
+  try { Logger.log(HB_LOG_PREFIX + ' ' + msg); } catch (e) {}
+}
+
+/**
+ * 児童IDから「いま何行目か」を引き直す（キャッシュしない）。
+ *
+ * 【返り値】
+ *   { rowNum, row, total, orphanRowNum }
+ *     rowNum      … 見つかった行番号（1-indexed）。見つからなければ -1
+ *     row         … その行の値配列（見つかったときのみ）
+ *     total       … シートの総行数（ヘッダー含む）
+ *     orphanRowNum… 児童IDが空の行のうち最初のもの（過去の行ズレ事故の残骸）。
+ *                   新規登録時に再利用して、空行を増やさず掃除するために使う。
+ *
+ * 【なぜキャッシュしないのか】
+ *   行番号は他の行の増減で簡単に変わる。CacheService に保持すると
+ *   「シート上で行を消した／挿入した」だけで恒久的にズレたままになる。
+ *   数百行の線形走査はミリ秒未満なので、毎回引き直す方が安全で十分に速い。
+ */
+function hbResolveRowByStudentId(sheet, headerMap, studentId) {
+  const idColIdx = headerMap['児童ID'] - 1;
+  const data = sheet.getDataRange().getValues();
+  const total = data.length;
+  if (idColIdx < 0) {
+    hbLog('resolve: 児童ID列が見つかりません（ヘッダー異常）');
+    return { rowNum: -1, row: null, total: total, orphanRowNum: -1 };
   }
-}
 
-/** 書き込み版（dev_v）を読む。取得できない場合は '' を返し、呼び出し側はキャッシュを使わない。 */
-function hbReadDevVersion() {
-  if (!hbCacheReady()) return '';
-  try {
-    const v = CacheService.getScriptCache().get('dev_v');
-    return String(v || '0');
-  } catch (e) {
-    return '';
+  const wantId = normalizeIdKey(studentId);
+  if (!wantId) {
+    hbLog('resolve: 児童IDが空のため照合しません');
+    return { rowNum: -1, row: null, total: total, orphanRowNum: -1 };
   }
-}
 
-function hbRowPrefix() {
-  return (typeof HB_ROW_CACHE_PREFIX === 'string') ? HB_ROW_CACHE_PREFIX : 'hbr2_';
-}
-function hbRowTtl() {
-  return (typeof HB_CACHE_TTL_SEC === 'number') ? HB_CACHE_TTL_SEC : 21600;
-}
-function hbHeaderKey() {
-  return (typeof HB_HEADER_CACHE_KEY === 'string') ? HB_HEADER_CACHE_KEY : 'hbh2';
-}
-function hbHeaderTtl() {
-  return (typeof HB_HEADER_TTL_SEC === 'number') ? HB_HEADER_TTL_SEC : 1800;
-}
-
-/** 端末一覧のヘッダーマップとして最低限必要な列が揃っているか。 */
-function hbHeaderKeysOk(headerMap) {
-  if (!headerMap || typeof headerMap !== 'object') return false;
-  const need = ['児童ID', '学校名', '氏名', 'クラス', '画面ロック', 'URL規制モード',
-    '許可URLリスト', '規制URLリスト', '一斉表示URL', '一斉表示実行ID',
-    '現在開いているURL', '最終同期日時'];
-  for (let i = 0; i < need.length; i++) {
-    const v = headerMap[need[i]];
-    if (!v || v < 1) return false;
+  // 一致行と「児童IDが空の残骸行」を 1 回の走査で確定させる。
+  // 途中で return すると、一致行より後ろにある残骸行を見落とすため、
+  // 最後まで走査する（data はメモリ上の配列なので追加の API 呼び出しは無い）。
+  let orphanRowNum = -1;
+  let foundRowNum = -1;
+  let foundRow = null;
+  let foundRawId = '';
+  for (let i = 1; i < total; i++) {
+    const rawId = data[i] ? data[i][idColIdx] : '';
+    const key = normalizeIdKey(rawId);
+    if (!key) {
+      if (orphanRowNum < 0) orphanRowNum = i + 1;
+      continue;
+    }
+    if (foundRowNum < 0 && key === wantId) {
+      foundRowNum = i + 1;
+      foundRow = data[i];
+      foundRawId = rawId;
+    }
   }
-  return true;
-}
 
-function hbGetCachedHeaderMap(ver) {
-  if (!ver || !hbCacheReady()) return null;
-  try {
-    const raw = CacheService.getScriptCache().get(hbHeaderKey());
-    if (!raw) return null;
-    const o = JSON.parse(raw);
-    if (!o || o.v !== ver || !hbHeaderKeysOk(o.m)) return null;
-    return o.m;
-  } catch (e) {
-    return null;
+  if (foundRowNum >= 0) {
+    hbLog('resolve: 一致 row=' + foundRowNum + ' id=' + String(foundRawId) +
+      ' (総行数=' + total + ', 空ID行の先頭=' + orphanRowNum + ')');
+    return { rowNum: foundRowNum, row: foundRow, total: total, orphanRowNum: orphanRowNum };
   }
-}
 
-function hbPutCachedHeaderMap(headerMap, ver) {
-  if (!ver || !hbCacheReady() || !hbHeaderKeysOk(headerMap)) return;
-  try {
-    CacheService.getScriptCache().put(hbHeaderKey(),
-      JSON.stringify({ v: ver, m: headerMap }), hbHeaderTtl());
-  } catch (e) {}
-}
-
-/** 児童1人分の行をキャッシュから取得する。{ r: 行番号, d: 行配列 } を返す。 */
-function hbGetCachedRow(studentId, ver) {
-  if (!ver || !hbCacheReady()) return null;
-  try {
-    const raw = CacheService.getScriptCache().get(hbRowPrefix() + studentId);
-    if (!raw) return null;
-    const o = JSON.parse(raw);
-    if (!o || o.v !== ver || !o.d || !(o.r >= 2)) return null;
-    return o;
-  } catch (e) {
-    return null;
-  }
-}
-
-function hbPutCachedRow(studentId, rowNumber, rowArray, ver) {
-  if (!ver || !hbCacheReady() || !rowArray || !(rowNumber >= 2)) return;
-  try {
-    CacheService.getScriptCache().put(hbRowPrefix() + studentId,
-      JSON.stringify({ v: ver, r: rowNumber, d: rowArray }), hbRowTtl());
-  } catch (e) {}
+  hbLog('resolve: 不一致 id=' + studentId + ' (総行数=' + total +
+    ', 空ID行の先頭=' + orphanRowNum + ')');
+  return { rowNum: -1, row: null, total: total, orphanRowNum: orphanRowNum };
 }
 
 /**
@@ -2123,17 +2102,28 @@ function hbApplyMonitor(sheet, rowNum, row, headerMap, currentUrl, now) {
  * 重複行が作成されないよう、書き込みロック内で「再確認 → 登録」を行う。
  */
 function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now) {
-  const devVer = hbReadDevVersion();
+  hbLog('register: 開始 id=' + studentId + ' url=' + currentUrl);
   return withWriteLock(function () {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
     const data = sheet.getDataRange().getValues();
     const idColIdx = headerMap['児童ID'] - 1;
 
+    // 再確認（同時アクセス対策）。あわせて「児童IDが空の残骸行」も探す。
+    // 残骸行＝過去の行ズレ事故で K列/L列 だけが書かれた行。新規行を増やさず再利用する。
+    const wantId = normalizeIdKey(studentId);
     let reRow = -1;
+    let orphanRowNum = -1;
     for (let i = 1; i < data.length; i++) {
-      if (normalizeIdKey(data[i][idColIdx]) === normalizeIdKey(studentId)) { reRow = i + 1; break; }
+      const key = normalizeIdKey(data[i][idColIdx]);
+      if (!key) {
+        if (orphanRowNum < 0) orphanRowNum = i + 1;
+        continue;
+      }
+      if (key === wantId) { reRow = i + 1; break; }
     }
+    hbLog('register: 再確認 reRow=' + reRow + ' 残骸行=' + orphanRowNum +
+      ' 総行数=' + data.length);
 
     if (reRow !== -1) {
       // 先に登録されていた（同時アクセス）。学校名が未設定なら補完して返す。
@@ -2146,8 +2136,7 @@ function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActiv
           row[reSchoolCol - 1] = incomingSchool;
         }
       }
-      hbPutCachedHeaderMap(headerMap, devVer);
-      hbPutCachedRow(studentId, reRow, row, devVer);
+      hbLog('register: 既に登録済み（同時アクセス）row=' + reRow + ' → 新規行は作らない');
       return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
     }
 
@@ -2203,9 +2192,19 @@ function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActiv
     if (headerMap['要注意URL']) newRow[headerMap['要注意URL'] - 1] = newMon.flagged ? (newMon.host || '') : '';
     if (headerMap['注意検知日時']) newRow[headerMap['注意検知日時'] - 1] = newMon.flagged ? now : '';
 
+    // 児童IDが空の残骸行（過去の行ズレ事故の跡）があれば、新規行を増やさずに
+    // その行へ全体を書き直して掃除する。getLastRow() が水増しされたままにならない。
+    if (orphanRowNum >= 2) {
+      hbLog('register: 残骸行を再利用 row=' + orphanRowNum +
+        '（新規行は追加しない） id=' + studentId);
+      sheet.getRange(orphanRowNum, 1, 1, CONFIG.DEVICE_COLUMNS.length).setValues([newRow]);
+      return buildHeartbeatResponse(newRow, headerMap, studentId, kaActive, kaInfo, now);
+    }
+
+    const beforeLast = sheet.getLastRow();
     sheet.appendRow(newRow);
-    hbPutCachedHeaderMap(headerMap, devVer);
-    hbPutCachedRow(studentId, data.length + 1, newRow, devVer);
+    hbLog('register: 新規行を追加 row=' + (beforeLast + 1) + ' id=' + studentId +
+      '（追加前の最終行=' + beforeLast + '）');
 
     return buildHeartbeatResponse(newRow, headerMap, studentId, kaActive, kaInfo, now);
   });
@@ -2224,43 +2223,27 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
   const nowMs = new Date().getTime();
 
-  // 書き込み版は 1 回だけ読む（この値でキャッシュの有効性を判定する）。
-  const devVer = hbReadDevVersion();
+  const t0 = new Date().getTime();
 
-  // ---- 1) キャッシュヒットを試す（ヒットすればシートを開かない＝高速化の本体） ----
-  let headerMap = hbGetCachedHeaderMap(devVer);
-  let row = null;
-  let rowNum = -1;
-  let sheet = null;
+  // ---- 1) 行番号はキャッシュしない。毎回シートから児童IDで引き直す ----
+  //   旧実装は hbGetCachedRow が最大6時間「行番号」を保持していた。dev_v は教員の
+  //   書き込みでしか進まないため、シート上で行を削除・挿入されると版は変わらないまま
+  //   行番号だけがズレ、2行目の児童が3行目の空行に書かれる事故になった。
+  //   ヘッダー位置も毎回読む（列の挿入・削除でも壊れない）。
+  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+  const resolved = hbResolveRowByStudentId(sheet, headerMap, studentId);
 
-  if (headerMap) {
-    const hit = hbGetCachedRow(studentId, devVer);
-    if (hit) { row = hit.d.slice(); rowNum = hit.r; }
+  if (resolved.rowNum < 0) {
+    // 未登録 → 新規自動登録へ（重複防止のため書き込みロック内で再確認する）
+    hbLog('heartbeat: 未登録のため新規登録へ id=' + studentId);
+    return hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now);
   }
 
-  // ---- 2) ミス時は従来どおりシートを読む ----
-  if (!row) {
-    sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
-    headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
-    hbPutCachedHeaderMap(headerMap, devVer);
-
-    const data = sheet.getDataRange().getValues();
-    const idColIdx = headerMap['児童ID'] - 1;
-    // 照合は正規化して行う（大文字小文字・全角半角・空白の揺れを吸収）
-    const wantId = normalizeIdKey(studentId);
-    for (let i = 1; i < data.length; i++) {
-      if (normalizeIdKey(data[i][idColIdx]) === wantId) {
-        rowNum = i + 1;
-        row = data[i];
-        break;
-      }
-    }
-    if (!row) {
-      // 未登録 → 新規自動登録へ（重複防止のため書き込みロック内で再確認する）
-      return hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now);
-    }
-    hbPutCachedRow(studentId, rowNum, row, devVer);
-  }
+  const row = resolved.row;
+  const rowNum = resolved.rowNum;
+  hbLog('heartbeat: id=' + studentId + ' -> row=' + rowNum +
+    ' (総行数=' + resolved.total + ')');
 
   // ---- 2.5) 子GAS: 氏名・学校名・クラスが未取得なら親の名簿で補完する ----
   // 空キー既定のフォールバックで子へ直行した端末は、子に名簿が無いため
@@ -2268,8 +2251,7 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   if (typeof hbApplyChildIdentity === 'function') {
     try {
       if (hbApplyChildIdentity(sheet, rowNum, row, headerMap, studentId)) {
-        if (!sheet) sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
-        hbPutCachedRow(studentId, rowNum, row, devVer);
+        hbLog('heartbeat: 子GASの名簿補完を反映 row=' + rowNum);
       }
     } catch (e) { /* 補完失敗でも通常のハートビートは続ける */ }
   }
@@ -2289,12 +2271,13 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   }
 
   if (!urlChanged && !syncDue && !schoolFill) {
-    // 何も書かない → シートに一切触らない（キャッシュのみで応答）
+    // 何も書かない → シートへは書かない（読み取りのみで応答）
+    hbLog('heartbeat: 書き込み不要 row=' + rowNum +
+      ' elapsed=' + (new Date().getTime() - t0) + 'ms');
     return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
   }
 
-  // ここから先は書き込みが必要。キャッシュヒット経由でも、この時点で初めてシートを開く。
-  if (!sheet) sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+  // ここから先は書き込みが必要（sheet は手順1で開済み）
 
   // 学校名の補完（未設定の行だけ。教員が設定済みの値は上書きしない）
   if (schoolFill) {
@@ -2304,16 +2287,20 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
 
   if (urlChanged && syncDue && urlCol && syncCol && syncCol === urlCol + 1) {
     // 隣接2列ならまとめて1回で書く（GAS/シートの往復を削減）
+    hbLog('heartbeat: 2列まとめ書き row=' + rowNum + ' cols=' + urlCol + '..' + syncCol +
+      ' url=' + currentUrl + ' sync=' + now);
     sheet.getRange(rowNum, urlCol, 1, 2).setValues([[currentUrl, now]]);
     row[urlCol - 1] = currentUrl;
     row[syncCol - 1] = now;
   } else {
     // 片方だけのときは、その列だけを書く（触っていない値の書式を変えない）
     if (urlChanged) {
+      hbLog('heartbeat: K列書き row=' + rowNum + ' col=' + urlCol + ' url=' + currentUrl);
       sheet.getRange(rowNum, urlCol).setValue(currentUrl);
       row[urlCol - 1] = currentUrl;
     }
     if (syncDue) {
+      hbLog('heartbeat: L列書き row=' + rowNum + ' col=' + syncCol + ' sync=' + now);
       sheet.getRange(rowNum, syncCol).setValue(now);
       row[syncCol - 1] = now;
     }
@@ -2322,8 +2309,9 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   // ---- AI監視（URLが変わったときだけ判定。毎回の同期で辞書照合しない＝GASを軽く保つ） ----
   if (urlChanged) hbApplyMonitor(sheet, rowNum, row, headerMap, currentUrl, now);
 
-  // 書いた内容をキャッシュへ反映（次回ヒットで古い値を返さない）
-  hbPutCachedRow(studentId, rowNum, row, devVer);
+  hbLog('heartbeat: 書き込み完了 row=' + rowNum + ' urlChanged=' + urlChanged +
+    ' syncDue=' + syncDue + ' schoolFill=' + schoolFill +
+    ' elapsed=' + (new Date().getTime() - t0) + 'ms');
 
   return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
 }
