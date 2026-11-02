@@ -2701,8 +2701,10 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
     const lastSeenStr = row[headerMap['最終同期日時'] - 1];
     let isOnline = false;
     if (lastSeenStr) {
-      const dt = new Date(lastSeenStr);
-      if (!isNaN(dt.getTime())) isOnline = (now - dt.getTime()) < 60000;
+      // シートの日時は日本時間。実行環境のタイムゾーンに依存しないよう
+      // sheetTsToMs で解釈する（9 時間ずれて常時オフラインになる事故の防止）。
+      const seenMs = sheetTsToMs(lastSeenStr);
+      if (seenMs) isOnline = (now - seenMs) < 60000;
     }
 
     // 画面一覧用の制御列（列が無い既存シートでも安全に '' を返す）
@@ -4241,6 +4243,8 @@ function shardFetchChildDevices(urlsOverride) {
         payload: body, muteHttpExceptions: true
       });
     }
+    // 取得できた／できなかった子GASを記録する（診断用。配列のプロパティとして載せる）
+    const diag = { requested: urls.length, ok: 0, failed: [], rows: 0 };
 
     // 並列（一括）取得。12 クラスあっても 1 回分の待ち時間で揃う。
     const responses = shardFetchMany(requests);
@@ -4250,23 +4254,40 @@ function shardFetchChildDevices(urlsOverride) {
       const res = responses[i];
       if (!res) continue;
       try {
-        if (res.getResponseCode() !== 200) continue;
+        const code = res.getResponseCode();
+        if (code !== 200) {
+          // 子GASが 200 以外を返した（共有シークレット不一致・公開範囲の誤り等）。
+          // 以前はここで黙って捨てていたため、親コンソールには「親の古い行」だけが
+          // 残り、端末がオフラインに見える原因が画面から全く分からなかった。
+          diag.failed.push({ url: urls[i], status: code });
+          continue;
+        }
         const parsed = JSON.parse(res.getContentText() || '{}');
         const list = (parsed && parsed.data) || [];
         if (!Array.isArray(list)) continue;
+        diag.ok++;
+        diag.rows += list.length;
         for (let k = 0; k < list.length; k++) {
           list[k]._shard_source = urls[i];
           out.push(list[k]);
         }
-      } catch (e) { /* 1台の子が落ちても他の子の結果は返す */ }
+      } catch (e) {
+        // JSON でない応答（ログイン画面の HTML 等）も原因として残す。
+        diag.failed.push({ url: urls[i], status: -1, error: 'not_json' });
+      }
     }
 
     if (cache) {
       try { cache.put(cacheKey, JSON.stringify(out), SHARD_LIST_CACHE_TTL); } catch (e) {}
     }
+    try { out._diag = diag; } catch (e) { /* 添付できなくても一覧は返す */ }
     return out;
   } catch (e) {
-    return []; // 分散が未設定・失敗なら空配列＝親の一覧だけを返す（従来動作）
+    // 分散が未設定・失敗なら空配列＝親の一覧だけを返す（従来動作）。
+    // ただし「失敗した」ことは残す（黙って親の古い行だけ返すと原因が追えない）。
+    const empty = [];
+    try { empty._diag = { requested: 0, ok: 0, failed: [{ status: -1, error: String(e) }], rows: 0 }; } catch (e2) {}
+    return empty;
   }
 }
 
@@ -4353,16 +4374,49 @@ function shardFilterMergedDevices(list, filterSchool, teacher, includeUnassigned
  *     親が空で子に入っていれば子を残す（伝達済みの値を消さない）
  *   ・is_online … 統合後の最終同期から再計算する（親だけ見ると誤判定する）
  */
+/**
+ * シートの日時セル（"2026/11/02 11:19:32" 等）をエポックmsへ変換する。
+ *
+ * 【なぜ new Date() に任せないか（R29 の実測で判明）】
+ *   "2026/11/02 11:19:32" はタイムゾーン表記を持たないため、解釈が実行環境の
+ *   タイムゾーンに依存する。実測では同じデータ・同じ比較時刻でも
+ *     TZ=UTC        → is_online=true
+ *     TZ=Asia/Tokyo → is_online=false
+ *   と結果が反転した。GAS のスクリプトタイムゾーンが変わると is_online（60秒窓）が
+ *   全端末で誤判定する。
+ *   シートへ書いているのは常に日本時間なので、ここでは UTC+9 と決め打ちして
+ *   組み立てる＝実行環境に依存せず同じ結果になる。
+ */
+const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000; // Asia/Tokyo (UTC+9)
+
+function sheetTsToMs(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  if (v instanceof Date) {
+    const t0 = v.getTime();
+    return isNaN(t0) ? 0 : t0;
+  }
+  if (typeof v === 'number') return v > 0 ? v : 0;
+  const s = String(v).trim();
+  if (!s) return 0;
+  // "2026/11/02 11:19:32" / "2026-11-02T11:19:32" 等（秒・時刻は省略可）
+  const m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) {
+    const utc = Date.UTC(
+      Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+      Number(m[4] || 0), Number(m[5] || 0), Number(m[6] || 0));
+    if (!isNaN(utc)) return utc - SHEET_TZ_OFFSET_MS;
+  }
+  const t = new Date(s).getTime();
+  return isNaN(t) ? 0 : t;
+}
+
 function shardMergeDeviceRow(parentDev, childDev) {
   const p = parentDev || {};
   const c = childDev || {};
 
-  const toMs = function (v) {
-    const s = String(v === null || v === undefined ? '' : v).trim();
-    if (!s) return 0;
-    const t = new Date(s).getTime();
-    return isNaN(t) ? 0 : t;
-  };
+  // シートの日時（"2026/11/02 11:19:32"）は日本時間。実行環境のタイムゾーンに
+  // 依存させないため sheetTsToMs で解釈する（9 時間ずれると常時オフラインになる）。
+  const toMs = function (v) { return sheetTsToMs(v); };
   const pSeen = toMs(p.last_seen);
   const cSeen = toMs(c.last_seen);
   const childFresher = cSeen > pSeen;
@@ -4397,6 +4451,8 @@ function shardMergeDeviceRow(parentDev, childDev) {
 
   // ---- 最終同期とオンライン判定（ここが症状の本体）----
   const bestSeen = Math.max(pSeen, cSeen);
+  // どちらを採ったかを残す（実機で「なぜオンライン/オフラインか」を追えるようにする）
+  out.last_seen_source = childFresher ? 'child' : (pSeen ? 'parent' : 'none');
   const bestStr = childFresher
     ? String(c.last_seen || p.last_seen || '')
     : String(p.last_seen || c.last_seen || '');
@@ -4427,7 +4483,20 @@ function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
     if (!urls.length) return base;
 
     const childList = shardFetchChildDevices(urls);
-    if (!childList.length) return base;
+    const childDiag = (childList && childList._diag) || null;
+    if (!childList.length) {
+      // 子が1台も返さなかった＝親の行だけでは「オフライン」と誤表示される。
+      // 原因（非200／JSONでない／0件）をログに残す。HB_DEBUG_LOG で ON/OFF できる。
+      if (childDiag && childDiag.failed && childDiag.failed.length) {
+        try {
+          if (typeof hbLog === 'function') {
+            hbLog('shard: 子GASから取得できません ' + JSON.stringify(childDiag.failed) +
+              '（この児童は親シートの古い最終同期で判定されます）');
+          }
+        } catch (e) { /* ログ失敗は本処理に影響させない */ }
+      }
+      return base;
+    }
 
     const merged = (Array.isArray(base) ? base.slice() : []);
     const rowOf = {};

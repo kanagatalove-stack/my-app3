@@ -165,6 +165,9 @@ async function main() {
   gasBundle += lineConst(gasSrc, 'SHARD_CFG_CACHE') + '\n';
   gasBundle += lineConst(gasSrc, 'SHARD_LIST_CACHE_TTL') + '\n';
   gasBundle += lineConst(gasSrc, 'SHARD_LIST_CACHE_PREFIX') + '\n';
+  // シート日時の解釈（実行タイムゾーン非依存）。R29 で追加。
+  gasBundle += lineConst(gasSrc, 'SHEET_TZ_OFFSET_MS') + '\n';
+  gasBundle += extract(gasSrc, 'sheetTsToMs') + '\n';
   // 動的解決（スクリプトプロパティ優先）用の定数
   gasBundle += lineConst(gasSrc, 'PROP_SHARD_MODE') + '\n';
   gasBundle += lineConst(gasSrc, 'PROP_SHARD_CHILD_MODE') + '\n';
@@ -924,8 +927,8 @@ async function main() {
       shardPropagateKaState(v) { g.kaCalls.push(v); return { sent: [] }; }
     };
     vm.createContext(c2);
-    let b = '';
-    ['shardMergeDeviceRow', 'shardMergeDevices',
+    let b = 'const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;\n';
+    ['sheetTsToMs', 'shardMergeDeviceRow', 'shardMergeDevices',
       'api_getAllDevices', 'api_consoleTouch', 'api_consoleRelease']
       .forEach(function (n) { b += extract(gasSrc, n) + '\n'; });
     vm.runInContext(b, c2);
@@ -1144,6 +1147,79 @@ async function main() {
   cE.api_updateSingle('tok', 's1@x.ed.jp', { notes: 'メモだけ' });
   check('伝える項目が無ければ子GASへ空リクエストを送らない',
     cE.g.patches.length === 0, cE.g.patches);
+
+  // =========================================================================
+  // §1-11 R29: 親の「読み取り時集計」が子の最新 last_seen を正しく評価するか
+  //   実機症状: 子シートの L列は 11:19:32 で更新中なのに、親シートの L列は
+  //             11:12:41 で停止。親コンソールは親シートの値だけを見て
+  //             時間経過で「オフライン」になっていた。
+  //   設計: 親シートへの書き戻しは行わない（読み取り時のメモリ上集約のみが正）。
+  //         よって「集約が子の値を採れているか」と「日時解釈が実行環境に
+  //         依存しないか」を固定する。
+  // =========================================================================
+  console.log('===== [GAS] R29: 集約が子の最新 last_seen を評価するか =====');
+
+  // --- §1-11a 日時解釈が実行タイムゾーンに依存しない ---
+  //   シートへは常に日本時間で書くため、UTC+9 決め打ちで解釈する。
+  //   （以前は new Date(str) 任せで、スクリプトTZが変わると is_online が反転した）
+  const tzJst = ctx2.sheetTsToMs('2026/11/02 11:19:32');
+  const tzExpect = Date.UTC(2026, 10, 2, 11, 19, 32) - 9 * 60 * 60 * 1000;
+  check('シート日時を日本時間として解釈する（実行TZ非依存）',
+    tzJst === tzExpect, { got: tzJst, expect: tzExpect });
+  check('ハイフン区切り・T区切りも同じ結果になる',
+    ctx2.sheetTsToMs('2026-11-02 11:19:32') === tzExpect &&
+    ctx2.sheetTsToMs('2026-11-02T11:19:32') === tzExpect);
+  check('日付のみでも解釈できる（00:00:00 扱い）',
+    ctx2.sheetTsToMs('2026/11/02') === (Date.UTC(2026, 10, 2) - 9 * 60 * 60 * 1000));
+  check('空値は 0（落ちない）',
+    ctx2.sheetTsToMs('') === 0 && ctx2.sheetTsToMs(null) === 0 && ctx2.sheetTsToMs(undefined) === 0);
+  check('壊れた文字列でも例外を投げない', typeof ctx2.sheetTsToMs('こわれた') === 'number');
+
+  // --- §1-11b 統合時に「どちらを採ったか」が分かる ---
+  const wbChild = ctx2.shardMergeDeviceRow(pRow, cRow);
+  check('子の方が新しければ last_seen_source=child',
+    wbChild.last_seen_source === 'child', wbChild.last_seen_source);
+  const wbParent = ctx2.shardMergeDeviceRow(
+    Object.assign({}, pRow, { last_seen: FRESH }), Object.assign({}, cRow, { last_seen: STALE }));
+  check('親の方が新しければ last_seen_source=parent',
+    wbParent.last_seen_source === 'parent', wbParent.last_seen_source);
+  check('両方空なら last_seen_source=none',
+    ctx2.shardMergeDeviceRow({}, {}).last_seen_source === 'none');
+
+  // --- §1-11c 子が最新を返す実機ケース: 集約結果がオンラインになる ---
+  const ago = (ms) => isoAt(new Date().getTime() - ms);
+  const realP = Object.assign({}, pRow, { last_seen: ago(30 * 60 * 1000) });
+  const realC = Object.assign({}, cRow, { last_seen: ago(5 * 1000) });
+  const realLoop = mkCtx2([realP]);
+  realLoop.g.childList = [realC];
+  const realMerged = realLoop.shardMergeDevices([realP], 'ALL', { role: 'ADMIN' }, false);
+  const realRow = realMerged.filter(function (d) { return d.student_id === 'child-1'; })[0];
+  check('子が最新なら統合結果はオンライン（ロック直後の誤オフラインを解消）',
+    !!realRow && realRow.is_online === true, realRow && realRow.is_online);
+  check('統合結果の last_seen は子の値（親の古い値で上書きしない）',
+    !!realRow && realRow.last_seen === realC.last_seen, realRow && realRow.last_seen);
+
+  // --- §1-11d 子の取得失敗は「親の古い値のまま」になる（症状の再現と可視化） ---
+  //   ここが silent に失敗すると、画面上は原因不明のオフラインに見える。
+  //   R29 で _diag に失敗理由を残すようにした。
+  const failLoop = mkCtx2([realP]);
+  failLoop.g.childList = [];
+  const failMerged = failLoop.shardMergeDevices([realP], 'ALL', { role: 'ADMIN' }, false);
+  const failRow = failMerged[0];
+  check('子が0件を返すと親の古い値のまま（誤ってオンラインにしない）',
+    !!failRow && failRow.is_online === false, failRow && failRow.is_online);
+
+  // --- §1-11e 診断情報: 子取得の失敗理由が _diag に残る ---
+  //   shardFetchChildDevices の実物を実測プローブ（tests/probe_r29.js）で検証済み。
+  //   ここでは「失敗を記録するコードが存在すること」を静的に固定する。
+  check('子GASの非200を黙って捨てず diag に残す',
+    /diag\.failed\.push\(\{ url: urls\[i\], status: code \}\)/.test(gasSrc));
+  check('JSONでない応答も diag に残す',
+    /diag\.failed\.push\(\{ url: urls\[i\], status: -1, error: 'not_json' \}\)/.test(gasSrc));
+  check('取得0件のときはログに残す（原因を追えるようにする）',
+    /shard: 子GASから取得できません/.test(gasSrc));
+  check('親シートへの書き戻しは行わない（設計どおり読み取り時集約のみ）',
+    !/shardWriteBackTelemetry/.test(gasSrc));
 
   console.log('');
   console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');

@@ -84,8 +84,9 @@ const ctx = {
   Logger: { log(){} }
 };
 
-const names = ['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isDeviceInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','getAllDevices','parseBoolean','applyMonitorVisibility'];
+const names = ['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isDeviceInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','sheetTsToMs','getAllDevices','parseBoolean','applyMonitorVisibility'];
 let code = '';
+code += 'const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;\n';
 code += 'const SCHOOL_ALIASES = ' + JSON.stringify({
   '第一小':'第一小学校','英田小':'英田小学校','大原小':'大原小学校','江見小':'江見小学校','勝田小':'勝田小学校','勝田東小':'勝田東小学校','北小':'北小学校','土居小':'土居小学校','英田中':'英田中学校','大原中':'大原中学校','作東中':'作東中学校','勝田中':'勝田中学校','美作中':'美作中学校'
 }) + ';\n';
