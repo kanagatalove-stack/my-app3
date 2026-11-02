@@ -4174,8 +4174,168 @@ function shardPropagateKaState(active) {
  * キーに dev_v を混ぜているため、ロック/配信/規制などの書き込みで自動的に失効する
  * （＝操作直後は必ず最新、自動更新や連続操作ではキャッシュに当たる）。
  */
+// ==================== 診断用（R30 実測） ====================
+// 原因が判明したら SHARD_DIAG_MODE を false にしてください（ログが止まります）。
+const SHARD_DIAG_MODE = true;
+
+/**
+ * 診断ログ。SHARD_DIAG_MODE=false のときは何もしない。
+ *
+ * 【テスト環境で落とさないための工夫】
+ *   この関数はテストが gas/Code.gs から関数単体で切り出して実行する。
+ *   その環境には SHARD_DIAG_MODE / Logger が無い場合があるため、
+ *   typeof で存在確認してから触る（ReferenceError を出さない）。
+ */
+function shardDiagLog(msg) {
+  try {
+    if (typeof SHARD_DIAG_MODE === 'undefined' || !SHARD_DIAG_MODE) return;
+    if (typeof Logger === 'undefined') return;
+    Logger.log('[SHARD-DIAG] ' + String(msg));
+  } catch (e) { /* ログ失敗は本処理に影響させない */ }
+}
+
+/** ログ用に長い文字列を切り詰める（応答本文をそのまま出すとログが溢れるため）。 */
+function shardDiagClip(v, n) {
+  const s = String(v === undefined || v === null ? '' : v);
+  const max = n || 400;
+  return s.length > max ? (s.slice(0, max) + '…(全' + s.length + '文字)') : s;
+}
+
+/**
+ * 【手動実行用】SHARD 構成を一括診断する。
+ *
+ * 使い方: GAS エディタ上部の関数選択で diagShardSetup を選び「実行」→「実行ログ」を見る。
+ * 親GAS と 子GAS の両方で実行すると、どちら側の設定が欠けているか即座に分かる。
+ */
+function diagShardSetup() {
+  const lines = [];
+  const p = function (s) { lines.push(String(s)); };
+  const safe = function (label, fn) {
+    try { p(label + ' = ' + String(fn())); }
+    catch (e) { p(label + ' = 例外: ' + String((e && e.message) || e)); }
+  };
+
+  p('===== SHARD 構成診断 =====');
+  p('日時: ' + new Date().toString());
+
+  safe('SHARD_MODE(プロパティ生値)', function () { return propRaw(PROP_SHARD_MODE); });
+  safe('SHARD_CHILD_MODE(プロパティ生値)', function () { return propRaw(PROP_SHARD_CHILD_MODE); });
+  safe('SPREADSHEET_ID(解決後)', function () { return getSpreadsheetId(); });
+
+  p('--- 役割判定 ---');
+  safe('isShardParent()', function () { return isShardParent(); });
+  safe('isShardChild()', function () { return isShardChild(); });
+
+  p('--- 共有シークレット ---');
+  safe('SHARD_SECRET の長さ', function () {
+    const v = String(PropertiesService.getScriptProperties().getProperty(SHARD_SECRET_PROP) || '');
+    return v ? (v.length + ' 文字（値そのものは表示しません）') : '未設定（空）';
+  });
+
+  p('--- 子GASのURL一覧 ---');
+  let urls = [];
+  try {
+    const cfg = shardConfigCached();
+    urls = shardAllChildUrls(cfg);
+    p('子GASの台数 = ' + urls.length);
+    for (let i = 0; i < urls.length; i++) p('  [' + i + '] ' + urls[i]);
+    p('SHARD_MAP_V1 = ' + String(shardDiagClip(JSON.stringify(cfg.map || {}), 600)));
+    p('SHARD_DEFAULT_URL = ' + String(cfg.def || '(未設定)'));
+  } catch (e) {
+    p('子GASのURL解決で例外: ' + String((e && e.message) || e));
+  }
+
+  // 子GASへ実際に shard_list を投げて応答をそのまま観察する（これが核心）
+  p('--- 子GASへの shard_list 実測 ---');
+  if (!urls.length) {
+    p('子GASが1台も設定されていません（親GASとしては集約できません）');
+  } else {
+    try {
+      const cfg2 = shardConfigCached();
+      const body = JSON.stringify({ action: 'shard_list', shard_secret: cfg2.sec });
+      for (let i = 0; i < urls.length; i++) {
+        try {
+          const res = UrlFetchApp.fetch(urls[i], {
+            method: 'post', contentType: 'application/json', payload: body,
+            muteHttpExceptions: true
+          });
+          const code = res.getResponseCode();
+          const text = res.getContentText() || '';
+          let judge = '';
+          try {
+            const o = JSON.parse(text);
+            if (o && o.success === true) {
+              judge = '正常（data ' + (Array.isArray(o.data) ? o.data.length : '?') + ' 件）';
+            } else if (o && o.success === false) {
+              judge = '★失敗: success=false error=' + String(o.error || '(理由なし)');
+            } else {
+              judge = '応答形式が想定外';
+            }
+          } catch (e2) {
+            judge = '★JSONではありません（ログイン画面/HTML の可能性）';
+          }
+          p('  [' + i + '] status=' + code + ' → ' + judge);
+          p('      本文先頭: ' + shardDiagClip(text, 300));
+        } catch (e3) {
+          p('  [' + i + '] 通信例外: ' + String((e3 && e3.message) || e3));
+        }
+      }
+    } catch (e4) {
+      p('実測中に例外: ' + String((e4 && e4.message) || e4));
+    }
+  }
+
+  p('--- 親シートの生データ（先頭3件） ---');
+  try {
+    const dev = getAllDevices('ALL', { role: 'ADMIN' }, true);
+    p('親シート由来 = ' + (Array.isArray(dev) ? dev.length : '?') + ' 件');
+    for (let i = 0; i < dev.length && i < 3; i++) {
+      p('  [' + i + '] id=' + String(dev[i].student_id || '空') +
+        ' last_seen=' + String(dev[i].last_seen || '空') +
+        ' is_online=' + String(dev[i].is_online));
+    }
+  } catch (e5) {
+    p('親シート読み取りで例外: ' + String((e5 && e5.message) || e5));
+  }
+
+  p('--- 集約結果（getShardMergedDevices） ---');
+  try {
+    const merged = getShardMergedDevices('ALL', { role: 'ADMIN' }, true);
+    p('集約後 = ' + (Array.isArray(merged) ? merged.length : '?') + ' 件');
+    let on = 0;
+    for (let i = 0; i < merged.length; i++) {
+      if (merged[i] && merged[i].is_online === true) on++;
+      if (i < 5) {
+        p('  [' + i + '] id=' + String((merged[i] || {}).student_id || '空') +
+          ' last_seen=' + String((merged[i] || {}).last_seen || '空') +
+          ' src=' + String((merged[i] || {}).last_seen_source || '-') +
+          ' is_online=' + String((merged[i] || {}).is_online));
+      }
+    }
+    p('オンライン件数 = ' + on + ' / ' + (Array.isArray(merged) ? merged.length : '?'));
+  } catch (e6) {
+    p('集約で例外: ' + String((e6 && e6.message) || e6));
+  }
+
+  p('===== 診断ここまで =====');
+  const text = lines.join('\n');
+  try { Logger.log(text); } catch (e) {}
+  return text;
+}
+
 function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
+  // 【DIAG-1】集約が「親モード」として動いているか。
+  // false の場合、子GASには一切問い合わせず親シートの古い日時だけで判定する（＝症状の直接原因）。
+  if (typeof shardDiagLog === 'function') {
+    shardDiagLog('DIAG-1 集約開始 isShardParent=' + String(isShardParent()) +
+      ' filterSchool=' + String(filterSchool) +
+      ' includeUnassigned=' + String(!!includeUnassigned));
+  }
   if (!isShardParent()) {
+    if (typeof shardDiagLog === 'function') {
+      shardDiagLog('DIAG-2 ★親モードではありません（子GASへ問い合わせません）' +
+        ' → 親GASのスクリプトプロパティ SHARD_MODE=true が必要です');
+    }
     return getAllDevices(filterSchool, teacher, includeUnassigned);
   }
 
@@ -4207,6 +4367,23 @@ function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
   if (cache) {
     try { cache.put(cacheKey, JSON.stringify(data), SHARD_LIST_CACHE_TTL); } catch (e) {}
   }
+  // 【DIAG-5】最終的にコンソールへ返る内容（ここが is_online=false の実体）
+  if (typeof shardDiagLog === 'function') {
+    const arrD = Array.isArray(data) ? data : [];
+    let onN = 0;
+    const heads = [];
+    for (let di = 0; di < arrD.length; di++) {
+      if (arrD[di] && arrD[di].is_online === true) onN++;
+      if (di < 5) {
+        heads.push(String((arrD[di] || {}).student_id || '?') +
+          '[seen=' + String((arrD[di] || {}).last_seen || '空') +
+          ',src=' + String((arrD[di] || {}).last_seen_source || '-') +
+          ',on=' + String((arrD[di] || {}).is_online) + ']');
+      }
+    }
+    shardDiagLog('DIAG-5 集約結果 ' + arrD.length + '件 オンライン=' + onN +
+      '件 先頭=' + heads.join(' / '));
+  }
   return data;
 }
 
@@ -4235,6 +4412,9 @@ function shardFetchChildDevices(urlsOverride) {
       cache = null;
     }
 
+    if (typeof shardDiagLog === 'function') {
+      shardDiagLog('DIAG-6 子GASへ問い合わせ 台数=' + urls.length + ' ' + urls.join(' , '));
+    }
     const body = JSON.stringify({ action: 'shard_list', shard_secret: cfg.sec });
     const requests = [];
     for (let i = 0; i < urls.length; i++) {
@@ -4260,9 +4440,23 @@ function shardFetchChildDevices(urlsOverride) {
           // 以前はここで黙って捨てていたため、親コンソールには「親の古い行」だけが
           // 残り、端末がオフラインに見える原因が画面から全く分からなかった。
           diag.failed.push({ url: urls[i], status: code });
+          if (typeof shardDiagLog === 'function') {
+            shardDiagLog('DIAG-8 ★子GASが非200 status=' + code + ' url=' + urls[i] +
+              ' 本文=' + shardDiagClip(res.getContentText(), 200));
+          }
           continue;
         }
         const parsed = JSON.parse(res.getContentText() || '{}');
+        // 【DIAG-9 最重要】子GASは失敗時も HTTP 200 で {success:false,error:...} を返す。
+        // 従来はステータスしか見ていなかったため「成功・0件」と誤記録していた（R29 の穴）。
+        if (typeof shardDiagLog === 'function') {
+          shardDiagLog('DIAG-9 子GAS応答 status=' + code +
+            ' success=' + String(parsed && parsed.success) +
+            ' error=' + String((parsed && parsed.error) || '-') +
+            ' data件数=' + String(parsed && parsed.data ? parsed.data.length : 'なし') +
+            ' url=' + urls[i] +
+            ' 本文=' + shardDiagClip(res.getContentText(), 300));
+        }
         const list = (parsed && parsed.data) || [];
         if (!Array.isArray(list)) continue;
         diag.ok++;
@@ -4273,12 +4467,23 @@ function shardFetchChildDevices(urlsOverride) {
         }
       } catch (e) {
         // JSON でない応答（ログイン画面の HTML 等）も原因として残す。
+        if (typeof shardDiagLog === 'function') {
+          let rawB = '';
+          try { rawB = res.getContentText(); } catch (eB) { rawB = '(本文取得不可)'; }
+          shardDiagLog('DIAG-10 ★JSONとして解釈できません url=' + urls[i] +
+            ' 本文=' + shardDiagClip(rawB, 300));
+        }
         diag.failed.push({ url: urls[i], status: -1, error: 'not_json' });
       }
     }
 
     if (cache) {
       try { cache.put(cacheKey, JSON.stringify(out), SHARD_LIST_CACHE_TTL); } catch (e) {}
+    }
+    if (typeof shardDiagLog === 'function') {
+      shardDiagLog('DIAG-11 子集約サマリ 要求=' + diag.requested + '台 OK=' + diag.ok +
+        '台 行=' + diag.rows + '件 失敗=' + diag.failed.length + '件 ' +
+        (diag.failed.length ? JSON.stringify(diag.failed) : ''));
     }
     try { out._diag = diag; } catch (e) { /* 添付できなくても一覧は返す */ }
     return out;
@@ -4484,6 +4689,10 @@ function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
 
     const childList = shardFetchChildDevices(urls);
     const childDiag = (childList && childList._diag) || null;
+    if (typeof shardDiagLog === 'function') {
+      shardDiagLog('DIAG-12 子から受領=' + (Array.isArray(childList) ? childList.length : -1) +
+        '件 親(集約前)=' + (Array.isArray(base) ? base.length : -1) + '件');
+    }
     if (!childList.length) {
       // 子が1台も返さなかった＝親の行だけでは「オフライン」と誤表示される。
       // 原因（非200／JSONでない／0件）をログに残す。HB_DEBUG_LOG で ON/OFF できる。
@@ -4512,18 +4721,42 @@ function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
     // オフライン表示になっていた。ここが split-brain の修正点。
     const extra = [];
     const newIds = {};
+    const diagMatched = [];
+    const diagUnmatched = [];
     for (let i = 0; i < childList.length; i++) {
       const child = childList[i] || {};
       const id = String(child.student_id || '').trim();
       if (!id) continue;
 
       if (rowOf[id] !== undefined) {
+        const diagBefore = merged[rowOf[id]] || {};
         merged[rowOf[id]] = shardMergeDeviceRow(merged[rowOf[id]], child);
+        diagMatched.push(id);
+        if (typeof shardDiagLog === 'function' && diagMatched.length <= 3) {
+          const diagAfter = merged[rowOf[id]] || {};
+          shardDiagLog('DIAG-14 突き合わせ id=' + id +
+            ' 親seen=' + String(diagBefore.last_seen || '空') +
+            ' 子seen=' + String(child.last_seen || '空') +
+            ' 採用seen=' + String(diagAfter.last_seen || '空') +
+            ' src=' + String(diagAfter.last_seen_source || '-') +
+            ' on=' + String(diagAfter.is_online));
+        }
         continue;
       }
       if (newIds[id]) continue; // 複数の子GASが同じ児童を返した場合は先着を採る
       newIds[id] = true;
+      diagUnmatched.push(id);
       extra.push(child);
+    }
+    if (typeof shardDiagLog === 'function') {
+      shardDiagLog('DIAG-15 突き合わせ結果 一致=' + diagMatched.length +
+        '件 親に無い=' + diagUnmatched.length + '件' +
+        (diagMatched.length ? ' 一致ID見本=' + diagMatched.slice(0, 3).join(',') : '') +
+        (diagUnmatched.length ? ' 親に無いID見本=' + diagUnmatched.slice(0, 3).join(',') : ''));
+      if (!diagMatched.length && diagUnmatched.length) {
+        shardDiagLog('DIAG-16 ★重大: 子の児童IDが親の一覧に1件も一致していません。' +
+          ' 親子でIDの表記（全角/半角・先頭ゼロ・空白）が揃っているか確認してください。');
+      }
     }
     if (!extra.length) return merged;
 
