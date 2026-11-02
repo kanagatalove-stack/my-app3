@@ -112,9 +112,76 @@ const CONFIG = {
 /**
  * シートオブジェクトを取得
  */
+// ==================== 実行内キャッシュ（R31） ====================
+// 【なぜ必要か / 実測】
+//   端末一覧は 3〜4行 × 16列しかないのに api_bulkLock が 6〜7 秒かかっていた。
+//   原因はデータ量ではなく「往復回数」。1回のロック操作で
+//     openById 4回 / getSheetByName 4回 / ヘッダー読み 4回 / ensure*Headers 3回
+//   が走っていた（実測: scope+lock だけで 11 往復）。
+//   GAS は1実行が独立プロセスなので、この器は「その実行の中だけ」で生きる。
+//   ＝ 別の教員・別の端末の操作に古い値を配ることはない。
+const __execSheetCache = { sheets: {}, headerMaps: [], ensured: [] };
+
+/** 実行内キャッシュからシートを取り出す（同一実行・同一シート名のみ）。 */
+function __execSheetGet(key) {
+  try {
+    const v = __execSheetCache.sheets[key];
+    return v || null;
+  } catch (e) { return null; }
+}
+
+/** 実行内キャッシュへシートを保存する。 */
+function __execSheetPut(key, sheet) {
+  try { __execSheetCache.sheets[key] = sheet; } catch (e) {}
+}
+
+/** 実行内キャッシュ: ヘッダーマップ（シート実体の同一性で判定）。 */
+function __execHeaderGet(sheet) {
+  try {
+    const arr = __execSheetCache.headerMaps;
+    for (let i = 0; i < arr.length; i++) { if (arr[i][0] === sheet) return arr[i][1]; }
+  } catch (e) {}
+  return null;
+}
+
+/** 実行内キャッシュ: ヘッダーマップを保存する。 */
+function __execHeaderPut(sheet, map) {
+  try { __execSheetCache.headerMaps.push([sheet, map]); } catch (e) {}
+}
+
+/** 実行内キャッシュ: ヘッダーマップを捨てる（列を足した直後に呼ぶ）。 */
+function __execHeaderDrop(sheet) {
+  try {
+    const arr = __execSheetCache.headerMaps;
+    for (let i = arr.length - 1; i >= 0; i--) { if (arr[i][0] === sheet) arr.splice(i, 1); }
+  } catch (e) {}
+}
+
+/** 実行内キャッシュ: ensure*Headers を実行済みか。 */
+function __execEnsureDone(sheet) {
+  try {
+    const arr = __execSheetCache.ensured;
+    for (let i = 0; i < arr.length; i++) { if (arr[i] === sheet) return true; }
+  } catch (e) {}
+  return false;
+}
+
+/** 実行内キャッシュ: ensure*Headers 済みとして記録する。 */
+function __execEnsureMark(sheet) {
+  try { __execSheetCache.ensured.push(sheet); } catch (e) {}
+}
+
 function getTargetSheet(sheetName) {
   // 書き込み先スプレッドシートIDはスクリプトプロパティ優先（子GASはここで子シートを指定）。
   const spreadsheetId = getSpreadsheetId();
+
+  // 【R31】同一実行内で同じシートを開き直さない。
+  //   openById はスプレッドシート全体を開くため 200〜500ms かかる。
+  //   1回のロック操作で4回呼ばれていたのが主因だった。
+  const __ck = String(spreadsheetId) + '|' + String(sheetName);
+  const __cached = __execSheetGet(__ck);
+  if (__cached) return __cached;
+
   let ss;
   try {
     ss = SpreadsheetApp.openById(spreadsheetId);
@@ -152,6 +219,7 @@ function getTargetSheet(sheetName) {
   } else if (sheetName === CONFIG.SCREENSHOT_SHEET_NAME) {
     ensureScreenshotHeaders(sheet);
   }
+  __execSheetPut(__ck, sheet);
   return sheet;
 }
 
@@ -169,12 +237,20 @@ function initializeDeviceHeaders(sheet) {
  * これにより、既に運用中のスプレッドシートでもコード更新だけで画面一覧機能が使える。
  */
 function ensureDeviceHeaders(sheet) {
+  // 【R31】同一実行内では1回だけ確認する（列の有無は実行中に外部から変わらない）。
+  //   列を足したときはヘッダーキャッシュを捨てる。
+  let __ok = false;
+  try { __ok = (typeof __execSheetCache !== 'undefined') && !!__execSheetCache; } catch (e) { __ok = false; }
+  if (__ok && __execEnsureDone(sheet)) return;
+
   const lastCol = sheet.getLastColumn();
   if (lastCol === 0) {
     initializeDeviceHeaders(sheet);
+    if (__ok) { __execEnsureMark(sheet); __execHeaderDrop(sheet); }
     return;
   }
   const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h).trim());
+  let added = false;
   CONFIG.DEVICE_COLUMNS.forEach(col => {
     if (!headers.includes(col)) {
       const newCol = sheet.getLastColumn() + 1;
@@ -182,8 +258,13 @@ function ensureDeviceHeaders(sheet) {
         .setBackground('#4f46e5')
         .setFontColor('#ffffff')
         .setFontWeight('bold');
+      added = true;
     }
   });
+  if (__ok) {
+    __execEnsureMark(sheet);
+    if (added) __execHeaderDrop(sheet);
+  }
 }
 
 function initializeScreenshotHeaders(sheet) {
@@ -226,12 +307,19 @@ function initializeTeacherHeaders(sheet) {
  * 既存の教員マスタシートに新しい列（対象クラス、登録URL情報など）がなければ末尾に自動補完
  */
 function ensureTeacherHeaders(sheet) {
+  // 【R31】ensureDeviceHeaders と同じ理由で実行内1回に畳む。
+  let __ok = false;
+  try { __ok = (typeof __execSheetCache !== 'undefined') && !!__execSheetCache; } catch (e) { __ok = false; }
+  if (__ok && __execEnsureDone(sheet)) return;
+
   const lastCol = sheet.getLastColumn();
   if (lastCol === 0) {
     initializeTeacherHeaders(sheet);
+    if (__ok) { __execEnsureMark(sheet); __execHeaderDrop(sheet); }
     return;
   }
   const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h).trim());
+  let added = false;
   CONFIG.TEACHER_COLUMNS.forEach(col => {
     if (!headers.includes(col)) {
       const newCol = sheet.getLastColumn() + 1;
@@ -239,17 +327,35 @@ function ensureTeacherHeaders(sheet) {
         .setBackground('#059669')
         .setFontColor('#ffffff')
         .setFontWeight('bold');
+      added = true;
     }
   });
+  if (__ok) {
+    __execEnsureMark(sheet);
+    if (added) __execHeaderDrop(sheet);
+  }
 }
 
 function getHeaderMap(sheet, defaultColumns) {
+  // 【R31】同一実行内ではヘッダー行を1回だけ読む。
+  //   ヘッダーは 1 行のみで、書き込み中に変わるのは ensure*Headers が列を足すときだけ。
+  //   そのときは __execHeaderDrop で捨てるので古い値を返すことはない。
+  //   ※ テストはこの関数を単体で切り出して実行するため、
+  //     キャッシュの器が無い環境では従来どおり毎回読む（typeof ガード）。
+  let __cacheOk = false;
+  try { __cacheOk = (typeof __execSheetCache !== 'undefined') && !!__execSheetCache; } catch (e) { __cacheOk = false; }
+  if (__cacheOk) {
+    const __hit = __execHeaderGet(sheet);
+    if (__hit) return __hit;
+  }
+
   const lastCol = sheet.getLastColumn() || defaultColumns.length;
   const headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
   const map = {};
   headerRow.forEach((name, index) => {
     map[String(name).trim()] = index + 1; // 1-indexed
   });
+  if (__cacheOk) __execHeaderPut(sheet, map);
   return map;
 }
 
@@ -2998,6 +3104,23 @@ function getScreenStatus(filterSchool, teacher, includeUnassigned, studentIds) {
 // ※ ハートビート（各児童端末からの高頻度アクセス）はロック対象外とし、
 //    教員による操作（一括ロック/配信/規制/単一更新）のみを保護して影響を最小化する。
 function withWriteLock(fn) {
+  // 【R31】入れ子（同じ実行の中で既にロックを持っている）場合は取り直さない。
+  //   子GASの shardApplyFromParent は
+  //     shardEnsureDeviceRows（lock）→ bulkUpdateScreenLock（lock）
+  //   と2回続けて取得していた。2回目は自分が持っているロックを待つだけの無駄で、
+  //   実行時間を押し上げる要因になっていた。
+  //   ※ 深さは関数オブジェクトのプロパティに持つ（グローバル変数を作らないため、
+  //     この関数を単体で切り出して実行するテストでも参照エラーにならない）。
+  if (typeof withWriteLock.__depth !== 'number') withWriteLock.__depth = 0;
+  if (withWriteLock.__depth > 0) {
+    withWriteLock.__depth++;
+    try {
+      return fn();
+    } finally {
+      withWriteLock.__depth--;
+    }
+  }
+
   const lock = LockService.getScriptLock();
   let acquired = false;
   try {
@@ -3006,6 +3129,9 @@ function withWriteLock(fn) {
   } catch (e) {
     throw new Error('他の操作と競合しました。少し待って再試行してください。');
   }
+  withWriteLock.__depth = 1;
+  // 【R32 計測】待ち時間（他実行との競合）を実行ログに出す。
+  try { if (typeof bulkTraceMark === 'function') bulkTraceMark('withWriteLock:排他ロック取得(waitLock)'); } catch (e) {}
   try {
     const result = fn();
     // 書き込みが成功したので端末一覧の読み取りキャッシュを無効化する。
@@ -3014,9 +3140,12 @@ function withWriteLock(fn) {
     try { if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache(); } catch (e) {}
     return result;
   } finally {
+    withWriteLock.__depth = 0;
     if (acquired) {
       try { lock.releaseLock(); } catch (e) {}
     }
+    // 【R32 計測】ロック保持中の実処理＋解放までの時間。
+    try { if (typeof bulkTraceMark === 'function') bulkTraceMark('withWriteLock:ロック解放(releaseLock)'); } catch (e) {}
   }
 }
 
@@ -3027,10 +3156,16 @@ function generateBroadcastId() {
 }
 
 function bulkUpdateScreenLock(studentIds, lockState) {
+  // 【R32 計測】
+  const __bt = function (label) {
+    try { if (typeof bulkTraceMark === 'function') bulkTraceMark(label); } catch (e) {}
+  };
   return withWriteLock(function () {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    __bt('bulkUpdateScreenLock:openById+見出し行');
     const data = sheet.getDataRange().getValues();
+    __bt('bulkUpdateScreenLock:getDataRange(読取)');
     const lockCol = headerMap['画面ロック'];
     const idColIdx = headerMap['児童ID'] - 1;
 
@@ -3055,7 +3190,9 @@ function bulkUpdateScreenLock(studentIds, lockState) {
         if (isAll || (idSet && idSet.has(id))) cur[r][0] = lockState;
       }
       range.setValues(cur);
+      __bt('bulkUpdateScreenLock:setValues(書込)');
     }
+    __bt('bulkUpdateScreenLock:完了');
   });
 }
 
@@ -4207,6 +4344,95 @@ function shardDiagClip(v, n) {
  * 使い方: GAS エディタ上部の関数選択で diagShardSetup を選び「実行」→「実行ログ」を見る。
  * 親GAS と 子GAS の両方で実行すると、どちら側の設定が欠けているか即座に分かる。
  */
+// ==================== 診断用（R32 実測: api_bulkLock の内訳） ====================
+// 「画面ロックが 5 秒かかる」の内訳（どこで何秒）を実行ログに出す一時計測。
+//   Logger.log -> GAS エディタの「実行数 / 実行トランスクリプト」に出る。
+//   出力例:
+//     [BULK-TRACE] STEP bulkUpdateScreenLock:getDataRange +820ms (累計 1210ms)
+//     [BULK-TRACE] 集計 api_bulkLock 総計 4321ms
+//     1. verifyToken(HMAC検証): 12ms
+//     2. ...
+// 不要になったら BULK_LOCK_TRACE = false にする（ログが止まる。処理は一切変わらない）。
+const BULK_LOCK_TRACE = true;
+
+/** 計測が有効か（GAS 以外のテスト環境では Logger/BULK_LOCK_TRACE が無い）。 */
+function bulkTraceEnabled() {
+  try {
+    if (typeof BULK_LOCK_TRACE === 'undefined' || !BULK_LOCK_TRACE) return false;
+    if (typeof Logger === 'undefined') return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 現在時刻(ms)。失敗しても 0 を返し、本処理を止めない。 */
+function bulkTraceNow() {
+  try { return new Date().getTime(); } catch (e) { return 0; }
+}
+
+/**
+ * 計測状態。グローバル変数を作らず関数オブジェクトのプロパティに持つ
+ * （このファイルの関数を単体で切り出して実行するテストでも安全）。
+ */
+function bulkTraceState() {
+  try {
+    if (!bulkTraceState.__s) bulkTraceState.__s = { t0: 0, last: 0, steps: [], label: '' };
+    return bulkTraceState.__s;
+  } catch (e) {
+    return { t0: 0, last: 0, steps: [], label: '' };
+  }
+}
+
+/** 計測開始。t0 をリセットして区間の起点にする。 */
+function bulkTraceBegin(label) {
+  try {
+    if (!bulkTraceEnabled()) return;
+    const s = bulkTraceState();
+    const now = bulkTraceNow();
+    s.t0 = now;
+    s.last = now;
+    s.steps = [];
+    s.label = String(label || '');
+    let stamp = '';
+    try { stamp = new Date().toISOString(); } catch (e2) { stamp = ''; }
+    Logger.log('[BULK-TRACE] 開始 ' + s.label + (stamp ? ' @ ' + stamp : ''));
+  } catch (e) { /* 計測失敗は本処理に影響させない */ }
+}
+
+/** 区間の区切り。直前のマークからの経過msを記録してログに出す。 */
+function bulkTraceMark(label) {
+  try {
+    if (!bulkTraceEnabled()) return;
+    const s = bulkTraceState();
+    if (!s.t0) return; // 計測外（begin されていない実行）では何もしない
+    const now = bulkTraceNow();
+    const dt = now - s.last;
+    s.steps.push([String(label), dt]);
+    s.last = now;
+    Logger.log('[BULK-TRACE] STEP ' + String(label) + ' +' + dt + 'ms (累計 ' + (now - s.t0) + 'ms)');
+  } catch (e) { /* 計測失敗は本処理に影響させない */ }
+}
+
+/** 計測終了。区間ごとの内訳と総計をまとめて1ブロックで出す。 */
+function bulkTraceEnd(name) {
+  try {
+    if (!bulkTraceEnabled()) return;
+    const s = bulkTraceState();
+    if (!s.t0) return;
+    const now = bulkTraceNow();
+    const total = now - s.t0;
+    const lines = [];
+    for (let i = 0; i < s.steps.length; i++) {
+      lines.push((i + 1) + '. ' + s.steps[i][0] + ': ' + s.steps[i][1] + 'ms');
+    }
+    const title = String(name || s.label || '');
+    Logger.log('[BULK-TRACE] 集計 ' + title + ' 総計 ' + total + 'ms\n' + lines.join('\n'));
+    s.t0 = 0;
+    s.steps = [];
+  } catch (e) { /* 計測失敗は本処理に影響させない */ }
+}
+
 function diagShardSetup() {
   const lines = [];
   const p = function (s) { lines.push(String(s)); };
@@ -4860,9 +5086,14 @@ function shardUpsertTelemetryFromChild(payload) {
  * SHARD_MODE が false なら即 return（従来動作に一切影響しない）。
  */
 function shardPropagatePolicy(studentIds, patch) {
+  // 【R32 計測】
+  const __bt = function (label) {
+    try { if (typeof bulkTraceMark === 'function') bulkTraceMark(label); } catch (e) {}
+  };
   if (!isShardParent()) return { skipped: true };
   try {
     const cfg = shardConfigCached();
+    __bt('shardPropagatePolicy:設定読込(CacheService/Properties)');
     const idx = shardMapIndexFromMap(cfg.map);
     const defUrl = String(cfg.def || '').trim();
     // SHARD_MAP_V1 の空キー（""）で指定された既定の子GAS。
@@ -4872,7 +5103,9 @@ function shardPropagatePolicy(studentIds, patch) {
 
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    __bt('shardPropagatePolicy:openById+見出し行');
     const data = sheet.getDataRange().getValues();
+    __bt('shardPropagatePolicy:getDataRange(読取)');
     const idCol = headerMap['児童ID'] - 1;
     const clsCol = headerMap['クラス'] - 1;
 
@@ -4918,7 +5151,9 @@ function shardPropagatePolicy(studentIds, patch) {
       });
     }
 
+    __bt('shardPropagatePolicy:子GASへ送信開始(' + urls.length + '件)');
     const responses = shardFetchMany(requests);
+    __bt('shardPropagatePolicy:子GAS応答受信(fetchAll)');
     const results = [];
     for (let i = 0; i < urls.length; i++) {
       const url = urls[i];
@@ -4944,6 +5179,7 @@ function shardPropagatePolicy(studentIds, patch) {
         results.push({ url: url, count: groups[url].length, error: String(e) });
       }
     }
+    __bt('shardPropagatePolicy:応答解析(完了)');
     return { sent: results };
   } catch (e) {
     // 子への伝達に失敗しても、親のシート更新（＝コンソール表示）は成立させる
@@ -5118,21 +5354,36 @@ function api_getScreens(token, schoolName, includeUnassigned, status, studentIds
 }
 
 function api_bulkLock(token, studentIds, locked) {
+  // 【R32 一時計測】各ステップの所要時間を実行ログに出す。
+  //   BULK_LOCK_TRACE = false にすればログは止まる（処理内容は変わらない）。
+  const __bt = function (label) {
+    try { if (typeof bulkTraceMark === 'function') bulkTraceMark(label); } catch (e) {}
+  };
   try {
+    try { if (typeof bulkTraceBegin === 'function') bulkTraceBegin('api_bulkLock'); } catch (e) {}
     const auth = verifyToken(token);
+    __bt('verifyToken(HMAC検証)');
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    __bt('resolveCurrentTeacher(教員マスタ読取)');
     const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
+    __bt('scopeStudentIdsForTeacher(端末一覧読取)');
     if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
+    __bt('--- 親シート書込 開始 ---');
     bulkUpdateScreenLock(scoped.ids, Boolean(locked));
+    __bt('--- 親シート書込 完了 ---');
     // 子GAS分散: 教員コンソールは google.script.run（この関数）を使うため、
     // ここで伝達しないと子担当の端末にロック指示が届かない。
     // doPost の bulk_lock と同じ内容を渡す（SHARD_MODE=false なら何もしない）。
+    __bt('--- 子GAS伝達 開始 ---');
     const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: Boolean(locked) });
+    __bt('--- 子GAS伝達 完了 ---');
+    try { if (typeof bulkTraceEnd === 'function') bulkTraceEnd('api_bulkLock'); } catch (e) {}
     return { success: true, message: `画面ロックを ${locked ? 'ON' : 'OFF'} に更新しました`, shard: shardLock };
   } catch (err) {
+    try { if (typeof bulkTraceEnd === 'function') bulkTraceEnd('api_bulkLock(異常終了)'); } catch (e) {}
     return { success: false, error: err.toString() };
   }
 }
