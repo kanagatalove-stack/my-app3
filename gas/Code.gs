@@ -5363,12 +5363,16 @@ function api_bulkLock(token, studentIds, locked) {
     try { if (typeof bulkTraceBegin === 'function') bulkTraceBegin('api_bulkLock'); } catch (e) {}
     const auth = verifyToken(token);
     __bt('verifyToken(HMAC検証)');
-    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    if (!auth.valid) {
+      try { if (typeof bulkTraceEnd === 'function') bulkTraceEnd('api_bulkLock(認証エラー)'); } catch (e) {}
+      return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    }
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
     __bt('resolveCurrentTeacher(教員マスタ読取)');
     const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
     __bt('scopeStudentIdsForTeacher(端末一覧読取)');
     if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
+      try { if (typeof bulkTraceEnd === 'function') bulkTraceEnd('api_bulkLock(対象0件)'); } catch (e) {}
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
     __bt('--- 親シート書込 開始 ---');
