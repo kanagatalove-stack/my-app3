@@ -171,6 +171,134 @@ function __execEnsureMark(sheet) {
   try { __execSheetCache.ensured.push(sheet); } catch (e) {}
 }
 
+// ==================== キャッシュ（R33: 実行横断） ====================
+// 【背景】
+//   R32 の実測で、api_bulkLock 8,899ms のうち
+//     resolveCurrentTeacher(教員マスタ読取)          1,666ms
+//     scopeStudentIdsForTeacher(端末一覧読取)        1,117ms
+//     shardPropagatePolicy の getDataRange(読取)      898ms
+//   と、シート読み取りだけで 3,681ms を占めていた。
+//   R31 の「実行内キャッシュ」は同一実行内の重複しか消せないため、
+//   別関数であるこの3つには効かなかった。
+//   → 実行をまたぐ CacheService に載せる（教員5分 / 端末2分）。
+//
+// 【無効化】
+//   教員マスタ: saveTeacherSettings / addTeacher / updateTeacherRecord /
+//               importTeachers が走った時点で tv_v を進める（全教員キャッシュ失効）。
+//   端末マスタ: withWriteLock が書き込み成功時に dev_v を進める既存機構に相乗りする。
+//   ＝「保存・更新系が走ったタイミングで該当キーをクリア」という承認済み仕様どおり。
+//
+// 【テスト環境】
+//   この関数群を切り出さないテストがあるため、呼び出し側は必ず typeof ガードする。
+
+/** スクリプトキャッシュを安全に取得する（無い環境では null）。 */
+function __cacheSafe() {
+  try {
+    if (typeof CacheService === 'undefined' || !CacheService) return null;
+    const c = CacheService.getScriptCache();
+    return c || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 教員キャッシュの版。保存・更新のたびに進める（全教員のキャッシュを一括失効）。 */
+function __teacherCacheVersion() {
+  const c = __cacheSafe();
+  if (!c) return '0';
+  try { return String(c.get('tv_v') || '0'); } catch (e) { return '0'; }
+}
+
+/** 教員キャッシュを全件失効させる（保存・更新系から呼ぶ）。 */
+function invalidateTeacherCache() {
+  const c = __cacheSafe();
+  if (!c) return;
+  try {
+    const cur = Number(c.get('tv_v') || '0');
+    c.put('tv_v', String((cur + 1) % 1000000000), 21600); // 6時間保持
+  } catch (e) { /* キャッシュ不可でも本処理は続行 */ }
+}
+
+/** 教員1件分のキャッシュキー（版を混ぜるので、失効は版を進めるだけで済む）。 */
+function __teacherCacheKey(email) {
+  return 'tch_' + __teacherCacheVersion() + '_' + String(email || '').trim().toLowerCase();
+}
+
+/**
+ * スコープ判定用の端末索引（児童ID / 学校名 / クラス のみ）を返す。
+ *
+ * 【なぜ列限定か】
+ *   端末一覧は 16 列あるが、スコープ判定に要るのは 3 列だけ。
+ *   getDataRange().getValues() は全列を返すため、列を絞って読むだけで
+ *   1 回あたりの転送量とパース時間が減る（実測 898〜1,117ms の主因）。
+ *
+ * 【キャッシュ】
+ *   dev_v（withWriteLock が書き込み時に進める既存の版）をキーに混ぜるため、
+ *   ロック/配信/規制/新規登録の直後は必ず作り直される（古い値を返さない）。
+ */
+function getDeviceScopeRowsCached() {
+  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+  const idCol = headerMap['児童ID'];
+  const schoolCol = headerMap['学校名'];
+  const classCol = headerMap['クラス'];
+
+  // 列が揃っていない（setup 前など）なら従来どおり全列で読む
+  if (!idCol || !schoolCol || !classCol) {
+    return sheet.getDataRange().getValues();
+  }
+
+  const cache = __cacheSafe();
+  let key = '';
+  if (cache) {
+    let ver = '0';
+    try { ver = String(cache.get('dev_v') || '0'); } catch (e) { ver = '0'; }
+    key = 'dvi_' + ver + '_' + idCol + '_' + schoolCol + '_' + classCol;
+    try {
+      const hit = cache.get(key);
+      if (hit) {
+        const parsed = JSON.parse(hit);
+        if (parsed && parsed.rows) return parsed.rows;
+      }
+    } catch (e) { /* 壊れたキャッシュは読み直す */ }
+  }
+
+  // 必要な3列だけを、最小の連続範囲で読む
+  const lastRow = sheet.getLastRow() || 0;
+  const rows = [];
+  if (lastRow >= 1) {
+    const minCol = Math.min(idCol, schoolCol, classCol);
+    const maxCol = Math.max(idCol, schoolCol, classCol);
+    const width = maxCol - minCol + 1;
+    // 【R33c】返す行は「シート全列幅」に揃える。
+    //   必要3列だけを読むのは読み取り量の削減のためだが、返す配列まで
+    //   短くすると、将来 4 列目以降を参照するコードが混ざったときに
+    //   undefined → 文字列 'undefined' としてシートへ書かれる恐れがある。
+    //   末尾を '' で埋めて「全列を持つ行」と同じ形にする（安全側）。
+    let totalCols = maxCol;
+    try { totalCols = sheet.getLastColumn() || maxCol; } catch (e) { totalCols = maxCol; }
+    const block = sheet.getRange(1, minCol, lastRow, width).getValues();
+    for (let r = 0; r < block.length; r++) {
+      const line = block[r];
+      // 呼び出し側（scopeStudentIdsForTeacher / shardPropagatePolicy）は
+      // 0-indexed の列位置で読むため、元の列配置に戻した配列を組み立てる。
+      const full = new Array(totalCols).fill('');
+      for (let c = 0; c < width; c++) full[minCol - 1 + c] = line[c];
+      rows.push(full);
+    }
+  }
+
+  if (cache && key) {
+    try {
+      const payload = JSON.stringify({ rows: rows });
+      // CacheService の値上限は 100KB。超える規模ではキャッシュせず毎回読む
+      // （＝大規模校でも壊れない。上限内なら従来どおり高速化の恩恵を受ける）。
+      if (payload.length <= 90000) cache.put(key, payload, 120);
+    } catch (e) { /* 容量超過等は無視 */ }
+  }
+  return rows;
+}
+
 function getTargetSheet(sheetName) {
   // 書き込み先スプレッドシートIDはスクリプトプロパティ優先（子GASはここで子シートを指定）。
   const spreadsheetId = getSpreadsheetId();
@@ -969,6 +1097,25 @@ function serializeTeacherUrls(urls) {
 function getTeacherSettings(email) {
   if (!email) throw new Error('教員メールアドレスが指定されていません');
 
+  // 【R33】教員マスタは実行をまたいでキャッシュする（既定5分）。
+  //   権限・所属校の変更は頻繁ではないため、数分の反映遅延は運用上許容（承認済み）。
+  //   保存・更新系は invalidateTeacherCache() で版を進めるので、変更直後は必ず最新。
+  let __tKey = '';
+  let __tCache = null;
+  try {
+    if (typeof __teacherCacheKey === 'function' && typeof __cacheSafe === 'function') {
+      __tCache = __cacheSafe();
+      if (__tCache) {
+        __tKey = __teacherCacheKey(email);
+        const __hit = __tCache.get(__tKey);
+        if (__hit) {
+          const __obj = JSON.parse(__hit);
+          if (__obj && __obj.email) return __obj;
+        }
+      }
+    }
+  } catch (e) { /* キャッシュ不調時はシートから読む */ }
+
   const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
   ensureTeacherHeaders(sheet);
   const headerMap = getHeaderMap(sheet, CONFIG.TEACHER_COLUMNS);
@@ -980,7 +1127,7 @@ function getTeacherSettings(email) {
     if (rowEmail === email.toLowerCase()) {
       const defaultWhitelist = 'nhk.or.jp, scratch.mit.edu, google.com';
       const defaultBlacklist = 'youtube.com, twitter.com, tiktok.com, instagram.com';
-      return {
+      const __found = {
         email: rowEmail,
         name: String(data[i][headerMap['氏名'] - 1] || '教員'),
         school: String(data[i][headerMap['所属学校'] - 1] || '全校管理'),
@@ -990,11 +1137,14 @@ function getTeacherSettings(email) {
         filter_whitelist: String(data[i][headerMap['個別ホワイトリスト'] - 1] || defaultWhitelist),
         filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist)
       };
+      if (__tCache && __tKey) {
+        try { __tCache.put(__tKey, JSON.stringify(__found), 300); } catch (e) { /* 容量超過等は無視 */ }
+      }
+      return __found;
     }
   }
   throw new Error('教員アカウントが見つかりません: ' + email);
 }
-
 /**
  * 認証トークン内の教員情報（24時間有効・発行時点のスナップショット）を、
  * 教員マスタシートの「最新レコード」で解決し直す。
@@ -1066,6 +1216,8 @@ function saveTeacherSettings(email, updateData) {
     sheet.getRange(targetRow, headerMap['氏名']).setValue(String(updateData.name).trim());
   }
 
+  // 【R33】教員マスタを変更したのでキャッシュを全件失効させる（承認済み仕様）。
+  try { if (typeof invalidateTeacherCache === 'function') invalidateTeacherCache(); } catch (e) {}
   return getTeacherSettings(email);
   });
 }
@@ -1152,6 +1304,8 @@ function addTeacher(teacher, payload) {
   newRow[headerMap['権限'] - 1] = role || 'TEACHER';
   newRow[headerMap['対象クラス'] - 1] = targetClass;
   sheet.appendRow(newRow);
+  // 【R33】教員を追加したのでキャッシュを失効させる
+  try { if (typeof invalidateTeacherCache === 'function') invalidateTeacherCache(); } catch (e) {}
   return getTeacherSettings(email);
   });
 }
@@ -1181,6 +1335,8 @@ function updateTeacherRecord(teacher, payload) {
   if (payload.school !== undefined && headerMap['所属学校']) sheet.getRange(targetRow, headerMap['所属学校']).setValue(String(payload.school).trim());
   if (payload.role !== undefined && headerMap['権限']) sheet.getRange(targetRow, headerMap['権限']).setValue(String(payload.role).trim().toUpperCase());
   if (payload.target_class !== undefined && headerMap['対象クラス']) sheet.getRange(targetRow, headerMap['対象クラス']).setValue(String(payload.target_class).trim());
+  // 【R33】教員情報を更新したのでキャッシュを失効させる（所属校・権限の変更を即反映）
+  try { if (typeof invalidateTeacherCache === 'function') invalidateTeacherCache(); } catch (e) {}
   return getTeacherSettings(email);
   });
 }
@@ -1388,6 +1544,8 @@ function importTeachers(teacher, payload) {
       sheet.getRange(startRow, 1, newRows.length, CONFIG.TEACHER_COLUMNS.length).setValues(newRows);
     }
 
+    // 【R33】教員を一括反映したのでキャッシュを失効させる
+    try { if (typeof invalidateTeacherCache === 'function') invalidateTeacherCache(); } catch (e) {}
     return { added: added, updated: updated, skipped: skipped, errors: errors };
   });
 }
@@ -2659,7 +2817,13 @@ function scopeStudentIdsForTeacher(studentIds, teacher) {
 
   const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
   const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
-  const data = sheet.getDataRange().getValues();
+  // 【R33】スコープ判定に必要な3列だけを読み、実行をまたいでキャッシュする。
+  //   実測 1,117ms の大半は「16列 × 全行」の取得そのものだった。
+  let data = null;
+  try {
+    if (typeof getDeviceScopeRowsCached === 'function') data = getDeviceScopeRowsCached();
+  } catch (e) { data = null; }
+  if (!data) data = sheet.getDataRange().getValues();
   const idColIdx = headerMap['児童ID'] - 1;
   const schoolColIdx = headerMap['学校名'] - 1;
   const classColIdx = headerMap['クラス'] - 1;
@@ -2701,7 +2865,6 @@ function scopeStudentIdsForTeacher(studentIds, teacher) {
 
   return { ids: allowed, denied: denied };
 }
-
 /**
  * 児童IDから端末レコード（学校名など）を取得
  */
@@ -5085,6 +5248,119 @@ function shardUpsertTelemetryFromChild(payload) {
  * 対象児童をクラスで束ね、子GASごとに 1 リクエストへまとめる（通信回数を最小化）。
  * SHARD_MODE が false なら即 return（従来動作に一切影響しない）。
  */
+// ---- R33: 子GAS伝達の後続実行への委譲（応答待ちをやめる） ----
+// 【なぜトリガーか】
+//   GAS は 1 実行が単一スレッドで、実行が終わると必ず停止する。
+//   「応答を返した後に送信を続ける」ことは同一実行では不可能なため、
+//   1回限りの時刻トリガーで“別の実行”として送信する。
+// 【安全性】
+//   トリガーが作れない環境（script.scriptapp 未承認・クォータ超過等）では
+//   false を返し、呼び出し側が従来どおり同期送信へフォールバックする。
+//   ＝ 機能が落ちることはない（速度の恩恵だけが受けられない）。
+const SHARD_ASYNC_ENABLED = true;      // false にすると常に同期送信（従来動作）
+const SHARD_ASYNC_DEFER_MS = 1000;     // 委譲してから送るまでの待ち（ms）
+const SHARD_ASYNC_PROP = 'SHARD_ASYNC_QUEUE';
+const SHARD_ASYNC_MAX_CHARS = 8000;    // Properties 1件あたりの上限(9KB)に対する安全弁
+const SHARD_ASYNC_HANDLER = 'shardRunDeferredPropagate';
+
+/** 保留中の送信を溜める。成功したら true（＝呼び出し側は待たなくてよい）。 */
+function shardQueueDeferred(requests) {
+  try {
+    if (typeof ScriptApp === 'undefined' || typeof PropertiesService === 'undefined') return false;
+    const reqs = Array.isArray(requests) ? requests : [];
+    if (!reqs.length) return false;
+
+    const props = PropertiesService.getScriptProperties();
+    // 既に保留があれば連結する（連続操作で先の指示を落とさない）
+    let pending = [];
+    try {
+      const raw = props.getProperty(SHARD_ASYNC_PROP);
+      if (raw) {
+        const old = JSON.parse(raw);
+        if (Array.isArray(old)) pending = old;
+      }
+    } catch (e0) { pending = []; }
+    const merged = pending.concat(reqs);
+    const payload = JSON.stringify(merged);
+    if (payload.length > SHARD_ASYNC_MAX_CHARS) {
+      // 大きすぎる（全校一括など）ときは同期送信に任せる
+      Logger.log('[SHARD-ASYNC] 委譲ペイロードが大きいため同期送信します (' + payload.length + '文字)');
+      return false;
+    }
+    props.setProperty(SHARD_ASYNC_PROP, payload);
+
+    // 同じハンドラのトリガーが既にあれば増やさない（実行数の無駄遣いを防ぐ）
+    const triggers = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < triggers.length; i++) {
+      try {
+        if (triggers[i].getHandlerFunction() === SHARD_ASYNC_HANDLER) return true;
+      } catch (e1) { /* 判定できないトリガーは無視 */ }
+    }
+    ScriptApp.newTrigger(SHARD_ASYNC_HANDLER).timeBased().after(SHARD_ASYNC_DEFER_MS).create();
+    return true;
+  } catch (e) {
+    // 承認されていない等で委譲できない。止めずに同期送信へ（承認済み仕様: ログのみ）
+    try { Logger.log('[SHARD-ASYNC] 委譲できません（同期送信へ切り替え）: ' + e); } catch (e2) {}
+    return false;
+  }
+}
+
+/**
+ * トリガーから呼ばれる本体。保留分をまとめて送り、失敗は Logger に残す。
+ * ここでの失敗は「一時的な到達失敗」であり、端末は定常同期で回復する（承認済み仕様）。
+ */
+function shardRunDeferredPropagate() {
+  let reqs = [];
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const raw = props.getProperty(SHARD_ASYNC_PROP);
+    if (!raw) return;
+    props.deleteProperty(SHARD_ASYNC_PROP); // 先に消す（二重送信を防ぐ）
+    reqs = JSON.parse(raw);
+    if (!Array.isArray(reqs)) reqs = [];
+  } catch (e) {
+    try { Logger.log('[SHARD-ASYNC] 保留分の読み出しに失敗: ' + e); } catch (e2) {}
+    return;
+  }
+  if (!reqs.length) return;
+
+  let responses = [];
+  try {
+    responses = shardFetchMany(reqs);
+  } catch (e) {
+    try { Logger.log('[SHARD-ASYNC] 子GASへの送信に失敗（' + reqs.length + '件）: ' + e); } catch (e2) {}
+    return;
+  }
+  for (let i = 0; i < reqs.length; i++) {
+    const res = responses[i];
+    const url = String((reqs[i] && reqs[i].url) || '');
+    if (!res) {
+      try { Logger.log('[SHARD-ASYNC] 応答なし: ' + url); } catch (e3) {}
+      continue;
+    }
+    try {
+      const code = res.getResponseCode();
+      if (code !== 200) {
+        try { Logger.log('[SHARD-ASYNC] 子GASが ' + code + ' を返しました: ' + url); } catch (e4) {}
+        continue;
+      }
+      // 子が拒否（success:false）でも HTTP 200 のことがある。本文も確認して残す。
+      let body = '';
+      try { body = String(res.getContentText() || ''); } catch (e5) { body = ''; }
+      if (body) {
+        try {
+          const parsed = JSON.parse(body);
+          if (parsed && parsed.success === false) {
+            Logger.log('[SHARD-ASYNC] 子GASが拒否しました: ' + url + ' / ' + String(parsed.error || ''));
+          }
+        } catch (e6) { /* JSONでない応答は成功扱い（ログイン画面等） */ }
+      }
+    } catch (e7) {
+      try { Logger.log('[SHARD-ASYNC] 応答確認に失敗: ' + url + ' / ' + e7); } catch (e8) {}
+    }
+  }
+}
+
 function shardPropagatePolicy(studentIds, patch) {
   // 【R32 計測】
   const __bt = function (label) {
@@ -5104,7 +5380,13 @@ function shardPropagatePolicy(studentIds, patch) {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
     __bt('shardPropagatePolicy:openById+見出し行');
-    const data = sheet.getDataRange().getValues();
+    // 【R33】直前に scopeStudentIdsForTeacher が読んだ索引を再利用する
+    //   （同一実行内キャッシュ + 実行横断キャッシュの二段構え）。実測 898ms の解消。
+    let data = null;
+    try {
+      if (typeof getDeviceScopeRowsCached === 'function') data = getDeviceScopeRowsCached();
+    } catch (e) { data = null; }
+    if (!data) data = sheet.getDataRange().getValues();
     __bt('shardPropagatePolicy:getDataRange(読取)');
     const idCol = headerMap['児童ID'] - 1;
     const clsCol = headerMap['クラス'] - 1;
@@ -5152,6 +5434,21 @@ function shardPropagatePolicy(studentIds, patch) {
     }
 
     __bt('shardPropagatePolicy:子GASへ送信開始(' + urls.length + '件)');
+
+    // 【R33】応答を待たずに後続実行へ委譲する（実測 4,122ms の解消）。
+    //   委譲できなければ従来どおり同期送信するため、機能は落ちない。
+    try {
+      if (typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
+          typeof shardQueueDeferred === 'function' && shardQueueDeferred(requests)) {
+        __bt('shardPropagatePolicy:後続実行へ委譲(応答待ちなし)');
+        const queuedResults = [];
+        for (let qi = 0; qi < urls.length; qi++) {
+          queuedResults.push({ url: urls[qi], count: groups[urls[qi]].length, queued: true });
+        }
+        return { sent: queuedResults, deferred: true };
+      }
+    } catch (eq) { /* 委譲の失敗は同期送信でカバー */ }
+
     const responses = shardFetchMany(requests);
     __bt('shardPropagatePolicy:子GAS応答受信(fetchAll)');
     const results = [];
@@ -5186,7 +5483,6 @@ function shardPropagatePolicy(studentIds, patch) {
     return { error: String(e) };
   }
 }
-
 /** 管理画面向け: 子GAS分散の現在の設定を返す（シークレットは伏せる）。 */
 function getShardSettingsForAdmin() {
   const map = readShardMapRaw();
