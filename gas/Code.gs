@@ -5359,6 +5359,30 @@ function shardRunDeferredPropagate() {
       try { Logger.log('[SHARD-ASYNC] 応答確認に失敗: ' + url + ' / ' + e7); } catch (e8) {}
     }
   }
+
+  // 【R33d】送信中に新しい指示が積まれた場合の取りこぼし対策。
+  //   1回限りのトリガーは「実行中も」getProjectTriggers() に現れるため、
+  //   その間に来た操作は新しいトリガーを作らない（＝送られずに残る）。
+  //   ここで残りを検知し、次の実行を自分で予約して確実に送る。
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const rest = props.getProperty(SHARD_ASYNC_PROP);
+    if (rest && rest !== '[]') {
+      const triggers = ScriptApp.getProjectTriggers();
+      let hasNext = false;
+      for (let i = 0; i < triggers.length; i++) {
+        try {
+          if (triggers[i].getHandlerFunction() === SHARD_ASYNC_HANDLER) { hasNext = true; break; }
+        } catch (e9) { /* 判定不能なトリガーは無視 */ }
+      }
+      if (!hasNext) {
+        ScriptApp.newTrigger(SHARD_ASYNC_HANDLER).timeBased().after(SHARD_ASYNC_DEFER_MS).create();
+        try { Logger.log('[SHARD-ASYNC] 未送信分が残っていたため次回実行を予約しました'); } catch (e10) {}
+      }
+    }
+  } catch (e11) {
+    try { Logger.log('[SHARD-ASYNC] 残存分の再予約に失敗: ' + e11); } catch (e12) {}
+  }
 }
 
 function shardPropagatePolicy(studentIds, patch) {
