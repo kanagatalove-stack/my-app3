@@ -650,13 +650,30 @@ function doPost(e) {
       // 子GAS分散: 子は親のコンソール稼働を知る手段が無いため、ここで配る。
       // （配らないと子担当の端末が ka_active=false を受け取り同期を止める）
       shardPropagateKaState(true);
+      // 【R34】取りこぼし回収: この通知は誰も応答を待たないため、保留分の送信もここで行う。
+      //   ブラウザのビーコンが届かなかった場合の自己修復経路（15秒ごとに必ず通る）。
+      try { if (typeof shardFlushPending === 'function') shardFlushPending(); } catch (e) {}
       return jsonResponse(touchRes);
     }
     if (action === 'console_release') {
       const releaseRes = releaseTeacherConsole(payload.session_id);
       // 全セッションが消えた（＝非稼働）ときだけ子へ停止を伝える
       try { if (!isTeacherConsoleActive()) shardPropagateKaState(false); } catch (e) {}
+      // 【R34】ブラウザ終了で最後の操作が消えないよう、停止時にも保留分を送る。
+      try { if (typeof shardFlushPending === 'function') shardFlushPending(); } catch (e) {}
       return jsonResponse(releaseRes);
+    }
+
+    // A3-b. 子GASへの伝達フラッシュ（R34）
+    //   教員操作の応答直後にブラウザが sendBeacon / fetch(keepalive:true) で投げる。
+    //   誰も応答を待たないため、数秒かかる子GASへの送信をここで実行してよい。
+    //   トークン必須（教員の操作結果を子へ流すため）。
+    if (action === 'shard_flush') {
+      const flushAuth = verifyToken(payload.token);
+      if (!flushAuth.valid) {
+        return jsonResponse({ success: false, error: '認証セッションが無効です', need_auth: true });
+      }
+      return jsonResponse(shardFlushPending());
     }
 
     // A4. 端末の「起こし確認」。シートに触らない軽量応答（通信負荷を増やさない）。
@@ -5248,30 +5265,54 @@ function shardUpsertTelemetryFromChild(payload) {
  * 対象児童をクラスで束ね、子GASごとに 1 リクエストへまとめる（通信回数を最小化）。
  * SHARD_MODE が false なら即 return（従来動作に一切影響しない）。
  */
-// ---- R33: 子GAS伝達の後続実行への委譲（応答待ちをやめる） ----
-// 【なぜトリガーか】
-//   GAS は 1 実行が単一スレッドで、実行が終わると必ず停止する。
-//   「応答を返した後に送信を続ける」ことは同一実行では不可能なため、
-//   1回限りの時刻トリガーで“別の実行”として送信する。
+// ---- R34: 子GAS伝達を「ブラウザ起点の投げっぱなし送信」へ移行 ----
+// 【なぜトリガーをやめたか】
+//   R33 は ScriptApp の1回限りトリガーで別実行に逃がしていたが、
+//   Google 側の遅延でトリガーが「エラー（無効）」判定され、
+//   保留分が送られずに残る実害が出た。トリガーは実行環境の都合に
+//   左右されるため、伝達経路の本線には使わない。
+// 【R34 の方式】
+//   1) 教員操作（ロック/配信/規制）は、子GASへの送信内容を
+//      スクリプトプロパティに貯めるだけで即座に応答を返す（＝教員は待たない）。
+//   2) ブラウザが応答直後に sendBeacon / fetch(keepalive:true) で
+//      action='shard_flush' を投げる（投げっぱなし。応答は誰も待たない）。
+//   3) 取りこぼし対策として、コンソールの稼働通知（15秒ごとの console_touch）と
+//      停止通知（console_release）でも同じフラッシュを実行する。
+//      → どのみち応答を待たない実行なので、追加の待ち時間は発生しない。
+//   4) ブラウザが落ちても、次に誰かがコンソールを開いた時点で必ず回収される。
 // 【安全性】
-//   トリガーが作れない環境（script.scriptapp 未承認・クォータ超過等）では
-//   false を返し、呼び出し側が従来どおり同期送信へフォールバックする。
+//   貯められない環境（Properties 不可・容量超過）では従来どおり同期送信する。
 //   ＝ 機能が落ちることはない（速度の恩恵だけが受けられない）。
 const SHARD_ASYNC_ENABLED = true;      // false にすると常に同期送信（従来動作）
-const SHARD_ASYNC_DEFER_MS = 1000;     // 委譲してから送るまでの待ち（ms）
 const SHARD_ASYNC_PROP = 'SHARD_ASYNC_QUEUE';
 const SHARD_ASYNC_MAX_CHARS = 8000;    // Properties 1件あたりの上限(9KB)に対する安全弁
-const SHARD_ASYNC_HANDLER = 'shardRunDeferredPropagate';
 
-/** 保留中の送信を溜める。成功したら true（＝呼び出し側は待たなくてよい）。 */
-function shardQueueDeferred(requests) {
+/** 保留中の送信を読む（削除はしない）。 */
+function shardReadPending() {
   try {
-    if (typeof ScriptApp === 'undefined' || typeof PropertiesService === 'undefined') return false;
+    if (typeof PropertiesService === 'undefined') return [];
+    const props = PropertiesService.getScriptProperties();
+    const raw = props.getProperty(SHARD_ASYNC_PROP);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+
+/**
+ * 保留中の送信を貯める。成功したら true（＝呼び出し側は応答を待たなくてよい）。
+ *
+ * 同じ内容（url + payload）の再送は畳む。shard_apply は
+ * 指定した値を書く冦等操作なので、畳んでも敷き換わらない。
+ */
+function shardQueuePending(requests) {
+  try {
+    if (typeof PropertiesService === 'undefined') return false;
     const reqs = Array.isArray(requests) ? requests : [];
-    if (!reqs.length) return false;
+    if (!reqs.length) return true; // 送るものが無い＝待つ必要なし
 
     const props = PropertiesService.getScriptProperties();
-    // 既に保留があれば連結する（連続操作で先の指示を落とさない）
+    // 既に保留があれば追加する（連続操作で先の指示を落とさない）
     let pending = [];
     try {
       const raw = props.getProperty(SHARD_ASYNC_PROP);
@@ -5280,109 +5321,251 @@ function shardQueueDeferred(requests) {
         if (Array.isArray(old)) pending = old;
       }
     } catch (e0) { pending = []; }
-    const merged = pending.concat(reqs);
-    const payload = JSON.stringify(merged);
+
+    const seen = {};
+    for (let i = 0; i < pending.length; i++) {
+      try { seen[String(pending[i].url) + '\u0000' + String(pending[i].payload)] = true; } catch (e1) {}
+    }
+    for (let j = 0; j < reqs.length; j++) {
+      const key = String(reqs[j].url) + '\u0000' + String(reqs[j].payload);
+      if (seen[key]) continue;
+      seen[key] = true;
+      pending.push(reqs[j]);
+    }
+
+    const payload = JSON.stringify(pending);
     if (payload.length > SHARD_ASYNC_MAX_CHARS) {
       // 大きすぎる（全校一括など）ときは同期送信に任せる
-      Logger.log('[SHARD-ASYNC] 委譲ペイロードが大きいため同期送信します (' + payload.length + '文字)');
+      try { Logger.log('[SHARD-ASYNC] 保留が大きいため同期送信します (' + payload.length + '文字)'); } catch (e2) {}
       return false;
     }
     props.setProperty(SHARD_ASYNC_PROP, payload);
-
-    // 同じハンドラのトリガーが既にあれば増やさない（実行数の無駄遣いを防ぐ）
-    const triggers = ScriptApp.getProjectTriggers();
-    for (let i = 0; i < triggers.length; i++) {
-      try {
-        if (triggers[i].getHandlerFunction() === SHARD_ASYNC_HANDLER) return true;
-      } catch (e1) { /* 判定できないトリガーは無視 */ }
-    }
-    ScriptApp.newTrigger(SHARD_ASYNC_HANDLER).timeBased().after(SHARD_ASYNC_DEFER_MS).create();
     return true;
   } catch (e) {
-    // 承認されていない等で委譲できない。止めずに同期送信へ（承認済み仕様: ログのみ）
-    try { Logger.log('[SHARD-ASYNC] 委譲できません（同期送信へ切り替え）: ' + e); } catch (e2) {}
+    try { Logger.log('[SHARD-ASYNC] 保留できません（同期送信へ切り替え）: ' + e); } catch (e2) {}
     return false;
   }
 }
 
 /**
- * トリガーから呼ばれる本体。保留分をまとめて送り、失敗は Logger に残す。
- * ここでの失敗は「一時的な到達失敗」であり、端末は定常同期で回復する（承認済み仕様）。
+ * 送信に成功した分だけを保留から取り除く。
+ * 失敗分は残すので、次回のフラッシュで自動的に再送される（自己修復）。
  */
-function shardRunDeferredPropagate() {
-  let reqs = [];
+function shardDropPending(doneKeys) {
+  const keys = doneKeys || {};
+  let locked = null;
   try {
+    if (typeof LockService !== 'undefined') {
+      try {
+        const lk = LockService.getScriptLock();
+        lk.waitLock(2000);
+        locked = lk;
+      } catch (eL) { locked = null; }
+    }
+  } catch (e0) { locked = null; }
+  try {
+    if (typeof PropertiesService === 'undefined') return 0;
     const props = PropertiesService.getScriptProperties();
     const raw = props.getProperty(SHARD_ASYNC_PROP);
-    if (!raw) return;
-    props.deleteProperty(SHARD_ASYNC_PROP); // 先に消す（二重送信を防ぐ）
-    reqs = JSON.parse(raw);
-    if (!Array.isArray(reqs)) reqs = [];
+    if (!raw || raw === '[]') return 0;
+    let arr = [];
+    try { arr = JSON.parse(raw); } catch (e1) { arr = []; }
+    if (!Array.isArray(arr)) arr = [];
+    const keep = [];
+    let removed = 0;
+    for (let i = 0; i < arr.length; i++) {
+      const key = String(arr[i].url) + '\u0000' + String(arr[i].payload);
+      if (keys[key]) { removed++; continue; } // 送信済み
+      keep.push(arr[i]);
+    }
+    props.setProperty(SHARD_ASYNC_PROP, JSON.stringify(keep));
+    return removed;
   } catch (e) {
-    try { Logger.log('[SHARD-ASYNC] 保留分の読み出しに失敗: ' + e); } catch (e2) {}
-    return;
+    try { Logger.log('[SHARD-ASYNC] 保留の整理に失敗: ' + e); } catch (e2) {}
+    return 0;
+  } finally {
+    try { if (locked) locked.releaseLock(); } catch (eR) {}
   }
-  if (!reqs.length) return;
+}
+
+/**
+ * 保留分を子GASへ送る。
+ *
+ * 呼び出し元は「ブラウザ起点のビーコン（shard_flush）」と
+ * 「コンソールの稼働/停止通知」だけで、どちらも誰も応答を待たない。
+ * したがって、ここで数秒かかっても教員の操作感に影響しない。
+ */
+/**
+ * 保留分を「子GASごとの 1 リクエスト」に畳む。
+ *
+ * 【なぜ畳むのか】
+ *   保留は数百ミリ秒以内に送られるが、その間に同じ児童への指示が
+ *   複数入ることがある（例: ロックONを押してすぐOFFに直す）。
+ *   そのまま並列で送ると、子GASがどちらを後に処理するか保証されず、
+ *   古い指示が勝ってしまう（＝画面はOFFなのに子はONのまま）。
+ *   ここで児童単位に合流し、同じ項目（screen_lock など）は
+ *   後から来た指示で上書きすることで、子の最終状態を一意に定める。
+ *   別の項目（例: ロックとURL配信）は両方保つので、片方が消えることはない。
+ *
+ * 返り値: { requests: [送信するリクエスト], sources: [[元の保留キー]] }
+ *   sources[i] は requests[i] が担当する元の保留。送信成功時にそれだけを除去する。
+ */
+function shardCoalescePending(reqs) {
+  const list = Array.isArray(reqs) ? reqs : [];
+  const requests = [];
+  const sources = [];
+  const order = [];
+  const state = {};
+  const secrets = {};
+
+  for (let i = 0; i < list.length; i++) {
+    const r = list[i] || {};
+    const key = String(r.url) + '\u0000' + String(r.payload);
+    let body = null;
+    try { body = JSON.parse(String(r.payload || '')); } catch (e) { body = null; }
+
+    // 形式が違うもの（将来の拡張や解析不能）はそのまま送る
+    if (!body || body.action !== 'shard_apply' ||
+        !Array.isArray(body.student_ids) || !body.student_ids.length) {
+      requests.push(r);
+      sources.push([key]);
+      continue;
+    }
+
+    const url = String(r.url || '');
+    if (!state[url]) { state[url] = {}; order.push(url); }
+    secrets[url] = body.shard_secret;
+    const ids = body.student_ids;
+    const cm = body.class_map || {};
+    const patch = body.patch || {};
+    for (let j = 0; j < ids.length; j++) {
+      const sid = String(ids[j]);
+      const prev = state[url][sid] || { patch: {}, cls: undefined, keys: [] };
+      const pk = Object.keys(patch);
+      for (let k = 0; k < pk.length; k++) prev.patch[pk[k]] = patch[pk[k]]; // 後から来た指示が勝つ
+      if (cm[sid] !== undefined) prev.cls = cm[sid];
+      if (prev.keys.indexOf(key) < 0) prev.keys.push(key);
+      state[url][sid] = prev;
+    }
+  }
+
+  // 同じ patch の児童をまとめて 1 リクエストにする
+  for (let u = 0; u < order.length; u++) {
+    const url = order[u];
+    const buckets = {};
+    const sigOrder = [];
+    const sids = Object.keys(state[url]);
+    for (let k = 0; k < sids.length; k++) {
+      const sid = sids[k];
+      const st = state[url][sid];
+      const sig = JSON.stringify(st.patch || {});
+      if (!buckets[sig]) { buckets[sig] = { ids: [], classMap: {}, patch: st.patch || {}, keys: [] }; sigOrder.push(sig); }
+      buckets[sig].ids.push(sid);
+      if (st.cls !== undefined) buckets[sig].classMap[sid] = st.cls;
+      for (let m = 0; m < st.keys.length; m++) {
+        if (buckets[sig].keys.indexOf(st.keys[m]) < 0) buckets[sig].keys.push(st.keys[m]);
+      }
+    }
+    for (let s = 0; s < sigOrder.length; s++) {
+      const b = buckets[sigOrder[s]];
+      requests.push({
+        url: url,
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'shard_apply',
+          shard_secret: secrets[url],
+          student_ids: b.ids,
+          class_map: b.classMap,
+          patch: b.patch
+        }),
+        muteHttpExceptions: true
+      });
+      sources.push(b.keys);
+    }
+  }
+  return { requests: requests, sources: sources };
+}
+
+/**
+ * 保留分を子GASへ送る。
+ *
+ * 呼び出し元は「ブラウザ起点のビーコン（shard_flush）」と
+ * 「コンソールの稼働/停止通知」だけで、どちらも誰も応答を待たない。
+ * したがって、ここで数秒かかっても教員の操作感に影響しない。
+ */
+function shardFlushPending() {
+  let reqs = [];
+  try {
+    if (typeof PropertiesService === 'undefined') return { skipped: true };
+    if (typeof SHARD_ASYNC_PROP === 'undefined') return { skipped: true };
+    reqs = shardReadPending();
+  } catch (e) {
+    return { error: String(e) };
+  }
+  if (!reqs.length) return { sent: 0, removed: 0 };
+
+  // 【R34b】同じ児童への複数指示を畳む（最後の指示が勝つ）
+  let plan = null;
+  try {
+    plan = (typeof shardCoalescePending === 'function')
+      ? shardCoalescePending(reqs)
+      : { requests: reqs, sources: reqs.map(function (r) { return [String(r.url) + '\u0000' + String(r.payload)]; }) };
+  } catch (eC) {
+    plan = { requests: reqs, sources: reqs.map(function (r) { return [String(r.url) + '\u0000' + String(r.payload)]; }) };
+  }
+  const sendReqs = (plan && plan.requests) || [];
+  const sendSrc = (plan && plan.sources) || [];
+  if (!sendReqs.length) return { sent: 0, removed: 0 };
 
   let responses = [];
   try {
-    responses = shardFetchMany(reqs);
+    responses = shardFetchMany(sendReqs);
   } catch (e) {
-    try { Logger.log('[SHARD-ASYNC] 子GASへの送信に失敗（' + reqs.length + '件）: ' + e); } catch (e2) {}
-    return;
+    // 送れなかったら保留は残したままにする（次回回収）
+    try { Logger.log('[SHARD-ASYNC] 子GASへの送信に失敗（' + sendReqs.length + '件・次回再送）: ' + e); } catch (e2) {}
+    return { error: String(e), sent: 0 };
   }
-  for (let i = 0; i < reqs.length; i++) {
+
+  const done = {};
+  for (let i = 0; i < sendReqs.length; i++) {
     const res = responses[i];
-    const url = String((reqs[i] && reqs[i].url) || '');
+    const url = String((sendReqs[i] && sendReqs[i].url) || '');
+    let ok = false;
     if (!res) {
       try { Logger.log('[SHARD-ASYNC] 応答なし: ' + url); } catch (e3) {}
-      continue;
-    }
-    try {
-      const code = res.getResponseCode();
-      if (code !== 200) {
-        try { Logger.log('[SHARD-ASYNC] 子GASが ' + code + ' を返しました: ' + url); } catch (e4) {}
-        continue;
-      }
-      // 子が拒否（success:false）でも HTTP 200 のことがある。本文も確認して残す。
-      let body = '';
-      try { body = String(res.getContentText() || ''); } catch (e5) { body = ''; }
-      if (body) {
-        try {
-          const parsed = JSON.parse(body);
-          if (parsed && parsed.success === false) {
-            Logger.log('[SHARD-ASYNC] 子GASが拒否しました: ' + url + ' / ' + String(parsed.error || ''));
+    } else {
+      try {
+        const code = res.getResponseCode();
+        if (code !== 200) {
+          try { Logger.log('[SHARD-ASYNC] 子GASが ' + code + ' を返しました: ' + url); } catch (e4) {}
+        } else {
+          ok = true;
+          // 子が拒否（success:false）でも HTTP 200 のことがある。本文も確認して残す。
+          let body = '';
+          try { body = String(res.getContentText() || ''); } catch (e5) { body = ''; }
+          if (body) {
+            try {
+              const parsed = JSON.parse(body);
+              if (parsed && parsed.success === false) {
+                ok = false; // 次回再送する
+                try { Logger.log('[SHARD-ASYNC] 子GASが拒否しました: ' + url + ' / ' + String(parsed.error || '')); } catch (e6) {}
+              }
+            } catch (e7) { /* JSONでない応答は成功扱い（ログイン画面等） */ }
           }
-        } catch (e6) { /* JSONでない応答は成功扱い（ログイン画面等） */ }
+        }
+      } catch (e8) {
+        try { Logger.log('[SHARD-ASYNC] 応答確認に失敗: ' + url + ' / ' + e8); } catch (e9) {}
       }
-    } catch (e7) {
-      try { Logger.log('[SHARD-ASYNC] 応答確認に失敗: ' + url + ' / ' + e7); } catch (e8) {}
+    }
+    if (ok) {
+      const keys = sendSrc[i] || [];
+      for (let k = 0; k < keys.length; k++) done[keys[k]] = true;
     }
   }
 
-  // 【R33d】送信中に新しい指示が積まれた場合の取りこぼし対策。
-  //   1回限りのトリガーは「実行中も」getProjectTriggers() に現れるため、
-  //   その間に来た操作は新しいトリガーを作らない（＝送られずに残る）。
-  //   ここで残りを検知し、次の実行を自分で予約して確実に送る。
-  try {
-    const props = PropertiesService.getScriptProperties();
-    const rest = props.getProperty(SHARD_ASYNC_PROP);
-    if (rest && rest !== '[]') {
-      const triggers = ScriptApp.getProjectTriggers();
-      let hasNext = false;
-      for (let i = 0; i < triggers.length; i++) {
-        try {
-          if (triggers[i].getHandlerFunction() === SHARD_ASYNC_HANDLER) { hasNext = true; break; }
-        } catch (e9) { /* 判定不能なトリガーは無視 */ }
-      }
-      if (!hasNext) {
-        ScriptApp.newTrigger(SHARD_ASYNC_HANDLER).timeBased().after(SHARD_ASYNC_DEFER_MS).create();
-        try { Logger.log('[SHARD-ASYNC] 未送信分が残っていたため次回実行を予約しました'); } catch (e10) {}
-      }
-    }
-  } catch (e11) {
-    try { Logger.log('[SHARD-ASYNC] 残存分の再予約に失敗: ' + e11); } catch (e12) {}
-  }
+  const removed = (typeof shardDropPending === 'function') ? shardDropPending(done) : 0;
+  return { sent: sendReqs.length, removed: removed, queued: Math.max(0, reqs.length - removed) };
 }
 
 function shardPropagatePolicy(studentIds, patch) {
@@ -5459,12 +5642,12 @@ function shardPropagatePolicy(studentIds, patch) {
 
     __bt('shardPropagatePolicy:子GASへ送信開始(' + urls.length + '件)');
 
-    // 【R33】応答を待たずに後続実行へ委譲する（実測 4,122ms の解消）。
-    //   委譲できなければ従来どおり同期送信するため、機能は落ちない。
+    // 【R34】応答を待たずに保留へ積み、ブラウザ起点のビーコンで送る（実測 4,122ms の解消）。
+    //   積めなければ従来どおり同期送信するため、機能は落ちない。
     try {
       if (typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
-          typeof shardQueueDeferred === 'function' && shardQueueDeferred(requests)) {
-        __bt('shardPropagatePolicy:後続実行へ委譲(応答待ちなし)');
+          typeof shardQueuePending === 'function' && shardQueuePending(requests)) {
+        __bt('shardPropagatePolicy:保留へ積む(応答待ちなし)');
         const queuedResults = [];
         for (let qi = 0; qi < urls.length; qi++) {
           queuedResults.push({ url: urls[qi], count: groups[urls[qi]].length, queued: true });
@@ -5590,6 +5773,8 @@ function api_consoleTouch(sessionId) {
   try { res = touchTeacherConsole(sessionId); }
   catch (err) { return { success: false, error: err.toString() }; }
   try { shardPropagateKaState(true); } catch (e) { /* 配信失敗でも稼働記録は成立させる */ }
+  // 【R34】取りこぼし回収（google.script.run 経由でも 15 秒ごとに必ず通る）
+  try { if (typeof shardFlushPending === 'function') shardFlushPending(); } catch (e) {}
   return res;
 }
 
@@ -5599,6 +5784,8 @@ function api_consoleRelease(sessionId) {
   catch (err) { return { success: false, error: err.toString() }; }
   // 全セッションが消えた（＝非稼働）ときだけ子へ停止を伝える（従来の doPost と同じ規則）
   try { if (!isTeacherConsoleActive()) shardPropagateKaState(false); } catch (e) {}
+  // 【R34】停止時にも保留分を送る（ブラウザ終了で最後の操作を落とさない）
+  try { if (typeof shardFlushPending === 'function') shardFlushPending(); } catch (e) {}
   return res;
 }
 

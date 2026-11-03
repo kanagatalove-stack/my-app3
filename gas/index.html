@@ -1635,6 +1635,57 @@
       } catch (e) {}
     }
 
+    // =====================================================================
+    // 子GAS伝達のフラッシュ（R34）
+    //   教員のロック/配信/規制は、応答を返す瞬間にサーバ側で「保留」に積まれる。
+    //   その保留分を子GASへ送る仕事を、このビーコンで別リクエストとして起動する。
+    //   ビーコンは応答を読まないので、子GASの応答を待つ時間が
+    //   教員の画面に出ない（＝体感の速度が落ちない）。
+    //   もしブラウザが落ちても、コンソールの稼働通知（15秒ごと）で
+    //   サーバ側が自動回収するため、指示が永久に消えることはない。
+    // =====================================================================
+    let eduShardFlushTimer = null;
+
+    // 子GAS伝達が発生する操作か（これ以外はビーコンを飛ばさない）
+    function isShardFlushAction(act) {
+      return act === 'bulk_lock' || act === 'bulk_broadcast' ||
+             act === 'bulk_filter' || act === 'update_single';
+    }
+
+    // 子GASへの伝達を促すビーコンを送る（応答は読まない）。
+    function sendShardFlushBeacon() {
+      try {
+        const url = getApiUrl();
+        if (!url || !authToken) return;
+        const body = JSON.stringify({ action: 'shard_flush', token: authToken });
+        if (typeof navigator !== 'undefined' && navigator && typeof navigator.sendBeacon === 'function') {
+          try {
+            const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
+            if (navigator.sendBeacon(url, blob)) return;
+          } catch (e) {}
+        }
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: body,
+          redirect: 'follow', keepalive: true
+        }).catch(() => {});
+      } catch (e) {}
+    }
+
+    // 連続操作（ロックON→解除など）でビーコンが連打されないよう、
+    // 直前の予約を上書きして 1 本にまとめる。上書きされても内容は
+    // サーバ側の保留（スクリプトプロパティ）に溜まっているので取りこぼしは無い。
+    function requestShardFlush(delayMs) {
+      try {
+        if (eduShardFlushTimer) clearTimeout(eduShardFlushTimer);
+        eduShardFlushTimer = setTimeout(() => {
+          eduShardFlushTimer = null;
+          sendShardFlushBeacon();
+        }, typeof delayMs === 'number' ? delayMs : 300);
+      } catch (e) {}
+    }
+
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
     function consoleTouch(sessionId) {
       const sid = sessionId || eduKeepaliveSessionId || getKeepaliveSessionId();
@@ -1811,6 +1862,9 @@
                 reject(new Error(res.error || 'リクエストに失敗しました'));
                 return;
               }
+              // 【R34】子GAS伝達が発生する操作なら、応答を返す直前に
+              //   フラッシュビーコンを予約する（待たない）。
+              try { if (isShardFlushAction(payload.action)) requestShardFlush(); } catch (e) {}
               resolve(res);
             })
             .withFailureHandler(err => {
@@ -1890,6 +1944,10 @@
       if (data && data.success === false) {
         throw new Error(data.error || 'リクエスト処理に失敗しました');
       }
+
+      // 【R34】fetch 経由でも、子GAS伝達が発生する操作なら
+      //   フラッシュビーコンを予約する（両経路で漏らさない）。
+      try { if (isShardFlushAction(payload.action)) requestShardFlush(); } catch (e) {}
 
       return data;
     }
