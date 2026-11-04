@@ -186,7 +186,9 @@ const p = {
   normalizeShardClass(raw) { return String(raw || '').replace('年', '-').replace('組', ''); },
   getTargetSheet() { return {}; },
   getHeaderMap() { return { '児童ID': 1, '学校名': 2, 'クラス': 3 }; },
-  getDeviceScopeRowsCached() { return rows.map(r => r.slice()); },
+  // 【R35】shardPropagatePolicy は索引（shardDeviceEntries）から引くようになった。
+  //   旧 getDeviceScopeRowsCached のモックはもう通らないため、索引側を差し替える。
+  shardDeviceEntries() { return rows.slice(1).map(r => r.slice()); },
   bulkTraceMark() {},
   shardFetchMany(reqs) { fetchManyCalled++; return (reqs || []).map(() => ok200); }
 };

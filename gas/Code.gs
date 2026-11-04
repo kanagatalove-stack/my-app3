@@ -299,6 +299,270 @@ function getDeviceScopeRowsCached() {
   return rows;
 }
 
+// ==================== 端末索引（R35: dev_v から独立した版管理） ====================
+// 【なぜ独立させるか】
+//   R32 の実測で shardPropagatePolicy のシート読み取りが 4,946ms に達していた。
+//   原因は行数ではなく「書き込み直後の再読み込み」で、withWriteLock が書き込み成功時に
+//   dev_v を進めるため、索引キャッシュのキー（dvi_<dev_v>_...）が自分自身の書き込みで
+//   失効し、直後の読み取りが必ずキャッシュミスになっていた。
+//   （同じ実行内でも bulkUpdateScreenLock の読取が 236ms、その直後の索引読取が 4,946ms。
+//     同一シート・同一行数で 21 倍の差が出ていた。）
+//
+// 【解決】索引だけを idx_v で版管理し、書き込み関数が変更差分を自分で索引へ反映する。
+//   → ロック/配信/規制（＝クラス情報を変えない操作）では索引が一切失効しない。
+//   → shardPropagatePolicy はキャッシュだけを見る（openById / getDataRange を呼ばない）。
+//
+// 【容量対策】
+//   CacheService の 1 値あたり上限は 100KB。1,000〜2,000 行を 1 キーに入れると
+//   JSON では溢れてキャッシュが効かなくなるため、250 行ずつに分割して保存する。
+//   表現も「id\u0001学校名\u0001クラス」の連結文字列にして 1 行あたりの容量を抑える。
+const SHARD_INDEX_TTL = 21600;         // 6時間（CacheService の上限）
+const SHARD_INDEX_CHUNK_ROWS = 250;    // 1キーあたりの行数（100KB に対する安全弁）
+const SHARD_INDEX_SEP = String.fromCharCode(2);    // 行区切り
+const SHARD_INDEX_FIELD = String.fromCharCode(1);  // 列区切り
+const SHARD_INDEX_VER_KEY = 'idx_v';
+
+/** 索引の版数（dev_v とは無関係）。 */
+function shardIndexVersion() {
+  const c = __cacheSafe();
+  if (!c) return '0';
+  try { return String(c.get(SHARD_INDEX_VER_KEY) || '0'); } catch (e) { return '0'; }
+}
+
+/** 索引を丸ごと無効化する（構造が変わったときだけ使う）。 */
+function shardIndexBump() {
+  const c = __cacheSafe();
+  if (!c) return;
+  try {
+    const cur = Number(c.get(SHARD_INDEX_VER_KEY) || '0');
+    c.put(SHARD_INDEX_VER_KEY, String((cur + 1) % 1000000000), SHARD_INDEX_TTL);
+  } catch (e) {}
+}
+
+/** 索引キー（版数を含むので、版が進むと自動的に別物になる）。 */
+function shardIndexKey(suffix) {
+  try { return 'dvi_' + shardIndexVersion() + '_' + suffix; } catch (e) { return 'dvi_0_' + suffix; }
+}
+
+/** 区切り文字を含む値を安全に潰す（索引の壊れを防ぐ）。 */
+function shardIndexSanitize(v) {
+  try {
+    return String(v === undefined || v === null ? '' : v)
+      .replace(/[\u0001\u0002\r\n]/g, ' ').trim();
+  } catch (e) { return ''; }
+}
+
+/**
+ * 索引（[児童ID, 学校名, クラス] の配列）をチャンク分割して保存する。
+ * 失敗したら false（呼び出し側は従来のシート読みにフォールバックできる）。
+ */
+function shardIndexSave(entries) {
+  const c = __cacheSafe();
+  if (!c) return false;
+  try {
+    const list = Array.isArray(entries) ? entries : [];
+    const chunkCount = Math.max(1, Math.ceil(list.length / SHARD_INDEX_CHUNK_ROWS));
+    let prevChunks = 0;
+    try {
+      const pm = c.get(shardIndexKey('m'));
+      if (pm) prevChunks = Number(JSON.parse(pm).c) || 0;
+    } catch (e0) { prevChunks = 0; }
+
+    for (let ci = 0; ci < chunkCount; ci++) {
+      const from = ci * SHARD_INDEX_CHUNK_ROWS;
+      const to = Math.min(list.length, from + SHARD_INDEX_CHUNK_ROWS);
+      const lines = [];
+      for (let i = from; i < to; i++) {
+        const e = list[i] || [];
+        lines.push(shardIndexSanitize(e[0]) + SHARD_INDEX_FIELD +
+                   shardIndexSanitize(e[1]) + SHARD_INDEX_FIELD +
+                   shardIndexSanitize(e[2]));
+      }
+      const payload = lines.join(SHARD_INDEX_SEP);
+      // 1 チャンクが上限に迫る異常時はキャッシュせず諦める（壊れた値を配らない）
+      if (payload.length > 95000) return false;
+      c.put(shardIndexKey('c' + ci), payload, SHARD_INDEX_TTL);
+    }
+    // 前回より少なくなった場合、余ったチャンクを消す（古い行が混ざらないように）
+    for (let ci = chunkCount; ci < prevChunks; ci++) {
+      try { c.remove(shardIndexKey('c' + ci)); } catch (e1) {}
+    }
+    c.put(shardIndexKey('m'), JSON.stringify({ c: chunkCount, n: list.length }), SHARD_INDEX_TTL);
+    return true;
+  } catch (e) { return false; }
+}
+
+/** 索引を読み出す。無い/欠けている場合は null（呼び出し側が作り直す）。 */
+function shardIndexLoad() {
+  const c = __cacheSafe();
+  if (!c) return null;
+  try {
+    const metaRaw = c.get(shardIndexKey('m'));
+    if (!metaRaw) return null;
+    const meta = JSON.parse(metaRaw);
+    const chunkCount = Number(meta && meta.c) || 0;
+    if (!chunkCount) return null;
+    const out = [];
+    for (let ci = 0; ci < chunkCount; ci++) {
+      const raw = c.get(shardIndexKey('c' + ci));
+      if (raw === null || raw === undefined) return null; // 欠け＝作り直す
+      if (!raw) continue;
+      const lines = String(raw).split(SHARD_INDEX_SEP);
+      for (let li = 0; li < lines.length; li++) {
+        const f = lines[li].split(SHARD_INDEX_FIELD);
+        if (!f.length) continue;
+        out.push([f[0] || '', f[1] || '', f[2] || '']);
+      }
+    }
+    return out;
+  } catch (e) { return null; }
+}
+
+/**
+ * 索引を保証する。無ければシートから 1 回だけ作って保存する。
+ * 以後は書き込み関数の差分更新で最新に保たれるため、ここは通常通らない。
+ * 返り値: [ [児童ID, 学校名, クラス], ... ] / 失敗時 null
+ */
+function shardIndexEnsure() {
+  try {
+    const hit = shardIndexLoad();
+    if (hit) return hit;
+
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    const idCol = headerMap['児童ID'];
+    const schoolCol = headerMap['学校名'];
+    const classCol = headerMap['クラス'];
+    if (!idCol || !schoolCol || !classCol) return null;
+
+    const lastRow = sheet.getLastRow() || 0;
+    const out = [];
+    if (lastRow >= 2) {
+      // 必要 3 列だけを最小の連続範囲で読む（全 16 列は読まない）
+      const minCol = Math.min(idCol, schoolCol, classCol);
+      const maxCol = Math.max(idCol, schoolCol, classCol);
+      const width = maxCol - minCol + 1;
+      const block = sheet.getRange(2, minCol, lastRow - 1, width).getValues();
+      for (let r = 0; r < block.length; r++) {
+        const line = block[r];
+        const sid = String(line[idCol - minCol] || '').trim();
+        if (!sid) continue;
+        out.push([sid,
+          String(line[schoolCol - minCol] || '').trim(),
+          String(line[classCol - minCol] || '').trim()]);
+      }
+    }
+    shardIndexSave(out);
+    return out;
+  } catch (e) { return null; }
+}
+
+/**
+ * 索引から差分を上書きする（書き込み関数が呼ぶ）。
+ * updates: [{ id, school, cls }]（undefined の項目は既存値を維持）
+ * 索引が無いときは何もしない（次回の shardIndexEnsure が正しく作り直す）。
+ */
+function shardIndexUpsert(updates) {
+  const list = Array.isArray(updates) ? updates : [];
+  if (!list.length) return false;
+  const cur = shardIndexLoad();
+  if (!cur) return false;
+  try {
+    const map = {};
+    const order = [];
+    for (let i = 0; i < cur.length; i++) {
+      const id = String(cur[i][0] || '');
+      if (!id) continue;
+      if (!map[id]) order.push(id);
+      map[id] = [id, String(cur[i][1] || ''), String(cur[i][2] || '')];
+    }
+    let changed = false;
+    for (let j = 0; j < list.length; j++) {
+      const u = list[j] || {};
+      const id = shardIndexSanitize(u.id);
+      if (!id) continue;
+      const prev = map[id] || [id, '', ''];
+      if (!map[id]) { order.push(id); changed = true; }
+      const nextSchool = (u.school !== undefined && u.school !== null) ? shardIndexSanitize(u.school) : prev[1];
+      const nextCls = (u.cls !== undefined && u.cls !== null) ? shardIndexSanitize(u.cls) : prev[2];
+      if (!map[id] || nextSchool !== prev[1] || nextCls !== prev[2]) changed = true;
+      map[id] = [id, nextSchool, nextCls];
+    }
+    if (!changed) return true; // 変化なし＝保存不要（無駄な書き込みを避ける）
+    const out = [];
+    for (let k = 0; k < order.length; k++) out.push(map[order[k]]);
+    return shardIndexSave(out);
+  } catch (e) { return false; }
+}
+
+/** 索引から指定児童を取り除く（卒業・削除など）。 */
+function shardIndexRemove(ids) {
+  const arr = Array.isArray(ids) ? ids : [];
+  if (!arr.length) return false;
+  const cur = shardIndexLoad();
+  if (!cur) return false;
+  try {
+    const drop = {};
+    for (let i = 0; i < arr.length; i++) drop[shardIndexSanitize(arr[i])] = true;
+    const out = [];
+    for (let i = 0; i < cur.length; i++) {
+      if (!drop[String(cur[i][0] || '')]) out.push(cur[i]);
+    }
+    return shardIndexSave(out);
+  } catch (e) { return false; }
+}
+
+/**
+ * 端末シートの読み取り結果から索引を作り直す（getAllDevices が呼ぶ）。
+ * get_all はどのみち全列を読むため、その結果を索引へ流し込めば
+ * 「シートを直接編集された」場合のズレもコンソール表示のたびに解消される。
+ */
+function shardIndexRefreshFromRows(data, headerMap) {
+  try {
+    const rows = Array.isArray(data) ? data : [];
+    const hm = headerMap || {};
+    const idColIdx = hm['児童ID'] - 1;
+    const schoolColIdx = hm['学校名'] - 1;
+    const classColIdx = hm['クラス'] - 1;
+    if (idColIdx < 0 || schoolColIdx < 0 || classColIdx < 0) return false;
+    const out = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i] || [];
+      const sid = String(r[idColIdx] || '').trim();
+      if (!sid) continue;
+      out.push([sid, String(r[schoolColIdx] || '').trim(), String(r[classColIdx] || '').trim()]);
+    }
+    return shardIndexSave(out);
+  } catch (e) { return false; }
+}
+
+/**
+ * 索引（無ければシートから 1 回だけ作成）を [児童ID, 学校名, クラス] で返す。
+ * 索引が使えない環境では従来どおりシートから読む（機能は落とさない）。
+ */
+function shardDeviceEntries() {
+  try {
+    const idx = shardIndexEnsure();
+    if (idx) return idx;
+  } catch (e) { /* 下のフォールバックへ */ }
+  try {
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+    const idColIdx = headerMap['児童ID'] - 1;
+    const schoolColIdx = headerMap['学校名'] - 1;
+    const classColIdx = headerMap['クラス'] - 1;
+    const data = sheet.getDataRange().getValues();
+    const out = [];
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i] || [];
+      const sid = String(row[idColIdx] || '').trim();
+      if (!sid) continue;
+      out.push([sid, String(row[schoolColIdx] || '').trim(), String(row[classColIdx] || '').trim()]);
+    }
+    return out;
+  } catch (e) { return null; }
+}
+
 function getTargetSheet(sheetName) {
   // 書き込み先スプレッドシートIDはスクリプトプロパティ優先（子GASはここで子シートを指定）。
   const spreadsheetId = getSpreadsheetId();
@@ -1387,6 +1651,16 @@ function addStudentRecord(teacher, payload) {
   newRow[headerMap['規制URLリスト'] - 1] = 'youtube.com, twitter.com, tiktok.com, instagram.com';
   newRow[headerMap['最終同期日時'] - 1] = nowStr;
   sheet.appendRow(newRow);
+  // 【R35】新規行を索引にも反映する（次回の全読みを待たない）
+  try {
+    if (typeof shardIndexUpsert === 'function') {
+      shardIndexUpsert([{
+        id: studentId,
+        school: String(newRow[headerMap['学校名'] - 1] || ''),
+        cls: String(newRow[headerMap['クラス'] - 1] || '')
+      }]);
+    }
+  } catch (eIdx) {}
   return { student_id: studentId, school_name: newRow[headerMap['学校名'] - 1], student_name: newRow[headerMap['氏名'] - 1] };
   });
 }
@@ -1479,6 +1753,24 @@ function importStudents(teacher, payload) {
       const startRow = sheet.getLastRow() + 1;
       sheet.getRange(startRow, 1, addedRows.length, CONFIG.DEVICE_COLUMNS.length).setValues(addedRows);
     }
+
+    // 【R35】インポートした全件を索引に反映する。
+    try {
+      if (typeof shardIndexUpsert === 'function') {
+        const __idxUp = [];
+        rows.forEach(function (raw) {
+          const r = raw || {};
+          const sid = String(r.student_id || '').trim();
+          if (!sid) return;
+          __idxUp.push({
+            id: sid,
+            school: String(r.school_name || '').trim() || '未設定',
+            cls: String(r.class_name || '').trim() || '未設定'
+          });
+        });
+        if (__idxUp.length) shardIndexUpsert(__idxUp);
+      }
+    } catch (eIdx) {}
 
     return { added: added, updated: updated, skipped: skipped, errors: errors };
   });
@@ -1640,6 +1932,19 @@ function runAnnualRollover(teacher, payload) {
       const startRow = archiveSheet.getLastRow() + 1;
       archiveSheet.getRange(startRow, 1, archiveRows.length, CONFIG.DEVICE_COLUMNS.length).setValues(archiveRows);
     }
+
+    // 【R35】削除される児童を索引からも外す（次回の全読みを待たない）
+    try {
+      if (typeof shardIndexRemove === 'function') {
+        const rmIds = [];
+        for (let k = 0; k < targetRows.length; k++) {
+          const r = data[targetRows[k] - 1] || [];
+          const sid = String(r[headerMap['児童ID'] - 1] || '').trim();
+          if (sid) rmIds.push(sid);
+        }
+        if (rmIds.length) shardIndexRemove(rmIds);
+      }
+    } catch (eIdx) {}
 
     // 2. 端末一覧から対象行を削除（下から消して行番号ズレを防ぐ）
     targetRows.sort(function (a, b) { return b - a; }).forEach(function (rowNum) {
@@ -2479,7 +2784,18 @@ function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActiv
       hbLog('register: 残骸行を再利用 row=' + orphanRowNum +
         '（新規行は追加しない） id=' + studentId);
       sheet.getRange(orphanRowNum, 1, 1, CONFIG.DEVICE_COLUMNS.length).setValues([newRow]);
-      return buildHeartbeatResponse(newRow, headerMap, studentId, kaActive, kaInfo, now);
+      // 【R35】新規登録された端末を索引にも反映する。
+    //   ここを漏らすと、初回ログイン直後の子童が一覧/配信の対象から漏れる。
+    try {
+      if (typeof shardIndexUpsert === 'function') {
+        shardIndexUpsert([{
+          id: studentId,
+          school: String(newRow[headerMap['学校名'] - 1] || ''),
+          cls: String(newRow[headerMap['クラス'] - 1] || '')
+        }]);
+      }
+    } catch (eIdx) {}
+    return buildHeartbeatResponse(newRow, headerMap, studentId, kaActive, kaInfo, now);
     }
 
     const beforeLast = sheet.getLastRow();
@@ -2487,6 +2803,17 @@ function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActiv
     hbLog('register: 新規行を追加 row=' + (beforeLast + 1) + ' id=' + studentId +
       '（追加前の最終行=' + beforeLast + '）');
 
+    // 【R35】新規登録された端末を索引にも反映する。
+    //   ここを漏らすと、初回ログイン直後の子童が一覧/配信の対象から漏れる。
+    try {
+      if (typeof shardIndexUpsert === 'function') {
+        shardIndexUpsert([{
+          id: studentId,
+          school: String(newRow[headerMap['学校名'] - 1] || ''),
+          cls: String(newRow[headerMap['クラス'] - 1] || '')
+        }]);
+      }
+    } catch (eIdx) {}
     return buildHeartbeatResponse(newRow, headerMap, studentId, kaActive, kaInfo, now);
   });
 }
@@ -2836,22 +3163,36 @@ function scopeStudentIdsForTeacher(studentIds, teacher) {
   const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
   // 【R33】スコープ判定に必要な3列だけを読み、実行をまたいでキャッシュする。
   //   実測 1,117ms の大半は「16列 × 全行」の取得そのものだった。
-  let data = null;
+  // 【R35】索引（idx_v で独立版管理）だけを見る。
+  //   dev_v は withWriteLock が書き込みごとに進めるため、これをキーにすると
+  //   書き込み直後の読み取りが必ずキャッシュミスになり、1,000〜2,000行を
+  //   毎回読み直していた（実測 1,210ms）。索引は書き込み関数が差分を自分で反映する。
+  let entries = null;
   try {
-    if (typeof getDeviceScopeRowsCached === 'function') data = getDeviceScopeRowsCached();
-  } catch (e) { data = null; }
-  if (!data) data = sheet.getDataRange().getValues();
-  const idColIdx = headerMap['児童ID'] - 1;
-  const schoolColIdx = headerMap['学校名'] - 1;
-  const classColIdx = headerMap['クラス'] - 1;
+    if (typeof shardDeviceEntries === 'function') entries = shardDeviceEntries();
+  } catch (e) { entries = null; }
+  if (!entries) {
+    // 索引が使えない環境のみ従来通りのシート読み
+    const data = sheet.getDataRange().getValues();
+    const idColIdx = headerMap['児童ID'] - 1;
+    const schoolColIdx = headerMap['学校名'] - 1;
+    const classColIdx = headerMap['クラス'] - 1;
+    entries = [];
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i] || [];
+      const sid = String(row[idColIdx] || '').trim();
+      if (!sid) continue;
+      entries.push([sid, String(row[schoolColIdx] || '').trim(), String(row[classColIdx] || '').trim()]);
+    }
+  }
 
   // 教員のスコープ内（学校境界＋クラス境界）に所属する児童IDのセット
   const scopedIds = {};
-  for (let i = 1; i < data.length; i++) {
-    const id = String(data[i][idColIdx] || '').trim();
+  for (let i = 0; i < entries.length; i++) {
+    const id = String(entries[i][0] || '').trim();
     if (!id) continue;
-    const sName = String(data[i][schoolColIdx] || '').trim();
-    const cName = String(data[i][classColIdx] || '').trim();
+    const sName = String(entries[i][1] || '').trim();
+    const cName = String(entries[i][2] || '').trim();
 
     // 学校境界: 自校の児童、および学校未設定（新規登録直後）の児童を対象に含める
     // ※ canonical 解決 → 表記ゆれ比較の順で判定し、略称・接頭辞付き表記も同一視する
@@ -2937,6 +3278,10 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
   const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
   const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
   const data = sheet.getDataRange().getValues();
+
+  // 【R35】どのみち全列を読んでいるので、その結果で索引を作り直す。
+  //   シートを直接編集された場合のズレも、コンソール表示ごとに解消される。
+  try { if (typeof shardIndexRefreshFromRows === 'function') shardIndexRefreshFromRows(data, headerMap); } catch (eIdx) {}
 
   if (data.length <= 1) return [];
 
@@ -3501,6 +3846,19 @@ function updateSingleDevice(studentId, updateData) {
     if (updateData.notes !== undefined && headerMap['備考']) {
       sheet.getRange(targetRow, headerMap['備考']).setValue(String(updateData.notes).trim());
     }
+
+    // 【R35】クラス/学校が変わったときだけ索引に反映する。
+    //   ロック/規制などの属性変更では索引は変わらないため、触らない（＝速度を落とさない）。
+    try {
+      if ((updateData.class_name !== undefined || updateData.school_name !== undefined) &&
+          typeof shardIndexUpsert === 'function') {
+        shardIndexUpsert([{
+          id: studentId,
+          school: updateData.school_name !== undefined ? String(updateData.school_name).trim() : undefined,
+          cls: updateData.class_name !== undefined ? String(updateData.class_name).trim() : undefined
+        }]);
+      }
+    } catch (eIdx) {}
   });
 }
 
@@ -5255,6 +5613,24 @@ function shardUpsertTelemetryFromChild(payload) {
       updated++;
     }
 
+    // 【R35】反映した行（新規追加含む）を索引にも反映する。
+    try {
+      if (typeof shardIndexUpsert === 'function') {
+        const __telUp = [];
+        for (let k = 0; k < rows.length; k++) {
+          const r = rows[k] || {};
+          const sid = String(r.student_id || '').trim();
+          if (!sid) continue;
+          __telUp.push({
+            id: sid,
+            school: String(r.school_name || '').trim() || undefined,
+            cls: String(r.class_name || '').trim() || undefined
+          });
+        }
+        if (__telUp.length) shardIndexUpsert(__telUp);
+      }
+    } catch (eIdx) {}
+
     invalidateDevicesCache();
     return { success: true, updated: updated, appended: appended };
   });
@@ -5584,30 +5960,43 @@ function shardPropagatePolicy(studentIds, patch) {
     const emptyDef = shardMapDefaultFromEmptyKey(cfg.map);
     if (!Object.keys(idx).length && !defUrl && !emptyDef) return { skipped: true, reason: 'no_child' };
 
-    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
-    const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
-    __bt('shardPropagatePolicy:openById+見出し行');
-    // 【R33】直前に scopeStudentIdsForTeacher が読んだ索引を再利用する
-    //   （同一実行内キャッシュ + 実行横断キャッシュの二段構え）。実測 898ms の解消。
-    let data = null;
+    // 【R35】索引（CacheService）だけで解決する。
+    //   【重要】ここで openById / getDataRange を呼んではいけない。
+    //   書き込み直後はシート側の反映待ちで読取が待たされ、
+    //   実測 4,946ms を占めていた。索引は書き込み関数が差分を自分で反映するので、
+    //   ここで再読みしなくても常に最新である。
+    let entries = null;
     try {
-      if (typeof getDeviceScopeRowsCached === 'function') data = getDeviceScopeRowsCached();
-    } catch (e) { data = null; }
-    if (!data) data = sheet.getDataRange().getValues();
-    __bt('shardPropagatePolicy:getDataRange(読取)');
-    const idCol = headerMap['児童ID'] - 1;
-    const clsCol = headerMap['クラス'] - 1;
+      if (typeof shardDeviceEntries === 'function') entries = shardDeviceEntries();
+    } catch (e) { entries = null; }
+    if (!entries) {
+      // 索引が使えない環境のみ従来通りのシート読み（機能は落とさない）
+      const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+      const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+      const d = sheet.getDataRange().getValues();
+      const idCol = headerMap['児童ID'] - 1;
+      const sCol = headerMap['学校名'] - 1;
+      const cCol = headerMap['クラス'] - 1;
+      entries = [];
+      for (let i = 1; i < d.length; i++) {
+        const row = d[i] || [];
+        const sid = String(row[idCol] || '').trim();
+        if (!sid) continue;
+        entries.push([sid, String(row[sCol] || '').trim(), String(row[cCol] || '').trim()]);
+      }
+    }
+    __bt('shardPropagatePolicy:索引取得(シートI/Oなし)');
 
     const isAll = (studentIds === 'ALL' || !Array.isArray(studentIds));
     const idSet = Array.isArray(studentIds) ? new Set(studentIds) : null;
 
     const groups = {}; // url -> [studentId]
     const groupClasses = {}; // url -> { studentId: 元のクラス名 }
-    for (let i = 1; i < data.length; i++) {
-      const id = String(data[i][idCol] || '').trim();
+    for (let i = 0; i < entries.length; i++) {
+      const id = String(entries[i][0] || '').trim();
       if (!id) continue;
       if (!isAll && !(idSet && idSet.has(id))) continue;
-      const rawClass = String(data[i][clsCol] || '').trim();
+      const rawClass = String(entries[i][2] || '').trim();
       const cls = normalizeShardClass(rawClass);
       // クラス一致 → 空キー既定 → SHARD_DEFAULT_URL の順で解決する
       const url = idx[cls] || emptyDef || defUrl;
