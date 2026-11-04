@@ -1686,26 +1686,48 @@
       } catch (e) {}
     }
 
-    // 【R36】送信と並列にビーコンを発火する。
-    //   押下と同時に投げると親の書き込み前でキューが空のことがあるため、
-    //   微小ディレイ（120ms）を挟んで1本目を投げる。
-    //   2本目は apiRequest が応答を受けた直後（＝書き込み完了後）に確実に投げる。
-    //   それでも漏れた場合は 15秒周期の console_touch が回収する（自己修復）。
-    var eduShardFlushRetryId = null;
+    // 【R37】子GASビーコンを「親の fetch と完全同時（0ms）」に撃つ。
+    //   R36 は 120ms 後だったが、実機の ③（親シートTRUE→子シートTRUE）が 4.0 秒で、
+    //   押下→親→子が直列に見えていた。0ms に前倒しして親の書き込みと重ねる。
+    //
+    //   ただし 0ms 時点では親がまだ shardQueuePending を書いていないため、
+    //   キューが空で「空振り」することがある。そこで多段で撃つ:
+    //     1本目 0ms    … 親 fetch と完全並列（書き込みが速ければここで当たる）
+    //     2本目 400ms  … 親の索引解決〜キュー投入の直後を狙う
+    //     3本目 900ms  … 親のシート書き込みが長引いた場合
+    //     4本目 1500ms … 保険（親内部は実測 1.38 秒）
+    //     5本目 応答直後 … キューが必ず埋まっているので確実
+    //   空振りしたビーコンは保留が空なので即座に返る（子GASへは出ない）。
+    //   全滅しても 15秒周期の console_touch が回収する（自己修復）。
+    var eduShardFlushTimers = [];
+    var SHARD_FLUSH_RETRY_DELAYS = [400, 900, 1500];
 
     function clearShardFlushRetries() {
-      try { if (eduShardFlushRetryId) clearTimeout(eduShardFlushRetryId); } catch (e) {}
-      eduShardFlushRetryId = null;
+      try {
+        for (var i = 0; i < eduShardFlushTimers.length; i++) {
+          try { clearTimeout(eduShardFlushTimers[i]); } catch (e0) {}
+        }
+      } catch (e) {}
+      eduShardFlushTimers = [];
+    }
+
+    // 即時発火（0ms）。押下と同じ tick で撃つ＝親 fetch と並列。
+    function fireShardFlushNow() {
+      try { sendShardFlushBeacon(); } catch (e) {}
     }
 
     function scheduleShardFlushRetries() {
-      try {
-        clearShardFlushRetries();
-        eduShardFlushRetryId = setTimeout(function () {
-          eduShardFlushRetryId = null;
-          try { sendShardFlushBeacon(); } catch (e) {}
-        }, 120);
-      } catch (e) {}
+      try { clearShardFlushRetries(); } catch (e0) {}
+      fireShardFlushNow();               // 1本目: 0ms（親 fetch と並列）
+      for (var i = 0; i < SHARD_FLUSH_RETRY_DELAYS.length; i++) {
+        (function (delay) {
+          try {
+            eduShardFlushTimers.push(setTimeout(function () {
+              try { sendShardFlushBeacon(); } catch (e) {}
+            }, delay));
+          } catch (e) {}
+        })(SHARD_FLUSH_RETRY_DELAYS[i]);
+      }
     }
 
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
@@ -1868,16 +1890,18 @@
 
     // ==================== ハイブリッド API リクエスト ====================
     async function apiRequest(payload, method = 'POST') {
-      // 【R36】一括操作系（ロック/一斉配信/規制/単一更新）は google.script.run を迂回し、
+      // 【R36】書き込み操作（ロック/一斉配信/規制/単一更新）は google.script.run を迂回し、
       //   /exec へ直接 fetch する。
       //   実測: callback?nocache_id= のポーリング往復が 3.6〜7.1秒かかっていた。
       //   GAS 内部は 1.38秒で完了しているため、この往復待ちが体感6秒の正体だった。
-      //   google.script.run は iframe 経由のポーリングで待ちを短縮できないため、
-      //   一括操作だけ直接 fetch に固定する（認証トークン・body構成は従来のまま）。
+      // 【R37】個別操作（update_single）も一括と同じ経路に統一した。
+      //   isShardFlushAction が4アクションすべてを対象にするため、
+      //   個別・一括で挙動差は生じない。
       const __directFetch = (typeof isShardFlushAction === 'function') &&
                             isShardFlushAction(payload && payload.action);
       if (__directFetch) {
-        // 応答を待たず、送信と並列で子GAS宛ビーコンを発火する。
+        // 【R37】応答を待たず、送信と「完全同時（0ms）」に子GASビーコンを撃つ。
+        //   親シートの書き込みと子シートの書き込みを時間軸で重ねるため。
         try { scheduleShardFlushRetries(); } catch (e0) {}
       }
 
@@ -2905,6 +2929,64 @@
       }
     }
 
+    // ==================== 【R37】書き込み操作の共通ランナー ====================
+    //  一括（bulk_lock / bulk_broadcast / bulk_filter）と個別（update_single）を
+    //  同じ1本の経路に通す。挙動差を作らないための土台。
+    //
+    //  ・押下 0.1 秒以内に楽観的UIを確定（通信を待たない）
+    //  ・完了トーストも即時に出す（通信完了を待たせない＝バックグラウンド化）
+    //  ・/exec への fetch と完全同時（0ms）に子GASビーコンを並列発火
+    //  ・失敗したときだけ元の表示へ戻し、エラートーストを出す（嘘を残さない）
+    //  ・後続操作に追い越されたら、古い応答では画面を触らない
+    let mutationSeq = 0;
+
+    async function runMutation(opts) {
+      const o = opts || {};
+      const payload = o.payload || {};
+      const seq = ++mutationSeq;
+      let applied = false;
+
+      // 1) 楽観的UI（押下と同値）
+      if (typeof o.apply === 'function') {
+        try { o.apply(); applied = true; } catch (e) {}
+      }
+      // 2) 完了トーストも即時（通信を待たない）
+      if (o.successMessage) { try { showToast(o.successMessage, 'success'); } catch (e) {} }
+      // 3) 連打防止
+      if (o.busy) { try { setBulkActionBusy(true); } catch (e) {} }
+
+      try {
+        // 4) 送信。apiRequest が同じ tick で 0ms ビーコンを撃つ。
+        await apiRequest(payload);
+        if (seq !== mutationSeq) return true;   // 追い越された（画面は触らない）
+
+        refreshSuppressedUntil = 0;
+        if (typeof o.afterSuccess === 'function') {
+          try { o.afterSuccess(); } catch (e) {}
+        }
+        // 5) 付随情報の再取得は「裏で・遅れて」。UI は既に確定している。
+        if (o.refreshDelay !== false) {
+          const delay = (typeof o.refreshDelay === 'number') ? o.refreshDelay : 1500;
+          setTimeout(function () {
+            if (seq !== mutationSeq) return;
+            try { loadDevices(true); } catch (e) {}
+          }, delay);
+        }
+        return true;
+      } catch (err) {
+        if (seq !== mutationSeq) return false;
+        if (applied && typeof o.revert === 'function') {
+          try { o.revert(); } catch (e) {}
+        }
+        refreshSuppressedUntil = 0;
+        const msg = (err && err.message) ? err.message : String(err);
+        try { showToast((o.errorPrefix || 'エラー') + ': ' + msg, 'error'); } catch (e) {}
+        return false;
+      } finally {
+        if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
+      }
+    }
+
     // 【R36】一括操作中はボタンを押せなくする（連打・二重送信の防止）。
     function setBulkActionBusy(busy) {
       try {
@@ -2953,9 +3035,8 @@
 
       if (!confirm(`${countLabel}の画面ロックを ${locked ? 'ON' : 'OFF'} にしますか？`)) return;
 
-      // 【R36】楽観的UI更新。
-      //   /exec への直接 fetch でも応答までは数秒かかるため、押下した瞬間に画面を作り替える。
-      //   通信は裏で続け、失敗したら元の表示へ戻す（嘘の状態を残さない）。
+      // 【R37】一括ロックも個別操作と同じ共通ランナーを通す。
+      //   押下 0.1 秒以内に表示とトーストを確定し、通信は裏で続ける。
       const prevLocks = {};
       ids.forEach(id => {
         const d = devicesData.find(x => x.student_id === id);
@@ -2976,25 +3057,15 @@
         try { renderDevices(); updateStatistics(); } catch (e) {}
       };
 
-      // 押下直後（0.1秒以内）に見た目を確定させる
-      applyOptimisticLock(locked);
-      showToast(`画面ロックを ${locked ? 'ON' : 'OFF'} にしています...`, 'info');
-      setBulkActionBusy(true);
-
-      try {
-        await apiRequest({ action: 'bulk_lock', student_ids: ids, locked: locked });
-        // サーバー側の書き込みは完了済み。表示は確定しているので、
-        // 「最終通信」等の付随情報だけを裏で静かに取り直す。
-        refreshSuppressedUntil = 0;
-        showToast(`画面ロックを ${locked ? 'ON' : 'OFF'} にしました`, 'success');
-        setTimeout(() => { try { loadDevices(true); } catch (e) {} }, 1500);
-      } catch (err) {
-        revertOptimisticLock();
-        refreshSuppressedUntil = 0;
-        showToast('エラー: ' + err.message, 'error');
-      } finally {
-        setBulkActionBusy(false);
-      }
+      await runMutation({
+        payload: { action: 'bulk_lock', student_ids: ids, locked: locked },
+        apply: () => applyOptimisticLock(locked),
+        revert: revertOptimisticLock,
+        successMessage: `画面ロックを ${locked ? 'ON' : 'OFF'} にしました`,
+        errorPrefix: 'エラー',
+        busy: true,
+        refreshDelay: 1500
+      });
     }
 
     async function toggleSingleLock(studentId, newLockState) {
@@ -3015,18 +3086,29 @@
         return;
       }
 
-      try {
-        await apiRequest({
+      // 【R37】個別操作も一括とまったく同じ経路（/exec 直接 fetch +
+      //   楽観的UI + ビーコン0ms並列 + バックグラウンド継続）に統一する。
+      const prevLock = dev ? !!dev.screen_lock : false;
+      await runMutation({
+        payload: {
           action: 'update_single',
           student_id: studentId,
           data: { screen_lock: newLockState }
-        });
-        showToast('画面ロック設定を更新しました', 'success');
-        refreshSuppressedUntil = Date.now() + 2500;
-        await loadDevices();
-      } catch (err) {
-        showToast('更新失敗: ' + err.message, 'error');
-      }
+        },
+        apply: () => {
+          const d = devicesData.find(x => x.student_id === studentId);
+          if (d) d.screen_lock = !!newLockState;
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        revert: () => {
+          const d = devicesData.find(x => x.student_id === studentId);
+          if (d) d.screen_lock = prevLock;
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        successMessage: '画面ロック設定を更新しました',
+        errorPrefix: '更新失敗',
+        refreshDelay: 1500
+      });
     }
 
     function openBroadcastModal() {
@@ -3064,16 +3146,33 @@
         return;
       }
 
-      try {
-        closeModal('broadcastModal');
-        showToast('URLを一斉配信中...', 'info');
-        await apiRequest({ action: 'bulk_broadcast', student_ids: ids, url: url });
-        showToast('URLを配信しました', 'success');
-        refreshSuppressedUntil = Date.now() + 2500;
-        await loadDevices();
-      } catch (err) {
-        showToast('配信エラー: ' + err.message, 'error');
-      }
+      // 【R37】一斉配信も個別・一括ロックと同じ共通ランナーへ統一。
+      try { closeModal('broadcastModal'); } catch (e0) {}
+      const prevUrls = {};
+      ids.forEach(id => {
+        const d = devicesData.find(x => x.student_id === id);
+        if (d) prevUrls[id] = d.broadcast_url || '';
+      });
+      await runMutation({
+        payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
+        apply: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d) d.broadcast_url = url;
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        revert: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d && Object.prototype.hasOwnProperty.call(prevUrls, id)) d.broadcast_url = prevUrls[id];
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        successMessage: 'URLを配信しました',
+        errorPrefix: '配信エラー',
+        refreshDelay: 1500
+      });
     }
 
     // ==================== 教員個別設定 & マイURL & 個別規制URL管理 ====================
@@ -3252,30 +3351,46 @@
         return;
       }
 
-      try {
-        closeModal('filterModal');
-        showToast('URL規制を更新中...', 'info');
-
-        await apiRequest({
+      // 【R37】URL規制も同じ共通ランナーへ統一。
+      try { closeModal('filterModal'); } catch (e0) {}
+      const prevModes = {};
+      ids.forEach(id => {
+        const d = devicesData.find(x => x.student_id === id);
+        if (d) prevModes[id] = d.filter_mode || '';
+      });
+      await runMutation({
+        payload: {
           action: 'bulk_filter',
           student_ids: ids,
           filter_mode: mode,
           whitelist_urls: whitelist,
           blacklist_urls: blacklist
-        });
-
-        if (saveAsPref && currentTeacher) {
-          currentTeacher.filter_whitelist = whitelist;
-          currentTeacher.filter_blacklist = blacklist;
-          localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
-        }
-
-        showToast(`URL規制を ${mode} に更新しました（教員個別設定も保持）`, 'success');
-        refreshSuppressedUntil = Date.now() + 2500;
-        await loadDevices();
-      } catch (err) {
-        showToast('設定エラー: ' + err.message, 'error');
-      }
+        },
+        apply: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d) d.filter_mode = mode;
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        revert: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d && Object.prototype.hasOwnProperty.call(prevModes, id)) d.filter_mode = prevModes[id];
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        afterSuccess: () => {
+          if (saveAsPref && currentTeacher) {
+            currentTeacher.filter_whitelist = whitelist;
+            currentTeacher.filter_blacklist = blacklist;
+            try { localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher)); } catch (e) {}
+          }
+        },
+        successMessage: `URL規制を ${mode} に更新しました（教員個別設定も保持）`,
+        errorPrefix: '設定エラー',
+        refreshDelay: 1500
+      });
     }
 
     function openTeacherSettingsModal() {
@@ -3528,15 +3643,36 @@
 
       if (!confirm(`現在表示中の児童（未選択時）または選択児童 [ ${title || url} ] を一斉配信しますか？`)) return;
 
-      try {
-        showToast('URLを配信中...', 'info');
-        await apiRequest({ action: 'bulk_broadcast', student_ids: ids, url: url });
-        showToast(`「${title || url}」を配信しました`, 'success');
-        refreshSuppressedUntil = Date.now() + 2500;
-        await loadDevices();
-      } catch (err) {
-        showToast('配信エラー: ' + err.message, 'error');
-      }
+      // 【R37b】マイURLの即時配信も、一括・個別と同じ共通ランナーへ統一する。
+      //   ここだけ旧実装（応答待ち→再取得）が残ると、同じ「一斉配信」でも
+      //   押したボタンによって体感速度が変わってしまう。
+      const prevUrlsQuick = {};
+      ids.forEach(id => {
+        const d = devicesData.find(x => x.student_id === id);
+        if (d) prevUrlsQuick[id] = d.broadcast_url || '';
+      });
+      await runMutation({
+        payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
+        apply: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d) d.broadcast_url = url;
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        revert: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d && Object.prototype.hasOwnProperty.call(prevUrlsQuick, id)) {
+              d.broadcast_url = prevUrlsQuick[id];
+            }
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        successMessage: `「${title || url}」を配信しました`,
+        errorPrefix: '配信エラー',
+        refreshDelay: 1500
+      });
     }
 
     function toggleBroadcastTitleInput(checked) {
