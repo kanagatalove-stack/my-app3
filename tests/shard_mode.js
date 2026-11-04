@@ -185,6 +185,9 @@ async function main() {
     'isShardParent','isShardChild','normalizeShardClass',
     'readShardMapRaw','readShardDefaultUrl','getOrCreateShardSecret','shardSecretMatches',
     'shardConfigCached','invalidateShardConfig','shardMapIndexFromMap',
+    // 【R38】shardApplyFromParent はロック状態を parseBoolean で解釈する
+    //   （Boolean("false") === true で解除がロックに化ける事故の修正）。
+    'parseBoolean',
     'resolveShardForHeartbeat','shardApplyFromParent','shardEnsureDeviceRows',
     'shardAllChildUrls','shardPropagateKaState',
     // fetchAll 並列化・キャッシュ・教員スコープ絞り込み（今回の最適化）
@@ -1091,7 +1094,10 @@ async function main() {
     };
     vm.createContext(c3);
     let b = '';
-    ['api_bulkLock', 'api_bulkBroadcast', 'api_bulkFilter', 'api_updateSingle']
+    // 【R38】api_bulkLock は Boolean() ではなく parseBoolean() でロック状態を解釈する。
+    //   Boolean("false") === true のため、文字列の "false"（＝解除）が
+    //   ロックに化けていた。抽出対象に parseBoolean を加える。
+    ['api_bulkLock', 'api_bulkBroadcast', 'api_bulkFilter', 'api_updateSingle', 'parseBoolean']
       .forEach(function (n) { b += extract(gasSrc, n) + '\n'; });
     vm.runInContext(b, c3);
     return c3;

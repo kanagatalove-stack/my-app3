@@ -1686,48 +1686,33 @@
       } catch (e) {}
     }
 
-    // 【R37】子GASビーコンを「親の fetch と完全同時（0ms）」に撃つ。
-    //   R36 は 120ms 後だったが、実機の ③（親シートTRUE→子シートTRUE）が 4.0 秒で、
-    //   押下→親→子が直列に見えていた。0ms に前倒しして親の書き込みと重ねる。
+    // 【R38】R37 の5段連射（0 / 400 / 900 / 1500ms + 応答直後）を廃止し、1本だけに戻す。
     //
-    //   ただし 0ms 時点では親がまだ shardQueuePending を書いていないため、
-    //   キューが空で「空振り」することがある。そこで多段で撃つ:
-    //     1本目 0ms    … 親 fetch と完全並列（書き込みが速ければここで当たる）
-    //     2本目 400ms  … 親の索引解決〜キュー投入の直後を狙う
-    //     3本目 900ms  … 親のシート書き込みが長引いた場合
-    //     4本目 1500ms … 保険（親内部は実測 1.38 秒）
-    //     5本目 応答直後 … キューが必ず埋まっているので確実
-    //   空振りしたビーコンは保留が空なので即座に返る（子GASへは出ない）。
-    //   全滅しても 15秒周期の console_touch が回収する（自己修復）。
-    var eduShardFlushTimers = [];
-    var SHARD_FLUSH_RETRY_DELAYS = [400, 900, 1500];
+    //   実測: callback?nocache_id= が 33〜35 秒 Pending になる通信詰まりが発生した。
+    //   原因は、1操作あたり最大5本のビーコンが GAS の同時実行枠とブラウザの
+    //   ホストあたり接続枠（HTTP/1.1 で 6 本）を食い潰し、本命の /exec と
+    //   後続通信を巻き込んで待たせていたこと。便益より害が大きいため撤回する。
+    //
+    //   空振り（親の書き込み完了前に発火して保留が空）は、15秒周期の
+    //   console_touch が必ず shardFlushPending を呼ぶため、そこで回収される。
+    //
+    //   SHARD_FLUSH_BEACON_AT:
+    //     'send'     … リクエスト送出と同時（0ms）に1本だけ撃つ（既定）
+    //     'response' … 親の書き込み完了後（応答直後）に1本だけ撃つ（空振りゼロ）
+    //   どちらも「1本だけ」であり、接続枠は1本しか使わない。
+    var SHARD_FLUSH_BEACON_AT = 'send';
 
-    function clearShardFlushRetries() {
-      try {
-        for (var i = 0; i < eduShardFlushTimers.length; i++) {
-          try { clearTimeout(eduShardFlushTimers[i]); } catch (e0) {}
-        }
-      } catch (e) {}
-      eduShardFlushTimers = [];
-    }
+    // R37 のタイマー予約は廃止。呼び出し側との互換のため関数は残す。
+    function clearShardFlushRetries() {}
 
-    // 即時発火（0ms）。押下と同じ tick で撃つ＝親 fetch と並列。
+    // 即時発火（0ms）。押下と同じ tick で撃つ＝親 fetch と並列。1本だけ。
     function fireShardFlushNow() {
       try { sendShardFlushBeacon(); } catch (e) {}
     }
 
     function scheduleShardFlushRetries() {
-      try { clearShardFlushRetries(); } catch (e0) {}
-      fireShardFlushNow();               // 1本目: 0ms（親 fetch と並列）
-      for (var i = 0; i < SHARD_FLUSH_RETRY_DELAYS.length; i++) {
-        (function (delay) {
-          try {
-            eduShardFlushTimers.push(setTimeout(function () {
-              try { sendShardFlushBeacon(); } catch (e) {}
-            }, delay));
-          } catch (e) {}
-        })(SHARD_FLUSH_RETRY_DELAYS[i]);
-      }
+      if (SHARD_FLUSH_BEACON_AT !== 'send') return;   // 'response' では送信時に撃たない
+      fireShardFlushNow();
     }
 
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
@@ -2005,10 +1990,11 @@
       }
 
       if (__directFetch) {
-        // 【R36】親の書き込みが完了した直後に2本目を投げる。
-        //   この時点で保留キューは必ず埋まっているため、空振りしない。
-        //   応答は読まないので、教員の画面は待たされない。
-        try { sendShardFlushBeacon(); } catch (e4) {}
+        // 【R38】応答直後の発火は SHARD_FLUSH_BEACON_AT==='response' のときだけ。
+        //   既定の 'send' では 0ms の1本で完結させ、二重発火を避ける。
+        if (SHARD_FLUSH_BEACON_AT === 'response') {
+          try { sendShardFlushBeacon(); } catch (e4) {}
+        }
       } else {
         // google.script.run 経路（一括操作以外）は従来どおり予約する。
         try { if (isShardFlushAction(payload.action)) requestShardFlush(); } catch (e) {}

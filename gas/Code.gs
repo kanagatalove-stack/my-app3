@@ -975,9 +975,9 @@ function doPost(e) {
       if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
-      bulkUpdateScreenLock(scoped.ids, Boolean(payload.locked));
+      bulkUpdateScreenLock(scoped.ids, parseBoolean(payload.locked));
       // 子GAS分散: 該当クラスの子GASへも同じロック状態を伝達する（SHARD_MODE=false なら何もしない）
-      const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: Boolean(payload.locked) });
+      const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: parseBoolean(payload.locked) });
       return jsonResponse({ success: true, message: `画面ロックを ${payload.locked ? 'ON' : 'OFF'} に更新しました`, shard: shardLock });
     }
 
@@ -1032,11 +1032,11 @@ function doPost(e) {
       updateSingleDevice(payload.student_id, payload.data || {});
       const single = payload.data || {};
       const shardPatch = {};
-      if (single.screen_lock !== undefined) shardPatch.screen_lock = Boolean(single.screen_lock);
+      if (single.screen_lock !== undefined) shardPatch.screen_lock = parseBoolean(single.screen_lock);
       if (single.filter_mode !== undefined) shardPatch.filter_mode = single.filter_mode;
       if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
       if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
-      if (single.broadcast_url) shardPatch.broadcast_url = single.broadcast_url;
+      if (single.broadcast_url !== undefined) shardPatch.broadcast_url = single.broadcast_url;
       const shardSingle = Object.keys(shardPatch).length
         ? shardPropagatePolicy([payload.student_id], shardPatch) : { skipped: true };
       return jsonResponse({ success: true, message: '設定を更新しました', shard: shardSingle });
@@ -3744,7 +3744,7 @@ function updateSingleDevice(studentId, updateData) {
     if (targetRow === -1) throw new Error('児童IDが見つかりません: ' + studentId);
 
     if (updateData.screen_lock !== undefined && headerMap['画面ロック']) {
-      sheet.getRange(targetRow, headerMap['画面ロック']).setValue(Boolean(updateData.screen_lock));
+      sheet.getRange(targetRow, headerMap['画面ロック']).setValue(parseBoolean(updateData.screen_lock));
     }
     if (updateData.filter_mode !== undefined && headerMap['URL規制モード']) {
       sheet.getRange(targetRow, headerMap['URL規制モード']).setValue(updateData.filter_mode);
@@ -4543,7 +4543,19 @@ function shardApplyFromParent(payload) {
   }
 
   const ids = (payload && payload.student_ids) || [];
-  const patch = (payload && payload.patch) || {};
+  // 【R38】patch の正規化。
+  //   ・文字列で届いた場合は JSON として解釈する（false が文字列になっても落とさない）
+  //   ・isLock / locked という別名で届いても screen_lock として扱う
+  //   Boolean("false") が true になる事故を避けるため、値の解釈は parseBoolean に一本化する。
+  let patch = (payload && payload.patch) || {};
+  if (typeof patch === 'string') {
+    try { patch = JSON.parse(patch); } catch (eP) { patch = {}; }
+  }
+  if (!patch || typeof patch !== 'object') patch = {};
+  if (patch.screen_lock === undefined) {
+    if (patch.isLock !== undefined) patch.screen_lock = patch.isLock;
+    else if (patch.locked !== undefined) patch.screen_lock = patch.locked;
+  }
   const idList = Array.isArray(ids) ? ids : [];
   if (!idList.length) {
     // ka 伝達だけの呼び出しは正常（ポリシー変更なし）
@@ -4567,9 +4579,10 @@ function shardApplyFromParent(payload) {
     }
 
     if (patch.screen_lock !== undefined) {
-      bulkUpdateScreenLock(idList, Boolean(patch.screen_lock));
+      bulkUpdateScreenLock(idList, parseBoolean(patch.screen_lock));
     }
-    if (patch.broadcast_url) {
+    // 【R38】真偽値判定だと空文字（配信の取り消し）が落ちる。undefined で判定する。
+    if (patch.broadcast_url !== undefined && patch.broadcast_url !== null) {
       bulkUpdateBroadcastUrl(idList, String(patch.broadcast_url), '');
     }
     if (patch.filter_mode !== undefined) {
@@ -5607,6 +5620,20 @@ function shardReadPending() {
  * 指定した値を書く冦等操作なので、畳んでも敷き換わらない。
  */
 function shardQueuePending(requests) {
+  // 【R38】保留（PropertiesService）の read-modify-write をスクリプトロックで直列化する。
+  //   ビーコンと本体処理が同時に走ると、後から積んだ指示（解除など）が
+  //   古い読み込み結果で上書きされ、消えることがあった。
+  //   ロックが取れない環境でも従来どおり動作させる（機能を落とさない）。
+  let qLock = null;
+  try {
+    if (typeof LockService !== 'undefined') {
+      try {
+        const lk = LockService.getScriptLock();
+        lk.waitLock(2000);
+        qLock = lk;
+      } catch (eL) { qLock = null; }
+    }
+  } catch (e0) { qLock = null; }
   try {
     if (typeof PropertiesService === 'undefined') return false;
     const reqs = Array.isArray(requests) ? requests : [];
@@ -5645,6 +5672,9 @@ function shardQueuePending(requests) {
   } catch (e) {
     try { Logger.log('[SHARD-ASYNC] 保留できません（同期送信へ切り替え）: ' + e); } catch (e2) {}
     return false;
+  } finally {
+    // 【R38】read-modify-write を守ったロックを必ず解放する。
+    try { if (qLock) qLock.releaseLock(); } catch (eR) {}
   }
 }
 
@@ -5743,7 +5773,13 @@ function shardCoalescePending(reqs) {
       const sid = String(ids[j]);
       const prev = state[url][sid] || { patch: {}, cls: undefined, keys: [] };
       const pk = Object.keys(patch);
-      for (let k = 0; k < pk.length; k++) prev.patch[pk[k]] = patch[pk[k]]; // 後から来た指示が勝つ
+      // 【R38】後から来た指示が勝つ。ただし undefined では前の値を消さない。
+      //   false は「解除」という意味のある指示なので、必ず上書きする
+      //   （ここで false を落とすと、子シートがロックされたままになる）。
+      for (let k = 0; k < pk.length; k++) {
+        if (patch[pk[k]] === undefined) continue;
+        prev.patch[pk[k]] = patch[pk[k]];
+      }
       if (cm[sid] !== undefined) prev.cls = cm[sid];
       if (prev.keys.indexOf(key) < 0) prev.keys.push(key);
       state[url][sid] = prev;
@@ -6197,13 +6233,13 @@ function api_bulkLock(token, studentIds, locked) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
     __bt('--- 親シート書込 開始 ---');
-    bulkUpdateScreenLock(scoped.ids, Boolean(locked));
+    bulkUpdateScreenLock(scoped.ids, parseBoolean(locked));
     __bt('--- 親シート書込 完了 ---');
     // 子GAS分散: 教員コンソールは google.script.run（この関数）を使うため、
     // ここで伝達しないと子担当の端末にロック指示が届かない。
     // doPost の bulk_lock と同じ内容を渡す（SHARD_MODE=false なら何もしない）。
     __bt('--- 子GAS伝達 開始 ---');
-    const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: Boolean(locked) });
+    const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: parseBoolean(locked) });
     __bt('--- 子GAS伝達 完了 ---');
     try { if (typeof bulkTraceEnd === 'function') bulkTraceEnd('api_bulkLock'); } catch (e) {}
     return { success: true, message: `画面ロックを ${locked ? 'ON' : 'OFF'} に更新しました`, shard: shardLock };
@@ -6276,11 +6312,11 @@ function api_updateSingle(token, studentId, data) {
     // 子GAS分散: 個別更新も子へ伝達する（doPost の update_single と同じ組み立て）
     const single = data || {};
     const shardPatch = {};
-    if (single.screen_lock !== undefined) shardPatch.screen_lock = Boolean(single.screen_lock);
+    if (single.screen_lock !== undefined) shardPatch.screen_lock = parseBoolean(single.screen_lock);
     if (single.filter_mode !== undefined) shardPatch.filter_mode = single.filter_mode;
     if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
     if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
-    if (single.broadcast_url) shardPatch.broadcast_url = single.broadcast_url;
+    if (single.broadcast_url !== undefined) shardPatch.broadcast_url = single.broadcast_url;
     const shardSingle = Object.keys(shardPatch).length
       ? shardPropagatePolicy([studentId], shardPatch) : { skipped: true };
     return { success: true, message: '設定を更新しました', shard: shardSingle };
