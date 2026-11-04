@@ -1700,6 +1700,11 @@
     //     'send'     … リクエスト送出と同時（0ms）に1本だけ撃つ（既定）
     //     'response' … 親の書き込み完了後（応答直後）に1本だけ撃つ（空振りゼロ）
     //   どちらも「1本だけ」であり、接続枠は1本しか使わない。
+    // 【R39】既定は 'send'（/exec の送出と完全同時・0ms・1本だけ）。
+    //   これで子GASへの伝達が /exec の応答（3.8秒）を待たずに走る。
+    //   0ms 時点では親がまだ保留を書いていないため空振りすることがある。
+    //   その場合でも 15秒周期の console_touch が回収する。
+    //   空振りを確実に避けたいときだけ 'response' にする（応答後に1本・同じく1本）。
     var SHARD_FLUSH_BEACON_AT = 'send';
 
     // R37 のタイマー予約は廃止。呼び出し側との互換のため関数は残す。
@@ -2915,42 +2920,67 @@
       }
     }
 
-    // ==================== 【R37】書き込み操作の共通ランナー ====================
+    // ==================== 書き込み操作の共通ランナー ====================
     //  一括（bulk_lock / bulk_broadcast / bulk_filter）と個別（update_single）を
     //  同じ1本の経路に通す。挙動差を作らないための土台。
     //
-    //  ・押下 0.1 秒以内に楽観的UIを確定（通信を待たない）
-    //  ・完了トーストも即時に出す（通信完了を待たせない＝バックグラウンド化）
-    //  ・/exec への fetch と完全同時（0ms）に子GASビーコンを並列発火
-    //  ・失敗したときだけ元の表示へ戻し、エラートーストを出す（嘘を残さない）
-    //  ・後続操作に追い越されたら、古い応答では画面を触らない
+    //  【R39】画面側処理を通信から完全に切り離した（fire-and-forget）。
+    //
+    //  実測: GAS 本体（echo）は 264〜388ms で完了しているのに、
+    //        /exec の応答は Google のリダイレクトを挟むため 3.81〜3.89秒かかる。
+    //        つまり「速くできないのは Google 側の転送」であり、
+    //        await して待つ限り体感は必ず 3.8 秒になる。
+    //
+    //  そこで、await を廃止した:
+    //    1. 押下と同一 tick で楽観的UIを確定（0.1 秒以内）
+    //    2. 同じ tick で完了トーストを表示（通信を待たない）
+    //    3. /exec へは投げっぱなし（Promise を await しない）
+    //    4. 応答は background で受け、成功なら静かに再取得、
+    //       失敗したときだけ revert ＋ エラートーストで嘘を残さない
+    //  これにより教員の操作は通信時間に一切引きずられない。
+    //
+    //  ・後続操作に追い越されたら、古い応答では画面を触らない（mutationSeq）
     let mutationSeq = 0;
 
-    async function runMutation(opts) {
+    function runMutation(opts) {
       const o = opts || {};
       const payload = o.payload || {};
       const seq = ++mutationSeq;
       let applied = false;
 
-      // 1) 楽観的UI（押下と同値）
+      // 1) 楽観的UI（押下と同値・0.1秒以内）
       if (typeof o.apply === 'function') {
         try { o.apply(); applied = true; } catch (e) {}
       }
       // 2) 完了トーストも即時（通信を待たない）
       if (o.successMessage) { try { showToast(o.successMessage, 'success'); } catch (e) {} }
-      // 3) 連打防止
+      // 3) 連打防止（画面は確定済みなので、ボタンの見た目だけ止める）
       if (o.busy) { try { setBulkActionBusy(true); } catch (e) {} }
 
+      // 4) 送信。apiRequest は呼び出した瞬間に fetch を開始し、
+      //    同じ tick で子GASビーコンも撃つ。戻り値の Promise は await しない。
+      let pending = null;
       try {
-        // 4) 送信。apiRequest が同じ tick で 0ms ビーコンを撃つ。
-        await apiRequest(payload);
-        if (seq !== mutationSeq) return true;   // 追い越された（画面は触らない）
+        pending = apiRequest(payload);
+      } catch (eStart) {
+        // 同期的に落ちた場合（URL未設定など）はその場で巻き戻す
+        if (applied && typeof o.revert === 'function') {
+          try { o.revert(); } catch (e) {}
+        }
+        const m0 = (eStart && eStart.message) ? eStart.message : String(eStart);
+        try { showToast((o.errorPrefix || 'エラー') + ': ' + m0, 'error'); } catch (e) {}
+        if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
+        return true;
+      }
 
+      // 5) 応答はバックグラウンドで処理する（画面はもう確定している）
+      Promise.resolve(pending).then(function () {
+        if (seq !== mutationSeq) return;   // 追い越された（画面は触らない）
         refreshSuppressedUntil = 0;
         if (typeof o.afterSuccess === 'function') {
           try { o.afterSuccess(); } catch (e) {}
         }
-        // 5) 付随情報の再取得は「裏で・遅れて」。UI は既に確定している。
+        // 付随情報の再取得は「裏で・遅れて」。UI は既に確定している。
         if (o.refreshDelay !== false) {
           const delay = (typeof o.refreshDelay === 'number') ? o.refreshDelay : 1500;
           setTimeout(function () {
@@ -2958,19 +2988,22 @@
             try { loadDevices(true); } catch (e) {}
           }, delay);
         }
-        return true;
-      } catch (err) {
-        if (seq !== mutationSeq) return false;
+      }).catch(function (err) {
+        if (seq !== mutationSeq) return;
+        // ここに来るのは本当に失敗したときだけ（ネットワーク断・認証切れ等）
         if (applied && typeof o.revert === 'function') {
           try { o.revert(); } catch (e) {}
         }
         refreshSuppressedUntil = 0;
         const msg = (err && err.message) ? err.message : String(err);
-        try { showToast((o.errorPrefix || 'エラー') + ': ' + msg, 'error'); } catch (e) {}
-        return false;
-      } finally {
+        try { showToast((o.errorPrefix || '通信失敗') + ': ' + msg, 'error'); } catch (e) {}
+      }).then(function () {
         if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
-      }
+      }, function () {
+        if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
+      });
+
+      return true;   // 呼び出し元へは即座に返す（await しても待たされない）
     }
 
     // 【R36】一括操作中はボタンを押せなくする（連打・二重送信の防止）。
