@@ -90,9 +90,35 @@
 > **順序が重要な理由:** 親を先に `SHARD_MODE = true` にすると、子GASが未準備のまま
 > 端末に「存在しない子GASのURL」を配ってしまい、端末が通信できなくなります。
 
+### 2-1. 事前に必要な権限（OAuthスコープ）の確認
+
+子GASへ伝達する処理は `UrlFetchApp` を使うため、**親・子の両方**に
+`script.external_request` の承認が必要です。
+
+| スコープ | 必要か | 用途 |
+|---|---|---|
+| `script.external_request` | **必須** | `UrlFetchApp.fetch` / `fetchAll` による親↔子の通信 |
+| `script.scriptapp` | **不要（R34以降）** | R34 で `ScriptApp` のトリガー依存を撤去したため |
+
+> **重要:** `script.external_request` が未承認だと `UrlFetchApp.fetch` が例外になります。
+> 例外を握りつぶす実装だと「0件取得」に見えてしまい、端末が**オフライン誤判定**されます
+> （8-7 を参照）。`appsscript.json` に以下があることを確認してください。
+>
+> ```json
+> {
+>   "oauthScopes": [
+>     "https://www.googleapis.com/auth/spreadsheets",
+>     "https://www.googleapis.com/auth/script.external_request",
+>     "https://www.googleapis.com/auth/script.scriptapp"
+>   ]
+> }
+> ```
+>
+> `script.scriptapp` は残っていても害はありませんが、不要です。
+> **トリガーの手動作成も不要**です（R34 でブラウザ起点のビーコン方式へ移行しました）。
+
 ---
 
-## 3. 子GASの準備
 
 ### 3-1. 子GASを何個作るか
 
@@ -496,6 +522,93 @@ SHARD_MODE: true,
 - 子GASの数が多すぎないか（1校 6〜12 個が目安）
 - 子GAS側の `processHeartbeat` が 3〜5ms で応答しているか
 
+#### 8-4-1. 計測ログの読み方（`[BULK-TRACE]` / `[SHARD-DIAG]`）
+
+性能問題は**推測せず、必ず計測してから**直します。次の2種類のログを残しています。
+
+| ログ | 出る場所 | 何が分かるか |
+|---|---|---|
+| `[BULK-TRACE] STEP <区間名> +<ms> (累計 <ms>)` | 親GASの実行ログ（一括操作時） | どの区間が何ms使ったか |
+| `[BULK-TRACE] TOTAL` | 同上（処理終了時） | 1回の一括操作の総時間 |
+| `[SHARD-DIAG] ...` | 親GASの実行ログ | 子GASからの取得結果（HTTPコード・件数・失敗理由） |
+
+`[BULK-TRACE]` は一括操作の開始時に自動で有効になります。出力例:
+
+```
+[BULK-TRACE] STEP waitLock +156ms (累計 156ms)
+[BULK-TRACE] STEP shardPropagatePolicy:設定読込(CacheService/Properties) +12ms (累計 168ms)
+[BULK-TRACE] STEP shardPropagatePolicy:索引取得(シートI/Oなし) +3ms (累計 171ms)
+[BULK-TRACE] STEP shardPropagatePolicy:保留へ積む(応答待ちなし) +2ms (累計 173ms)
+[BULK-TRACE] STEP 子GASへ伝達(委譲) +207ms (累計 380ms)
+```
+
+> **注意:** `STEP` の値は「直前の STEP からの差分」です。合計は `TOTAL` を見てください。
+
+#### 8-4-2. 改善の履歴（実測値）
+
+| 版 | 内容 | 実測 |
+|---|---|---|
+| R31 | 同一実行内で同じシートを開き直さない | — |
+| R32 | `[BULK-TRACE]` を導入し、ボトルネックを特定 | 合計 8,899ms（うち `waitLock` は 156ms のみ＝ロック競合ではないと判明） |
+| R33 | 教員マスタを `CacheService` 化＋必要4列のみ読み | 8.9秒 → 約1.8秒 |
+| R33 | さらにスコープ判定を3列読み＋キャッシュ | 1,117ms → 236ms |
+| R34 | 子GAS伝達のトリガー依存を廃止（ブラウザ起点ビーコン） | 応答待ち 4,122ms → **207ms**（委譲） |
+| R35 | 端末索引を `dev_v` から独立（`idx_v`） | `getDataRange` **4,946ms → 0ms**（目標 合計 1.5秒以下） |
+
+#### 8-4-3. R35: 索引の独立版数化（`idx_v`）とは
+
+**症状（R34 時点で残っていた最後のボトルネック）**
+
+- 一括ロック・一斉表示を押すと、**書き込み直後だけ** 4〜5秒かかる
+- 同じ実行の直前に同じシートを読んだときは 236ms なのに、その直後の読み取りだけ 4,946ms
+
+**原因**
+
+`withWriteLock` は書き込みが成功するたびに `dev_v`（端末一覧キャッシュの版）を進めます。
+端末索引のキャッシュキーが `dvi_<dev_v>_...` だったため、
+
+> 書き込み → `dev_v` が進む → **自分自身の書き込みで索引キャッシュが失効** →
+> 次の読み取りが必ずキャッシュミス → 1,000〜2,000行を全列再読込
+
+という「自作自演の cache miss」が起きていました。
+
+**修正**
+
+- 索引専用の版キー **`idx_v`** を新設し、`dev_v` と完全に分離しました
+  （`CacheService` に6時間保持。`dev_v` が進んでも索引は破棄されません）
+- **書き込み関数が、変更のあった差分だけを索引へ直接上書き**します
+  （`getAllDevices` / `updateSingleDevice` / `addStudentRecord` / `importStudents` /
+  `runAnnualRollover` / `hbRegisterDevice` / `shardUpsertTelemetryFromChild`）
+- `shardPropagatePolicy` と `scopeStudentIdsForTeacher` は**索引だけ**を参照します
+- 索引は 250行/キーに分割して保存（`CacheService` の1値 100KB 上限対策）。
+  1チャンクが 95,000文字を超える異常時はキャッシュを諦め、シート読みへ戻ります
+- 索引が無い初回だけ「児童ID・学校名・クラス」の**4列を1回**読みます
+
+> **関数の戻り値は変更していません。** 既存シグネチャを維持したまま、
+> 書き込み関数が「自分の変更を索引へ反映する」副作用だけを追加しています。
+
+**確認のしかた**
+
+`[BULK-TRACE]` に次の STEP が出ていれば、シートI/Oは発生していません。
+
+```
+[BULK-TRACE] STEP shardPropagatePolicy:索引取得(シートI/Oなし) +2ms (累計 ...)
+```
+
+この STEP が **数百ms〜数秒** かかっている場合は、索引が失効して
+シート読みにフォールバックしています。次を確認してください。
+
+| 確認項目 | 期待値 |
+|---|---|
+| `idx_v` が存在するか | 1回以上アクセスがあれば存在 |
+| 端末一覧シートの列 | `児童ID` / `学校名` / `クラス` のヘッダーがある |
+| `CacheService` が使えるか | 子GASではなく親GASで実行しているか |
+
+> **`idx_v` を意図的に作り直したい場合**（列構成を変えた等）は、
+> 親GASのエディタで `shardIndexBump()` を1回実行してください。
+> 版が進み、次の読み取りで索引が作り直されます（古い版は自然に失効します）。
+
+
 ### 8-5. 子シートのクラス・氏名が空（または「未設定」）になる
 
 **症状**: 子スプレッドシートの「端末一覧」で、A〜D列（児童ID・学校名・氏名・クラス）が
@@ -742,6 +855,13 @@ const HB_DEBUG_LOG = true;
 | `shardEnsureDeviceRows()` | 指示前に対象児童の行を用意 |
 | `shardPropagatePolicy()` | 親→子へ一括指示（`fetchAll`） |
 | `shardPropagateKaState()` | 親→子へ教員稼働状態を伝達（30秒間引き） |
+| `shardIndexEnsure()` / `shardDeviceEntries()` | 端末索引（児童ID/学校名/クラス）を取得。索引が無ければ4列を1回だけ読む（R35） |
+| `shardIndexSave()` / `shardIndexLoad()` | 索引の保存・読み出し。250行/キーに分割、1チャンク95,000文字の安全弁（R35） |
+| `shardIndexUpsert()` / `shardIndexRemove()` | 書き込み関数が差分だけを索引へ反映／卒業・削除を索引から除外（R35） |
+| `shardIndexRefreshFromRows()` | `getAllDevices` の全読み結果で索引を作り直す（手編集のズレも解消）（R35） |
+| `shardIndexBump()` | 版キー `idx_v` を進めて索引を丸ごと作り直す（構造変更時のみ）（R35） |
+| `shardReadPending()` / `shardQueuePending()` / `shardFlushPending()` | 子GAS宛の指示を保留キューへ積む／回収する（R34） |
+| `shardCoalescePending()` | 同一児童への連続指示を畳む（最後の指示が勝つ）（R34） |
 | `shardUrlsForTeacher()` | 教員スコープに応じて問い合わせ先の子GASを絞る |
 | `shardFetchMany()` | `fetchAll` 並列取得（不可なら直列へフォールバック） |
 | `shardFetchChildDevices()` | 子の端末一覧を取得（4秒キャッシュ） |
