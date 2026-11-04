@@ -1686,6 +1686,28 @@
       } catch (e) {}
     }
 
+    // 【R36】送信と並列にビーコンを発火する。
+    //   押下と同時に投げると親の書き込み前でキューが空のことがあるため、
+    //   微小ディレイ（120ms）を挟んで1本目を投げる。
+    //   2本目は apiRequest が応答を受けた直後（＝書き込み完了後）に確実に投げる。
+    //   それでも漏れた場合は 15秒周期の console_touch が回収する（自己修復）。
+    var eduShardFlushRetryId = null;
+
+    function clearShardFlushRetries() {
+      try { if (eduShardFlushRetryId) clearTimeout(eduShardFlushRetryId); } catch (e) {}
+      eduShardFlushRetryId = null;
+    }
+
+    function scheduleShardFlushRetries() {
+      try {
+        clearShardFlushRetries();
+        eduShardFlushRetryId = setTimeout(function () {
+          eduShardFlushRetryId = null;
+          try { sendShardFlushBeacon(); } catch (e) {}
+        }, 120);
+      } catch (e) {}
+    }
+
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
     function consoleTouch(sessionId) {
       const sid = sessionId || eduKeepaliveSessionId || getKeepaliveSessionId();
@@ -1846,7 +1868,20 @@
 
     // ==================== ハイブリッド API リクエスト ====================
     async function apiRequest(payload, method = 'POST') {
-      if (typeof google !== 'undefined' && google.script && google.script.run) {
+      // 【R36】一括操作系（ロック/一斉配信/規制/単一更新）は google.script.run を迂回し、
+      //   /exec へ直接 fetch する。
+      //   実測: callback?nocache_id= のポーリング往復が 3.6〜7.1秒かかっていた。
+      //   GAS 内部は 1.38秒で完了しているため、この往復待ちが体感6秒の正体だった。
+      //   google.script.run は iframe 経由のポーリングで待ちを短縮できないため、
+      //   一括操作だけ直接 fetch に固定する（認証トークン・body構成は従来のまま）。
+      const __directFetch = (typeof isShardFlushAction === 'function') &&
+                            isShardFlushAction(payload && payload.action);
+      if (__directFetch) {
+        // 応答を待たず、送信と並列で子GAS宛ビーコンを発火する。
+        try { scheduleShardFlushRetries(); } catch (e0) {}
+      }
+
+      if (!__directFetch && typeof google !== 'undefined' && google.script && google.script.run) {
         return new Promise((resolve, reject) => {
           const runner = google.script.run
             .withSuccessHandler(res => {
@@ -1945,9 +1980,15 @@
         throw new Error(data.error || 'リクエスト処理に失敗しました');
       }
 
-      // 【R34】fetch 経由でも、子GAS伝達が発生する操作なら
-      //   フラッシュビーコンを予約する（両経路で漏らさない）。
-      try { if (isShardFlushAction(payload.action)) requestShardFlush(); } catch (e) {}
+      if (__directFetch) {
+        // 【R36】親の書き込みが完了した直後に2本目を投げる。
+        //   この時点で保留キューは必ず埋まっているため、空振りしない。
+        //   応答は読まないので、教員の画面は待たされない。
+        try { sendShardFlushBeacon(); } catch (e4) {}
+      } else {
+        // google.script.run 経路（一括操作以外）は従来どおり予約する。
+        try { if (isShardFlushAction(payload.action)) requestShardFlush(); } catch (e) {}
+      }
 
       return data;
     }
@@ -2864,6 +2905,19 @@
       }
     }
 
+    // 【R36】一括操作中はボタンを押せなくする（連打・二重送信の防止）。
+    function setBulkActionBusy(busy) {
+      try {
+        const btns = document.querySelectorAll(
+          '[onclick^="executeBulkLock"], [onclick="openBroadcastModal()"]');
+        for (let i = 0; i < btns.length; i++) {
+          btns[i].disabled = !!busy;
+          btns[i].style.opacity = busy ? '0.6' : '';
+          btns[i].style.pointerEvents = busy ? 'none' : '';
+        }
+      } catch (e) {}
+    }
+
     async function executeBulkLock(locked) {
       // 対象: チェック済みがあればその児童、なければ「現在表示中の児童」のみ
       const target = resolveBulkTargetIds();
@@ -2899,14 +2953,47 @@
 
       if (!confirm(`${countLabel}の画面ロックを ${locked ? 'ON' : 'OFF'} にしますか？`)) return;
 
+      // 【R36】楽観的UI更新。
+      //   /exec への直接 fetch でも応答までは数秒かかるため、押下した瞬間に画面を作り替える。
+      //   通信は裏で続け、失敗したら元の表示へ戻す（嘘の状態を残さない）。
+      const prevLocks = {};
+      ids.forEach(id => {
+        const d = devicesData.find(x => x.student_id === id);
+        if (d) prevLocks[id] = !!d.screen_lock;
+      });
+      const applyOptimisticLock = (state) => {
+        ids.forEach(id => {
+          const d = devicesData.find(x => x.student_id === id);
+          if (d) d.screen_lock = state;
+        });
+        try { renderDevices(); updateStatistics(); } catch (e) {}
+      };
+      const revertOptimisticLock = () => {
+        ids.forEach(id => {
+          const d = devicesData.find(x => x.student_id === id);
+          if (d && Object.prototype.hasOwnProperty.call(prevLocks, id)) d.screen_lock = prevLocks[id];
+        });
+        try { renderDevices(); updateStatistics(); } catch (e) {}
+      };
+
+      // 押下直後（0.1秒以内）に見た目を確定させる
+      applyOptimisticLock(locked);
+      showToast(`画面ロックを ${locked ? 'ON' : 'OFF'} にしています...`, 'info');
+      setBulkActionBusy(true);
+
       try {
-        showToast('画面ロック更新中...', 'info');
         await apiRequest({ action: 'bulk_lock', student_ids: ids, locked: locked });
+        // サーバー側の書き込みは完了済み。表示は確定しているので、
+        // 「最終通信」等の付随情報だけを裏で静かに取り直す。
+        refreshSuppressedUntil = 0;
         showToast(`画面ロックを ${locked ? 'ON' : 'OFF'} にしました`, 'success');
-        refreshSuppressedUntil = Date.now() + 2500; // 反映前の古い状態を一瞬表示しない
-        await loadDevices();
+        setTimeout(() => { try { loadDevices(true); } catch (e) {} }, 1500);
       } catch (err) {
+        revertOptimisticLock();
+        refreshSuppressedUntil = 0;
         showToast('エラー: ' + err.message, 'error');
+      } finally {
+        setBulkActionBusy(false);
       }
     }
 
