@@ -977,8 +977,8 @@ function doPost(e) {
       }
       bulkUpdateScreenLock(scoped.ids, parseBoolean(payload.locked));
       // 子GAS分散: 該当クラスの子GASへも同じロック状態を伝達する（SHARD_MODE=false なら何もしない）
-      // 【R40】親シート書き込み完了後、サーバ側から子GASへ直送する
-      const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: parseBoolean(payload.locked) }, { inlineKick: true });
+      // 【R41】子GASへの反映はブラウザが直接・並列で行う（親は待たない）
+      const shardLock = shardPropagatePolicy(scoped.ids, { screen_lock: parseBoolean(payload.locked) });
       return jsonResponse({ success: true, message: `画面ロックを ${payload.locked ? 'ON' : 'OFF'} に更新しました`, shard: shardLock });
     }
 
@@ -991,7 +991,7 @@ function doPost(e) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
       const broadcastId = bulkUpdateBroadcastUrl(scoped.ids, targetUrl, '');
-      const shardBc = shardPropagatePolicy(scoped.ids, { broadcast_url: targetUrl }, { inlineKick: true });
+      const shardBc = shardPropagatePolicy(scoped.ids, { broadcast_url: targetUrl });
       return jsonResponse({ success: true, message: '一斉URLを配信しました', broadcast_id: broadcastId, shard: shardBc });
     }
 
@@ -1002,12 +1002,12 @@ function doPost(e) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
       bulkUpdateFilterMode(scoped.ids, payload.filter_mode, payload.whitelist_urls, payload.blacklist_urls);
-      // 【R40】親シート書き込み完了後、サーバ側から子GASへ直送する
+      // 【R41】子GASへの反映はブラウザが直接・並列で行う（親は待たない）
       const shardFilter = shardPropagatePolicy(scoped.ids, {
         filter_mode: payload.filter_mode,
         whitelist_urls: payload.whitelist_urls,
         blacklist_urls: payload.blacklist_urls
-      }, { inlineKick: true });
+      });
       // 教員アカウントの個別設定としても保持
       if (currentTeacher && currentTeacher.email) {
         try {
@@ -1039,10 +1039,19 @@ function doPost(e) {
       if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
       if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
       if (single.broadcast_url !== undefined) shardPatch.broadcast_url = single.broadcast_url;
-      // 【R40】親シート書き込み完了後、サーバ側から子GASへ直送する
+      // 【R41】子GASへの反映はブラウザが直接・並列で行う（親は待たない）
       const shardSingle = Object.keys(shardPatch).length
-        ? shardPropagatePolicy([payload.student_id], shardPatch, { inlineKick: true }) : { skipped: true };
+        ? shardPropagatePolicy([payload.student_id], shardPatch) : { skipped: true };
       return jsonResponse({ success: true, message: '設定を更新しました', shard: shardSingle });
+    }
+
+    // H2. 【R41】子GASの接続情報をブラウザへ配布する
+    //   ブラウザが親 /exec と子 /exec を「並列」で叩けるようにするため、
+    //   子GASのURLと共有シークレットを返す。
+    //   1校独立運用（自校のブラウザは自校のGASにしかアクセスしない）を前提とする。
+    //   SHARD_MODE が無効なら enabled:false を返すだけで、他は何もしない。
+    if (action === 'shard_config') {
+      return jsonResponse(shardClientConfig());
     }
 
     // I. 教員アカウント設定の保存（登録URL情報・個別規制URL・対象クラスの更新）
@@ -5604,55 +5613,6 @@ const SHARD_ASYNC_ENABLED = true;      // false にすると常に同期送信�
 const SHARD_ASYNC_PROP = 'SHARD_ASYNC_QUEUE';
 const SHARD_ASYNC_MAX_CHARS = 8000;    // Properties 1件あたりの上限(9KB)に対する安全弁
 
-// =====================================================================
-// 【R40】「親の書き込み完了直後に、サーバ側から子GASへ直接蹴る」経路。
-//
-//   ブラウザのビーコンは「750ms 後に撃つ」という当て推量なので、親が混んで
-//   いると空振りし得る。一方サーバ側は、bulkUpdateScreenLock の完了後に
-//   shardPropagatePolicy を呼んでいるため、保留に積んだ時点で
-//   親シートへの書き込みは必ず終わっている（順序が保証される）。
-//   したがって、ここで直送すれば空振りは原理的に起きない。
-//
-//   doPost の一括操作からだけ呼ぶ（google.script.run 経路は、応答を待つ
-//   教員がいるため同期送信のままとし、体感を悪化させない）。
-//   2回目以降の呼び出しは「保留なし」で即座に返るため、実行時間の増加は実質ゼロ。
-//
-//   SHARD_INLINE_KICK を false にすれば従来どおりブラウザ任せになる。
-// =====================================================================
-const SHARD_INLINE_KICK = true;
-
-/**
- * 保留へ積んだ直後に子GASへ直送する（R40）。
- *  ・失敗しても保留は残るので、ビーコンか console_touch が回収する
- *
- * 【R40 修正】当初は「1実行につき1回」をモジュール変数（let __shardInlineKicked）
- *   で数えていたが、GAS はウォームインスタンスを再利用するためグローバル変数が
- *   実行をまたいで残ることがある。その場合 true のまま固定され、2回目以降の
- *   直送が永久にスキップされる（＝子シートが更新されない）危険があった。
- *   モジュール変数での回数制限は廃止する。
- *   shardFlushPending は送った分を保留から取り除くので、2回目以降の呼び出しは
- *   「保留なし」で即座に返る（通信しない）。実行時間の増加は実質ゼロ。
- */
-function shardInlineKick(label) {
-  try {
-    if (typeof SHARD_INLINE_KICK === 'undefined' || !SHARD_INLINE_KICK) return null;
-    if (typeof shardFlushPending !== 'function') return null;
-    const t0 = Date.now();
-    const r = shardFlushPending();
-    const ms = Date.now() - t0;
-    try {
-      if (typeof shardDiagLog === 'function') {
-        shardDiagLog('[R40] 直送キック(' + String(label || '') + '): ' + ms + 'ms / sent=' +
-          ((r && r.sent) || 0) + ' / 残り=' + ((r && r.queued) || 0));
-      }
-    } catch (eL) {}
-    return r;
-  } catch (e) {
-    try { if (typeof shardDiagLog === 'function') shardDiagLog('[R40] 直送キック失敗: ' + e); } catch (e2) {}
-    return null;
-  }
-}
-
 /** 保留中の送信を読む（削除はしない）。 */
 function shardReadPending() {
   try {
@@ -5971,10 +5931,10 @@ function shardFlushPending() {
   return { sent: sendReqs.length, removed: removed, queued: Math.max(0, reqs.length - removed) };
 }
 
-function shardPropagatePolicy(studentIds, patch, opts) {
-  // 【R40】第3引数 opts.inlineKick: 積んだ直後にサーバ側から子GASへ直送する。
-  //   既存の呼び出し元は第2引数までなので、未指定なら false（従来どおり）。
-  const kickNow = !!(opts && opts.inlineKick);
+function shardPropagatePolicy(studentIds, patch) {
+  // 【R41】子GASへの送信はブラウザが直接・並列で行う（親の /exec は待たない）。
+  //   ここでは保留（PropertiesService）へ積むだけにして、親の実行時間を短く保つ。
+  //   積んだ内容は 15秒周期の console_touch が回収する（取りこぼし防止）。
   // 【R32 計測】
   const __bt = function (label) {
     try { if (typeof bulkTraceMark === 'function') bulkTraceMark(label); } catch (e) {}
@@ -6067,13 +6027,6 @@ function shardPropagatePolicy(studentIds, patch, opts) {
       if (typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
           typeof shardQueuePending === 'function' && shardQueuePending(requests)) {
         __bt('shardPropagatePolicy:保留へ積む(応答待ちなし)');
-        // 【R40】親シートへの書き込みは完了済み（呼び出し順で保証）。ここで直送する。
-        //   inlineKick を明示した呼び出し元（doPost の一括操作）だけが対象。
-        try {
-          if (kickNow && typeof shardInlineKick === 'function') {
-            shardInlineKick('shardPropagatePolicy');
-          }
-        } catch (ek) {}
         const queuedResults = [];
         for (let qi = 0; qi < urls.length; qi++) {
           queuedResults.push({ url: urls[qi], count: groups[urls[qi]].length, queued: true });
@@ -6237,6 +6190,45 @@ function api_verifySession(token) {
     return { success: true, teacher: currentTeacher };
   } catch (err) {
     return { success: false, error: err.toString() };
+  }
+}
+
+/**
+ * 【R41】ブラウザへ配布する子GAS接続情報。
+ *
+ *   ブラウザが「親 /exec」と「子 /exec」を同じ tick で並列に POST するために必要。
+ *   Google のリダイレクト待ち（約3.8秒）を親・子で同時に消化させるのが目的。
+ *
+ *   1校独立運用のため、自校のブラウザが自校の子GAS URLとシークレットを持つことは
+ *   許容される（他校のGASへは到達できない）。
+ *
+ *   SHARD_MODE が無効な環境では enabled:false を返し、ブラウザは並列直送を行わない
+ *   （＝従来どおり親だけに送る。機能は落ちない）。
+ */
+function shardClientConfig() {
+  try {
+    if (!isShardParent()) return { success: true, enabled: false };
+    const cfg = shardConfigCached();
+    const idx = shardMapIndexFromMap(cfg.map);
+    const classes = Object.keys(idx).map(function (k) {
+      return { normalized: k, url: String(idx[k] || '') };
+    });
+    // 子GASが1つも無ければ並列直送の意味がない
+    const emptyDefault = shardMapDefaultFromEmptyKey(cfg.map);
+    const defUrl = String(cfg.def || '').trim();
+    if (!classes.length && !emptyDefault && !defUrl) {
+      return { success: true, enabled: false };
+    }
+    return {
+      success: true,
+      enabled: true,
+      secret: String(cfg.sec || ''),
+      classes: classes,
+      empty_default: String(emptyDefault || ''),
+      default_url: defUrl
+    };
+  } catch (e) {
+    return { success: false, enabled: false, error: String(e) };
   }
 }
 

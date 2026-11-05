@@ -1514,6 +1514,8 @@
         // サーバから最新の教員情報を取得して上書きする。
         await refreshCurrentTeacher();
         showDashboard();
+        // 【R41】再読み込み後も並列直送できるよう、子GAS設定を取り直す
+        try { syncShardClientConfig(true); } catch (eSC2) {}
       } else {
         showLoginView();
       }
@@ -1726,6 +1728,12 @@
     }
 
     function scheduleShardFlushRetries() {
+      // 【R41】ブラウザ直送（並列 shard_apply）が有効なら、親経由のビーコンは撃たない。
+      //   親が UrlFetchApp で子へ送る経路を復活させないため（/exec を遅くしない）。
+      //   直送に失敗した分は親の保留に残り、15秒周期の console_touch が回収する。
+      try {
+        if (shardClientCfg && shardClientCfg.enabled) return;
+      } catch (eC) {}
       if (SHARD_FLUSH_BEACON_AT === 'response') return;   // 応答後に1本撃つ
       if (SHARD_FLUSH_BEACON_AT === 'send') { fireShardFlushNow(); return; }
       try { scheduleShardFlushDelayed(); } catch (e) {}    // 既定 'delayed'
@@ -1745,6 +1753,182 @@
         if (mySeq !== shardFlushDelaySeq) return;   // 追い越された
         fireShardFlushNow();
       }, (typeof SHARD_FLUSH_DELAY_MS === 'number') ? SHARD_FLUSH_DELAY_MS : 750);
+    }
+
+    // ==================================================================
+    // 【R41】ブラウザから親GAS・子GASへ「並列」で直接 POST する。
+    //
+    //   GAS の UrlFetchApp は応答まで必ずブロックするため、親の中で子へ送ると
+    //   親の /exec に子の待ち時間が加算される（実測 6.62〜7.41 秒）。
+    //   そこで親からは送らず、ブラウザから
+    //     ・親 /exec（親シート書き込み）
+    //     ・子 /exec（shard_apply で子シート書き込み）
+    //   を同じ tick で並列に投げる。Google のリダイレクト待ち（約3.8秒）を
+    //   親・子で同時に消化するので、双方がほぼ同時刻に確定する。
+    //
+    //   1校独立運用（自校のブラウザは自校のGASにしか到達しない）を前提に、
+    //   子GASのURLと共有シークレットは親の shard_config から受け取る。
+    //   SHARD_MODE が無効なら enabled:false が返り、何もしない（従来動作）。
+    // ==================================================================
+    var shardClientCfg = null;          // { enabled, secret, classes:[{normalized,url}], empty_default, default_url }
+    var shardClientCfgPromise = null;
+
+    // GAS 側 normalizeShardClass と完全に同じ規則（キーがずれると子へ届かない）。
+    function normalizeShardClassJs(raw) {
+      // GAS 側と一字一句同じ式にする（差があるとキーがずれて子へ届かない）
+      let s = String(raw || '').trim();
+      if (!s) return '';
+      s = s.replace(/[０-９]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
+      s = s.replace(/[Ａ-Ｚａ-ｚ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
+      s = s.replace(/[\s\u3000]+/g, '');
+      if (!s || s === '未設定') return '';
+      let m = s.match(/^(\d{1,2})\s*[年\-ー/／]\s*(\d{1,2})/);
+      if (m) return Number(m[1]) + '-' + Number(m[2]);
+      m = s.match(/^(\d{1,2})組?$/);
+      if (m) return Number(m[1]) + '-1';
+      return s;
+    }
+
+    // GAS 側 parseBoolean と同じ意味（"false" を true にしない）。
+    function parseBoolJs(v) {
+      if (v === true || v === false) return v;
+      if (typeof v === 'number') return v !== 0;
+      const s = String(v === undefined || v === null ? '' : v).trim().toLowerCase();
+      if (!s) return false;
+      return s === 'true' || s === '1' || s === 'on' || s === 'yes' || s === 'する' || s === 'あり';
+    }
+
+    // shard_config を直接 fetch で取得する（google.script.run の runner 表に無いため）。
+    function fetchShardConfigDirect() {
+      let url = '';
+      try { url = getApiUrl(); } catch (e0) { url = ''; }
+      if (!url || !authToken) return Promise.resolve({ enabled: false });
+      return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'shard_config', token: authToken }),
+        redirect: 'follow'
+      }).then(function (r) { return r.json(); })
+        .then(function (d) { return (d && d.enabled) ? d : { enabled: false }; })
+        .catch(function () { return { enabled: false }; });
+    }
+
+    // ログイン直後・セッション復元後に1回だけ取得する（以降はメモリを使う）。
+    function syncShardClientConfig(force) {
+      if (!authToken) return Promise.resolve(null);
+      if (!force && shardClientCfg) return Promise.resolve(shardClientCfg);
+      if (shardClientCfgPromise) return shardClientCfgPromise;
+      shardClientCfgPromise = fetchShardConfigDirect().then(function (cfg) {
+        shardClientCfg = cfg || { enabled: false };
+        shardClientCfgPromise = null;
+        return shardClientCfg;
+      }, function () {
+        shardClientCfg = { enabled: false };
+        shardClientCfgPromise = null;
+        return shardClientCfg;
+      });
+      return shardClientCfgPromise;
+    }
+
+    // 操作アクション → 子GASへ渡す patch（GAS 側 shardPropagatePolicy と同じ形）。
+    function shardPatchFromPayload(act, p) {
+      const patch = {};
+      const src = p || {};
+      if (act === 'bulk_lock') {
+        patch.screen_lock = parseBoolJs(src.locked);
+      } else if (act === 'bulk_broadcast') {
+        patch.broadcast_url = String(src.url === undefined ? '' : src.url);
+      } else if (act === 'bulk_filter') {
+        if (src.filter_mode !== undefined) patch.filter_mode = src.filter_mode;
+        if (src.whitelist_urls !== undefined) patch.whitelist_urls = src.whitelist_urls;
+        if (src.blacklist_urls !== undefined) patch.blacklist_urls = src.blacklist_urls;
+      } else if (act === 'update_single') {
+        const d = src.data || {};
+        if (d.screen_lock !== undefined) patch.screen_lock = parseBoolJs(d.screen_lock);
+        if (d.filter_mode !== undefined) patch.filter_mode = d.filter_mode;
+        if (d.whitelist_urls !== undefined) patch.whitelist_urls = d.whitelist_urls;
+        if (d.blacklist_urls !== undefined) patch.blacklist_urls = d.blacklist_urls;
+        if (d.broadcast_url !== undefined) patch.broadcast_url = d.broadcast_url;
+      }
+      return patch;
+    }
+
+    // 児童ID → 子GAS URL に振り分ける（GAS 側 shardPropagatePolicy と同じ順序）。
+    function shardResolveTargets(studentIds) {
+      const cfg = shardClientCfg;
+      if (!cfg || !cfg.enabled) return null;
+      const idx = {};
+      const list = Array.isArray(cfg.classes) ? cfg.classes : [];
+      for (let i = 0; i < list.length; i++) {
+        if (list[i] && list[i].normalized) idx[list[i].normalized] = String(list[i].url || '');
+      }
+      const emptyDefault = String(cfg.empty_default || '');
+      const defUrl = String(cfg.default_url || '');
+      const groups = {};   // url -> { ids:[], classMap:{} }
+      const ids = Array.isArray(studentIds) ? studentIds : [];
+      for (let k = 0; k < ids.length; k++) {
+        const id = String(ids[k] || '');
+        if (!id) continue;
+        let dev = null;
+        try { dev = (devicesData || []).find(function (x) { return x && x.student_id === id; }) || null; } catch (e) {}
+        const rawCls = dev ? String(dev.class_name || '') : '';
+        const key = normalizeShardClassJs(rawCls);
+        const url = idx[key] || emptyDefault || defUrl;
+        if (!url) continue;
+        if (!groups[url]) groups[url] = { ids: [], classMap: {} };
+        groups[url].ids.push(id);
+        groups[url].classMap[id] = rawCls;
+      }
+      return groups;
+    }
+
+    // 子GASへ並列 POST する。戻り値の Promise は await しない（fire-and-forget）。
+    //   親 /exec と同じ tick で呼ぶことで、リダイレクト待ちを完全に重ねる。
+    function fireShardApplyParallel(act, p) {
+      try {
+        if (typeof isShardFlushAction === 'function' && !isShardFlushAction(act)) return null;
+        const cfg = shardClientCfg;
+        if (!cfg || !cfg.enabled) {
+          // まだ設定を取れていなければ取りに行く（この操作には間に合わないが次回以降効く）
+          try { syncShardClientConfig(); } catch (e0) {}
+          return null;
+        }
+        const src = p || {};
+        const patch = shardPatchFromPayload(act, src);
+        if (!Object.keys(patch).length) return null;
+        const ids = (act === 'update_single') ? [src.student_id] : (src.student_ids || []);
+        const groups = shardResolveTargets(ids);
+        if (!groups) return null;
+        const urls = Object.keys(groups);
+        if (!urls.length) return null;
+
+        const tasks = urls.map(function (u) {
+          let body = '';
+          try {
+            body = JSON.stringify({
+              action: 'shard_apply',
+              shard_secret: cfg.secret,
+              student_ids: groups[u].ids,
+              class_map: groups[u].classMap,
+              patch: patch
+            });
+          } catch (eB) { return Promise.resolve(null); }
+          // text/plain は CORS プリフライトを起こさない（GAS は OPTIONS を扱わない）。
+          try {
+            return fetch(u, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+              body: body,
+              redirect: 'follow'
+            }).catch(function () { return null; });
+          } catch (eF) {
+            return Promise.resolve(null);
+          }
+        });
+        return Promise.all(tasks).catch(function () { return null; });
+      } catch (e) {
+        return null;
+      }
     }
 
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
@@ -1878,6 +2062,8 @@
           localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
           showToast(`ようこそ、${currentTeacher.name} 先生`, 'success');
           showDashboard();
+          // 【R41】子GASのURLと共有シークレットを取得しておく（並列直送の準備）
+          try { syncShardClientConfig(true); } catch (eSC) {}
         } else {
           errBox.textContent = res.error || 'ログインに失敗しました';
           errBox.classList.remove('hidden');
@@ -1901,6 +2087,9 @@
         localStorage.removeItem('edu_teacher_info');
         authToken = null;
         currentTeacher = null;
+        // 【R41】子GAS設定（URL・シークレット）も破棄する
+        shardClientCfg = null;
+        shardClientCfgPromise = null;
         showLoginView();
       }
     }
@@ -2987,6 +3176,11 @@
 
       // 4) 送信。apiRequest は呼び出した瞬間に fetch を開始し、
       //    同じ tick で子GASビーコンも撃つ。戻り値の Promise は await しない。
+      // 【R41】親 /exec と「同じ tick」で子GASへも並列 POST する。
+      //   ここで待たないので画面は即時のまま。子シートは親と同時刻に確定する。
+      let shardPush = null;
+      try { shardPush = fireShardApplyParallel(payload.action, payload); } catch (eP) {}
+
       let pending = null;
       try {
         pending = apiRequest(payload);
