@@ -3534,18 +3534,27 @@ function getScreenshots(filterSchool, teacher, includeUnassigned, status, studen
     if (want === 'ready' && !ready) continue;
     if (want === 'pending' && ready) continue;
 
+    // 【R42.1】最終同期日時は親シートと子シートで書式が異なる。
+    //   ・シート書式           "2026/11/05 20:39:25"
+    //   ・日付値の String() 形 "Wed Oct 28 2026 09:44:57 GMT+0900 (日本標準時)"
+    //   後者は Google スプレッドシートが日付型として保持しているセルを getValues() で
+    //   読むと返る。生の文字列で大小比較すると "Nov" < "Oct"（月名の辞書順）となり
+    //   子の新しいデータが古い親データに負ける。必ず数値（ミリ秒）へ直して判定する。
+    //
+    //   last_seen はブラウザへそのまま返す。ブラウザ側（mergeScreenRows）が
+    //   親・子の last_seen を併合し、is_online を再計算するために使う。
+    const lastSeenRaw = row[dMap['最終同期日時'] - 1];
+    const lastSeenStr = lastSeenRaw ? String(lastSeenRaw) : '';
+    const lastSeenMs = sheetTsToMs(lastSeenRaw);
+
     out.push({
       student_id: studentId,
       school_name: schoolName,
       student_name: String(row[dMap['氏名'] - 1] || ''),
       class_name: className,
       current_url: String(row[dMap['現在開いているURL'] - 1] || ''),
-      is_online: (function () {
-        const ls = row[dMap['最終同期日時'] - 1];
-        if (!ls) return false;
-        const dt = new Date(ls);
-        return !isNaN(dt.getTime()) && (new Date().getTime() - dt.getTime()) < 60000;
-      })(),
+      last_seen: lastSeenStr,
+      is_online: lastSeenMs ? ((new Date().getTime() - lastSeenMs) < 60000) : false,
       screen_request_at: requestAt,
       screenshot_at: shotAt,
       has_image: ready,

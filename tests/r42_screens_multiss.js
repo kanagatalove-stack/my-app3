@@ -226,10 +226,18 @@ check("request_screens → loadScreens の順序が維持されている（fe15 
 function runMergeTests() {
 console.log('\n===== [FE] R42: mergeScreenRows（親優先・新しい画像のみ採用） =====');
 
-const mCtx = { Object, Array, String, Number, console };
+// mergeScreenRows は R42.1 で screenTsToMs / formatStampJst に依存するようになった。
+//   extract は関数しか切り出さないため、依存する const と関数を明示的に載せる。
+const mCtx = { Object, Array, String, Number, Date, isNaN, console };
 vm.createContext(mCtx);
-vm.runInContext(extract(html, 'mergeScreenRows'), mCtx);
+let mCode = 'const SCREEN_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;\n';
+mCode += extract(html, 'screenTsToMs') + '\n';
+mCode += extract(html, 'formatStampJst') + '\n';
+mCode += extract(html, 'mergeScreenRows') + '\n';
+vm.runInContext(mCode, mCtx);
 const merge = mCtx.mergeScreenRows;
+// 本物の screenTsToMs をそのまま使う（テスト側で日時解釈を再実装しない）
+const screenTsOf = function (v) { return mCtx.screenTsToMs(v); };
 
 // 親: a@x は古い画像、b@x は画像なし
 const parent = [
@@ -263,6 +271,94 @@ check('親の方が新しければ上書きしない', m2[0].image_data_url === 
 check('子が空配列でも親をそのまま返す', merge(parent, []).length === 2);
 check('親が空でも子を返す', merge([], child).length === 3);
 check('null でも落ちない', merge(null, null).length === 0);
+
+// ==================================================================
+// 5) 【R42.1】実機で起きた書式混在の逆転（Nov < Oct）を再現する
+//
+//   親シートの日付型セルは String(Date) 形式、子シートは "YYYY/MM/DD HH:mm:ss"。
+//   生の文字列比較だと "Wed Nov 05..." < "Wed Oct 28..." となり、
+//   実際には新しい子の画像が古い親の画像に負けていた。
+// ==================================================================
+console.log('\n===== [FE] R42.1: 書式混在（String(Date) vs シート形式） =====');
+
+const parentDateStyle = [
+  { student_id: 'd@x', student_name: '実機の児童', has_image: true,
+    image_data_url: 'PARENT_OLD',
+    screenshot_at: 'Wed Oct 28 2026 09:44:57 GMT+0900 (日本標準時)',
+    last_seen: 'Wed Oct 28 2026 09:44:57 GMT+0900 (日本標準時)', is_online: false }
+];
+const childSheetStyle = [
+  { student_id: 'd@x', has_image: true, image_data_url: 'CHILD_NEW',
+    screenshot_at: '2026/11/05 20:39:25',
+    last_seen: '2026/11/05 20:39:25' }
+];
+
+// 前提の確認: 素の文字列比較では子が負ける（＝修正前の挙動の再現）
+check('前提: 生の文字列比較では子の新しい画像が負ける',
+  !('2026/11/05 20:39:25' > 'Wed Oct 28 2026 09:44:57 GMT+0900 (日本標準時)'));
+
+const m3 = merge(parentDateStyle, childSheetStyle);
+check('【修正】書式が違っても子の新しい画像を採用する',
+  m3[0].image_data_url === 'CHILD_NEW', m3[0].image_data_url);
+check('【修正】撮影日時も子の新しい値を採用する',
+  m3[0].screenshot_at === '2026/11/05 20:39:25', m3[0].screenshot_at);
+check('【修正】撮影日時は YYYY/MM/DD HH:mm:ss へ表示統一される',
+  /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}$/.test(String(m3[0].screenshot_at)),
+  m3[0].screenshot_at);
+
+// 逆方向: 親の方が新しい（11月 > 10月）なら巻き戻さない
+const m4 = merge(
+  [{ student_id: 'd@x', has_image: true, image_data_url: 'PARENT_NEWER',
+     screenshot_at: '2026/11/05 21:00:00' }],
+  [{ student_id: 'd@x', has_image: true, image_data_url: 'CHILD_OLDER',
+     screenshot_at: 'Wed Oct 28 2026 09:44:57 GMT+0900 (日本標準時)' }]);
+check('【修正】親が新しければ子の古い画像で巻き戻さない',
+  m4[0].image_data_url === 'PARENT_NEWER', m4[0].image_data_url);
+
+// 月名の辞書順が時系列と逆になる全パターン（Nov<Oct / Dec<Feb / Mar<May 等）
+check('【修正】Nov(子) > Oct(親) を数値で判定できる', screenTsOf('2026/11/05 20:39:25') > screenTsOf('Wed Oct 28 2026 09:44:57 GMT+0900 (日本標準時)'));
+check('【修正】Jan(子) > Dec(親) を数値で判定できる', screenTsOf('2027/01/05 00:00:00') > screenTsOf('2026/12/31 23:59:59'));
+check('【修正】Mar(子) > Feb(親) を数値で判定できる', screenTsOf('2027/03/01 00:00:00') > screenTsOf('2027/02/28 23:59:59'));
+
+// ==================================================================
+// 6) 【R42.1】is_online の併合再計算
+// ==================================================================
+console.log('\n===== [FE] R42.1: is_online（子の最終同期で再計算） =====');
+
+const nowMs2 = new Date().getTime();
+const fmtJst = (ms) => {
+  const d = new Date(ms + 9 * 60 * 60 * 1000);
+  const p = (n) => (n < 10 ? '0' : '') + n;
+  return d.getUTCFullYear() + '/' + p(d.getUTCMonth() + 1) + '/' + p(d.getUTCDate()) +
+    ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds());
+};
+const FRESH_JST = fmtJst(nowMs2 - 5 * 1000);        // 5秒前
+const STALE_JST = fmtJst(nowMs2 - 30 * 60 * 1000);  // 30分前
+
+// 親は停止（古い）、子だけが新しい → オンライン表示になること
+const m5 = merge(
+  [{ student_id: 'e@x', has_image: true, image_data_url: 'IMG', screenshot_at: STALE_JST,
+     last_seen: STALE_JST, is_online: false }],
+  [{ student_id: 'e@x', has_image: false, last_seen: FRESH_JST }]);
+check('子の最終同期が新しければオンラインになる（誤オフラインの解消）',
+  m5[0].is_online === true, { is_online: m5[0].is_online, last_seen: m5[0].last_seen });
+check('最終同期日時は子の新しい値を採る', m5[0].last_seen === FRESH_JST, m5[0].last_seen);
+
+// 両方古ければオフライン（誤ってオンラインにしない）
+const m6 = merge(
+  [{ student_id: 'e@x', has_image: false, last_seen: STALE_JST }],
+  [{ student_id: 'e@x', has_image: false, last_seen: STALE_JST }]);
+check('両方古ければオフラインのまま', m6[0].is_online === false, m6[0].is_online);
+
+// 子が空でも is_online は再計算される（親の is_online を鵜呑みにしない）
+const m7 = merge(
+  [{ student_id: 'e@x', last_seen: FRESH_JST, is_online: false }], []);
+check('子が0件でも親の新しい最終同期からオンラインを再計算する',
+  m7[0].is_online === true, { is_online: m7[0].is_online, last_seen: m7[0].last_seen });
+
+// last_seen が空なら落ちずオフライン
+const m8 = merge([{ student_id: 'e@x', is_online: true }], []);
+check('最終同期が空ならオフライン扱いで落ちない', m8[0].is_online === false, m8[0].is_online);
 
 finish();
 }

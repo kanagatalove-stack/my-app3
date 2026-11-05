@@ -2112,6 +2112,52 @@
       }).catch(function () { return []; });
     }
 
+    // ==================================================================
+    // 【R42.1】日時の数値化と表示書式の統一
+    //
+    //   同じ「撮影日時」でも、入手経路によって書式が違う。
+    //     ・シート書式            "2026/11/05 20:39:25"
+    //     ・日付型セルの String() "Wed Oct 28 2026 09:44:57 GMT+0900 (日本標準時)"
+    //   生の文字列で大小比較すると月名の辞書順になり
+    //     "Nov" < "Oct" / "Dec" < "Feb" / "Mar" < "May"
+    //   と、実際には新しい子のデータが古い親のデータに負ける。
+    //   必ずミリ秒へ直してから比較する（GAS の sheetTsToMs と同一規則）。
+    //
+    //   シート書式はタイムゾーン表記を持たないため、実行環境の TZ に任せると
+    //   9 時間ずれる（＝常時オフライン判定になる）。日本時間と決め打ちする。
+    // ==================================================================
+    const SCREEN_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+    function screenTsToMs(v) {
+      if (v === null || v === undefined || v === '') return 0;
+      if (v instanceof Date) {
+        const t0 = v.getTime();
+        return isNaN(t0) ? 0 : t0;
+      }
+      if (typeof v === 'number') return v > 0 ? v : 0;
+      const str = String(v).trim();
+      if (!str) return 0;
+      const m = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+      if (m) {
+        const utc = Date.UTC(
+          Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+          Number(m[4] || 0), Number(m[5] || 0), Number(m[6] || 0));
+        if (!isNaN(utc)) return utc - SCREEN_TZ_OFFSET_MS;
+      }
+      const t = new Date(str).getTime();
+      return isNaN(t) ? 0 : t;
+    }
+
+    // 画面カードの「撮影:」表示を常に "YYYY/MM/DD HH:mm:ss"（日本時間）へ揃える。
+    function formatStampJst(v) {
+      const ms = screenTsToMs(v);
+      if (!ms) return '';
+      const d = new Date(ms + SCREEN_TZ_OFFSET_MS);
+      const p = function (n) { return (n < 10 ? '0' : '') + n; };
+      return d.getUTCFullYear() + '/' + p(d.getUTCMonth() + 1) + '/' + p(d.getUTCDate()) +
+        ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds());
+    }
+
     // 親の行を正とし、子の行からは「画像」だけを新しい場合に取り込む。
     //   氏名・学校・クラスは親（名簿の正）を保つため上書きしない。
     function mergeScreenRows(parentRows, childRows) {
@@ -2132,9 +2178,10 @@
           return;
         }
         const cur = byId[id];
-        const curStamp = String(cur.screenshot_at || '');
-        const newStamp = String(c.screenshot_at || '');
-        if (c.has_image && (!cur.has_image || newStamp > curStamp)) {
+        // 【R42.1】書式の異なる撮影日時をミリ秒へ直して比較する（生の文字列比較は廃止）。
+        const curMs = screenTsToMs(cur.screenshot_at);
+        const newMs = screenTsToMs(c.screenshot_at);
+        if (c.has_image && (!cur.has_image || newMs > curMs)) {
           cur.has_image = true;
           cur.image_data_url = c.image_data_url;
           cur.screenshot_at = c.screenshot_at;
@@ -2142,7 +2189,27 @@
         } else if (!cur.has_image && !cur.screen_request_at && c.screen_request_at) {
           cur.screen_request_at = c.screen_request_at;
         }
+        // 【R42.1】最終同期日時も新しい方を採る。
+        //   端末は割り当て後「子GAS」にしかハートビートしないため、親シートの
+        //   最終同期日時は切り替え時点で止まる。親だけ見ると誤ってオフラインになる。
+        if (screenTsToMs(c.last_seen) > screenTsToMs(cur.last_seen)) {
+          cur.last_seen = c.last_seen;
+        }
       });
+
+      // 【R42.1】ここで表示書式を揃え、オンライン判定を作り直す。
+      //   is_online は「親・子の最終同期のうち新しい方」から 60 秒以内かで決める。
+      //   子シート側の通信ログを参照しないと、実際に通信している端末が
+      //   オフライン表示のままになる（R42 の実機症状）。
+      const nowMs = new Date().getTime();
+      order.forEach(function (id) {
+        const r = byId[id];
+        if (!r) return;
+        r.screenshot_at = formatStampJst(r.screenshot_at) || String(r.screenshot_at || '');
+        const seenMs = screenTsToMs(r.last_seen);
+        r.is_online = seenMs ? ((nowMs - seenMs) < 60000) : false;
+      });
+
       return order.map(function (id) { return byId[id]; });
     }
 
@@ -2703,17 +2770,24 @@
         });
 
         let data = (res && Array.isArray(res.data)) ? res.data : [];
-        // 子GASの結果を併合（撮影日時が新しい画像を採用する）
+        // 【R42.1】子GASの結果を併合（撮影日時をミリ秒で比較し、新しい方を採用）。
+        //   子が0件でも併合を通す。表示書式の統一と is_online の再計算は
+        //   子の有無に関係なく必要（親シートだけでも日時書式が揺れるため）。
+        let childRows = [];
         if (childP) {
-          let childRows = [];
           try { childRows = (await childP) || []; } catch (eMg) { childRows = []; }
-          if (childRows.length) {
-            const before = data.filter(d => d.has_image).length;
-            data = mergeScreenRows(data, childRows);
-            const after = data.filter(d => d.has_image).length;
-            if (after !== before) {
-              slog('子GASの画面情報を併合: 取得済 ' + before + '件 → ' + after + '件');
-            }
+        }
+        {
+          const before = data.filter(d => d.has_image).length;
+          const beforeOnline = data.filter(d => d.is_online).length;
+          data = mergeScreenRows(data, childRows);
+          const after = data.filter(d => d.has_image).length;
+          const afterOnline = data.filter(d => d.is_online).length;
+          if (after !== before) {
+            slog('子GASの画面情報を併合: 取得済 ' + before + '件 → ' + after + '件');
+          }
+          if (afterOnline !== beforeOnline) {
+            slog('オンライン判定を再計算: ' + beforeOnline + '台 → ' + afterOnline + '台');
           }
         }
 
