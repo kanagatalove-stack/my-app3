@@ -1985,6 +1985,167 @@
       }
     }
 
+    // ==================================================================
+    // 【R42】画面情報のマルチスプレッドシート対応。
+    //
+    //   これまで「画面情報取得」は親スプレッドシートだけを見ていたため、
+    //   子GAS（子スプレッドシート）を参照しているクラスの端末には
+    //   要求が届かず、子に保存された画像も表示できなかった。
+    //
+    //   R41 の書き込み系と同じ方式で、ブラウザから親 /exec と子 /exec へ
+    //   「並列」に投げる。親の中で UrlFetchApp を使うと応答までブロックして
+    //   /exec が遅くなるため、子との送受信はブラウザが担う。
+    // ==================================================================
+    var SHARD_SCREEN_LOG = true;
+    function slog(msg) {
+      try {
+        if (!SHARD_SCREEN_LOG) return;
+        if (typeof console !== 'undefined' && console && typeof console.log === 'function') {
+          console.log('[R42-SCREEN] ' + String(msg));
+        }
+      } catch (e) {}
+    }
+
+    // 児童ID → 子GAS URL（R41 の shardResolveTargets をそのまま使う）
+    function shardScreenTargets(studentIds) {
+      try {
+        const cfg = shardClientCfg;
+        if (!cfg || !cfg.enabled) return null;
+        if (typeof shardResolveTargets !== 'function') return null;
+        const ids = Array.isArray(studentIds) ? studentIds : [];
+        if (!ids.length) return null;
+        return shardResolveTargets(ids);
+      } catch (e) { return null; }
+    }
+
+    // 子GASへ「画面情報取得の要求」を並列送出する（戻り値は await しない）。
+    //   児童端末が撮影・送信するきっかけは子シートの『画面情報要求日時』なので、
+    //   ここが届かないと子担当の端末は永久に撮影しない。
+    function fireShardRequestScreensParallel(studentIds) {
+      try {
+        const groups = shardScreenTargets(studentIds);
+        if (!groups) {
+          slog('子GASへの画面取得要求: スキップ（子GAS設定が未取得/無効、または宛先未解決）');
+          try { syncShardClientConfig(); } catch (e0) {}
+          return null;
+        }
+        const cfg = shardClientCfg;
+        const urls = Object.keys(groups);
+        if (!urls.length) return null;
+        slog('子GASへ画面取得要求を並列送出: ' + urls.length + '件');
+
+        const tasks = urls.map(function (u) {
+          const body = JSON.stringify({
+            action: 'shard_request_screens',
+            shard_secret: cfg.secret,
+            student_ids: groups[u].ids,
+            class_map: groups[u].classMap
+          });
+          slog('  → request_screens ' + u + '（児童' + groups[u].ids.length + '件）');
+          try {
+            return fetch(u, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+              body: body,
+              redirect: 'follow'
+            }).then(function (r) {
+              slog('  ← request_screens 完了 ' + u + ' / HTTP ' + r.status);
+              return r;
+            }).catch(function (e) {
+              slog('  ← request_screens 失敗 ' + u + ': ' + String(e));
+              return null;
+            });
+          } catch (eF) {
+            return Promise.resolve(null);
+          }
+        });
+        return Promise.all(tasks).catch(function () { return null; });
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // 子GASから「画面情報」を並列取得し、平坦な配列で返す。
+    function fetchShardScreensParallel(studentIds) {
+      let groups = null;
+      try { groups = shardScreenTargets(studentIds); } catch (e) { groups = null; }
+      if (!groups) return Promise.resolve([]);
+      const cfg = shardClientCfg;
+      const urls = Object.keys(groups);
+      if (!urls.length) return Promise.resolve([]);
+
+      slog('子GASから画面情報を並列取得: ' + urls.length + '件');
+      const tasks = urls.map(function (u) {
+        const body = JSON.stringify({
+          action: 'shard_get_screens',
+          shard_secret: cfg.secret,
+          student_ids: groups[u].ids
+        });
+        try {
+          return fetch(u, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: body,
+            redirect: 'follow'
+          }).then(function (r) { return r.json(); })
+            .then(function (d) {
+              const arr = (d && Array.isArray(d.data)) ? d.data : [];
+              slog('  ← get_screens 完了 ' + u + ' / ' + arr.length + '件');
+              return arr;
+            })
+            .catch(function (e) {
+              slog('  ← get_screens 失敗 ' + u + ': ' + String(e));
+              return [];
+            });
+        } catch (eF) {
+          return Promise.resolve([]);
+        }
+      });
+      return Promise.all(tasks).then(function (lists) {
+        const out = [];
+        (lists || []).forEach(function (arr) {
+          if (Array.isArray(arr)) {
+            for (let i = 0; i < arr.length; i++) out.push(arr[i]);
+          }
+        });
+        return out;
+      }).catch(function () { return []; });
+    }
+
+    // 親の行を正とし、子の行からは「画像」だけを新しい場合に取り込む。
+    //   氏名・学校・クラスは親（名簿の正）を保つため上書きしない。
+    function mergeScreenRows(parentRows, childRows) {
+      const byId = {};
+      const order = [];
+      (Array.isArray(parentRows) ? parentRows : []).forEach(function (r) {
+        if (!r || !r.student_id) return;
+        const id = String(r.student_id);
+        if (!(id in byId)) { byId[id] = Object.assign({}, r); order.push(id); }
+      });
+      (Array.isArray(childRows) ? childRows : []).forEach(function (c) {
+        if (!c || !c.student_id) return;
+        const id = String(c.student_id);
+        if (!(id in byId)) {
+          const row = Object.assign({}, c);
+          if (row.has_image === undefined) row.has_image = !!row.image_data_url;
+          byId[id] = row; order.push(id);
+          return;
+        }
+        const cur = byId[id];
+        const curStamp = String(cur.screenshot_at || '');
+        const newStamp = String(c.screenshot_at || '');
+        if (c.has_image && (!cur.has_image || newStamp > curStamp)) {
+          cur.has_image = true;
+          cur.image_data_url = c.image_data_url;
+          cur.screenshot_at = c.screenshot_at;
+          if (!cur.screen_request_at && c.screen_request_at) cur.screen_request_at = c.screen_request_at;
+        } else if (!cur.has_image && !cur.screen_request_at && c.screen_request_at) {
+          cur.screen_request_at = c.screen_request_at;
+        }
+      });
+      return order.map(function (id) { return byId[id]; });
+    }
+
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
     function consoleTouch(sessionId) {
       const sid = sessionId || eduKeepaliveSessionId || getKeepaliveSessionId();
@@ -2436,6 +2597,11 @@
       if (text) text.textContent = '取得中...';
 
       try {
+        // 【R42】親 /exec と「同じ tick」で子GASへも取得要求を出す。
+        //   子シートの『画面情報要求日時』が更新されないと、子担当の端末は
+        //   撮影を始めない（これが「押しても更新されない」の直接原因だった）。
+        try { fireShardRequestScreensParallel(ids); } catch (eRq) {}
+
         await apiRequest({ action: 'request_screens', student_ids: ids });
         // 要求後は必ず一覧を表示（「送信待ち」のまま何も出ない状態を避ける）
         await loadScreens({ silent: true });
@@ -2522,6 +2688,12 @@
           : (document.getElementById('schoolFilter')?.value || 'ALL');
         const targetIds = (opts && Array.isArray(opts.ids)) ? opts.ids : resolveBulkTargetIds().ids;
 
+        // 【R42】親 /exec と「同じ tick」で子GASへも問い合わせる。
+        //   親は自スプレッドシートしか読まないため、これが無いと
+        //   子GAS配下のクラスの画面は永久に「未取得」のままになる。
+        let childP = null;
+        try { childP = fetchShardScreensParallel(targetIds); } catch (eCh) { childP = null; }
+
         const res = await apiRequest({
           action: 'get_screens',
           school_name: schoolFilter,
@@ -2530,7 +2702,21 @@
           student_ids: targetIds
         });
 
-        const data = (res && Array.isArray(res.data)) ? res.data : [];
+        let data = (res && Array.isArray(res.data)) ? res.data : [];
+        // 子GASの結果を併合（撮影日時が新しい画像を採用する）
+        if (childP) {
+          let childRows = [];
+          try { childRows = (await childP) || []; } catch (eMg) { childRows = []; }
+          if (childRows.length) {
+            const before = data.filter(d => d.has_image).length;
+            data = mergeScreenRows(data, childRows);
+            const after = data.filter(d => d.has_image).length;
+            if (after !== before) {
+              slog('子GASの画面情報を併合: 取得済 ' + before + '件 → ' + after + '件');
+            }
+          }
+        }
+
         const prevReady = screensData.filter(d => d.has_image).length;
         screensData = data;
         renderScreens();

@@ -899,6 +899,19 @@ function doPost(e) {
       return jsonResponse(shardLookupStudent(payload.student_id));
     }
 
+    // A6-c. 【R42】画面情報のマルチスプレッドシート対応。
+    //   「画面情報取得」の要求と、取得済み画像の読み出しを、ブラウザが
+    //   親 /exec と子 /exec へ「並列」に投げる（R41 と同じ方式）。
+    //   親の中で UrlFetchApp を使うと応答までブロックし /exec が遅くなるため、
+    //   子への送受信はブラウザに担わせる。
+    //   認証は教員トークンではなく共有シークレット（1校独立運用のため自校のみ到達可能）。
+    if (action === 'shard_request_screens') {
+      return jsonResponse(shardRequestScreensFromBrowser(payload));
+    }
+    if (action === 'shard_get_screens') {
+      return jsonResponse(shardScreensFromBrowser(payload));
+    }
+
     // B. 教員ログイン認証
     if (action === 'login') {
       const email = (payload.email || '').trim().toLowerCase();
@@ -6191,6 +6204,92 @@ function api_verifySession(token) {
   } catch (err) {
     return { success: false, error: err.toString() };
   }
+}
+
+/**
+ * 【R42】この子GASが持つ端末の児童IDをすべて返す。
+ *   ブラウザから student_ids が配列で来なかった（'ALL' 等）ときの展開用。
+ *   索引（shardDeviceEntries）を使うのでシート全読みはしない。
+ */
+function shardAllStudentIdsForChild() {
+  const out = [];
+  try {
+    const entries = shardDeviceEntries();
+    if (entries && entries.length) {
+      for (let i = 0; i < entries.length; i++) {
+        const id = String(entries[i][0] || '').trim();
+        if (id) out.push(id);
+      }
+    }
+  } catch (e) { /* 索引が無ければ空で返す（要求0件として扱う） */ }
+  return out;
+}
+
+/**
+ * 【R42】ブラウザから子GASへ直接届く「画面情報取得の要求」。
+ *   子の「端末一覧」の『画面情報要求日時』に「日時|要求ID」を書き込む。
+ *   子GASを参照している児童端末は、この列の変化を見て撮影・送信する。
+ *
+ *   親が既に学校・クラスのスコープを適用したIDを渡してくるため、
+ *   ここでは改めてスコープ制限を掛けない（掛けると親の判断と食い違う）。
+ */
+function shardRequestScreensFromBrowser(payload) {
+  if (!isShardChild() && !isShardParent()) {
+    return { success: false, error: '子GASとして構成されていません', requested: 0 };
+  }
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）', requested: 0 };
+  }
+
+  let ids = (payload && payload.student_ids);
+  if (!Array.isArray(ids)) ids = shardAllStudentIdsForChild();
+  ids = ids.map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+  if (!ids.length) return { success: true, requested: 0, ids: [] };
+
+  const classMap = (payload && payload.class_map) || null;
+
+  // 子のシートに行が無い児童は要求を書けない。先に行を用意する。
+  //   （クラス名が分かる場合のみ。分からなくても requestScreenCapture は動く）
+  try {
+    if (classMap && typeof shardEnsureDeviceRows === 'function') {
+      shardEnsureDeviceRows(ids, classMap);
+    }
+  } catch (eE) { /* 行の用意に失敗しても要求自体は試す */ }
+
+  const adminLike = { email: '__shard_parent__', role: 'ADMIN', school: '全校管理', target_class: '' };
+  const res = requestScreenCapture(ids, adminLike);
+  return {
+    success: true,
+    requested: res.requested,
+    ids: res.ids,
+    request_id: res.request_id,
+    at: res.at,
+    missing: Math.max(0, ids.length - (res.requested || 0))
+  };
+}
+
+/**
+ * 【R42】ブラウザから子GASへ直接届く「画面情報の読み出し」。
+ *   子の「画面情報」シートから Base64 画像を取り出して返す。
+ *   親コンソールは、この結果と親自身の結果を児童IDで突き合わせ、
+ *   撮影日時が新しい方を採用して描画する（＝子の最新画像が出る）。
+ */
+function shardScreensFromBrowser(payload) {
+  if (!isShardChild() && !isShardParent()) {
+    return { success: false, error: '子GASとして構成されていません', data: [] };
+  }
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）', data: [] };
+  }
+
+  let ids = (payload && payload.student_ids);
+  if (!Array.isArray(ids)) ids = shardAllStudentIdsForChild();
+  ids = ids.map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+  if (!ids.length) return { success: true, data: [] };
+
+  const adminLike = { email: '__shard_parent__', role: 'ADMIN', school: '全校管理', target_class: '' };
+  const data = getScreenshots('ALL', adminLike, false, 'all', ids);
+  return { success: true, data: data };
 }
 
 /**
