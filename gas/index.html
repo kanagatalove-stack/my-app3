@@ -1697,15 +1697,25 @@
     //   console_touch が必ず shardFlushPending を呼ぶため、そこで回収される。
     //
     //   SHARD_FLUSH_BEACON_AT:
-    //     'send'     … リクエスト送出と同時（0ms）に1本だけ撃つ（既定）
-    //     'response' … 親の書き込み完了後（応答直後）に1本だけ撃つ（空振りゼロ）
-    //   どちらも「1本だけ」であり、接続枠は1本しか使わない。
-    // 【R39】既定は 'send'（/exec の送出と完全同時・0ms・1本だけ）。
-    //   これで子GASへの伝達が /exec の応答（3.8秒）を待たずに走る。
-    //   0ms 時点では親がまだ保留を書いていないため空振りすることがある。
-    //   その場合でも 15秒周期の console_touch が回収する。
-    //   空振りを確実に避けたいときだけ 'response' にする（応答後に1本・同じく1本）。
-    var SHARD_FLUSH_BEACON_AT = 'send';
+    //     'delayed'  … 送出から 750ms 後に1本だけ撃つ（既定）
+    //     'send'     … 送出と同時（0ms）に1本だけ撃つ（R39 の設定）
+    //     'response' … 親の応答が返ってから1本だけ撃つ（空振りゼロ・ただし約3.8秒後）
+    //
+    // 【R40】既定を 'delayed'（750ms）にした理由（実機 DevTools 実測）。
+    //   R39 の 'send'（0ms）は、親がシートへ書き終える前（echo 実測 345〜533ms）に
+    //   届いてしまい「保留なし（空振り）」になっていた。空振りすると次の
+    //   15秒周期 console_touch まで待つことになり、子シートの連動が遅れていた。
+    //   750ms は「echo の実測上限 533ms ＋ 余裕 約200ms」で、
+    //   ご依頼の「書き込み完了後 150〜200ms で届く」に一致する。
+    //
+    //   再試行は行わない（1操作＝1本）。
+    //     理由: ビーコンの結果を読んで再試行すると、/exec の応答自体が
+    //           3.3〜4.9秒かかるため「1.5秒後に再試行」のつもりが実際には
+    //           5〜8秒後に発火してしまい、15秒周期の回収と大差なくなる。
+    //           それでいて /exec を余計に消費するため、害の方が大きい。
+    //   取りこぼしは 15秒周期の console_touch が回収する（従来どおり）。
+    var SHARD_FLUSH_BEACON_AT = 'delayed';
+    var SHARD_FLUSH_DELAY_MS = 750;
 
     // R37 のタイマー予約は廃止。呼び出し側との互換のため関数は残す。
     function clearShardFlushRetries() {}
@@ -1716,8 +1726,25 @@
     }
 
     function scheduleShardFlushRetries() {
-      if (SHARD_FLUSH_BEACON_AT !== 'send') return;   // 'response' では送信時に撃たない
-      fireShardFlushNow();
+      if (SHARD_FLUSH_BEACON_AT === 'response') return;   // 応答後に1本撃つ
+      if (SHARD_FLUSH_BEACON_AT === 'send') { fireShardFlushNow(); return; }
+      try { scheduleShardFlushDelayed(); } catch (e) {}    // 既定 'delayed'
+    }
+
+    // 【R40】送出から 750ms 後に1本だけ撃つ（親の書き込み完了を待つ）。
+    //   連続操作では直前の予約を上書きするので、同時に走るビーコンは常に1本。
+    //   R37 で問題になった「同時多発ビーコンによる接続枠の枯渇」は起きない。
+    var shardFlushDelayTimer = null;
+    var shardFlushDelaySeq = 0;
+
+    function scheduleShardFlushDelayed() {
+      const mySeq = ++shardFlushDelaySeq;
+      try { if (shardFlushDelayTimer) clearTimeout(shardFlushDelayTimer); } catch (e0) {}
+      shardFlushDelayTimer = setTimeout(function () {
+        shardFlushDelayTimer = null;
+        if (mySeq !== shardFlushDelaySeq) return;   // 追い越された
+        fireShardFlushNow();
+      }, (typeof SHARD_FLUSH_DELAY_MS === 'number') ? SHARD_FLUSH_DELAY_MS : 750);
     }
 
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
@@ -1995,8 +2022,9 @@
       }
 
       if (__directFetch) {
-        // 【R38】応答直後の発火は SHARD_FLUSH_BEACON_AT==='response' のときだけ。
-        //   既定の 'send' では 0ms の1本で完結させ、二重発火を避ける。
+        // 【R40】応答直後の発火は SHARD_FLUSH_BEACON_AT==='response' のときだけ。
+        //   既定 'delayed' は送出後 750ms に1本撃つので、ここでは撃たない
+        //   （撃つと二重になり、接続枠を無駄に使う）。
         if (SHARD_FLUSH_BEACON_AT === 'response') {
           try { sendShardFlushBeacon(); } catch (e4) {}
         }
