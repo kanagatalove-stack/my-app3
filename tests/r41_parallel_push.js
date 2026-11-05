@@ -297,6 +297,7 @@ console.log('\n===== [FE] R41: 並列 fetch の実行時検証 =====');
 
 function runFire(cfg, devices, act, payload) {
   const sent = [];
+  const logs = [];
   const ctx = {
     String, Number, Boolean, Object, JSON, Array, Promise, console,
     shardClientCfg: cfg,
@@ -305,13 +306,16 @@ function runFire(cfg, devices, act, payload) {
     normalizeShardClassJs: feCtx.normalizeShardClassJs,
     parseBoolJs: pCtx.parseBoolJs,
     syncShardClientConfig: () => {},
-    fetch: (u, o) => { sent.push({ url: u, opt: o }); return Promise.resolve({ ok: true }); }
+    // 【R41.1】plog は観測専用。未定義だと ReferenceError で外側の try に
+    //   握りつぶされ「何も送らない」ように見えるため、必ずスタブを渡す。
+    plog: m => { logs.push(String(m)); },
+    fetch: (u, o) => { sent.push({ url: u, opt: o }); return Promise.resolve({ ok: true, status: 200 }); }
   };
   vm.createContext(ctx);
   ['parseBoolJs', 'shardPatchFromPayload', 'shardResolveTargets', 'fireShardApplyParallel']
     .forEach(n => { if (!ctx[n]) vm.runInContext(extract(html, n), ctx); });
   const p = ctx.fireShardApplyParallel(act, payload);
-  return { sent, p };
+  return { sent, p, logs };
 }
 
 const r1 = runFire(cfgA, devicesA, 'bulk_lock', { locked: true, student_ids: ['a@x', 'b@x'] });
@@ -341,5 +345,45 @@ check('直送が無効なら何も送らない', r4.sent.length === 0 && r4.p ==
 const r5 = runFire(cfgA, devicesA, 'bulk_lock', { locked: true, student_ids: ['c@x'] });
 check('宛先が解決できない児童だけなら送らない', r5.sent.length === 0, r5.sent.length);
 
-console.log('\n===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
-process.exit(fail === 0 ? 0 : 1);
+// ==================================================================
+// 8) R41.1: 並列直送の観測ログ（一目で分かること）
+// ==================================================================
+console.log('\n===== [FE] R41.1: 並列直送の観測ログ =====');
+
+check('plog が1つだけ定義されている',
+  (html.match(/function\s+plog\s*\(/g) || []).length === 1);
+check("[R41-PARALLEL] の接頭辞で出力する", /\[R41-PARALLEL\]/.test(html));
+check('ログは SHARD_PARALLEL_LOG で一括停止できる',
+  /var\s+SHARD_PARALLEL_LOG\s*=/.test(html) && /if\s*\(!SHARD_PARALLEL_LOG\)\s*return/.test(html));
+check('ログ出力自体が例外を投げない（try で包む）',
+  /function\s+plog\s*\([^)]*\)\s*\{[\s\S]{0,200}?try\s*\{/.test(html));
+
+// 送信時: 「開始」と「各URLへのPOST」が出る
+check('直送開始をログに出す', r1.logs.some(m => m.indexOf('子GASへ直接POST開始') >= 0), r1.logs);
+check('開始ログに URL 件数と action を含む',
+  r1.logs.some(m => m.indexOf('子GASへ直接POST開始') >= 0 && m.indexOf('action=bulk_lock') >= 0),
+  r1.logs.filter(m => m.indexOf('開始') >= 0));
+check('URL ごとに POST 先をログに出す',
+  r1.logs.filter(m => m.indexOf('→ POST') >= 0).length === 2,
+  r1.logs.filter(m => m.indexOf('→ POST') >= 0));
+check('POST ログに子GASのURLそのものを含む',
+  r1.logs.some(m => m.indexOf('→ POST') >= 0 && m.indexOf('https://child-51/exec') >= 0));
+
+// スキップ理由も残す（原因切り分け用）
+check('設定未取得でスキップした理由をログに出す',
+  r4.logs.some(m => m.indexOf('子GAS設定が未取得/無効') >= 0), r4.logs);
+check('宛先未解決でスキップした理由をログに出す',
+  r5.logs.some(m => m.indexOf('宛先を解決できませんでした') >= 0), r5.logs);
+check('対象外アクションではログを出さない（騒がしくしない）', r3.logs.length === 0, r3.logs);
+
+// 完了ログ（解決後・非同期）
+(async function () {
+  const rr = runFire(cfgA, devicesA, 'bulk_lock', { locked: true, student_ids: ['a@x', 'b@x'] });
+  try { await rr.p; } catch (e) {}
+  check('各URLの完了をログに出す（HTTP と所要ms）',
+    rr.logs.filter(m => m.indexOf('← 完了') >= 0).length === 2,
+    rr.logs.filter(m => m.indexOf('← 完了') >= 0));
+
+  console.log('\n===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
+  process.exit(fail === 0 ? 0 : 1);
+})();

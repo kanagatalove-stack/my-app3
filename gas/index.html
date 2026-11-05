@@ -1773,6 +1773,19 @@
     var shardClientCfg = null;          // { enabled, secret, classes:[{normalized,url}], empty_default, default_url }
     var shardClientCfgPromise = null;
 
+    // 【R41.1】並列直送が「実際に走っているか」をコンソールで一目で分かるようにする。
+    //   観測専用。送信の順序・待ち方・ヘッダには一切影響しない。
+    //   調査が済んだら SHARD_PARALLEL_LOG を false にすれば出力だけ止まる。
+    var SHARD_PARALLEL_LOG = true;
+    function plog(msg) {
+      try {
+        if (!SHARD_PARALLEL_LOG) return;
+        if (typeof console !== 'undefined' && console && typeof console.log === 'function') {
+          console.log('[R41-PARALLEL] ' + String(msg));
+        }
+      } catch (e) {}
+    }
+
     // GAS 側 normalizeShardClass と完全に同じ規則（キーがずれると子へ届かない）。
     function normalizeShardClassJs(raw) {
       // GAS 側と一字一句同じ式にする（差があるとキーがずれて子へ届かない）
@@ -1802,15 +1815,33 @@
     function fetchShardConfigDirect() {
       let url = '';
       try { url = getApiUrl(); } catch (e0) { url = ''; }
-      if (!url || !authToken) return Promise.resolve({ enabled: false });
+      if (!url || !authToken) {
+        plog('shard_config 取得スキップ: ' + (!url ? 'API URL が未設定' : '未ログイン') +
+          '（並列直送は行わず従来のビーコン経路になります）');
+        return Promise.resolve({ enabled: false });
+      }
       return fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ action: 'shard_config', token: authToken }),
         redirect: 'follow'
       }).then(function (r) { return r.json(); })
-        .then(function (d) { return (d && d.enabled) ? d : { enabled: false }; })
-        .catch(function () { return { enabled: false }; });
+        .then(function (d) {
+          const ok = !!(d && d.enabled);
+          if (ok) {
+            const nCls = (d.classes && d.classes.length) ? d.classes.length : 0;
+            plog('shard_config 取得: enabled=true / クラス対応=' + nCls + '件' +
+              ' / secret=' + (d.secret ? 'あり' : 'なし') +
+              ' / 既定URL=' + (d.default_url || d.empty_default || 'なし'));
+          } else {
+            plog('shard_config 取得: enabled=false（親GASがSHARD_MODE無効、または子GAS未登録）');
+          }
+          return ok ? d : { enabled: false };
+        })
+        .catch(function (e) {
+          plog('shard_config 取得失敗: ' + String(e) + '（並列直送は行わず従来経路になります）');
+          return { enabled: false };
+        });
     }
 
     // ログイン直後・セッション復元後に1回だけ取得する（以降はメモリを使う）。
@@ -1890,6 +1921,7 @@
         const cfg = shardClientCfg;
         if (!cfg || !cfg.enabled) {
           // まだ設定を取れていなければ取りに行く（この操作には間に合わないが次回以降効く）
+          plog('直送スキップ(action=' + String(act) + '): 子GAS設定が未取得/無効。取得を試みます');
           try { syncShardClientConfig(); } catch (e0) {}
           return null;
         }
@@ -1900,7 +1932,13 @@
         const groups = shardResolveTargets(ids);
         if (!groups) return null;
         const urls = Object.keys(groups);
-        if (!urls.length) return null;
+        if (!urls.length) {
+          plog('直送スキップ(action=' + String(act) + '): 児童' + ids.length +
+            '件のうち子GASの宛先を解決できませんでした（SHARD_MAP_V1 のクラスキーをご確認ください）');
+          return null;
+        }
+        plog('子GASへ直接POST開始: ' + urls.length + '件 / action=' + String(act) +
+          ' / 対象児童=' + ids.length + '件');
 
         const tasks = urls.map(function (u) {
           let body = '';
@@ -1914,14 +1952,30 @@
             });
           } catch (eB) { return Promise.resolve(null); }
           // text/plain は CORS プリフライトを起こさない（GAS は OPTIONS を扱わない）。
+          plog('  → POST ' + u + '（児童' + groups[u].ids.length + '件）');
           try {
+            const __t0 = (typeof performance !== 'undefined' && performance && performance.now)
+              ? performance.now() : Date.now();
+            const __now = function () {
+              return (typeof performance !== 'undefined' && performance && performance.now)
+                ? performance.now() : Date.now();
+            };
             return fetch(u, {
               method: 'POST',
               headers: { 'Content-Type': 'text/plain;charset=utf-8' },
               body: body,
               redirect: 'follow'
-            }).catch(function () { return null; });
+            }).then(function (r) {
+              plog('  ← 完了 ' + u + ' / HTTP ' + r.status +
+                ' / ' + Math.round(__now() - __t0) + 'ms');
+              return r;
+            }).catch(function (e) {
+              plog('  ← 失敗 ' + u + ': ' + String(e) +
+                '（親の保留に残るため15秒周期で回収されます）');
+              return null;
+            });
           } catch (eF) {
+            plog('  ← 送出失敗 ' + u + ': ' + String(eF));
             return Promise.resolve(null);
           }
         });
