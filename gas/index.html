@@ -2217,11 +2217,31 @@
     //   由来する場合、それは撮影時刻ではない（過去の要求や別経路の書き込みが残る）。
     //   画像の実体を持つ子の値を正とし、親の古い値で上書きしない。
     //
-    // 【R43】要求時刻（screen_req_ts）より新しい撮影が来るまでは、旧画像を
-    //   「最新の取得結果」として扱わない（pending_new フラグを立てて描画側で示す）。
+    // 【R43.1】「新着かどうか」の判定は“シート側の時計どうし”で行う。
+    //
+    //   R43 の欠陥：
+    //     押下時刻 … ブラウザの Date.now()（ミリ秒まで）
+    //     撮影時刻 … GAS が書いた "YYYY/MM/DD HH:mm:ss" を ms 化（秒未満は切り捨て）
+    //   を比較していたため  screenshot_at < 押下時刻  が永久に成立し、
+    //   pending_new が解除されず、しかも hasFresh がその行を除外するので
+    //   画像を取りに行く条件も永久に偽 → 「更新待ち」のまま固まった（実機症状）。
+    //
+    //   R43.1 の判定：
+    //     screenBaseMs = 押した瞬間に手元にあった「最新の撮影時刻（シート時計）」
+    //     新着 = screenshot_ms > screenBaseMs
+    //   基準も比較対象も同じ GAS が書いた値なので、精度差は原理的に生じない。
     function mergeScreenRows(parentRows, childRows) {
-      // 要求時刻（request_screens を送った時刻）。未要求なら 0。
-      const reqTs = (typeof screenReqTs === 'number' && screenReqTs > 0) ? screenReqTs : 0;
+      // 押下時に観測した最新の撮影時刻（シート時計）。未押下なら 0。
+      const baseMs = (typeof screenBaseMs === 'number' && screenBaseMs > 0) ? screenBaseMs : 0;
+      // 【R43.1】児童ごとの基準（押した瞬間の最新撮影時刻）。全体の最大値より優先する。
+      const baseById = (typeof screenBaseById === 'object' && screenBaseById) ? screenBaseById : {};
+      // ポーリング稼働中だけ「更新待ち」を出す（終了後は必ず解除される）。
+      const reqActive = (typeof screenFetchActive !== 'undefined') ? !!screenFetchActive : false;
+      // 【R43.1】保険の期限。これを超えたら「更新待ち」を出さない（固着の最終防壁）。
+      const pendSince = (typeof screenPendingSince === 'number' && screenPendingSince > 0) ? screenPendingSince : 0;
+      const pendTtl = (typeof SCREEN_PENDING_TTL_MS === 'number' && SCREEN_PENDING_TTL_MS > 0)
+        ? SCREEN_PENDING_TTL_MS : 45000;
+      const pendExpired = pendSince > 0 && (Date.now() - pendSince) > pendTtl;
       const byId = {};
       const order = [];
       (Array.isArray(parentRows) ? parentRows : []).forEach(function (r) {
@@ -2257,6 +2277,16 @@
         } else if (!cur.has_image && !cur.screen_request_at && c.screen_request_at) {
           cur.screen_request_at = c.screen_request_at;
         }
+        // 【R43.1】要求日時（ミリ秒）は新しい方を採る。
+        //   子GASの『画面情報要求日時』は押下のたびにその子が書き換えるため、
+        //   親の値より新しいことがある。ここを取りこぼすと、子担当の端末だけ
+        //   要求時刻の基準が古いままになり「更新待ち」判定が狂う。
+        const curReqMs = (typeof cur.screen_request_ms === 'number') ? cur.screen_request_ms : 0;
+        const newReqMs = (typeof c.screen_request_ms === 'number') ? c.screen_request_ms : 0;
+        if (newReqMs > curReqMs) {
+          cur.screen_request_ms = newReqMs;
+          if (c.screen_request_at) cur.screen_request_at = c.screen_request_at;
+        }
         // 【R42.1】最終同期日時も新しい方を採る。
         //   端末は割り当て後「子GAS」にしかハートビートしないため、親シートの
         //   最終同期日時は切り替え時点で止まる。親だけ見ると誤ってオフラインになる。
@@ -2277,12 +2307,30 @@
         r.screenshot_at = formatStampJst(r.screenshot_at) || String(r.screenshot_at || '');
         const seenMs = screenTsToMs(r.last_seen);
         r.is_online = seenMs ? ((nowMs - seenMs) < 60000) : false;
-        // 【R43】空振り防止。
-        //   要求（request_screens）より前に撮られた画像しか無い場合、
-        //   それは「今回の取得結果」ではない。古い画像を最新として見せず、
-        //   pending_new=true にして描画側で「更新待ち」を明示する。
-        //   ※ 要求していない（reqTs=0）ときは通常どおり表示する。
-        r.pending_new = !!(reqTs > 0 && r.has_image && rawShotMs > 0 && rawShotMs < reqTs);
+        // 【R43.1】「更新待ち」の判定（シート時計どうしで比較）。
+        //   優先順位:
+        //     1) シートの『画面情報要求日時』(screen_request_ms) があればそれを使う
+        //        → 同じGASが書いた要求時刻なので精度差が無い（最も確実）
+        //     2) 無ければ“その児童の”押下時の最新撮影時刻 (screenBaseById) を基準にする
+        //     3) それも無ければ全体の最大値 (screenBaseMs)
+        //   すべて 0 なら判定しない（＝通常表示）。ブラウザ時計は一切使わない。
+        const sheetReqMs = (typeof r.screen_request_ms === 'number' && r.screen_request_ms > 0)
+          ? r.screen_request_ms : 0;
+        //   ※ 児童ごとの基準が無い＝押下時にその児童の画像が無かった、ということなので
+        //     基準 0 のままにする（全体の最大値を流用すると、他児童の新しい画像が
+        //     基準を押し上げて新着を「古い」と誤判定する＝R43 と同じ固着の温床）。
+        //     基準 0 では pending にならないため、安全側（固着しない側）に倒れる。
+        const ownBaseMs = (baseById && typeof baseById[id] === 'number' && baseById[id] > 0)
+          ? baseById[id] : 0;
+        const refMs = sheetReqMs > 0 ? sheetReqMs : ownBaseMs;
+        // 新着 = 撮影時刻が要求時刻以降（同一秒は新着とみなす＝切捨て誤差を吸収）
+        const isFresh = rawShotMs > 0 && refMs > 0 && rawShotMs >= refMs;
+        // ポーリング稼働中に限り、古い画像は「更新待ち」として明示する。
+        //   ・ポーリングが終われば reqActive=false になり必ず解除される
+        //   ・万一の時計ズレでも TTL 超過で解除される
+        //   → R43 のような「永久に更新待ち」の固着は原理的に起こらない。
+        r.pending_new = !!(reqActive && !pendExpired && r.has_image && refMs > 0 && !isFresh);
+        r.shot_is_fresh = !!(r.has_image && isFresh);
         r.screenshot_ms = rawShotMs;
       });
 
@@ -2698,9 +2746,31 @@
     let screenPollTimer = null;
     let screenRevealTime = {};
     let screenFetchActive = false;
-    // 【R43】「画面情報取得」を押した時刻（ms）。これより新しい撮影が返るまで
-    //   旧画像を「最新の取得結果」として扱わない（空振り判定用）。
-    let screenReqTs = 0;
+    // 【R43.1】空振り判定の基準値。
+    //   R43 は「押した時刻 = ブラウザの壁時計(Date.now)」と
+    //   「シートの撮影日時 = JST文字列のミリ秒」を比較していた。
+    //   両者は時計の出どころが違い、秒未満も切り捨てられるため
+    //     screenshot_at < 押した時刻
+    //   が永久に成立し、カードが「更新待ち」のまま固まっていた（実機の症状）。
+    //
+    //   対策：判定はすべて「シート側の時計」で行う。
+    //     ・要求時刻 … 端末一覧の『画面情報要求日時』（GAS が書く）
+    //     ・撮影時刻 … 画面情報シートの『更新日時』（GAS が書く）
+    //   同じGASが同じ時計で書くので必ず整合する。
+    //   screenBaseMs は「押した瞬間に手元にあった最新の撮影時刻」で、
+    //   これより新しい撮影が来た＝新着、と判定する。
+    let screenReqTs = 0;      // 押した時刻（ブラウザ時計・表示用の目安のみ）
+    let screenBaseMs = 0;     // 押した瞬間の最新撮影時刻（シート時計・全体の控え）
+    // 【R43.1】児童ごとの「押した瞬間に手元にあった最新の撮影時刻（シート時計）」。
+    //   全体の最大値（screenBaseMs）だけだと、ある児童の新しい画像が基準を
+    //   押し上げてしまい、別の児童の新着を「古い」と誤判定する。
+    //   児童ごとに控えることで「前回取得したタイムスタンプより新しいか」を
+    //   そのまま判定できる（ユーザー指定の方式）。
+    let screenBaseById = {};
+    let screenPendingSince = 0; // 更新待ちが始まった時刻（ブラウザ時計・期限切れ用）
+    // 【R43.1】保険：この時間を超えたら「更新待ち」表示を強制解除する。
+    //   時計の不整合が万一あっても永久に固まらないようにする最終防壁。
+    const SCREEN_PENDING_TTL_MS = 45000;
     // 【R43】ポーリングの多重実行を防ぐ番号（中止・再実行で古いループを捨てる）。
     let screenPollGen = 0;
     // 【R43】直近に描画した画像の署名（同じ画像でDOMを作り直さない）。
@@ -2751,9 +2821,29 @@
       if (spinner) spinner.classList.remove('hidden');
       if (icon) icon.classList.add('hidden');
       if (text) text.textContent = '取得中...';
-      // 【R43】「いつ要求したか」を記録する。これより新しい撮影が返るまで、
-      //   旧画像を最新として表示しない（空振り防止）。
-      screenReqTs = new Date().getTime();
+      // 【R43.1】「いつ要求したか」の基準を“シート時計”で控える。
+      //   R43 は Date.now() を基準にしていたため、シートの撮影日時（秒未満切捨て）と
+      //   永久に噛み合わず「更新待ち」が解除されないデッドロックになっていた。
+      //   ここでは「押した瞬間に手元にある最新の撮影時刻（シート時計）」を
+      //   児童ごとに控え、それより新しい撮影が来た＝新着、と判定する
+      //   （基準も比較対象も同じGASが書いたシート時計なので精度差が生じない）。
+      screenReqTs = new Date().getTime();  // 表示用の目安（判定には使わない）
+      let __base = 0;
+      const __baseById = {};
+      try {
+        (screensData || []).forEach(function (d) {
+          if (!d || !d.student_id) return;
+          const ms = (typeof d.screenshot_ms === 'number' && d.screenshot_ms > 0)
+            ? d.screenshot_ms : screenTsToMs(d.screenshot_at);
+          if (ms <= 0) return;
+          __baseById[String(d.student_id)] = ms;
+          if (ms > __base) __base = ms;
+        });
+      } catch (eB) { __base = 0; }
+      // 手元に画像が無い児童は基準 0（＝最初の取得は常に新着扱い）
+      screenBaseById = __baseById;
+      screenBaseMs = __base;
+      screenPendingSince = new Date().getTime();
       screenRenderedSig = '';
       // 押した瞬間に中止ボタンを出す（応答待ちの間も操作できる）。
       if (cancelBtn) cancelBtn.classList.remove('hidden');
@@ -2804,10 +2894,13 @@
     //   /exec が待たされ、UI が固まって見えた（実機の「26s 停止」）。
     //   1本ずつ直列に回せば、遅いときは自然に間隔が延びるだけで詰まらない。
     function startScreenPolling() {
+      // stopScreenPolling は後片付けで screenPendingSince を 0 に戻すため、
+      // 【R43.1】期限の基準はその“後”で必ず引き直す（ここで上書きする）。
       stopScreenPolling();
       screenPollGen++;
       screenPollTries = 0;
       screenFetchActive = true;
+      screenPendingSince = new Date().getTime();  // TTL の起点
       updateScreenFetchButton(true, SCREEN_POLL_MAX);
       scheduleScreenPollTick(1000);
     }
@@ -2854,8 +2947,26 @@
         try { clearInterval(screenPollTimer); } catch (eT2) {}
         screenPollTimer = null;
       }
+      const wasActive = !!screenFetchActive;
       screenFetchActive = false;
+      screenPendingSince = 0;   // 期限の基準もリセット（次回押下で引き直す）
       updateScreenFetchButton(false, 0);
+      // 【R43.1】ポーリング終了時に「更新待ち」を必ず解除して描き直す。
+      //   R43 は screenFetchActive を false にしたまま再描画しなかったため、
+      //   最後に描いた「更新待ち」チップが画面に残り続けた（実機の固着症状）。
+      //   ここでフラグを落として再描画すれば、取得できなかった場合でも
+      //   「取得済（前回の画像）」表示に戻り、操作不能に見えることがなくなる。
+      //   ※ 実際にチップを消したときだけ描き直す（無駄な再描画でちらつかせない）。
+      if (wasActive) {
+        let dirty = false;
+        (screensData || []).forEach(function (d) {
+          if (d && d.pending_new) { d.pending_new = false; dirty = true; }
+        });
+        if (dirty) {
+          screenRenderedSig = '';
+          try { renderScreens(); } catch (eRS) {}
+        }
+      }
     }
 
     // 「取得中(n)」表示・中止ボタンの表示切替・取得ボタンの有効/無効をまとめて更新
@@ -2937,14 +3048,22 @@
           }
         }
 
-        // 【R43】「新しく撮れた」＝要求時刻より新しい撮影が存在するか。
-        //   メタ取得でも screenshot_ms / pending_new が返るので、これだけで判定できる。
+        // 【R43.1】「新しく撮れた」＝ 要求時刻以降の撮影が存在するか。
+        //   判定は mergeScreenRows が「シート時計どうし」で済ませており、
+        //   その結果が shot_is_fresh / pending_new に入っている。
+        //   ここでブラウザ時計(screenReqTs)を混ぜると R43 のデッドロックが再発するため、
+        //   フォールバックも必ずシート時計（screen_request_ms → screenBaseMs）で行う。
         const hasFresh = data.some(function (d) {
           if (!d || !d.has_image) return false;
+          if (d.shot_is_fresh === true) return true;
           if (d.pending_new) return false;
-          if (!screenReqTs) return true;
-          const ms = (typeof d.screenshot_ms === 'number') ? d.screenshot_ms : screenTsToMs(d.screenshot_at);
-          return ms > 0 && ms >= screenReqTs;
+          const ms = (typeof d.screenshot_ms === 'number' && d.screenshot_ms > 0)
+            ? d.screenshot_ms : screenTsToMs(d.screenshot_at);
+          const reqMs = (typeof d.screen_request_ms === 'number' && d.screen_request_ms > 0)
+            ? d.screen_request_ms : 0;
+          if (reqMs > 0 && ms > 0) return ms >= reqMs;   // シートの要求日時と比較
+          if (screenBaseMs > 0 && ms > 0) return ms > screenBaseMs; // 押下時の最新より新しい
+          return true;  // 基準が無い（未要求の単純表示）なら「取得済み」として扱う
         });
 
         // メタ取得のときは、既に持っている画像を消さない（画像本体は返ってこないため）。

@@ -3610,6 +3610,13 @@ function getScreenshots(filterSchool, teacher, includeUnassigned, status, studen
       last_seen: lastSeenStr,
       is_online: lastSeenMs ? ((new Date().getTime() - lastSeenMs) < 60000) : false,
       screen_request_at: requestAt,
+      // 【R43.1】要求日時をミリ秒でも返す。
+      //   ブラウザは「押した時刻(Date.now)」ではなく、この値（GASが書いた
+      //   シート時計）と screenshot_ms を比較する。同じGASが同じ時計で
+      //   書いた値どうしなので、秒未満の精度差で永久に「更新待ち」に
+      //   なることが原理的に起きない（R43 のデッドロックの恒久対策）。
+      //   形式 "2026/11/06 13:46:40|sr_..." なので '|' の前だけを見る。
+      screen_request_ms: sheetTsToMs(String(requestAt || '').split('|')[0]),
       screenshot_at: shotAt,
       // 【R43】撮影日時をミリ秒でも返す。ブラウザ側で日時文字列を再解釈せずに
       //   新旧比較・要求時刻との突き合わせができる（TZ 依存のブレを無くす）。

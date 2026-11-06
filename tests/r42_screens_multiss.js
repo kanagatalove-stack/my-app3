@@ -360,6 +360,131 @@ check('子が0件でも親の新しい最終同期からオンラインを再計
 const m8 = merge([{ student_id: 'e@x', is_online: true }], []);
 check('最終同期が空ならオフライン扱いで落ちない', m8[0].is_online === false, m8[0].is_online);
 
+// ==================================================================
+// 7) 【R43.1】pending_new の時計ドメイン不一致（デッドロック）回帰
+//
+//   R43 の欠陥：
+//     押下時刻 … ブラウザの Date.now()（ミリ秒まで）
+//     撮影時刻 … GAS が書いた "YYYY/MM/DD HH:mm:ss" を ms 化（秒未満は切捨て）
+//   を比較していたため  screenshot_at < 押下時刻  が永久に成立し、
+//   pending_new が解除されず「更新待ち」のまま固まった（実機症状）。
+//
+//   R43.1 では判定をすべて「シート時計」に統一した。以下はその回帰テスト。
+//   状態変数を差し替えられるよう、独立した vm コンテキストを作り直す。
+// ==================================================================
+console.log('\n===== [FE] R43.1: pending_new のデッドロック回帰 =====');
+
+function mkMergeCtx(state) {
+  const c = { Object, Array, String, Number, Date, isNaN, console };
+  vm.createContext(c);
+  let code = 'const SCREEN_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;\n';
+  const st = state || {};
+  if (st.screenBaseMs !== undefined) code += 'var screenBaseMs = ' + Number(st.screenBaseMs) + ';\n';
+  if (st.screenFetchActive !== undefined) code += 'var screenFetchActive = ' + (!!st.screenFetchActive) + ';\n';
+  if (st.screenPendingSince !== undefined) code += 'var screenPendingSince = ' + Number(st.screenPendingSince) + ';\n';
+  if (st.SCREEN_PENDING_TTL_MS !== undefined) code += 'var SCREEN_PENDING_TTL_MS = ' + Number(st.SCREEN_PENDING_TTL_MS) + ';\n';
+  if (st.screenBaseById) code += 'var screenBaseById = ' + JSON.stringify(st.screenBaseById) + ';\n';
+  code += extract(html, 'screenTsToMs') + '\n';
+  code += extract(html, 'formatStampJst') + '\n';
+  code += extract(html, 'mergeScreenRows') + '\n';
+  vm.runInContext(code, c);
+  return c;
+}
+
+// (a) ブラウザ時計が判定に混ざっていないこと（これが R43 のバグの本体）
+check('【R43.1】mergeScreenRows が browser 時計(screenReqTs)を参照しない',
+  !/screenReqTs/.test(extract(html, 'mergeScreenRows')));
+
+// 共通の基準時刻（シート時計）
+const ctxA = mkMergeCtx({ screenFetchActive: true, screenBaseMs: 0 });
+const REQ_JST = '2026/11/06 13:46:40';
+const REQ_MS = ctxA.screenTsToMs(REQ_JST);
+check('前提: 要求日時をシート時計でミリ秒化できる', REQ_MS > 0, REQ_MS);
+
+// (b) 要求と同一秒に撮れた画像は「新着」＝「更新待ち」にしない
+//     （秒未満切捨ての誤差を >= で吸収していることの確認）
+const mB1 = ctxA.mergeScreenRows([
+  { student_id: 'p@x', has_image: true, image_data_url: 'NEW',
+    screenshot_at: REQ_JST, screen_request_at: REQ_JST, screen_request_ms: REQ_MS }
+], []);
+check('【R43.1】要求と同一秒の撮影を新着とみなす（更新待ちにしない）',
+  mB1[0].pending_new === false, mB1[0].pending_new);
+check('【R43.1】新着なら shot_is_fresh=true', mB1[0].shot_is_fresh === true, mB1[0].shot_is_fresh);
+
+// (c) 要求より前に撮れた画像は、ポーリング稼働中は「更新待ち」
+const mB2 = ctxA.mergeScreenRows([
+  { student_id: 'p@x', has_image: true, image_data_url: 'OLD',
+    screenshot_at: '2026/11/06 13:40:00', screen_request_at: REQ_JST, screen_request_ms: REQ_MS }
+], []);
+check('【R43.1】要求前の撮影は稼働中なら更新待ち', mB2[0].pending_new === true, mB2[0].pending_new);
+check('【R43.1】要求前の撮影は shot_is_fresh=false', mB2[0].shot_is_fresh === false, mB2[0].shot_is_fresh);
+
+// (d) ポーリングが終われば（screenFetchActive=false）古い画像でも更新待ちにしない
+//     → R43 の「永久に更新待ち」固着の再発防止
+const ctxStopped = mkMergeCtx({ screenFetchActive: false, screenBaseMs: 0 });
+const mB3 = ctxStopped.mergeScreenRows([
+  { student_id: 'p@x', has_image: true, image_data_url: 'OLD',
+    screenshot_at: '2026/11/06 13:40:00', screen_request_at: REQ_JST, screen_request_ms: REQ_MS }
+], []);
+check('【R43.1】ポーリング停止中は更新待ちを出さない（固着しない）',
+  mB3[0].pending_new === false, mB3[0].pending_new);
+
+// (e) TTL 超過（保険）でも更新待ちを解除する
+const ctxTtl = mkMergeCtx({
+  screenFetchActive: true, screenBaseMs: 0,
+  screenPendingSince: Date.now() - 120000, SCREEN_PENDING_TTL_MS: 45000
+});
+const mB4 = ctxTtl.mergeScreenRows([
+  { student_id: 'p@x', has_image: true, image_data_url: 'OLD',
+    screenshot_at: '2026/11/06 13:40:00', screen_request_at: REQ_JST, screen_request_ms: REQ_MS }
+], []);
+check('【R43.1】TTL 超過で更新待ちを強制解除する（最終防壁）',
+  mB4[0].pending_new === false, mB4[0].pending_new);
+
+// (f) 児童ごとの基準（screenBaseById）: 他児童の新しい画像に引きずられない
+//     全体最大値だけだと b@x の新着が「古い」と誤判定される（R43 と同じ固着の温床）。
+const tsA = ctxA.screenTsToMs('2026/11/06 13:00:00');
+const tsB = ctxA.screenTsToMs('2026/11/06 12:00:00');
+const ctxPer = mkMergeCtx({
+  screenFetchActive: true,
+  screenBaseMs: tsA,                          // 全体の最大は a@x の 13:00
+  screenBaseById: { 'a@x': tsA, 'b@x': tsB }  // 児童ごとの基準
+});
+const mC = ctxPer.mergeScreenRows([
+  { student_id: 'a@x', has_image: true, image_data_url: 'A_OLD', screenshot_at: '2026/11/06 13:00:00' },
+  { student_id: 'b@x', has_image: true, image_data_url: 'B_OLD', screenshot_at: '2026/11/06 12:00:00' }
+], [
+  { student_id: 'a@x', has_image: true, image_data_url: 'A_NEW', screenshot_at: '2026/11/06 13:30:00' },
+  { student_id: 'b@x', has_image: true, image_data_url: 'B_NEW', screenshot_at: '2026/11/06 12:30:00' }
+]);
+const ca = mC.find(d => d.student_id === 'a@x');
+const cb = mC.find(d => d.student_id === 'b@x');
+check('【R43.1】a@x の新着を検出する', ca.shot_is_fresh === true && ca.pending_new === false,
+  { fresh: ca.shot_is_fresh, pending: ca.pending_new });
+check('【R43.1】b@x も“自分の”基準より新しければ新着（全体最大に引きずられない）',
+  cb.shot_is_fresh === true && cb.pending_new === false,
+  { fresh: cb.shot_is_fresh, pending: cb.pending_new, globalBase: tsA, ownShot: cb.screenshot_ms });
+
+// (g) 児童ごとの基準が無い（押下時に画像が無かった）場合は固着させない
+const ctxNoBase = mkMergeCtx({ screenFetchActive: true, screenBaseMs: tsA, screenBaseById: {} });
+const mD = ctxNoBase.mergeScreenRows([
+  { student_id: 'z@x', has_image: true, image_data_url: 'Z_OLD', screenshot_at: '2026/11/06 10:00:00' }
+], []);
+check('【R43.1】基準が無い児童は更新待ちにしない（安全側に倒す）',
+  mD[0].pending_new === false, mD[0].pending_new);
+
+// (h) 子GAS側の要求日時（screen_request_ms）が親より新しければ採用する
+const childReqJst = '2026/11/06 13:50:00';
+const childReqMs = ctxA.screenTsToMs(childReqJst);
+const mE = ctxA.mergeScreenRows([
+  { student_id: 'q@x', has_image: false, screen_request_at: '2026/11/06 13:40:00',
+    screen_request_ms: ctxA.screenTsToMs('2026/11/06 13:40:00') }
+], [
+  { student_id: 'q@x', has_image: false, screen_request_at: childReqJst, screen_request_ms: childReqMs }
+]);
+check('【R43.1】子の新しい要求日時を併合する', mE[0].screen_request_ms === childReqMs,
+  { got: mE[0].screen_request_ms, want: childReqMs });
+
 finish();
 }
 
