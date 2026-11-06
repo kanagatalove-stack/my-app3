@@ -976,10 +976,16 @@ function doPost(e) {
     }
 
     // D3. 画面情報一覧取得（画像付き）：console の「画面一覧」タブ表示に使用
+    //   【R43】payload.meta_only = true を渡すと、画像(Base64)を含めずに
+    //   「誰の画面がいつ撮られたか」だけを軽量に返す。ポーリング（送信待ちの監視）は
+    //   これを使い、画像本体は「本当に新しい画像が来た1回」だけ取得する。
     if (action === 'get_screens') {
       const status = payload.status || 'all';
-      const data = getScreenshots(payload.school_name, currentTeacher, Boolean(payload.include_unassigned), status, payload.student_ids);
-      return jsonResponse({ success: true, data: data });
+      const data = getScreenshots(
+        payload.school_name, currentTeacher, Boolean(payload.include_unassigned),
+        status, payload.student_ids, { meta_only: !!payload.meta_only }
+      );
+      return jsonResponse({ success: true, data: data, meta_only: !!payload.meta_only });
     }
 
     // E. 一括画面ロック（教員の所属学校スコープを適用）
@@ -3471,7 +3477,12 @@ function processScreenshotUpload(studentId, imageData, mimeType) {
  *  - 各児童について、端末一覧側の要求／更新日時と、画面情報シートの画像有無を突き合わせる。
  *  - 画像は base64 データURLに組み立てて返す（console が <img src> へ直接渡せる）。
  */
-function getScreenshots(filterSchool, teacher, includeUnassigned, status, studentIds) {
+function getScreenshots(filterSchool, teacher, includeUnassigned, status, studentIds, opts) {
+  // 【R43】opts.meta_only = true のとき、画像(Base64)を一切読まず・返さない。
+  //   1児童あたり最大 42,000 文字の Base64 を人数分連結すると、30人で 1MB を超え、
+  //   その JSON 生成・転送・ブラウザ側 parse だけで数秒かかる（＝体感の遅延とUI停止の主因）。
+  //   ポーリングは「撮影日時が進んだか」だけ分かればよいので、メタのみを返す。
+  const __metaOnly = !!(opts && opts.meta_only);
   const scoped = scopeStudentIdsForTeacher(studentIds, teacher);
   const only = (Array.isArray(studentIds) && studentIds.length) ? scoped.ids : null;
 
@@ -3481,15 +3492,45 @@ function getScreenshots(filterSchool, teacher, includeUnassigned, status, studen
 
   const shotSheet = getTargetSheet(CONFIG.SCREENSHOT_SHEET_NAME);
   const sMap = getHeaderMap(shotSheet, CONFIG.SCREENSHOT_COLUMNS);
-  const shotRows = shotSheet.getDataRange().getValues();
+  // 【R43】メタのみのときは「児童ID」「更新日時」の2列だけを読む。
+  //   画像列の読み込みを外すだけで Apps Script 内部の転送量が激減する。
+  //   getRange が使えない環境（テスト用の擬似シート等）では従来どおり全列を読む。
+  let shotRows = null;
+  if (__metaOnly) {
+    // 「児童ID / 更新日時 / MIMEタイプ」まで読む（画像列(4列目)は読まない）。
+    //   MIMEタイプが入っていれば「画像行が存在する」と判定できるため、
+    //   Base64 を読まずに has_image を返せる。
+    try {
+      const srLast = shotSheet.getLastRow();
+      const srCols = Math.max(
+        Number(sMap['更新日時'] || 2),
+        Number(sMap['MIMEタイプ'] || 3),
+        2
+      );
+      shotRows = (srLast > 1) ? shotSheet.getRange(1, 1, srLast, srCols).getValues() : [];
+    } catch (eMeta) {
+      shotRows = null; // getRange が無い環境（テスト用の擬似シート等）は全列読みへフォールバック
+    }
+  }
+  if (!shotRows) shotRows = shotSheet.getDataRange().getValues();
+
   const shotIndex = {};
   for (let i = 1; i < shotRows.length; i++) {
     const sid = String(shotRows[i][sMap['児童ID'] - 1] || '').trim();
     if (!sid) continue;
+    const atVal = String(shotRows[i][sMap['更新日時'] - 1] || '');
+    const mimeVal = String(shotRows[i][sMap['MIMEタイプ'] - 1] || '');
+    const b64Val = __metaOnly ? '' : String(shotRows[i][sMap['画像データ(Base64)'] - 1] || '');
+    const prev = shotIndex[sid];
+    // 同一児童が複数行ある場合は「更新日時が新しい行」を残す（古い行が勝つのを防ぐ）
+    if (prev && sheetTsToMs(prev.at) > sheetTsToMs(atVal)) continue;
     shotIndex[sid] = {
-      at: String(shotRows[i][sMap['更新日時'] - 1] || ''),
-      mime: String(shotRows[i][sMap['MIMEタイプ'] - 1] || 'image/jpeg'),
-      b64: String(shotRows[i][sMap['画像データ(Base64)'] - 1] || '')
+      // 【R42.3】「画面情報」シート自身の更新日時。これが撮影日時の正。
+      at: atVal,
+      mime: mimeVal || 'image/jpeg',
+      b64: b64Val,
+      // 画像行が存在するか（メタのみのときは MIME の有無で判定する）
+      exists: __metaOnly ? !!mimeVal : !!b64Val
     };
   }
 
@@ -3527,10 +3568,23 @@ function getScreenshots(filterSchool, teacher, includeUnassigned, status, studen
 
     const shot = shotIndex[studentId];
     const requestAt = dMap['画面情報要求日時'] ? String(row[dMap['画面情報要求日時'] - 1] || '').trim() : '';
-    const shotAt = dMap['画面情報更新日時'] ? String(row[dMap['画面情報更新日時'] - 1] || '').trim() : '';
+
+    // 【R42.3】撮影日時の参照先を統一する。
+    //   旧実装は「端末一覧」シートの『画面情報更新日時』を screenshot_at にしていた。
+    //   しかし画像の実体は「画面情報」シートにあり、その行の『更新日時』こそが撮影時刻。
+    //   端末一覧側の列は過去の要求や別経路の書き込みで古い値が残ることがあり、
+    //   「子シートには 11:15:14 の新しい画像があるのに、カードは 10/28 のまま」
+    //   という実機症状（R42.3）を生んでいた。
+    //   したがって、画像行が存在する場合は『画面情報』シートの更新日時を正とし、
+    //   画像が無い場合のみ端末一覧側の列を（要求の痕跡として）使う。
+    const devShotAt = dMap['画面情報更新日時'] ? String(row[dMap['画面情報更新日時'] - 1] || '').trim() : '';
+    const sheetShotAt = shot ? String(shot.at || '').trim() : '';
+    const useSheetAt = !!(shot && shot.exists && sheetShotAt);
+    const shotAt = useSheetAt ? sheetShotAt : devShotAt;
 
     // ready = 画像が保存されている、pending = 要求済みだが未取得
-    const ready = !!(shot && shot.b64);
+    //   【R43】メタのみ取得のときは Base64 を持たないため shot.exists で判定する。
+    const ready = !!(shot && (shot.exists || shot.b64));
     if (want === 'ready' && !ready) continue;
     if (want === 'pending' && ready) continue;
 
@@ -3557,8 +3611,19 @@ function getScreenshots(filterSchool, teacher, includeUnassigned, status, studen
       is_online: lastSeenMs ? ((new Date().getTime() - lastSeenMs) < 60000) : false,
       screen_request_at: requestAt,
       screenshot_at: shotAt,
+      // 【R43】撮影日時をミリ秒でも返す。ブラウザ側で日時文字列を再解釈せずに
+      //   新旧比較・要求時刻との突き合わせができる（TZ 依存のブレを無くす）。
+      screenshot_ms: sheetTsToMs(shotAt),
+      // 【R42.3/R43】この日時がどこ由来かを明示する。
+      //   'sheet'  = 『画面情報』シートの更新日時（＝実際の撮影時刻。正）
+      //   'device' = 『端末一覧』シートの画面情報更新日時（撮影時刻ではない）
+      //   ブラウザは 'device' 由来の値を「撮影時刻」として信用しない。
+      screenshot_from: useSheetAt ? 'sheet' : 'device',
       has_image: ready,
-      image_data_url: ready ? ('data:' + shot.mime + ';base64,' + shot.b64) : ''
+      // 【R43】メタのみ取得のときは画像本体を返さない（転送量を 1/100 以下に）。
+      image_data_url: (!__metaOnly && ready && shot && shot.b64)
+        ? ('data:' + shot.mime + ';base64,' + shot.b64)
+        : ''
     });
   }
 
@@ -6297,8 +6362,11 @@ function shardScreensFromBrowser(payload) {
   if (!ids.length) return { success: true, data: [] };
 
   const adminLike = { email: '__shard_parent__', role: 'ADMIN', school: '全校管理', target_class: '' };
-  const data = getScreenshots('ALL', adminLike, false, 'all', ids);
-  return { success: true, data: data };
+  // 【R43】meta_only を透過する。ポーリングは「新しい撮影が来たか」だけ分かればよいので、
+  //   Base64 を含めずに返す（転送量と JSON 生成コストを大幅に削減）。
+  const metaOnly = !!(payload && payload.meta_only);
+  const data = getScreenshots('ALL', adminLike, false, 'all', ids, { meta_only: metaOnly });
+  return { success: true, data: data, meta_only: metaOnly };
 }
 
 /**
