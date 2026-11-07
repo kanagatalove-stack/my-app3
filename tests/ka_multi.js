@@ -38,8 +38,11 @@ vm.createContext(gctx);
 vm.runInContext(
   "const KA_KEY='ka_console';const KA_PROP_KEY='KA_LAST_TOUCH';const KA_SESS_KEY='ka_sessions';"+
   "const KA_SESS_PROP_KEY='KA_SESSIONS';const KA_ACTIVE_WINDOW_MS=120000;const KA_MAX_SESSIONS=200;"+
-  "const KA_IDLE_DRIFT_SEC=20;const ACTIVE_SYNC_INTERVAL_SEC=1.5;\n"+
+  "const KA_IDLE_DRIFT_SEC=20;const ACTIVE_SYNC_INTERVAL_SEC=1.5;"+
+  // 緊急呼び出しフラグ（wake_epoch）関連。touchTeacherConsole が参照するため注入する。
+  "const WAKE_CACHE_KEY='wake_epoch';const WAKE_PROP_KEY='WAKE_EPOCH_V1';\n"+
   extract(codeGs,'readKaSessions')+'\n'+extract(codeGs,'writeKaSessions')+'\n'+extract(codeGs,'pruneKaSessions')+'\n'+
+  extract(codeGs,'readWakeEpoch')+'\n'+extract(codeGs,'bumpWakeEpoch')+'\n'+
   extract(codeGs,'touchTeacherConsole')+'\n'+extract(codeGs,'releaseTeacherConsole')+'\n'+extract(codeGs,'isTeacherConsoleActive')+'\n'+
   extract(codeGs,'computeKaInterval')+
   '\n__touch=touchTeacherConsole;__release=releaseTeacherConsole;__active=isTeacherConsoleActive;__interval=computeKaInterval;', gctx);

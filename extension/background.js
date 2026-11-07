@@ -44,6 +44,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     maybeSync();
   } else if (alarm.name === 'idleDriftAlarm') {
     maybeSync();
+  } else if (alarm.name === 'wakeAlarm') {
+    // 非稼働中でも「先生が復帰したか」だけを軽く確認する（シート非接触の短い応答）。
+    probeWake();
   }
 });
 
@@ -118,10 +121,15 @@ function applyRemoteKeepalive(payload) {
       ensureSyncLoop();        // 稼働中のみアラームを登録（状態遷移時だけ）
       clearIdleDriftAlarm();
     }
+    // 稼働中は起こしプローブ不要（通常同期が走っているため）。止めて通信を増やさない。
+    clearWakeProbe();
   } else if (activeChanged || driftChanged) {
     // 非稼働: 30 秒アラームを止めて無駄な起床を止める。猶予期間だけ再開を確認する。
     stopSyncLoop();
     scheduleIdleDrift();
+    // 猶予が尽きた後も「先生が復帰したか」だけは拾えるようにする。
+    // 間隔は時間帯で切り替える（平日日中=1分固定／夜間・土日祝=10分）。
+    ensureWakeProbe();
   }
 }
 
@@ -188,6 +196,254 @@ function scheduleIdleDrift() {
 function clearIdleDriftAlarm() {
   try { chrome.alarms.clear('idleDriftAlarm'); } catch (e) {}
 }
+
+// ==================== 非稼働時の「起こしプローブ」 ====================
+// 課題: 非稼働になると端末は同期を完全に止めるため、先生が再ログインしても
+//       端末が眠ったままでオンラインにならず、ロック・URL配信も届かなかった。
+//       「蓋を閉じて開いただけ」では onStartup もタブ生成も起きないため復帰できない。
+// 方針: 通信負荷を増やさないことを最優先に、二段構えで復帰させる。
+//   ① イベント起床（通信ゼロ）… 蓋を開けた/操作再開（chrome.idle）で 1 回だけ同期。
+//   ② 時間帯で間隔を変えるプローブ … ①で拾えない場合に備え、シートに触らない
+//      軽量な wake_check だけを送る。間隔は「学校の稼働時間」に合わせて切り替える。
+//       ・平日 08:00〜17:00 … 1 分固定（バックオフしない＝ログイン後すぐ復帰）
+//       ・上記以外（17:00以降・土日・祝日）… 10 分（バッテリー保護・ログ削減）
+//      先生が復帰していれば（ka_active か wake_epoch の変化）即座に通常同期へ戻る。
+//
+// ※ 13 校は校ごとに Google アカウント／スプレッドシート／GAS を独立分離しているため、
+//    1 アカウントあたりの負荷余裕は大きい。日中の 1 分固定はその前提に基づく。
+const WAKE_ALARM_NAME = 'wakeAlarm';
+
+// ---- 時間帯の定義（日本時間で判定する。端末のタイムゾーン設定に依存させない）----
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000; // UTC+9
+const PROBE_DAY_START_HOUR = 8;   // 平日の開始時刻（この時刻から日中扱い）
+const PROBE_DAY_END_HOUR = 17;    // 平日の終了時刻（この時刻から夜間扱い）
+const PROBE_DAY_MIN = 1;          // 平日日中：1 分固定
+const PROBE_NIGHT_MIN = 10;       // 夜間・土日祝：10 分（0 にすると停止）
+
+/** その月の第 n 曜日の日付を返す（nth は 1 始まり）。 */
+function nthWeekdayOfMonth(year, month, weekday, nth) {
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const firstDow = first.getUTCDay();
+  return 1 + ((weekday - firstDow + 7) % 7) + (nth - 1) * 7;
+}
+
+/** 春分／秋分の日（近似式。1948〜2150 年で有効）。 */
+function equinoxDay(year, isSpring) {
+  const base = isSpring ? 20.8431 : 23.2488;
+  const v = base + 0.242194 * (year - 1980) - Math.floor((year - 1980) / 4);
+  return Math.floor(v);
+}
+
+/**
+ * その年の日本の祝日（振替休日・国民の休日を含む）を "月-日" の集合で返す。
+ * 祝日判定は端末内で完結させる（外部通信しない＝通信負荷ゼロ）。
+ */
+function japaneseHolidaySet(year) {
+  const set = {};
+  const add = (m, d) => { if (d >= 1 && d <= 31) set[m + '-' + d] = true; };
+
+  add(1, 1);                                            // 元日
+  add(1, nthWeekdayOfMonth(year, 1, 1, 2));             // 成人の日（第2月曜）
+  add(2, 11);                                           // 建国記念の日
+  add(2, 23);                                           // 天皇誕生日
+  add(3, equinoxDay(year, true));                       // 春分の日
+  add(4, 29);                                           // 昭和の日
+  add(5, 3); add(5, 4); add(5, 5);                      // 憲法記念日／みどりの日／こどもの日
+  add(7, nthWeekdayOfMonth(year, 7, 1, 3));             // 海の日（第3月曜）
+  add(8, 11);                                           // 山の日
+  add(9, nthWeekdayOfMonth(year, 9, 1, 3));             // 敬老の日（第3月曜）
+  add(9, equinoxDay(year, false));                      // 秋分の日
+  add(10, nthWeekdayOfMonth(year, 10, 1, 2));           // スポーツの日（第2月曜）
+  add(11, 3);                                           // 文化の日
+  add(11, 23);                                          // 勤労感謝の日
+
+  // 振替休日: 日曜に当たる祝日は、翌日以降で最初の「祝日でない日」が休日になる。
+  const base = {};
+  Object.keys(set).forEach(k => { base[k] = true; });
+  Object.keys(base).forEach(k => {
+    const p = k.split('-');
+    const m = Number(p[0]), d = Number(p[1]);
+    const dt = new Date(Date.UTC(year, m - 1, d));
+    if (dt.getUTCDay() !== 0) return;
+    let cur = new Date(Date.UTC(year, m - 1, d));
+    for (let i = 0; i < 10; i++) {
+      cur = new Date(cur.getTime() + 86400000);
+      const key = (cur.getUTCMonth() + 1) + '-' + cur.getUTCDate();
+      if (!base[key]) { set[key] = true; break; }
+    }
+  });
+
+  // 国民の休日: 祝日に挟まれた 1 日（例: 敬老の日と秋分の日に挟まれた 9/22）。
+  Object.keys(base).forEach(k => {
+    const p = k.split('-');
+    const m = Number(p[0]), d = Number(p[1]);
+    const mid = m + '-' + (d + 1);
+    const nxt = m + '-' + (d + 2);
+    if (base[mid] || set[mid]) return;
+    if (base[nxt] && d + 2 <= 31) set[mid] = true;
+  });
+
+  return set;
+}
+
+// 年の祝日集合は使い回す（毎回作り直すと無駄）。
+let holidayCacheYear = 0;
+let holidayCacheSet = null;
+
+/** 指定日が日本の祝日かどうか。 */
+function isJapaneseHoliday(year, month, day) {
+  if (holidayCacheYear !== year || !holidayCacheSet) {
+    holidayCacheSet = japaneseHolidaySet(year);
+    holidayCacheYear = year;
+  }
+  return !!holidayCacheSet[month + '-' + day];
+}
+
+/** 指定時刻（エポックms）が「日中（平日8:00-17:00）か」を日本時間で判定する。 */
+function probeBandState(nowMs) {
+  const j = new Date(nowMs + JST_OFFSET_MS);
+  const y = j.getUTCFullYear();
+  const mo = j.getUTCMonth() + 1;
+  const d = j.getUTCDate();
+  const h = j.getUTCHours();
+  const dow = j.getUTCDay();
+  const holiday = isJapaneseHoliday(y, mo, d);
+  const weekend = (dow === 0 || dow === 6);
+  const dayTime = (h >= PROBE_DAY_START_HOUR) && (h < PROBE_DAY_END_HOUR);
+  return { inDay: (!weekend && !holiday && dayTime), weekend: weekend, holiday: holiday };
+}
+
+/**
+ * 現在の時間帯から「プローブ間隔（分）」と「次の時間帯境界までの分」を求める。
+ * 戻り値: { inDay, weekend, holiday, minutes, minutesUntilChange }
+ */
+function getProbeBand(nowMs) {
+  const t = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+  const cur = probeBandState(t);
+
+  // 次の境界（inDay が反転する時刻）を 1 分刻みで探す。
+  // 日本には夏時間が無いため、1 分 = 60000ms で厳密に数えられる。
+  const MAX_STEPS = 60 * 24 * 8;
+  let step = 0;
+  while (step < MAX_STEPS) {
+    step++;
+    if (probeBandState(t + step * 60000).inDay !== cur.inDay) break;
+  }
+
+  return {
+    inDay: cur.inDay,
+    weekend: cur.weekend,
+    holiday: cur.holiday,
+    minutes: cur.inDay ? PROBE_DAY_MIN : PROBE_NIGHT_MIN,
+    minutesUntilChange: Math.max(0.5, step)
+  };
+}
+
+/**
+ * 起こしプローブを「現在の時間帯」の間隔で登録する。
+ * 次の時間帯境界が来る前に一度起きるよう delay を短くするので、
+ * 8:00 や 17:00 の切り替わりに最大でも境界時刻ちょうどで間隔が更新される。
+ */
+function ensureWakeProbe() {
+  const band = getProbeBand(Date.now());
+  if (!band.minutes || band.minutes <= 0) { clearWakeProbe(); return; } // 0 = 停止
+  const delay = Math.min(band.minutes, band.minutesUntilChange);
+  try {
+    chrome.alarms.create(WAKE_ALARM_NAME, {
+      delayInMinutes: delay,
+      periodInMinutes: band.minutes
+    });
+  } catch (e) {}
+}
+
+/** 起こしプローブを止める（稼働中は不要なため）。 */
+function clearWakeProbe() {
+  try { chrome.alarms.clear(WAKE_ALARM_NAME); } catch (e) {}
+}
+
+/**
+ * 「先生が復帰したか」だけを軽く確認する。
+ * シートに触らない wake_check を使うため、GAS 側の実行はごく短時間で終わる。
+ * 復帰を検知したら、その場で通常のハートビート（＝詳細なオンライン通知）を送り、
+ * 端末一覧に即座にオンラインとして現れるようにする。
+ */
+async function probeWake() {
+  if (keepaliveActive) { clearWakeProbe(); return; } // 既に稼働中なら何もしない
+  try {
+    const data = await chrome.storage.local.get(null);
+    const gasUrl = resolveGasUrl(data);
+    if (!gasUrl) return;
+
+    const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    let timer = null;
+    if (controller) {
+      timer = setTimeout(() => { try { controller.abort(); } catch (e) {} }, 8000);
+    }
+    let res;
+    try {
+      res = await fetch(gasUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'wake_check' }),
+        redirect: 'follow',
+        signal: controller ? controller.signal : undefined
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (!res || !res.ok) return;
+
+    const j = await res.json();
+    if (!j || !j.success) return;
+
+    const epoch = Number(j.wake_epoch) || 0;
+    const seen = Number(data.wake_epoch_seen) || 0;
+
+    // 「先生がログインしている」または「緊急呼び出しフラグが更新された」→ 起こす
+    if (j.ka_active || (epoch && epoch !== seen)) {
+      if (epoch) await chrome.storage.local.set({ wake_epoch_seen: epoch });
+      // 稼働状態へ切り替える（ensureSyncLoop が 30 秒アラームを張る）
+      applyRemoteKeepalive({
+        ka_active: !!j.ka_active,
+        sync_interval_sec: j.sync_interval_sec,
+        idle_drift_until: j.idle_drift_until
+      });
+      // 詳細なオンライン通知（doPost）。これが「最終同期日時」を更新し、
+      // 端末一覧にオンラインとして表示される。
+      lastSyncMs = 0;
+      syncWithGas();
+      return;
+    }
+
+    // 復帰していない → その時点の時間帯に応じた間隔で次回を待つ。
+    // （平日日中は 1 分、夜間・土日祝は 10 分。境界をまたぐと自動で切り替わる）
+    if (epoch) await chrome.storage.local.set({ wake_epoch_seen: epoch });
+    ensureWakeProbe();
+  } catch (e) {}
+}
+
+// ① イベント起床: 蓋を開けた／スリープから復帰して操作を再開した瞬間に 1 回だけ同期する。
+//    アラームと違い「実際に人が端末を使ったとき」しか動かないため、通信は増えない。
+//    （これが無いと、蓋の開閉だけでは SW が起きず復帰できなかった）
+try {
+  if (chrome.idle && chrome.idle.onStateChanged) {
+    chrome.idle.setDetectionInterval(60);
+    chrome.idle.onStateChanged.addListener((state) => {
+      if (state !== 'active') return;
+      lastSyncMs = 0;      // レート制限を無視して必ず 1 回同期する
+      syncWithGas();
+    });
+  }
+} catch (e) {}
+
+// SW が停止状態から復帰したとき（端末が眠ったまま SW だけ再起動した場合）に備え、
+// 非稼働なら起こしプローブを張り直す。これが無いとアラームが失われたまま復帰できない。
+try {
+  chrome.storage.local.get(['keepalive_active'], (d) => {
+    if (chrome.runtime.lastError) return;
+    if (!(d && d.keepalive_active)) ensureWakeProbe();
+  });
+} catch (e) {}
 
 /**
  * 停止後に管理アプリ（教員コンソール）が再度開かれた場合の復帰。
@@ -297,8 +553,13 @@ async function initializeClient() {
       google_account: googleAccount || ''
     };
 
-    if (managed.school_name && !initialData.school_name) {
-      initialData.school_name = managed.school_name;
+    // 管理ポリシーの school_name は学校OUごとに配布されるため最優先。
+    // 保存済みが「未設定」のままでも、ポリシー値で上書きする。
+    const managedSchool = String(managed.school_name || '').trim();
+    if (managedSchool && managedSchool !== '未設定') {
+      initialData.school_name = managedSchool;
+    } else {
+      initialData.school_name = pickMeaningfulSchoolName(initialData.school_name);
     }
 
     await chrome.storage.local.set(initialData);
@@ -374,6 +635,22 @@ function normalizeSchoolKey(name) {
 }
 
 /**
+ * 端末に保存・送信する学校名を決める（複数候補から最初の「意味のある値」を採用）。
+ *
+ * GAS 側のスプレッドシートは、教員が管理画面で紐付けるまで学校名を「未設定」で返す。
+ * その「未設定」をそのまま採用すると、管理ポリシーで配布した school_name が
+ * 毎回上書きされて失われ、端末から GAS へ学校名を送れなくなる。
+ * そのため '' と '未設定' は「値なし」として読み飛ばす。
+ */
+function pickMeaningfulSchoolName() {
+  for (let i = 0; i < arguments.length; i++) {
+    const v = String(arguments[i] || '').trim();
+    if (v && v !== '未設定') return v;
+  }
+  return '未設定';
+}
+
+/**
  * 1つの拡張機能で複数校（13校）のGASへ振り分けるためのGAS URL解決。
  * 優先度:
  *   1. gas_url_map[学校名]  … 学校ごとに別のGAS（スプレッドシート）を使う場合（推奨）
@@ -386,6 +663,11 @@ function resolveGasUrl(data) {
   const map = (data && data.gas_url_map && typeof data.gas_url_map === 'object') ? data.gas_url_map : {};
   const school = String((data && data.school_name) || '').trim();
   const direct = String((data && data.gas_url) || '').trim();
+
+  // 子GAS分散（SHARD_MODE）: 親から割り当てられた子GASがあれば、それを最優先で使う。
+  // これが無い場合（＝従来運用・SHARD_MODE 無効）は、以下の学校名ベースの解決に進む。
+  const assigned = String((data && data.assigned_gas_url) || '').trim();
+  if (assigned) return assigned;
 
   if (school && school !== '未設定') {
     // 完全一致
@@ -402,6 +684,113 @@ function resolveGasUrl(data) {
   return direct;
 }
 
+// ==================== 子GAS分散（SHARD_MODE）: 動的ルーティング ====================
+// 1校240台 × 1.5秒周期 ≒ 160 req/秒 を 1 つの GAS で受けると、GAS の
+// 「同時実行 30/ユーザー」に達する。そこで親GASが端末のクラスから子GASを割り当て、
+// 端末は以後その子GASへ直接ハートビートする（親は割り当ての指示だけを出す）。
+//
+// 【端末側の状態】
+//   assigned_gas_url   … 割り当てられた子GASのURL（空＝親に繋ぐ）
+//   assigned_from      … 割り当てを出した親のURL（再確認・切り戻し先）
+//   assigned_at        … 割り当てを受けた時刻（エポックms）
+//   assigned_class     … 割り当ての根拠になったクラス（表示・診断用）
+//   assigned_fail_count… 子GASへの連続失敗回数（閾値で親へ戻す）
+const SHARD_RECHECK_MS = 6 * 60 * 60 * 1000; // 6時間ごとに親へ再確認（クラス変更に追従）
+const SHARD_FAIL_LIMIT = 3;                  // 子GASへ3回連続で失敗したら親へ戻す
+const SHARD_COOLDOWN_MS = 30 * 60 * 1000;    // 切り戻し後30分は再割り当てを受けない（失敗の無限往復を防ぐ）
+
+// 割り当て状態のメモリ上の写し。
+//   同期の先頭で storage.local.get(null) を 1 回読んでいるので、その値で初期化する。
+//   これにより 1.5 秒ごとの判定で余分なストレージ読み取りを行わない。
+let shardAssignedCache = '';
+let shardFailCount = 0;
+
+function shardAssignedUrl(data) {
+  return String((data && data.assigned_gas_url) || '').trim();
+}
+
+/** 同期の先頭で読み込んだ data から、割り当て状態のメモリ写しを作る。 */
+function shardSyncMemory(data) {
+  shardAssignedCache = shardAssignedUrl(data);
+  shardFailCount = Number((data && data.assigned_fail_count) || 0) || 0;
+}
+
+/**
+ * 親の応答に含まれる assigned_gas_url を保存し、次回以降の通信先を切り替える。
+ * 子GASは assigned_gas_url を返さないため、子と通信している間は割り当てが維持される。
+ * 親と通信していて assigned_gas_url が返らない場合は、分散が無効化されたとみなして
+ * 割り当てを捨てる（子GASを廃止したときに端末が取り残されないようにする）。
+ *
+ * ※ talkingToParent のときは、値が変わらなくても assigned_at を更新する。
+ *   これが無いと「6時間経過」の条件が永久に真になり、以後ずっと親へ送り続けてしまう。
+ */
+async function applyShardAssignment(resJson, data, usedUrl, talkingToParent) {
+  const next = String((resJson && resJson.assigned_gas_url) || '').trim();
+  const cur = shardAssignedUrl(data);
+  const patch = {};
+
+  if (next) {
+    // 切り戻し直後のクールダウン中は再割り当てを受けない。
+    const fbAt = Number((data && data.shard_fallback_at) || 0);
+    if (!cur && fbAt && (Date.now() - fbAt) < SHARD_COOLDOWN_MS) return;
+
+    if (next !== cur || talkingToParent) {
+      patch.assigned_gas_url = next;
+      patch.assigned_at = Date.now(); // 変更なしでも再確認時刻を更新（B1 の修正）
+      patch.assigned_class = String((resJson && resJson.assigned_class) || '');
+      patch.assigned_fail_count = 0;
+      if (talkingToParent) patch.assigned_from = String(usedUrl || '');
+      else if (!cur) patch.assigned_from = String((data && data.assigned_from) || '');
+      if (data && data.shard_fallback) patch.shard_fallback = false;
+      if (fbAt) patch.shard_fallback_at = 0;
+    }
+  } else if (talkingToParent && cur) {
+    // 親が割り当てを返さない＝SHARD_MODE 無効／マップ削除。親へ戻す。
+    patch.assigned_gas_url = '';
+    patch.assigned_at = 0;
+    patch.assigned_class = '';
+    patch.assigned_from = '';
+    patch.assigned_fail_count = 0;
+  }
+
+  if (Object.keys(patch).length) {
+    try { await chrome.storage.local.set(patch); } catch (e) {}
+    shardAssignedCache = String(patch.assigned_gas_url || '');
+    shardFailCount = 0;
+  }
+}
+
+/**
+ * 子GASへの同期結果を数え、連続失敗が閾値に達したら割り当てを捨てて親へ戻す。
+ * 子GASのURL誤り・デプロイ漏れ・共有シークレット相違などで端末が孤立するのを防ぐ。
+ *
+ * ※ 未割り当て（従来運用・SHARD_MODE 無効）のときは何もせず、ストレージも読まない。
+ */
+async function noteShardOutcome(ok) {
+  try {
+    if (!shardAssignedCache) return;
+    if (ok) {
+      if (shardFailCount !== 0) {
+        shardFailCount = 0;
+        await chrome.storage.local.set({ assigned_fail_count: 0 });
+      }
+      return;
+    }
+    shardFailCount += 1;
+    if (shardFailCount >= SHARD_FAIL_LIMIT) {
+      shardAssignedCache = '';
+      shardFailCount = 0;
+      await chrome.storage.local.set({
+        assigned_gas_url: '', assigned_at: 0, assigned_class: '',
+        assigned_from: '', assigned_fail_count: 0,
+        shard_fallback: true, shard_fallback_at: Date.now()
+      });
+    } else {
+      await chrome.storage.local.set({ assigned_fail_count: shardFailCount });
+    }
+  } catch (e) {}
+}
+
 // 同期の多重実行ガード。
 // ・syncInterval(1.5秒)より GAS 応答が遅い場合、複数の同期が重なって走る。
 // ・古いリクエストの応答が新しい応答の後に到着すると、古い状態（例: ロック解除前）で
@@ -409,6 +798,61 @@ function resolveGasUrl(data) {
 // ・実行中はスキップし、常に1本だけ直列で走らせる。
 const SYNC_TIMEOUT_MS = 12000; // GAS 応答のタイムアウト。ハングで syncInFlight が立ったまま（＝反映停止）になるのを防ぐ。
 let syncInFlight = false;
+
+// 同期結果の診断情報。
+//   直接読み込み版（検証用）のポップアップは chrome://extensions が使えない環境で
+//   「なぜ同期できないのか」を表示する唯一の窓口になるため、失敗理由を保持する。
+//   通信負荷を増やさないため、書き込みは「成功可否・理由が変わったときだけ」に限定する。
+let lastSyncDiag = { ok: null, code: '', message: '', at: '' };
+async function recordSyncDiag(ok, code, message) {
+  const at = new Date().toLocaleTimeString();
+  const changed = (lastSyncDiag.ok !== ok) || (lastSyncDiag.code !== code) ||
+                  (lastSyncDiag.message !== message);
+  lastSyncDiag = { ok: !!ok, code: String(code || ''), message: String(message || ''), at: at };
+  // 子GAS分散: 子へ連続失敗したら親へ戻す（変化の有無に関わらず毎回判定する）
+  try { await noteShardOutcome(!!ok); } catch (e) {}
+  if (!changed) return; // 変化なし＝ストレージ書込みしない（I/O を増やさない）
+  try {
+    await chrome.storage.local.set({
+      sync_diag_ok: lastSyncDiag.ok,
+      sync_diag_code: lastSyncDiag.code,
+      sync_diag_message: lastSyncDiag.message,
+      sync_diag_at: lastSyncDiag.at
+    });
+  } catch (e) {}
+}
+
+// 疎通確認（手動実行のみ・通常運用では呼ばれない）。
+//   直接読み込み版の検証で「URL が正しいか」「Web アプリの公開範囲が正しいか」を
+//   切り分けるために使う。シートに触らない wake_check（GET）を 1 回だけ叩く。
+const TEST_TIMEOUT_MS = 8000;
+async function testGasConnection(urlOverride) {
+  const data = await chrome.storage.local.get(null);
+  const url = String(urlOverride || '').trim() || resolveGasUrl(data);
+  if (!url) return { ok: false, error: 'GAS WebアプリURLが未設定です' };
+  const started = Date.now();
+  const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  let timer = null;
+  if (controller) timer = setTimeout(() => { try { controller.abort(); } catch (e) {} }, TEST_TIMEOUT_MS);
+  try {
+    const sep = (url.indexOf('?') === -1) ? '?' : '&';
+    const res = await fetch(url + sep + 'api=wake_check&_t=' + started, {
+      method: 'GET', redirect: 'follow', cache: 'no-store',
+      signal: controller ? controller.signal : undefined
+    });
+    const ms = Date.now() - started;
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) { json = null; }
+    const ok = !!res.ok && !!json && json.success !== false;
+    return { ok: ok, status: res.status, ms: ms, json: json, head: text.slice(0, 300), url: url };
+  } catch (e) {
+    const detail = String((e && e.message) ? e.message : e);
+    return { ok: false, ms: Date.now() - started, error: detail, url: url };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
  * GASとのハートビート・ポリシー同期
@@ -418,6 +862,8 @@ async function syncWithGas() {
   syncInFlight = true;
   try {
     const data = await chrome.storage.local.get(null);
+    // 子GAS分散: 割り当て状態をメモリへ写す（以降の判定でストレージを読まない）
+    shardSyncMemory(data);
     let studentId = data.student_id;
 
     // もし student_id が未設定の場合、Googleアカウントの再検出を試みる
@@ -433,11 +879,29 @@ async function syncWithGas() {
     // まず保存済みの school_name / gas_url_map から解決する。
     let effectiveGasUrl = resolveGasUrl(data);
 
+    // 子GAS分散（SHARD_MODE）: 割り当て済みなら子GASへ直接送る（resolveGasUrl が最優先で返す）。
+    // ただし 6 時間ごとに親へ問い合わせ直し、クラス変更などで割り当てが変わった場合に追従する。
+    const assignedFromUrl = String((data && data.assigned_from) || '').trim();
+    const assignedAtMs = Number((data && data.assigned_at) || 0);
+    let talkingToParent = !shardAssignedUrl(data);
+    if (shardAssignedUrl(data) && assignedFromUrl && assignedAtMs &&
+        (Date.now() - assignedAtMs) > SHARD_RECHECK_MS) {
+      effectiveGasUrl = assignedFromUrl; // 今回は親へ（応答で新しい割り当てが返る）
+      talkingToParent = true;
+    }
+
+    // 端末の学校名も heartbeat で GAS へ送る。
+    // これが無いと GAS 側は端末一覧を「学校名 = 未設定」で登録してしまい、
+    // 管理ポリシーで school_name を配布してもシートに反映されない。
+    // （教員の学校スコープ判定はシートの学校名を使うため、未設定のままだと全校の教員から見える）
+    let schoolNameForGas = String(data.school_name || '').trim();
+    if (schoolNameForGas === '未設定') schoolNameForGas = '';
+
     // 解決できない場合（学校未確定・マップ未取得）は managed storage を再確認する。
     if (!effectiveGasUrl || !data.school_name || data.school_name === '未設定') {
       const managed = await getManagedPolicy();
       const merged = {
-        school_name: data.school_name || managed.school_name || '',
+        school_name: pickMeaningfulSchoolName(data.school_name, managed.school_name),
         gas_url_map: (data.gas_url_map && Object.keys(data.gas_url_map).length)
           ? data.gas_url_map
           : (managed.gas_url_map || {}),
@@ -446,13 +910,18 @@ async function syncWithGas() {
       const managedGasUrl = resolveGasUrl(merged);
       if (managedGasUrl) effectiveGasUrl = managedGasUrl;
 
+      if (!schoolNameForGas && merged.school_name && merged.school_name !== '未設定') {
+        schoolNameForGas = merged.school_name;
+      }
+
       // ポリシー由来の値が保存されていなければ補完保存する
       const persist = {};
       if (merged.gas_url_map && Object.keys(merged.gas_url_map).length &&
           (!data.gas_url_map || !Object.keys(data.gas_url_map).length)) {
         persist.gas_url_map = merged.gas_url_map;
       }
-      if (merged.school_name && merged.school_name !== data.school_name) {
+      if (merged.school_name && merged.school_name !== '未設定' &&
+          merged.school_name !== data.school_name) {
         persist.school_name = merged.school_name;
       }
       if (merged.gas_url && merged.gas_url !== data.gas_url) {
@@ -463,6 +932,9 @@ async function syncWithGas() {
 
     if (!effectiveGasUrl || !studentId) {
       // GAS URL または 児童ID が未設定の場合は同期不可
+      await recordSyncDiag(false, 'not_configured',
+        !effectiveGasUrl ? 'GAS WebアプリURLが未設定です'
+                         : '児童ID（Googleアカウント）が未設定です');
       return;
     }
 
@@ -473,7 +945,9 @@ async function syncWithGas() {
     const payload = {
       action: 'heartbeat',
       student_id: studentId,
-      current_url: currentUrl
+      current_url: currentUrl,
+      // 端末の学校名（未確定なら空文字）。GAS はこれで端末一覧の学校名を補完する。
+      school_name: schoolNameForGas
     };
 
     // タイムアウト付きで送信する（応答が返らない場合でも syncInFlight を解放し、
@@ -500,14 +974,30 @@ async function syncWithGas() {
 
     if (!response.ok) {
       console.warn('[EduAgent] GASレスポンスエラー:', response.status);
+      await recordSyncDiag(false, 'http_' + response.status,
+        'GASが HTTP ' + response.status + ' を返しました（URLの誤り／デプロイ権限を確認）');
       return;
     }
 
-    const resJson = await response.json();
-    if (!resJson.success) {
-      console.warn('[EduAgent] 同期エラー:', resJson.error);
+    let resJson;
+    try {
+      resJson = await response.json();
+    } catch (e) {
+      // GAS がログイン画面（HTML）を返した場合などに該当する。
+      await recordSyncDiag(false, 'not_json',
+        'GASの応答がJSONではありません（Webアプリの「アクセスできるユーザー」を確認）');
       return;
     }
+    if (!resJson.success) {
+      console.warn('[EduAgent] 同期エラー:', resJson.error);
+      await recordSyncDiag(false, 'gas_error',
+        'GASがエラーを返しました: ' + String(resJson.error || '(詳細なし)'));
+      return;
+    }
+
+    // 子GAS分散: 親からの割り当て（assigned_gas_url）を保存し、次回以降の通信先を切り替える。
+    // ※ applyPolicies より先に評価するため、data（更新前）と実使用URLを渡す。
+    await applyShardAssignment(resJson, data, effectiveGasUrl, talkingToParent);
 
     // 最新ポリシーの反映
     await applyPolicies(resJson, data);
@@ -522,8 +1012,15 @@ async function syncWithGas() {
       idle_drift_until: resJson.idle_drift_until
     });
 
+    await recordSyncDiag(true, 'ok', '');
+
   } catch (err) {
     console.error('[EduAgent] 通信エラー:', err);
+    try {
+      const detail = String((err && err.message) ? err.message : err);
+      await recordSyncDiag(false, 'network',
+        'GASへ到達できません（URL・ネットワーク・公開範囲を確認）: ' + detail);
+    } catch (e2) {}
   } finally {
     syncInFlight = false;
   }
@@ -535,7 +1032,9 @@ async function syncWithGas() {
 async function applyPolicies(newPolicy, oldStorage) {
   const updates = {
     last_sync_time: new Date().toLocaleTimeString(),
-    school_name: newPolicy.school_name || oldStorage.school_name || '未設定',
+    // GAS は教員が紐付けるまで「未設定」を返すため、そのまま採用すると
+    // 管理ポリシーで配布した学校名が毎回失われる。意味のある値だけを採用する。
+    school_name: pickMeaningfulSchoolName(newPolicy.school_name, oldStorage.school_name),
     student_name: newPolicy.student_name || oldStorage.student_name || '',
     class_name: newPolicy.class_name || oldStorage.class_name || '',
     screen_lock: Boolean(newPolicy.screen_lock),
@@ -665,15 +1164,30 @@ async function captureAndUploadScreenshot() {
     }
     if (!tab || !tab.windowId) return;
 
-    // キャプチャ不可のページ（内部ページ・拡張機能ページ）はスキップ
+    // 【R43.2】キャプチャ不可のページ（内部ページ・拡張機能ページ）は
+    //   黙って return せず、理由を必ずログに残す（原因究明のため）。
+    //   画面一覧は補助機能のため、通知できなくても他の同期処理には影響させない。
     const url = tab.url || '';
     if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
         url.startsWith('about:') || url.startsWith('devtools://')) {
+      console.warn('[EduAgent] 画面キャプチャ不可（保護されたページ）のため送信しません:', url);
       return;
     }
 
-    const raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
-    if (!raw || !/^data:image\//.test(raw)) return;
+    // 【R43.2】captureVisibleTab の失敗を握り潰さない。
+    //   URL 判定をすり抜ける保護ページや非アクティブウィンドウでも例外になる。
+    let raw = null;
+    try {
+      raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
+    } catch (eCap) {
+      console.warn('[EduAgent] 画面キャプチャに失敗（送信しません）:',
+        eCap && eCap.message ? eCap.message : eCap);
+      return;
+    }
+    if (!raw || !/^data:image\//.test(raw)) {
+      console.warn('[EduAgent] 画面キャプチャ結果が画像ではありません（送信しません）');
+      return;
+    }
 
     // セル上限に収まるよう縮小（収まらなければ送信しない＝壊れたデータを残さない）
     const dataUrl = await downscaleForSheet(raw);
@@ -682,17 +1196,43 @@ async function captureAndUploadScreenshot() {
       return;
     }
 
-    await fetch(effectiveGasUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'screenshot',
-        student_id: studentId,
-        image_data: dataUrl,
-        mime_type: 'image/jpeg'
-      }),
-      redirect: 'follow'
-    });
+    // 【R43.2】レスポンスを検証する。
+    //   R43.1 までは response.ok を見ておらず、GAS が 500 を返しても
+    //   「送信しました」と出力していた（実機で原因究明を遅らせた誤ログ）。
+    let response = null;
+    try {
+      response = await fetch(effectiveGasUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'screenshot',
+          student_id: studentId,
+          image_data: dataUrl,
+          mime_type: 'image/jpeg'
+        }),
+        redirect: 'follow'
+      });
+    } catch (eNet) {
+      console.warn('[EduAgent] 画面情報の送信に失敗（通信）:',
+        eNet && eNet.message ? eNet.message : eNet, '(base64 ' + dataUrl.length + ' 文字)');
+      return;
+    }
+
+    if (!response || !response.ok) {
+      console.warn('[EduAgent] 画面情報の送信が拒否されました: HTTP ' +
+        (response ? response.status : 0) + '（base64 ' + dataUrl.length + ' 文字）');
+      return;
+    }
+
+    // GAS は 200 でも {"success":false,...} を返すことがある。成功と誤認しない。
+    let body = null;
+    try { body = await response.json(); } catch (eJson) { body = null; }
+    if (body && body.success === false) {
+      console.warn('[EduAgent] 画面情報の保存に失敗:',
+        body.error_code || '', body.error || '', '(base64 ' + dataUrl.length + ' 文字)');
+      return;
+    }
+
     console.log('[EduAgent] 画面情報（スクリーンショット）を送信しました', dataUrl.length);
   } catch (err) {
     // captureVisibleTab はマニフェスト権限が無い/対象外ページで失敗する。
@@ -1078,10 +1618,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'TRIGGER_SYNC') {
+    // 診断（直接読み込み版のポップアップ表示用）。
+    // 同期の多重実行中は syncWithGas が即 return するため、その場合も直前の結果を返す。
     syncWithGas().then(() => {
-      chrome.storage.local.get(null).then(data => sendResponse({ success: true, data }));
+      chrome.storage.local.get(null).then(data => {
+        sendResponse({ success: true, data, diag: lastSyncDiag });
+      });
     }).catch(err => {
-      sendResponse({ success: false, error: err.toString() });
+      sendResponse({ success: false, error: err.toString(), diag: lastSyncDiag });
+    });
+    return true;
+  }
+  if (message.type === 'GET_SYNC_DIAG') {
+    sendResponse({ success: true, diag: lastSyncDiag });
+    return true;
+  }
+  // 疎通確認（直接読み込み版の設定画面から手動で実行される）。
+  if (message.type === 'TEST_CONNECTION') {
+    testGasConnection(message.url).then(function (r) { sendResponse(r); })
+      .catch(function (e) { sendResponse({ ok: false, error: String(e) }); });
+    return true;
+  }
+  // 通信状態の取得（直接読み込み版のポップアップ表示用・通信は発生しない）。
+  if (message.type === 'GET_STATUS_FULL') {
+    let probe = null;
+    try { probe = getProbeBand(Date.now()); } catch (e) { probe = null; }
+    sendResponse({
+      ok: true,
+      status: {
+        ka_active: !!keepaliveActive,
+        sync_interval_sec: keepaliveActive ? (activeIntervalMs / 1000) : 0,
+        idle_drift_until: idleDriftUntil || 0,
+        probe: probe
+      }
     });
     return true;
   }
