@@ -3419,56 +3419,73 @@ const SCREENSHOT_MAX_BYTES = 45000;
  * 児童端末から届いたスクリーンショットを『画面情報』シートへ保存し、
  * 端末一覧の『画面情報更新日時』を更新する。
  * ※ 認証不要（ハートビートと同じ経路）。データURLは画像として検証する。
+ *
+ * 【R43.2】関数全体を try-catch で保護する。
+ *   R43.1 までは途中で例外が起きると doPost の外へ抜け、GAS が HTTP 500 を返していた。
+ *   端末側は 500 を受け取ると保存できていないのに「更新待ち」のままになる。
+ *   ここで例外を捕まえて JSON を返せば、500 にならず、端末側でも
+ *   「保存に失敗した理由」をログに出せる（原因究明が進む）。
  */
 function processScreenshotUpload(studentId, imageData, mimeType) {
-  if (!studentId) return { success: false, error: 'student_id is required' };
-  const data = String(imageData || '');
-  if (!/^data:image\/(png|jpeg|jpg|webp);base64,/i.test(data) && !/^[A-Za-z0-9+/=\s]+$/.test(data)) {
-    return { success: false, error: 'invalid image data' };
-  }
-  const mime = (mimeType || 'image/jpeg').toString();
-  const base64 = data.replace(/^data:image\/[a-z]+;base64,/i, '');
-  if (base64.length > SCREENSHOT_MAX_BYTES) {
-    return { success: false, error: 'image too large' };
-  }
-
-  const sheet = getTargetSheet(CONFIG.SCREENSHOT_SHEET_NAME);
-  const headerMap = getHeaderMap(sheet, CONFIG.SCREENSHOT_COLUMNS);
-  const rows = sheet.getDataRange().getValues();
-  const idColIdx = headerMap['児童ID'] - 1;
-  const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
-
-  let targetRow = -1;
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][idColIdx] || '').trim() === String(studentId).trim()) { targetRow = i + 1; break; }
-  }
-  const rowValues = [[studentId, now, mime, base64]];
-  if (targetRow !== -1) {
-    sheet.getRange(targetRow, 1, 1, CONFIG.SCREENSHOT_COLUMNS.length).setValues(rowValues);
-  } else {
-    sheet.appendRow(rowValues[0]);
-  }
-
-  // 端末一覧の『画面情報更新日時』を更新（取得完了の可視化）
   try {
-    const dSheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
-    const dMap = getHeaderMap(dSheet, CONFIG.DEVICE_COLUMNS);
-    const shotCol = dMap['画面情報更新日時'];
-    if (shotCol) {
-      const dRows = dSheet.getDataRange().getValues();
-      const dIdCol = dMap['児童ID'] - 1;
-      for (let i = 1; i < dRows.length; i++) {
-        if (String(dRows[i][dIdCol] || '').trim() === String(studentId).trim()) {
-          dSheet.getRange(i + 1, shotCol).setValue(now);
-          break;
+    if (!studentId) return { success: false, error: 'student_id is required' };
+    const data = String(imageData || '');
+    if (!/^data:image\/(png|jpeg|jpg|webp);base64,/i.test(data) && !/^[A-Za-z0-9+/=\s]+$/.test(data)) {
+      return { success: false, error: 'invalid image data' };
+    }
+    const mime = (mimeType || 'image/jpeg').toString();
+    const base64 = data.replace(/^data:image\/[a-z]+;base64,/i, '');
+    if (base64.length > SCREENSHOT_MAX_BYTES) {
+      return { success: false, error: 'image too large', base64_len: base64.length, limit: SCREENSHOT_MAX_BYTES };
+    }
+
+    const sheet = getTargetSheet(CONFIG.SCREENSHOT_SHEET_NAME);
+    const headerMap = getHeaderMap(sheet, CONFIG.SCREENSHOT_COLUMNS);
+    const rows = sheet.getDataRange().getValues();
+    const idColIdx = headerMap['児童ID'] - 1;
+    const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+
+    let targetRow = -1;
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][idColIdx] || '').trim() === String(studentId).trim()) { targetRow = i + 1; break; }
+    }
+    const rowValues = [[studentId, now, mime, base64]];
+    if (targetRow !== -1) {
+      sheet.getRange(targetRow, 1, 1, CONFIG.SCREENSHOT_COLUMNS.length).setValues(rowValues);
+    } else {
+      sheet.appendRow(rowValues[0]);
+    }
+
+    // 端末一覧の『画面情報更新日時』を更新（取得完了の可視化）
+    try {
+      const dSheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+      const dMap = getHeaderMap(dSheet, CONFIG.DEVICE_COLUMNS);
+      const shotCol = dMap['画面情報更新日時'];
+      if (shotCol) {
+        const dRows = dSheet.getDataRange().getValues();
+        const dIdCol = dMap['児童ID'] - 1;
+        for (let i = 1; i < dRows.length; i++) {
+          if (String(dRows[i][dIdCol] || '').trim() === String(studentId).trim()) {
+            dSheet.getRange(i + 1, shotCol).setValue(now);
+            break;
+          }
         }
       }
+    } catch (e) {
+      Logger.log('画面情報更新日時の更新に失敗: ' + e);
     }
-  } catch (e) {
-    Logger.log('画面情報更新日時の更新に失敗: ' + e);
-  }
 
-  return { success: true, student_id: studentId, at: now };
+    return { success: true, student_id: studentId, at: now };
+
+  } catch (err) {
+    // 【R43.2】未捕捉例外を HTTP 500 にせず JSON で返す（端末側が理由を記録できる）。
+    const msg = (err && err.message) ? err.message : String(err);
+    try {
+      Logger.log('[SCREENSHOT] upload failed: student=' + String(studentId || '') +
+                 ' error=' + msg);
+    } catch (eLog) {}
+    return { success: false, error: msg, error_code: 'upload_failed' };
+  }
 }
 
 /**

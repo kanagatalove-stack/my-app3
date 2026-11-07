@@ -1164,15 +1164,30 @@ async function captureAndUploadScreenshot() {
     }
     if (!tab || !tab.windowId) return;
 
-    // キャプチャ不可のページ（内部ページ・拡張機能ページ）はスキップ
+    // 【R43.2】キャプチャ不可のページ（内部ページ・拡張機能ページ）は
+    //   黙って return せず、理由を必ずログに残す（原因究明のため）。
+    //   画面一覧は補助機能のため、通知できなくても他の同期処理には影響させない。
     const url = tab.url || '';
     if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
         url.startsWith('about:') || url.startsWith('devtools://')) {
+      console.warn('[EduAgent] 画面キャプチャ不可（保護されたページ）のため送信しません:', url);
       return;
     }
 
-    const raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
-    if (!raw || !/^data:image\//.test(raw)) return;
+    // 【R43.2】captureVisibleTab の失敗を握り潰さない。
+    //   URL 判定をすり抜ける保護ページや非アクティブウィンドウでも例外になる。
+    let raw = null;
+    try {
+      raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
+    } catch (eCap) {
+      console.warn('[EduAgent] 画面キャプチャに失敗（送信しません）:',
+        eCap && eCap.message ? eCap.message : eCap);
+      return;
+    }
+    if (!raw || !/^data:image\//.test(raw)) {
+      console.warn('[EduAgent] 画面キャプチャ結果が画像ではありません（送信しません）');
+      return;
+    }
 
     // セル上限に収まるよう縮小（収まらなければ送信しない＝壊れたデータを残さない）
     const dataUrl = await downscaleForSheet(raw);
@@ -1181,17 +1196,43 @@ async function captureAndUploadScreenshot() {
       return;
     }
 
-    await fetch(effectiveGasUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'screenshot',
-        student_id: studentId,
-        image_data: dataUrl,
-        mime_type: 'image/jpeg'
-      }),
-      redirect: 'follow'
-    });
+    // 【R43.2】レスポンスを検証する。
+    //   R43.1 までは response.ok を見ておらず、GAS が 500 を返しても
+    //   「送信しました」と出力していた（実機で原因究明を遅らせた誤ログ）。
+    let response = null;
+    try {
+      response = await fetch(effectiveGasUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'screenshot',
+          student_id: studentId,
+          image_data: dataUrl,
+          mime_type: 'image/jpeg'
+        }),
+        redirect: 'follow'
+      });
+    } catch (eNet) {
+      console.warn('[EduAgent] 画面情報の送信に失敗（通信）:',
+        eNet && eNet.message ? eNet.message : eNet, '(base64 ' + dataUrl.length + ' 文字)');
+      return;
+    }
+
+    if (!response || !response.ok) {
+      console.warn('[EduAgent] 画面情報の送信が拒否されました: HTTP ' +
+        (response ? response.status : 0) + '（base64 ' + dataUrl.length + ' 文字）');
+      return;
+    }
+
+    // GAS は 200 でも {"success":false,...} を返すことがある。成功と誤認しない。
+    let body = null;
+    try { body = await response.json(); } catch (eJson) { body = null; }
+    if (body && body.success === false) {
+      console.warn('[EduAgent] 画面情報の保存に失敗:',
+        body.error_code || '', body.error || '', '(base64 ' + dataUrl.length + ' 文字)');
+      return;
+    }
+
     console.log('[EduAgent] 画面情報（スクリーンショット）を送信しました', dataUrl.length);
   } catch (err) {
     // captureVisibleTab はマニフェスト権限が無い/対象外ページで失敗する。
