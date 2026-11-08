@@ -2753,6 +2753,28 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
   const shotCol = headerMap['画面情報更新日時'];
   const monFlagCol = headerMap['要注意'];
   const monReasonCol = headerMap['注意理由'];
+
+  // 【フェーズ3】スケジュール（タイマー）の配信。
+  //   端末は受信した時間窓を storage にキャッシュし、chrome.alarms で
+  //   「開始時刻ちょうど／終了時刻ちょうど」に発動する。オフラインでも
+  //   予約が効くのはこのキャッシュがあるため。
+  //   ※ 予約シートが読めなくてもハートビート自体は必ず返す（監視を止めない）。
+  const schClassName = String(row[headerMap['クラス'] - 1] || '');
+  const schSchoolName = String(row[headerMap['学校名'] - 1] || '');
+  // server_time（文字列）と同じ瞬間を ms で表す。sheetTsToMs は JST 決め打ちなので
+  // 実行環境のタイムゾーンに依存せず、server_time と server_time_ms がずれない。
+  let serverTimeMs = 0;
+  try { serverTimeMs = sheetTsToMs(now); } catch (eMs) { serverTimeMs = 0; }
+  if (!serverTimeMs) serverTimeMs = new Date().getTime();
+
+  let schedulesPayload = { active: [], upcoming: [], overridden_ids: [] };
+  try {
+    schedulesPayload = buildSchedulePayloadForDevice_(
+      studentId, schClassName, schSchoolName, serverTimeMs);
+  } catch (eSch) {
+    try { Logger.log('[SCHEDULE] payload build failed: ' + eSch); } catch (eLog) {}
+  }
+
   return {
     student_id: studentId,
     school_name: String(row[headerMap['学校名'] - 1] || ''),
@@ -2772,7 +2794,13 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
     ka_active: kaActive,
     sync_interval_sec: kaInfo.sync_interval_sec,
     idle_drift_until: kaInfo.idle_drift_until,
-    server_time: now
+    server_time: now,
+    // 【フェーズ3】端末の時計補正とスケジュール判定のための配信契約。
+    //   server_time_ms … server_time と同じ瞬間の epoch ms（端末はこれで時計を補正）
+    //   schedules      … { active, upcoming, overridden_ids }
+    //                    active=いま効いている窓 / upcoming=直近の1件 / overridden=解除済みID
+    server_time_ms: serverTimeMs,
+    schedules: schedulesPayload
   };
 }
 

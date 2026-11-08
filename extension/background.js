@@ -47,6 +47,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   } else if (alarm.name === 'wakeAlarm') {
     // 非稼働中でも「先生が復帰したか」だけを軽く確認する（シート非接触の短い応答）。
     probeWake();
+  } else if (alarm.name === 'scheduleEdge' || alarm.name === 'scheduleTick') {
+    // 【フェーズ3】スケジュール（タイマー）の境界発動。
+    //   scheduleEdge … 開始/終了時刻ちょうどに1回だけ起こす（本命）
+    //   scheduleTick … 1分ごとの見張り（Edge を取りこぼした場合の保険）
+    //   どちらも通信せず、storage にキャッシュした予約だけで判定する（オフライン保護）。
+    reevaluateSchedules().catch(e => {
+      console.warn('[EduAgent] スケジュール再評価エラー:', e && e.message ? e.message : e);
+    });
   }
 });
 
@@ -576,6 +584,12 @@ async function initializeClient() {
     if (initialGasUrl) {
       await syncWithGas();
     }
+
+    // 【フェーズ3】保存済みの予約から制限状態と境界アラームを復元する。
+    //   chrome.alarms は再起動で消えるため、これが無いと
+    //   「翌朝、予約が効かない」「終了時刻を過ぎても解除されない」事故になる。
+    //   syncWithGas の後に呼ぶ（新しい予約を取り込んだ直後の状態で張り直すため）。
+    await restoreSchedulesOnBoot();
   } catch (err) {
     console.error('[EduAgent] 初期化エラー:', err);
   }
@@ -952,6 +966,9 @@ async function syncWithGas() {
 
     // タイムアウト付きで送信する（応答が返らない場合でも syncInFlight を解放し、
     // 以後の同期が永久に止まらないようにする）。
+    // 【フェーズ3】送信時刻を控える。応答受信時に往復の中央時刻を求めて
+    //   サーバ時刻との差（時計補正）を NTP 風に算出するために使う。
+    lastHeartbeatSentMs = Date.now();
     const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     let timer = null;
     if (controller) {
@@ -1026,6 +1043,405 @@ async function syncWithGas() {
   }
 }
 
+// ============================================================================
+// スケジュール／タイマー  ―  フェーズ3: 端末判定エンジン
+//
+//   放課後・休日・家庭持ち帰り端末で「指定した時間帯だけ」URL規制/画面ロックを
+//   自動で ON にし、時間が来たら自動で解除する。
+//
+//   【設計の芯】
+//     1) 判定は「純粋関数」で行う（Date.now を内部で呼ばない）。
+//        時刻は必ず引数 nowMs で渡す → テストで任意の瞬間を再現できる。
+//     2) サーバ時刻との差は NTP 風に平滑化して保持する（EMA）。
+//        GAS は server_time_ms（数値 epoch）を返すので、通信の往復中央時刻との
+//        差分をサンプルとして取り込む。端末の時計が大きく狂っていても
+//        予約が「別の日の同じ時刻」に発動する事故を防ぐ。
+//     3) スケジュールは「締める方向」にだけ重ねる。
+//        学校全体の常時ポリシーを緩めることは絶対にない（安全側）。
+//     4) 予約は storage にキャッシュする。オフラインでも、
+//        同期が throttle で飛ばされても、境界時刻に正しく発動できる。
+//     5) 境界発動は chrome.alarms。MV3 の Service Worker は suspend されるため
+//        setTimeout は信用できない（アラームだけが確実に起こす）。
+// ============================================================================
+
+const SCHEDULE_OFFSET_SMOOTH = 0.3;        // EMA の平滑化係数
+const SCHEDULE_OFFSET_MAX_ABS = 300000;    // 5分超のズレは異常値として捨てる
+const SCHEDULE_CACHE_KEY = 'schedule_cache';
+const SCHEDULE_EDGE_ALARM = 'scheduleEdge'; // 境界ちょうどに1回だけ起こす
+const SCHEDULE_TICK_ALARM = 'scheduleTick'; // 1分ごとの見張り（取りこぼし保険）
+
+let clockOffsetMs = 0;        // サーバ時刻 - 端末時刻（ms）
+let scheduleCache = null;     // { schedules:{active,upcoming,overridden_ids}, saved_at }
+let lastHeartbeatSentMs = 0;  // 直近ハートビートの送信時刻（RTT 計算用）
+
+/**
+ * NTP 風の時計補正（純粋関数）。
+ *   往復の中央時刻を基準にサンプルを取り、EMA で滑らかに追従させる。
+ *   異常値（5分超）は捨て、既存の補正値を維持する。
+ */
+function updateClockOffset(serverMs, sentMs, recvMs, curOffset) {
+  const cur = (typeof curOffset === 'number' && isFinite(curOffset)) ? curOffset : 0;
+  const s = Number(serverMs), a = Number(sentMs), b = Number(recvMs);
+  // server_time_ms は「正の epoch ms」。0 / NaN / 未設定はサーバ時刻なしとして無視する
+  //   （1970年を本物のサーバ時刻として採用してしまうのを防ぐ）。
+  if (!isFinite(s) || s <= 0) return cur;
+  // 送受信時刻は 0 でも妥当（!a のような falsy 判定にすると 0 を弾いてしまう）。
+  if (!isFinite(a) || !isFinite(b) || a < 0 || b < 0) return cur;
+  const mid = (a + b) / 2;
+  const sample = s - mid;
+  if (Math.abs(sample) > SCHEDULE_OFFSET_MAX_ABS) return cur; // 異常値は捨てる
+  if (curOffset === undefined || curOffset === null) return sample; // 初回
+  return cur + (sample - cur) * SCHEDULE_OFFSET_SMOOTH;
+}
+
+/** 補正後の現在時刻（ms）。offset 省略時は保持中の補正値を使う。 */
+function correctedNowMs(offset) {
+  const o = (typeof offset === 'number' && isFinite(offset)) ? offset : clockOffsetMs;
+  return Date.now() + o;
+}
+
+/** 与えられた窓が nowMs を含むか（純粋関数）。 */
+function isScheduleActiveAt(s, nowMs) {
+  if (!s) return false;
+  const start = Number(s.start_ms);
+  const end = Number(s.end_ms);
+  if (!start || !end || isNaN(start) || isNaN(end)) return false;
+  return nowMs >= start && nowMs < end;
+}
+
+/** active / upcoming を1本の配列にまとめる（重複IDは除く）。 */
+function buildScheduleList(schedules) {
+  const out = [];
+  const seen = {};
+  const push = function (arr) {
+    if (!Array.isArray(arr)) return;
+    arr.forEach(function (s) {
+      if (!s || !s.id) return;
+      if (seen[s.id]) return;
+      seen[s.id] = true;
+      out.push(s);
+    });
+  };
+  if (schedules && typeof schedules === 'object') {
+    push(schedules.active);
+    push(schedules.upcoming);
+  }
+  return out;
+}
+
+/** ホスト一覧の正規化（小文字・空白除去・空要素の排除）。 */
+function normalizeHostList(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  list.forEach(function (x) {
+    const h = String(x === null || x === undefined ? '' : x).trim().toLowerCase();
+    if (h && out.indexOf(h) < 0) out.push(h);
+  });
+  return out;
+}
+
+/**
+ * 規制モードの重ね合わせ（純粋関数）。
+ *   原則: 必ず「締める方向」にだけ倒す。
+ *     WHITELIST 同士        … 許可リストの積集合（両方許可したものだけ通す）
+ *     WHITELIST と BLACKLIST … WHITELIST を採用し、許可から規制分を差し引く
+ *     BLACKLIST 同士        … 規制リストの和集合（規制が増える）
+ *     それ以外              … 制限の強い側を採用
+ */
+function composeFilterRestriction(base, sched) {
+  const baseMode = String((base && base.filter_mode) || 'OFF').toUpperCase();
+  const baseWhite = normalizeHostList(base && base.whitelist_urls);
+  const baseBlack = normalizeHostList(base && base.blacklist_urls);
+
+  if (!sched || String(sched.type || '').toLowerCase() !== 'url_block') {
+    return { filter_mode: baseMode, whitelist_urls: baseWhite, blacklist_urls: baseBlack };
+  }
+  const sMode = String(sched.filter_mode || '').toUpperCase();
+  const sWhite = normalizeHostList(sched.whitelist);
+  const sBlack = normalizeHostList(sched.blacklist);
+
+  // 1) WHITELIST × WHITELIST → 積集合
+  if (baseMode === 'WHITELIST' && sMode === 'WHITELIST') {
+    const inter = baseWhite.filter(function (h) { return sWhite.indexOf(h) >= 0; });
+    return { filter_mode: 'WHITELIST', whitelist_urls: inter, blacklist_urls: baseBlack };
+  }
+  // 2) どちらかが WHITELIST → WHITELIST が強い。許可から規制分を差し引く
+  if (baseMode === 'WHITELIST' || sMode === 'WHITELIST') {
+    const white = (baseMode === 'WHITELIST') ? baseWhite : sWhite;
+    const black = (baseMode === 'WHITELIST')
+      ? baseBlack.concat(sBlack)
+      : sBlack.concat(baseBlack);
+    const blackUniq = normalizeHostList(black);
+    const whiteTight = white.filter(function (h) { return blackUniq.indexOf(h) < 0; });
+    return { filter_mode: 'WHITELIST', whitelist_urls: whiteTight, blacklist_urls: blackUniq };
+  }
+  // 3) BLACKLIST × BLACKLIST → 和集合
+  if (baseMode === 'BLACKLIST' && sMode === 'BLACKLIST') {
+    return { filter_mode: 'BLACKLIST', whitelist_urls: baseWhite, blacklist_urls: normalizeHostList(baseBlack.concat(sBlack)) };
+  }
+  // 4) ベースOFF + スケジュールBLACKLIST
+  if (sMode === 'BLACKLIST') {
+    return { filter_mode: 'BLACKLIST', whitelist_urls: baseWhite, blacklist_urls: sBlack };
+  }
+  // 5) それ以外はベース維持
+  return { filter_mode: baseMode, whitelist_urls: baseWhite, blacklist_urls: baseBlack };
+}
+
+/**
+ * いま効いているスケジュール制限を求める（純粋関数）。
+ *   解除済み（overridden_ids）は対象外。
+ */
+function computeEffectiveScheduleRestriction(schedules, nowMs) {
+  const result = {
+    screen_lock: false,
+    url_block: false,
+    filter_mode: 'OFF',
+    whitelist_urls: [],
+    blacklist_urls: [],
+    active_ids: []
+  };
+  const overridden = (schedules && Array.isArray(schedules.overridden_ids))
+    ? schedules.overridden_ids : [];
+  const list = buildScheduleList(schedules);
+
+  let acc = { filter_mode: 'OFF', whitelist_urls: [], blacklist_urls: [] };
+  list.forEach(function (s) {
+    if (overridden.indexOf(s.id) >= 0) return;      // 今回だけ解除されている
+    if (!isScheduleActiveAt(s, nowMs)) return;      // いまは時間外
+    if (result.active_ids.indexOf(s.id) < 0) result.active_ids.push(s.id);
+    const type = String(s.type || 'url_block').toLowerCase();
+    if (type === 'screen_lock') {
+      result.screen_lock = true;
+    } else {
+      result.url_block = true;
+      acc = composeFilterRestriction(acc, s);
+    }
+  });
+
+  result.filter_mode = acc.filter_mode;
+  result.whitelist_urls = acc.whitelist_urls;
+  result.blacklist_urls = acc.blacklist_urls;
+  return result;
+}
+
+/**
+ * ベースポリシー（シートの常時設定）とスケジュールを合成する（純粋関数）。
+ *   合成結果は必ず「ベース以上に厳しい」。
+ */
+function composeEffectivePolicy(base, schedules, nowMs) {
+  const baseMode = String((base && base.filter_mode) || 'OFF').toUpperCase();
+  const baseWhite = normalizeHostList(base && base.whitelist_urls);
+  const baseBlack = normalizeHostList(base && base.blacklist_urls);
+  const baseLock = !!(base && base.screen_lock);
+
+  const sch = computeEffectiveScheduleRestriction(schedules, nowMs);
+
+  let mode = baseMode, white = baseWhite, black = baseBlack;
+  if (sch.url_block) {
+    const merged = composeFilterRestriction(
+      { filter_mode: baseMode, whitelist_urls: baseWhite, blacklist_urls: baseBlack },
+      {
+        type: 'url_block',
+        filter_mode: sch.filter_mode,
+        whitelist: sch.whitelist_urls,
+        blacklist: sch.blacklist_urls
+      }
+    );
+    mode = merged.filter_mode;
+    white = merged.whitelist_urls;
+    black = merged.blacklist_urls;
+  }
+
+  return {
+    screen_lock: baseLock || sch.screen_lock,
+    filter_mode: mode,
+    whitelist_urls: white,
+    blacklist_urls: black,
+    schedule_active_ids: sch.active_ids
+  };
+}
+
+/** 予約を storage に保存する（オフライン保護の実体）。 */
+async function persistScheduleCache(schedules) {
+  const safe = (schedules && typeof schedules === 'object')
+    ? {
+        active: Array.isArray(schedules.active) ? schedules.active : [],
+        upcoming: Array.isArray(schedules.upcoming) ? schedules.upcoming : [],
+        overridden_ids: Array.isArray(schedules.overridden_ids) ? schedules.overridden_ids : []
+      }
+    : { active: [], upcoming: [], overridden_ids: [] };
+  scheduleCache = { schedules: safe, saved_at: Date.now() };
+  try { await chrome.storage.local.set({ [SCHEDULE_CACHE_KEY]: scheduleCache }); } catch (e) {}
+  return scheduleCache;
+}
+
+/** キャッシュを読む（メモリ → storage）。壊れていても空で返す。 */
+async function loadScheduleCache() {
+  if (scheduleCache && scheduleCache.schedules) return scheduleCache;
+  try {
+    const d = await chrome.storage.local.get([SCHEDULE_CACHE_KEY]);
+    const c = d && d[SCHEDULE_CACHE_KEY];
+    if (c && c.schedules) { scheduleCache = c; return c; }
+  } catch (e) {}
+  return { schedules: { active: [], upcoming: [], overridden_ids: [] }, saved_at: 0 };
+}
+
+/** storage からベースポリシー（合成前のシート値）を読む。 */
+async function loadBasePolicy() {
+  let d = {};
+  try { d = (await chrome.storage.local.get(null)) || {}; } catch (e) { d = {}; }
+  return {
+    screen_lock: (typeof d.base_screen_lock === 'boolean') ? d.base_screen_lock : !!d.screen_lock,
+    filter_mode: d.base_filter_mode || d.filter_mode || 'OFF',
+    whitelist_urls: Array.isArray(d.base_whitelist_urls) ? d.base_whitelist_urls
+      : (Array.isArray(d.whitelist_urls) ? d.whitelist_urls : []),
+    blacklist_urls: Array.isArray(d.base_blacklist_urls) ? d.base_blacklist_urls
+      : (Array.isArray(d.blacklist_urls) ? d.blacklist_urls : [])
+  };
+}
+
+/**
+ * 境界アラームを設定する。
+ *   次の開始/終了時刻ちょうどに1回起こす scheduleEdge と、
+ *   取りこぼし保険の scheduleTick（1分）の二段構え。
+ */
+async function armScheduleAlarms(schedules, offset) {
+  const now = correctedNowMs(offset);
+  const overridden = (schedules && Array.isArray(schedules.overridden_ids))
+    ? schedules.overridden_ids : [];
+  const list = buildScheduleList(schedules);
+
+  let nextEdge = 0;
+  list.forEach(function (s) {
+    if (overridden.indexOf(s.id) >= 0) return;
+    const edges = [Number(s.start_ms), Number(s.end_ms)];
+    edges.forEach(function (t) {
+      if (!t || isNaN(t)) return;
+      if (t > now && (!nextEdge || t < nextEdge)) nextEdge = t;
+    });
+  });
+
+  try { await chrome.alarms.clear(SCHEDULE_EDGE_ALARM); } catch (e) {}
+  if (nextEdge) {
+    const delayMs = nextEdge - now + 1000; // 1秒の余裕（時計誤差の吸収）
+    if (delayMs >= 1000) {
+      try { chrome.alarms.create(SCHEDULE_EDGE_ALARM, { when: Date.now() + delayMs }); } catch (e) {}
+    }
+  }
+
+  if (list.length) {
+    try { chrome.alarms.create(SCHEDULE_TICK_ALARM, { periodInMinutes: 1 }); } catch (e) {}
+  } else {
+    try { await chrome.alarms.clear(SCHEDULE_TICK_ALARM); } catch (e) {}
+  }
+}
+
+/**
+ * ブラウザ／拡張機能の起動直後に、保存済みの予約から制限状態と境界アラームを復元する。
+ *   ※ chrome.alarms は再起動で消えるため、これが無いと「翌朝、予約が効かない」
+ *     「終了時刻を過ぎても解除されない」という事故になる。
+ *   ※ 予約が1件も無いときは何もしない（無駄なタブ走査・ロック解除を避ける）。
+ */
+async function restoreSchedulesOnBoot() {
+  try {
+    const cache = await loadScheduleCache();
+    const s = cache.schedules || {};
+    const total = (Array.isArray(s.active) ? s.active.length : 0) +
+                  (Array.isArray(s.upcoming) ? s.upcoming.length : 0);
+    if (total === 0) return;
+    await reevaluateSchedules();
+    console.log('[EduAgent] スケジュールを復元しました（予約 ' + total + ' 件）');
+  } catch (e) {
+    console.warn('[EduAgent] スケジュール復元エラー:', e && e.message ? e.message : e);
+  }
+}
+
+/**
+ * 現在時刻でスケジュールを再評価して端末へ適用する。
+ *   アラーム（境界・1分）から呼ばれる。通信はしない（キャッシュのみ使用）。
+ */
+async function reevaluateSchedules() {
+  const cache = await loadScheduleCache();
+  const base = await loadBasePolicy();
+  const eff = composeEffectivePolicy(base, cache.schedules, correctedNowMs(clockOffsetMs));
+
+  const updates = {
+    screen_lock: eff.screen_lock,
+    filter_mode: eff.filter_mode,
+    whitelist_urls: eff.whitelist_urls,
+    blacklist_urls: eff.blacklist_urls,
+    schedule_active_ids: eff.schedule_active_ids,
+    clock_offset_ms: clockOffsetMs
+  };
+  try { await chrome.storage.local.set(updates); } catch (e) {}
+
+  notifyAllTabsLockState(eff.screen_lock);
+  checkAllTabsFiltering(eff.filter_mode, eff.whitelist_urls, eff.blacklist_urls);
+  if (eff.screen_lock) {
+    checkSpecialTabsForLock();
+  } else {
+    releaseLockedTabs();
+  }
+
+  await armScheduleAlarms(cache.schedules, clockOffsetMs);
+  return eff;
+}
+
+/**
+ * ハートビート応答からスケジュール制限を取り込み、updates を「合成後の値」に差し替える。
+ *   ※ applyPolicies の出口で1回だけ呼ぶ最小限の介入点。
+ */
+async function applyScheduleFromHeartbeat(newPolicy, updates) {
+  const policy = newPolicy || {};
+
+  // --- 1) 時計補正 ---
+  const serverMs = Number(policy.server_time_ms);
+  if (serverMs > 0) {
+    const recvMs = Date.now();
+    const sentMs = lastHeartbeatSentMs > 0 ? lastHeartbeatSentMs : recvMs;
+    clockOffsetMs = updateClockOffset(serverMs, sentMs, recvMs, clockOffsetMs);
+  }
+
+  // --- 2) 予約の保存（オフライン保護） ---
+  let schedules = { active: [], upcoming: [], overridden_ids: [] };
+  if (policy.schedules && typeof policy.schedules === 'object') {
+    schedules = policy.schedules;
+    await persistScheduleCache(schedules);
+  } else {
+    const cached = await loadScheduleCache();
+    schedules = cached.schedules || schedules;
+  }
+
+  // --- 3) ベース（シート値）を保存し、合成結果で上書き ---
+  const base = {
+    screen_lock: Boolean(policy.screen_lock),
+    filter_mode: String(policy.filter_mode || 'OFF').toUpperCase(),
+    whitelist_urls: Array.isArray(updates.whitelist_urls) ? updates.whitelist_urls : [],
+    blacklist_urls: Array.isArray(updates.blacklist_urls) ? updates.blacklist_urls : []
+  };
+  updates.base_screen_lock = base.screen_lock;
+  updates.base_filter_mode = base.filter_mode;
+  updates.base_whitelist_urls = base.whitelist_urls;
+  updates.base_blacklist_urls = base.blacklist_urls;
+  updates.clock_offset_ms = clockOffsetMs;
+
+  const eff = composeEffectivePolicy(base, schedules, correctedNowMs(clockOffsetMs));
+  updates.screen_lock = eff.screen_lock;
+  updates.filter_mode = eff.filter_mode;
+  updates.whitelist_urls = eff.whitelist_urls;
+  updates.blacklist_urls = eff.blacklist_urls;
+  updates.schedule_active_ids = eff.schedule_active_ids;
+
+  // --- 4) 境界アラームを張り直す ---
+  await armScheduleAlarms(schedules, clockOffsetMs);
+
+  if (eff.schedule_active_ids.length) {
+    console.log('[EduAgent] スケジュール制限を適用中:', eff.schedule_active_ids.join(','),
+      'mode=' + eff.filter_mode, 'lock=' + eff.screen_lock);
+  }
+  return eff;
+}
+
 /**
  * 取得したポリシーの適用
  */
@@ -1042,6 +1458,17 @@ async function applyPolicies(newPolicy, oldStorage) {
     whitelist_urls: Array.isArray(newPolicy.whitelist_urls) ? newPolicy.whitelist_urls : oldStorage.whitelist_urls,
     blacklist_urls: Array.isArray(newPolicy.blacklist_urls) ? newPolicy.blacklist_urls : oldStorage.blacklist_urls
   };
+
+  // 0. 【フェーズ3】スケジュール（タイマー）の合成
+  //   ここが唯一の介入点。updates を「シート値」から「シート値＋予約」へ差し替える。
+  //   同時に、時計補正の更新・予約キャッシュの保存・境界アラームの再設定を行う。
+  //   ※ 合成は「締める方向」のみ。シートの常時ポリシーを緩めることはない。
+  try {
+    await applyScheduleFromHeartbeat(newPolicy, updates);
+  } catch (eSch) {
+    // 予約の合成に失敗しても、シート由来のポリシー適用は必ず続行する。
+    console.warn('[EduAgent] スケジュール合成をスキップ:', eSch && eSch.message ? eSch.message : eSch);
+  }
 
   // 1. 画面ロック状態の適用
   // ストレージ保存（content.js の chrome.storage.onChanged が全タブで自動発火しリロード不要で即解除）
