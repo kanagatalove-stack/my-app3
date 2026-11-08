@@ -193,7 +193,9 @@ const FNS = [
   'schNowJstSec_', 'generateScheduleId_', 'validateScheduleInput_',
   'authorizeScheduleTarget_', 'appendScheduleRow_', 'updateScheduleCells_',
   'isScheduleRowInTeacherScope_', 'scheduleRowToJson_',
-  'handleSaveSchedule_', 'handleListSchedules_', 'handleCancelSchedule_', 'handleOverrideSchedule_'
+  'handleSaveSchedule_', 'handleListSchedules_', 'handleCancelSchedule_', 'handleOverrideSchedule_',
+  // --- フェーズ5: 子GAS伝播の入口（isShardParent が false なら即 skipped） ---
+  'propagateScheduleToChildren_'
 ];
 FNS.forEach(function (n) { pieces.push(extractFn(n)); });
 
@@ -218,6 +220,13 @@ pieces.push([
 pieces.push([
   'function withWriteLock(fn){ return fn(); }',
   'function invalidateDevicesCache(){}',
+  // フェーズ5: このスイートは「親でも子でもない」単体GASとして扱う。
+  //   propagateScheduleToChildren_ は isShardParent()===false で即 skipped を返す。
+  'function isShardParent(){ return false; }',
+  // 索引は「使えない環境」を再現する。null を返すこと（[] だと truthy のため
+  // scopeStudentIdsForTeacher がシート読みフォールバックへ落ちず、個別児童が
+  // 全滅する）。
+  'function shardDeviceEntries(){ return null; }',
 ].join('\n'));
 
 // __SHEETS / __SCHOOLS は context 側で渡す（ここで var 宣言すると上書きしてしまう）

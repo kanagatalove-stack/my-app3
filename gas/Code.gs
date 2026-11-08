@@ -2769,7 +2769,9 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
 
   let schedulesPayload = { active: [], upcoming: [], overridden_ids: [] };
   try {
-    schedulesPayload = buildSchedulePayloadForDevice_(
+    // 【フェーズ5】子GASは親から受け取った展開済みキャッシュだけを見る
+    //   （シート読みを挟まないので、端末への応答が速い）。
+    schedulesPayload = resolveSchedulePayloadForDevice_(
       studentId, schClassName, schSchoolName, serverTimeMs);
   } catch (eSch) {
     try { Logger.log('[SCHEDULE] payload build failed: ' + eSch); } catch (eLog) {}
@@ -4982,6 +4984,33 @@ function shardApplyFromParent(payload) {
     }
   }
 
+  // 【フェーズ5】親から同封された「展開済みスケジュール」を PropertiesService へ保存する。
+  //   ・親が繰り返し・曜日を解釈済みなので、子は再計算しない
+  //   ・シートには書かない（子シートへのI/Oを増やさず、ハートビートを速く保つ）
+  //   ・保存に失敗してもポリシー適用は続ける（スケジュールだけの欠落に留める）
+  let scheduleSaved = null;
+  if (payload && payload.schedules) {
+    try {
+      let sch = payload.schedules;
+      if (typeof sch === 'string') {
+        try { sch = JSON.parse(sch); } catch (eS) { sch = null; }
+      }
+      if (sch && typeof sch === 'object') {
+        if (sch.by_student && typeof sch.by_student === 'object') {
+          // 【確定仕様3】親は「その子GASの全児童」を丸ごと送ってくる。
+          //   差分マージではなく置き換えにして、取消した予約が子に残り続ける
+          //   不整合を原理的に排除する。
+          scheduleSaved = shardSaveScheduleCache_(sch.by_student, sch.updated_ms, true);
+        } else {
+          // 児童ID→ウィンドウ の素の地図でも受け付ける（後方互換・こちらはマージ）
+          scheduleSaved = shardSaveScheduleCache_(sch, 0, false);
+        }
+      }
+    } catch (eSch) {
+      scheduleSaved = { saved: 0, error: String((eSch && eSch.message) ? eSch.message : eSch) };
+    }
+  }
+
   const ids = (payload && payload.student_ids) || [];
   // 【R38】patch の正規化。
   //   ・文字列で届いた場合は JSON として解釈する（false が文字列になっても落とさない）
@@ -4998,8 +5027,10 @@ function shardApplyFromParent(payload) {
   }
   const idList = Array.isArray(ids) ? ids : [];
   if (!idList.length) {
-    // ka 伝達だけの呼び出しは正常（ポリシー変更なし）
-    return { success: true, applied: 0, ka_active: kaApplied };
+    // ka 伝達だけの呼び出しは正常（ポリシー変更なし）。
+    // 【フェーズ5】ただし schedules は「ポリシーではない」ため、児童IDが空でも
+    //   保存結果を必ず返す。返さないと親が「同期できたか」を確認できない。
+    return { success: true, applied: 0, ka_active: kaApplied, schedules: scheduleSaved };
   }
 
   // 行の用意結果。try の外で宣言する（return が try の外にあるため、
@@ -5032,7 +5063,14 @@ function shardApplyFromParent(payload) {
   } catch (e) {
     return { success: false, error: String(e) };
   }
-  return { success: true, applied: idList.length, ka_active: kaApplied, ensure: ensureResult };
+  return {
+    success: true,
+    applied: idList.length,
+    ka_active: kaApplied,
+    ensure: ensureResult,
+    // 【フェーズ5】スケジュールを保存できたかを親が確認できるようにする
+    schedules: scheduleSaved
+  };
 }
 
 /** 設定から子GASのURL一覧を取り出す（重複除去・既定URL含む）。 */
@@ -6359,7 +6397,9 @@ function shardFlushPending() {
   return { sent: sendReqs.length, removed: removed, queued: Math.max(0, reqs.length - removed) };
 }
 
-function shardPropagatePolicy(studentIds, patch) {
+function shardPropagatePolicy(studentIds, patch, forceSync) {
+  // forceSync=true … 保留キューを使わず、その場で同期送信する。
+  //   【フェーズ5】スケジュール（タイマー）の反映漏れ・遅延を防ぐために使う。
   // 【R41】子GASへの送信はブラウザが直接・並列で行う（親の /exec は待たない）。
   //   ここでは保留（PropertiesService）へ積むだけにして、親の実行時間を短く保つ。
   //   積んだ内容は 15秒周期の console_touch が回収する（取りこぼし防止）。
@@ -6427,22 +6467,65 @@ function shardPropagatePolicy(studentIds, patch) {
     }
 
     const urls = Object.keys(groups);
+
+    // 【フェーズ5】スケジュール（タイマー）の同封。
+    //   確定仕様:
+    //     ・繰り返し・曜日を親が解釈し、start_ms/end_ms まで確定した
+    //       「展開済みウィンドウ」を渡す（子は再計算しない）
+    //     ・子GASごとの“全児童”を丸ごと送る（差分管理をしない＝不整合が出ない）
+    //     ・予約が1件も無いときは同封そのものを省く（通信量ゼロ）
+    let schRows = null;
+    let entriesByUrl = null;
+    try {
+      if (typeof readScheduleRows_ === 'function') {
+        // 予約が 0 件でも配列として読む（forceSync 時に「空」を丸ごと上書きするため）
+        schRows = readScheduleRows_();
+        if (Array.isArray(schRows)) {
+          entriesByUrl = {};
+          for (let i = 0; i < entries.length; i++) {
+            const sid0 = String(entries[i][0] || '').trim();
+            if (!sid0) continue;
+            const u0 = idx[normalizeShardClass(entries[i][2])] || emptyDef || defUrl;
+            if (!u0) continue;
+            if (!entriesByUrl[u0]) entriesByUrl[u0] = [];
+            entriesByUrl[u0].push([sid0, String(entries[i][1] || ''), String(entries[i][2] || '')]);
+          }
+        }
+      }
+    } catch (eSch0) { schRows = null; entriesByUrl = null; }
+    const schNowMs = new Date().getTime();
+    let scheduleAttached = false;
+
     // 全校一括ロック／一括URL配信でも、全子GASへ 1 回分の待ち時間で一斉に伝達する（並列）。
     const requests = [];
     for (let i = 0; i < urls.length; i++) {
       const url = urls[i];
+      const body = {
+        action: 'shard_apply',
+        shard_secret: cfg.sec,
+        student_ids: groups[url],
+        // 子が行を作るときにクラスを埋められるよう、児童ID→クラス名を添える。
+        class_map: groupClasses[url] || {},
+        patch: patch
+      };
+      // この子GASに属する全児童の展開済みウィンドウを丸ごと添える。
+      if (entriesByUrl && entriesByUrl[url]) {
+        try {
+          const byStudent = shardBuildScheduleByStudent_(schRows, entriesByUrl[url], schNowMs);
+          // 【確定仕様2】有効な予約が無い児童は地図に入れない（子は「制限なし」と解釈）。
+          // 【確定仕様3】ただし forceSync（予約CRUD起点）では 0 件でも「空の地図」を送る。
+          //   最後の1件を取り消したとき、何も送らないと子に古い制限が残り続けるため。
+          if (Object.keys(byStudent).length || forceSync) {
+            body.schedules = { updated_ms: schNowMs, by_student: byStudent };
+            scheduleAttached = true;
+          }
+        } catch (eSch1) { /* 同封に失敗してもポリシー伝達は続ける */ }
+      }
       requests.push({
         url: url,
         method: 'post',
         contentType: 'application/json',
-        payload: JSON.stringify({
-          action: 'shard_apply',
-          shard_secret: cfg.sec,
-          student_ids: groups[url],
-            // 子が行を作るときにクラスを埋められるよう、児童ID→クラス名を添える。
-            class_map: groupClasses[url] || {},
-            patch: patch
-          }),
+        payload: JSON.stringify(body),
         muteHttpExceptions: true
       });
     }
@@ -6451,8 +6534,11 @@ function shardPropagatePolicy(studentIds, patch) {
 
     // 【R34】応答を待たずに保留へ積み、ブラウザ起点のビーコンで送る（実測 4,122ms の解消）。
     //   積めなければ従来どおり同期送信するため、機能は落ちない。
+    // 【フェーズ5】ただしスケジュールを同封したリクエストは保留に積まない。
+    //   タイマーの反映漏れ・遅延を防ぐため、必ず即時の同期送信にする（確定仕様1・2）。
     try {
-      if (typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
+      if (!scheduleAttached && !forceSync &&
+          typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
           typeof shardQueuePending === 'function' && shardQueuePending(requests)) {
         __bt('shardPropagatePolicy:保留へ積む(応答待ちなし)');
         const queuedResults = [];
@@ -7355,11 +7441,14 @@ function readScheduleRows_() {
 }
 
 /** 端末のハートビートに載せる「有効/予定/解除済み」の塊を作る */
-function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs) {
+function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs, rowsArg) {
   const payload = { active: [], upcoming: [], overridden_ids: [] };
   const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  // 【フェーズ5】親が全校ぶんを一度に組み立てるとき、予約シートを児童数だけ
+  //   読み直してしまう。読み込み済みの行を渡せるようにして 1 回に畳む。
   let rows = [];
-  try { rows = readScheduleRows_(); } catch (e) { return payload; }
+  if (Array.isArray(rowsArg)) rows = rowsArg;
+  else { try { rows = readScheduleRows_(); } catch (e) { return payload; } }
   if (!rows.length) return payload;
 
   const sid = String(studentId || '').trim();
@@ -7403,6 +7492,283 @@ function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs)
   upcoming.sort(function (a, b) { return a.start_ms - b.start_ms; });
   if (upcoming.length) payload.upcoming = [upcoming[0]]; // 直近の1件だけ先出し
   return payload;
+}
+
+// ============================================================================
+// 【フェーズ5】子GAS 伝播: 展開済みスケジュールの受け取りと配信
+//
+//   設計（確定）:
+//     ・親が繰り返し・曜日を解釈し、start_ms / end_ms まで確定した
+//       「展開済みウィンドウ」を子へ渡す（子は再計算しない）
+//     ・子はシートではなく PropertiesService に保持する（シートI/Oを増やさない）
+//     ・経路は既存の shard_apply に schedules を同封する 1 本に集約する
+//
+//   子のハートビートは PropertiesService（+ 30秒のCacheServiceメモ）から
+//   引くだけになるため、端末への応答がシート読みに引きずられない。
+// ============================================================================
+
+/** 子GASが親から受け取った展開済みスケジュールを持つプロパティキー */
+const SHARD_SCHEDULES_PROP = 'SHARD_SCHEDULES_CACHE';
+/** ハートビート毎の PropertiesService 読みを避けるためのメモ（秒） */
+const SHARD_SCHEDULES_MEMO_SEC = 30;
+const SHARD_SCHEDULES_MEMO_KEY = 'shard_sched_memo1';
+
+/** 予約の無い端末へ返す空の配信契約（フェーズ3と同じ形） */
+function emptySchedulePayload_() {
+  return { active: [], upcoming: [], overridden_ids: [] };
+}
+
+/**
+ * 子GAS: 親から受け取った展開済みスケジュールを保存する。
+ *   byStudent = { "<児童ID>": { windows:[{id,type,filter_mode,whitelist,blacklist,start_ms,end_ms}],
+ *                              overridden_ids:["..."] } }
+ *   マージではなく「受け取った児童ぶんを置き換える」方式。親が常に正である。
+ */
+function shardSaveScheduleCache_(byStudent, updatedMs, replace) {
+  const now = (typeof updatedMs === 'number' && updatedMs > 0) ? updatedMs : new Date().getTime();
+  // 【確定仕様3】親は「その子GASの全児童」を丸ごと送る。差分マージではなく
+  //   置き換え（replace=true）にすることで、取消した予約が子に残り続ける
+  //   不整合を原理的に排除する。replace が無いときは従来どおりマージ。
+  let cur = {};
+  if (replace !== true) {
+    try {
+      const existing = shardLoadScheduleCache_();
+      if (existing && existing.by_student) cur = existing.by_student;
+    } catch (e0) { cur = {}; }
+  }
+
+  let n = 0;
+  Object.keys(byStudent || {}).forEach(function (sid) {
+    const key = String(sid || '').trim();
+    if (!key) return;
+    const rec = byStudent[sid] || {};
+    cur[key] = {
+      windows: Array.isArray(rec.windows) ? rec.windows : [],
+      overridden_ids: Array.isArray(rec.overridden_ids) ? rec.overridden_ids : []
+    };
+    n++;
+  });
+
+  const obj = { updated_ms: now, by_student: cur };
+  try {
+    PropertiesService.getScriptProperties().setProperty(SHARD_SCHEDULES_PROP, JSON.stringify(obj));
+  } catch (e) {
+    return { saved: 0, error: String(e) };
+  }
+  // メモを捨てて、次のハートビートから新しい内容を読ませる
+  try { CacheService.getScriptCache().remove(SHARD_SCHEDULES_MEMO_KEY); } catch (e2) {}
+  return { saved: n, total: Object.keys(cur).length };
+}
+
+/** 子GAS: 保持しているスケジュールキャッシュを読む（無ければ null） */
+function shardLoadScheduleCache_() {
+  try {
+    const memo = CacheService.getScriptCache().get(SHARD_SCHEDULES_MEMO_KEY);
+    if (memo) {
+      const o = JSON.parse(memo);
+      if (o && typeof o === 'object' && o.by_student) return o;
+    }
+  } catch (eM) { /* キャッシュ不可時はプロパティへ */ }
+  try {
+    const raw = PropertiesService.getScriptProperties().getProperty(SHARD_SCHEDULES_PROP);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || typeof o !== 'object' || !o.by_student || typeof o.by_student !== 'object') return null;
+    try { CacheService.getScriptCache().put(SHARD_SCHEDULES_MEMO_KEY, raw, SHARD_SCHEDULES_MEMO_SEC); } catch (eC) {}
+    return o;
+  } catch (e) { return null; }
+}
+
+/**
+ * 親GAS: 1児童ぶんの「展開済みウィンドウ」を組み立てる。
+ *   buildSchedulePayloadForDevice_ と違い、active / upcoming に振り分けず
+ *   全ウィンドウをそのまま渡す（子の時刻で判定させるため）。
+ *   rows を渡すことで予約シートの読みを呼び出し側で1回に畳める。
+ */
+function shardBuildWindowsForStudent_(rows, studentId, className, schoolName, nowMs) {
+  const out = { windows: [], overridden_ids: [] };
+  if (!rows || !rows.length) return out;
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const sid = String(studentId || '').trim();
+  const cn = normalizeClassName(className);
+  const horizon = (CONFIG.SCHEDULE_HORIZON_DAYS || 14) * 86400000;
+  const maxWin = CONFIG.SCHEDULE_MAX_WINDOWS || 20;
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!deviceMatchesSchedule_(r, sid, cn, schoolName)) continue;
+    // 解除済みは窓を配信せずIDだけ渡す（端末は「今回解除」の表示に使う）
+    if (r.overridden) { out.overridden_ids.push(r.id); continue; }
+    if (!r.enabled) continue;
+    const sched = {
+      dateFrom: r.dateFrom, dateTo: r.dateTo, repeat: r.repeat,
+      startTimeOfDayMs: schTimeOfDayMs_(r.startTime),
+      endTimeOfDayMs: schTimeOfDayMs_(r.endTime),
+      weekdays: parseWeekdays_(r.weekdaysRaw)
+    };
+    let wins = [];
+    try { wins = expandScheduleWindows_(sched, now, horizon); } catch (eW) { wins = []; }
+    for (let w = 0; w < wins.length; w++) {
+      if (out.windows.length >= maxWin) break;
+      out.windows.push({
+        id: r.id,
+        type: r.type,
+        filter_mode: r.filterMode,
+        whitelist: r.whitelist,
+        blacklist: r.blacklist,
+        start_ms: wins[w].start_ms,
+        end_ms: wins[w].end_ms
+      });
+    }
+  }
+  out.windows.sort(function (a, b) { return a.start_ms - b.start_ms; });
+  return out;
+}
+
+/** 親GAS: 子GASへ渡す「児童ID→展開済みウィンドウ」の地図を作る */
+function shardBuildScheduleByStudent_(rows, entries, nowMs) {
+  const by = {};
+  if (!Array.isArray(entries) || !entries.length) return by;
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return by; // 予約が1件も無ければ同封そのものを省く（通信量ゼロ）
+  for (let i = 0; i < entries.length; i++) {
+    const sid = String(entries[i][0] || '').trim();
+    if (!sid || by[sid]) continue;
+    const school = String(entries[i][1] || '').trim();
+    const cls = String(entries[i][2] || '').trim();
+    const r = shardBuildWindowsForStudent_(list, sid, cls, school, now);
+    if (r.windows.length || r.overridden_ids.length) by[sid] = r;
+  }
+  return by;
+}
+
+/** 親GAS: 地図から、その子GASへ送る児童ぶんだけを抜き出す */
+function shardPickSchedulesFor_(byStudent, ids, nowMs) {
+  if (!byStudent) return null;
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const picked = {};
+  let n = 0;
+  const list = Array.isArray(ids) ? ids : [];
+  for (let i = 0; i < list.length; i++) {
+    const k = String(list[i] || '').trim();
+    if (!k || !byStudent[k]) continue;
+    picked[k] = byStudent[k];
+    n++;
+  }
+  if (!n) return null;
+  return { updated_ms: now, by_student: picked };
+}
+
+/**
+ * 子GAS: 保持しているキャッシュから、端末へ返す配信契約を組み立てる。
+ *   時刻比較（start_ms <= now < end_ms）だけを行う。繰り返しの再解釈はしない。
+ */
+function shardSchedulePayloadFromCache_(studentId, nowMs) {
+  const payload = emptySchedulePayload_();
+  const cache = shardLoadScheduleCache_();
+  if (!cache || !cache.by_student) return payload;
+  const sid = String(studentId || '').trim();
+  if (!sid) return payload;
+  const rec = cache.by_student[sid];
+  if (!rec) return payload;
+
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const active = [];
+  const upcoming = [];
+  const wins = Array.isArray(rec.windows) ? rec.windows : [];
+  for (let i = 0; i < wins.length; i++) {
+    const w = wins[i];
+    if (!w || typeof w.start_ms !== 'number' || typeof w.end_ms !== 'number') continue;
+    const item = {
+      id: w.id,
+      type: w.type,
+      filter_mode: w.filter_mode,
+      whitelist: w.whitelist,
+      blacklist: w.blacklist,
+      start_ms: w.start_ms,
+      end_ms: w.end_ms,
+      start_jst: schMsToJstStr_(w.start_ms),
+      end_jst: schMsToJstStr_(w.end_ms)
+    };
+    if (w.start_ms <= now && now < w.end_ms) active.push(item);
+    else if (w.start_ms > now) upcoming.push(item);
+  }
+  active.sort(function (a, b) { return a.start_ms - b.start_ms; });
+  upcoming.sort(function (a, b) { return a.start_ms - b.start_ms; });
+
+  const maxActive = CONFIG.SCHEDULE_MAX_ACTIVE || 5;
+  payload.active = active.slice(0, maxActive);
+  // 直近の1件だけ先出し（次に来る制限を端末が事前に把握できるようにする）
+  if (upcoming.length) payload.upcoming = [upcoming[0]];
+  payload.overridden_ids = Array.isArray(rec.overridden_ids) ? rec.overridden_ids.slice() : [];
+  return payload;
+}
+
+/**
+ * 端末へ渡す配信契約の解決口（buildHeartbeatResponse から呼ぶ）。
+ *   子GASで、かつ親から受け取ったキャッシュがあるときはキャッシュだけを見る。
+ *   これにより子のハートビートがスケジュールシート読みに引きずられない。
+ */
+function resolveSchedulePayloadForDevice_(studentId, className, schoolName, nowMs) {
+  let isChild = false;
+  try { isChild = (typeof isShardChild === 'function' && isShardChild()); } catch (eC) { isChild = false; }
+  if (isChild) {
+    // 【確定仕様2】子GASは親から受け取ったキャッシュだけを正とする。
+    //   キャッシュが無い＝まだ親から同期されていない＝制限なし。
+    //   ここでシート読みへフォールバックすると、子側に残った古い行が復活し
+    //   「解除したのに制限が残る」不整合になるため、あえて読みに行かない。
+    try { return shardSchedulePayloadFromCache_(studentId, nowMs); }
+    catch (eC2) { return emptySchedulePayload_(); }
+  }
+  // 親・単体GASは従来どおり自前のシートから組み立てる。
+  return buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs);
+}
+
+/**
+ * 親GAS: 予約の作成・取消・解除を、該当する子GASへ即時伝播する。
+ *   確定仕様:
+ *     ・保留キューを使わず、その場で同期送信する（forceSync=true）
+ *     ・子GASごとに「全児童の最新構造体」を丸ごと送る（差分管理しない）
+ *   対象校の児童が1人もいない（子GAS未設定など）ときは何もしない。
+ */
+function propagateScheduleToChildren_(schedRow) {
+  try {
+    if (typeof isShardParent !== 'function' || !isShardParent()) return { skipped: true };
+    if (!schedRow) return { skipped: true, reason: 'no_row' };
+
+    const ids = [];
+    if (schedRow.targetType === 'student') {
+      const list = Array.isArray(schedRow.studentIds) ? schedRow.studentIds : [];
+      for (let i = 0; i < list.length; i++) {
+        const s = String(list[i] || '').trim();
+        if (s) ids.push(s);
+      }
+    } else {
+      // クラス対象: 索引から該当クラスの児童IDを集める（シート全読みはしない）
+      let entries = [];
+      try { entries = (typeof shardDeviceEntries === 'function') ? (shardDeviceEntries() || []) : []; }
+      catch (eE) { entries = []; }
+      const cn = normalizeClassName(schedRow.className);
+      for (let i = 0; i < entries.length; i++) {
+        const sid = String(entries[i][0] || '').trim();
+        if (!sid) continue;
+        if (normalizeClassName(entries[i][2]) !== cn) continue;
+        // 学校名が入っていれば一致確認（表記ゆれは schoolNamesMatch で吸収）
+        if (schedRow.schoolName && entries[i][1] &&
+            !schoolNamesMatch(schedRow.schoolName, entries[i][1])) continue;
+        ids.push(sid);
+      }
+    }
+    if (!ids.length) return { skipped: true, reason: 'no_target' };
+
+    // patch は空（ロック・配信・規制には触れない）。スケジュールだけを運ぶ。
+    return shardPropagatePolicy(ids, {}, true);
+  } catch (e) {
+    // 伝播に失敗しても予約自体は成立させる（次回の伝播で追いつく）
+    try { Logger.log('[SCHEDULE] propagate failed: ' + e); } catch (eL) {}
+    return { error: String(e) };
+  }
 }
 
 /**
@@ -7773,11 +8139,19 @@ function handleSaveSchedule_(payload, teacher) {
 
   Logger.log('[SCHEDULE] saved id=' + obj.id + ' target=' + obj.targetType +
     ' by=' + obj.createdBy + ' row=' + rowIndex);
+
+  // 【フェーズ5】子GASへ即時伝播（保留キューを使わない同期送信）。
+  const shardProp = propagateScheduleToChildren_(saved || {
+    targetType: obj.targetType, className: obj.className,
+    schoolName: obj.schoolName, studentIds: obj.studentIds
+  });
+
   return {
     success: true,
     message: 'スケジュールを登録しました',
     schedule: saved ? scheduleRowToJson_(saved, nowMs) : null,
-    row_index: rowIndex
+    row_index: rowIndex,
+    shard: shardProp
   };
 }
 
@@ -7819,7 +8193,12 @@ function handleCancelSchedule_(payload, teacher) {
   });
 
   Logger.log('[SCHEDULE] cancelled id=' + id + ' by=' + String((teacher && teacher.email) || ''));
-  return { success: true, message: '予約を取り消しました（履歴は残ります）', schedule_id: id, enabled: false, updated_at: nowStr };
+
+  // 【フェーズ5】取消を子GASへ即時伝播する。
+  //   子は丸ごと上書きなので、この予約が子のキャッシュからも消える。
+  const shardProp = propagateScheduleToChildren_(target);
+
+  return { success: true, message: '予約を取り消しました（履歴は残ります）', schedule_id: id, enabled: false, updated_at: nowStr, shard: shardProp };
 }
 
 /** override_schedule … 今回の時間帯だけ解除（予約は残す） */
@@ -7847,7 +8226,11 @@ function handleOverrideSchedule_(payload, teacher) {
   });
 
   Logger.log('[SCHEDULE] overridden id=' + id + ' by=' + String((teacher && teacher.email) || ''));
-  return { success: true, message: 'この予約を今回だけ解除しました（次回以降は再び適用されます）', schedule_id: id, overridden: true, override_at: nowStr };
+
+  // 【フェーズ5】解除を子GASへ即時伝播する（子は overridden_ids として端末へ配る）。
+  const shardProp = propagateScheduleToChildren_(target);
+
+  return { success: true, message: 'この予約を今回だけ解除しました（次回以降は再び適用されます）', schedule_id: id, overridden: true, override_at: nowStr, shard: shardProp };
 }
 
 
