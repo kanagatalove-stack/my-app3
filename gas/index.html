@@ -2293,6 +2293,17 @@
         if (screenTsToMs(c.last_seen) > screenTsToMs(cur.last_seen)) {
           cur.last_seen = c.last_seen;
         }
+        // 【R43.3】「撮影不可」の状態も新しい方を採る。
+        //   子GAS担当の端末の報告は子シートにしか入らないため、親だけ見ていると
+        //   「保護されたページを表示中」が表示されない（端末が子担当の場合）。
+        const curBlkMs = (typeof cur.capture_blocked_ms === 'number') ? cur.capture_blocked_ms : 0;
+        const newBlkMs = (typeof c.capture_blocked_ms === 'number') ? c.capture_blocked_ms : 0;
+        if (c.capture_blocked && newBlkMs > curBlkMs) {
+          cur.capture_blocked = true;
+          cur.capture_blocked_reason = c.capture_blocked_reason || 'chrome_protected';
+          cur.capture_blocked_at = c.capture_blocked_at || '';
+          cur.capture_blocked_ms = newBlkMs;
+        }
       });
 
       // 【R42.1】ここで表示書式を揃え、オンライン判定を作り直す。
@@ -2325,11 +2336,21 @@
         const refMs = sheetReqMs > 0 ? sheetReqMs : ownBaseMs;
         // 新着 = 撮影時刻が要求時刻以降（同一秒は新着とみなす＝切捨て誤差を吸収）
         const isFresh = rawShotMs > 0 && refMs > 0 && rawShotMs >= refMs;
+        // 【R43.3】端末が「撮影できなかった」と報告している場合は、
+        //   要求より新しい画像が無くても「更新待ち」にしない。
+        //   chrome://newtab/ 等の特権ページは Chrome の仕様上撮影できず、
+        //   待っても永久に画像は来ない。ここで解除し、代わりに
+        //   「保護されたページを表示中」を出す（renderScreens）。
+        //   ブロック報告が古い（＝その後撮影に成功した）場合は
+        //   GAS 側（getScreenshots）で capture_blocked=false に落としてあるので、
+        //   ここでは素直に従ってよい。
+        const isBlocked = !!r.capture_blocked;
         // ポーリング稼働中に限り、古い画像は「更新待ち」として明示する。
         //   ・ポーリングが終われば reqActive=false になり必ず解除される
         //   ・万一の時計ズレでも TTL 超過で解除される
         //   → R43 のような「永久に更新待ち」の固着は原理的に起こらない。
-        r.pending_new = !!(reqActive && !pendExpired && r.has_image && refMs > 0 && !isFresh);
+        r.pending_new = !!(reqActive && !pendExpired && !isBlocked &&
+                           r.has_image && refMs > 0 && !isFresh);
         r.shot_is_fresh = !!(r.has_image && isFresh);
         r.screenshot_ms = rawShotMs;
       });
@@ -3140,23 +3161,38 @@
       const ready = screensData.filter(d => d.has_image).length;
       // 【R43】要求より前に撮れた旧画像 = 「更新待ち」（取得済みだが最新ではない）
       const waiting = screensData.filter(d => d.has_image && d.pending_new).length;
-      const pending = screensData.filter(d => !d.has_image && d.screen_request_at).length;
-      const none = screensData.filter(d => !d.has_image && !d.screen_request_at).length;
+      // 【R43.3】「保護されたページ表示中」＝端末は応答したが撮影できなかった。
+      //   更新待ち／取得待ちとは別枠で数える（待っても来ないため）。
+      //   画像が既にある端末（更新待ちの旧画像表示）は取得済み側に残す。
+      const blocked = screensData.filter(d => d.capture_blocked && !d.has_image).length;
+      const pending = screensData.filter(d => !d.has_image && !d.capture_blocked && d.screen_request_at).length;
+      const none = screensData.filter(d => !d.has_image && !d.capture_blocked && !d.screen_request_at).length;
       if (statusBar) {
-        statusBar.innerHTML = `対象 <b>${screensData.length}</b> 台 ／ 取得済 <span class="text-emerald-600 font-bold">${ready}</span> ／ 更新待ち <span class="text-amber-600 font-bold">${waiting}</span> ／ 取得待ち <span class="text-amber-600 font-bold">${pending}</span> ／ 未取得 <span class="text-slate-500 font-bold">${none}</span>`;
+        statusBar.innerHTML = `対象 <b>${screensData.length}</b> 台 ／ 取得済 <span class="text-emerald-600 font-bold">${ready}</span> ／ 更新待ち <span class="text-amber-600 font-bold">${waiting}</span> ／ 取得待ち <span class="text-amber-600 font-bold">${pending}</span> ／ 保護ページ <span class="text-sky-600 font-bold">${blocked}</span> ／ 未取得 <span class="text-slate-500 font-bold">${none}</span>`;
       }
 
       // カード内容の署名。変わっていなければ作り直さない（無駄な再描画を防ぐ）。
+      //   【R43.3】capture_blocked を署名に含める。含めないと、
+      //   「更新待ち → 保護ページ表示中」の切り替えが同一署名と判定され、
+      //   カードが描き直されずに古い表示のまま残ってしまう。
       const sig = screensData.map(function (d) {
         return [d.student_id, d.screenshot_at || '', d.has_image ? 1 : 0,
-                d.pending_new ? 1 : 0, d.is_online ? 1 : 0].join('~');
+                d.pending_new ? 1 : 0, d.is_online ? 1 : 0,
+                d.capture_blocked ? 1 : 0,
+                d.capture_blocked_reason || ''].join('~');
       }).join('|');
 
       if (light && screenRenderedSig) {
-        updateScreenCardStates();
-        return;
-      }
-      if (!light && sig === screenRenderedSig) {
+        // 【R43.3】ポーリング中でも、内容が変わったときは作り直す。
+        //   これが無いと「更新待ち → 保護ページ表示中」への切り替えが
+        //   light 経路で握り潰され、カードが古い表示のまま残ってしまう
+        //   （ポーリングは最大 30 秒続くため、実質その間ずっと誤表示になる）。
+        //   内容が同じときだけ軽量更新に留める（R43 の重さ対策は維持）。
+        if (sig === screenRenderedSig) {
+          updateScreenCardStates();
+          return;
+        }
+      } else if (!light && sig === screenRenderedSig) {
         // 内容が同じなら再構築しない（画像の再デコードによるちらつきを避ける）
         updateScreenCardStates();
         return;
@@ -3180,12 +3216,30 @@
           const isNew = screenRevealTime[d.student_id] && !d.pending_new;
           // 【R43】要求後にまだ撮れていない場合は「更新待ち」と明示する
           //   （古い画像を最新として見せない＝空振りの防止）。
-          const chip = d.pending_new
-            ? '<span class="absolute top-1.5 left-1.5 bg-amber-500/95 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">更新待ち</span>'
-            : `<span class="absolute top-1.5 left-1.5 bg-emerald-600/90 text-white text-[10px] font-bold px-2 py-0.5 rounded-full ${isNew ? 'animate-pulse-subtle' : ''}">取得済</span>`;
+          // 【R43.3】保護ページ表示中（撮れなかった）は、旧画像は残しつつ
+          //   「更新待ち」ではなく「保護ページ」と表示する（待っても来ないため）。
+          const chip = d.capture_blocked
+            ? '<span class="absolute top-1.5 left-1.5 bg-sky-600/95 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">保護ページ</span>'
+            : (d.pending_new
+              ? '<span class="absolute top-1.5 left-1.5 bg-amber-500/95 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">更新待ち</span>'
+              : `<span class="absolute top-1.5 left-1.5 bg-emerald-600/90 text-white text-[10px] font-bold px-2 py-0.5 rounded-full ${isNew ? 'animate-pulse-subtle' : ''}">取得済</span>`);
           body = `<div class="relative bg-slate-900 aspect-video overflow-hidden group ${d.pending_new ? 'opacity-60' : ''}">
             <img src="${d.image_data_url}" alt="${escapeHtml(d.student_id)} の画面" class="w-full h-full object-contain cursor-zoom-in" onclick="openScreenPreview('${escapeHtml(d.student_id)}')">
             ${chip}
+          </div>`;
+        } else if (d.capture_blocked) {
+          // 【R43.3】端末は応答したが撮影できなかった（chrome://newtab/ 等の特権ページ）。
+          //   「端末の送信待ち」のまま放置すると教員は待ち続けてしまうため、
+          //   撮れない理由を明示する（Chrome の仕様であり、待っても来ない）。
+          const why = (d.capture_blocked_reason === 'image_too_large')
+            ? '画面が大きすぎて送信できませんでした'
+            : (d.capture_blocked_reason === 'capture_error'
+              ? '画面のキャプチャに失敗しました'
+              : '保護されたページ（設定/新しいタブ等）を表示中');
+          body = `<div class="bg-sky-50 aspect-video flex flex-col items-center justify-center text-sky-400">
+            <svg class="w-7 h-7 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+            <span class="text-xs mt-2 font-semibold text-sky-700 text-center px-2 leading-snug">${escapeHtml(why)}</span>
+            <span class="text-[10px] text-slate-400 mt-0.5">${escapeHtml(d.capture_blocked_at || '')}</span>
           </div>`;
         } else if (d.screen_request_at) {
           body = `<div class="bg-slate-100 aspect-video flex flex-col items-center justify-center text-slate-400">

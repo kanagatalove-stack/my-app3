@@ -1143,6 +1143,48 @@ async function downscaleForSheet(dataUrl) {
   return null; // どの組み合わせでも上限に収まらなかった
 }
 
+/**
+ * 【R43.3】「撮影できなかった」ことを子GASへ通知する（画像を含まない軽量POST）。
+ *
+ * 背景（実機の DevTools で確定した真因）:
+ *   ログイン状態のトップ画面（新しいタブ）は Chrome の仕様上 chrome://newtab/
+ *   という特権ページになり、chrome.tabs.captureVisibleTab では撮影できない。
+ *   ログアウト時は https://www.google.com になるため撮影できていた
+ *   （＝ログイン/ログアウトで症状が分かれた理由はこれで完全に説明できる）。
+ *
+ *   R43.2 までは「撮れない」とログを出して return するだけで、GAS へは何も
+ *   届かなかった。そのため教員画面は「更新待ち」のまま永久に待ち続けていた。
+ *   撮れないこと自体は Chrome の仕様なので、画像の代わりに「撮れなかった」という
+ *   事実（理由コード）だけを送り、教員画面が理由を表示できるようにする。
+ *
+ * 画面一覧は補助機能のため、この通知の失敗は他の同期処理へ影響させない。
+ */
+async function notifyScreenshotBlocked(gasUrl, studentId, reason) {
+  const kind = reason || 'chrome_protected';
+  try {
+    if (!gasUrl || !studentId) return;
+    const response = await fetch(gasUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'screenshot_blocked',
+        student_id: studentId,
+        reason: kind
+      }),
+      redirect: 'follow'
+    });
+    if (!response || !response.ok) {
+      console.warn('[EduAgent] キャプチャ不可の通知が拒否されました: HTTP ' +
+        (response ? response.status : 0) + ' (' + kind + ')');
+      return;
+    }
+    console.log('[EduAgent] キャプチャ不可を通知しました:', kind);
+  } catch (e) {
+    console.warn('[EduAgent] キャプチャ不可の通知に失敗（通信）:',
+      e && e.message ? e.message : e, '(' + kind + ')');
+  }
+}
+
 async function captureAndUploadScreenshot() {
   try {
     const data = await chrome.storage.local.get(null);
@@ -1167,32 +1209,44 @@ async function captureAndUploadScreenshot() {
     // 【R43.2】キャプチャ不可のページ（内部ページ・拡張機能ページ）は
     //   黙って return せず、理由を必ずログに残す（原因究明のため）。
     //   画面一覧は補助機能のため、通知できなくても他の同期処理には影響させない。
+    // 【R43.3】さらに「撮れなかった」ことを子GASへ通知する。
+    //   chrome://newtab/（ログイン状態の新しいタブ）は Chrome の仕様上
+    //   captureVisibleTab で撮影できず、待っても永久に画像は来ない。
+    //   通知しないと教員画面の「更新待ち」が解除されないまま残る。
     const url = tab.url || '';
     if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
         url.startsWith('about:') || url.startsWith('devtools://')) {
       console.warn('[EduAgent] 画面キャプチャ不可（保護されたページ）のため送信しません:', url);
+      // 画面一覧の補助機能なので、通知の成否で他の同期処理を止めない。
+      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'chrome_protected');
       return;
     }
 
     // 【R43.2】captureVisibleTab の失敗を握り潰さない。
     //   URL 判定をすり抜ける保護ページや非アクティブウィンドウでも例外になる。
+    // 【R43.3】失敗も「撮れなかった」として通知する（理由: capture_error）。
     let raw = null;
     try {
       raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
     } catch (eCap) {
       console.warn('[EduAgent] 画面キャプチャに失敗（送信しません）:',
         eCap && eCap.message ? eCap.message : eCap);
+      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
       return;
     }
     if (!raw || !/^data:image\//.test(raw)) {
       console.warn('[EduAgent] 画面キャプチャ結果が画像ではありません（送信しません）');
+      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
       return;
     }
 
     // セル上限に収まるよう縮小（収まらなければ送信しない＝壊れたデータを残さない）
+    // 【R43.3】縮小しきれなかった場合も通知する（理由: image_too_large）。
+    //   通知しないと「端末の送信待ち」のまま残り、教員が原因を知れない。
     const dataUrl = await downscaleForSheet(raw);
     if (!dataUrl) {
       console.warn('[EduAgent] 画面情報を上限サイズまで縮小できませんでした');
+      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'image_too_large');
       return;
     }
 

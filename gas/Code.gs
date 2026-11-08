@@ -83,7 +83,15 @@ const CONFIG = {
     '要注意',
     '注意理由',
     '要注意URL',
-    '注意検知日時'
+    '注意検知日時',
+    // 【R43.3】画面キャプチャの状態（撮影不可の通知先）。
+    //   ログイン状態の新しいタブは chrome://newtab/ という特権ページになり、
+    //   Chrome の仕様上 captureVisibleTab では撮影できない。
+    //   端末は「撮れなかった」事実をここへ記録し、教員画面は
+    //   「更新待ち」を解除して「保護されたページを表示中」と表示する。
+    //   形式: "capture_blocked:<理由>|YYYY/MM/DD HH:mm:ss"（日時はシート時計）
+    //   ※ 末尾に追加する（既存シートは ensureDeviceHeaders が自動追加＝後方互換）。
+    '画面情報状態'
   ],
 
   // 画面情報 シート列定義（スクリーンショット本体を保持）
@@ -827,6 +835,20 @@ function doPost(e) {
       const imageData = payload.image_data || payload.data_url || '';
       const mimeType = payload.mime_type || payload.mime || '';
       const res = processScreenshotUpload(studentId, imageData, mimeType);
+      return jsonResponse(res);
+    }
+
+    // A2-b. 【R43.3】「撮影できなかった」通知
+    //     chrome://newtab/ など Chrome の特権ページを表示中は captureVisibleTab が
+    //     仕様上できない。黙って諦めると教員画面の「更新待ち」が残り続けるため、
+    //     画像の代わりに状態だけを送ってもらい、『画面情報状態』へ記録する。
+    //     形式: "capture_blocked:<理由>|YYYY/MM/DD HH:mm:ss"
+    //     ※ 認証不要（screenshot と同じ経路）。画像は一切保存しない。
+    if (action === 'screenshot_blocked' || action === 'screenshot_unavailable') {
+      const res = processScreenshotBlocked(
+        payload.student_id,
+        payload.reason || payload.kind || 'chrome_protected'
+      );
       return jsonResponse(res);
     }
 
@@ -3489,6 +3511,68 @@ function processScreenshotUpload(studentId, imageData, mimeType) {
 }
 
 /**
+ * 【R43.3】「撮影できない状態」を端末から受け取り、『端末一覧』の『画面情報状態』へ記録する。
+ *
+ * 背景（実機で確定した真因）:
+ *   ログイン状態の新しいタブは Chrome の仕様上 chrome://newtab/ という特権ページになり、
+ *   chrome.tabs.captureVisibleTab では撮影できない。ログアウト時は https://www.google.com
+ *   になるため撮影できていた（＝症状の差はこれで完全に説明できる）。
+ *
+ *   これまでは拡張が無言で return していたため教員画面へ何も届かず、
+ *   「更新待ち」が残り続けていた。撮れないこと自体は Chrome の仕様なので、
+ *   「撮れなかった」という事実を状態として記録し、教員画面が
+ *   「保護されたページを表示中（キャプチャ不可）」と表示できるようにする。
+ *
+ * 画像は保存しない（撮れていないため）。認証不要（screenshot と同じ経路）。
+ * reason: 'chrome_protected'（chrome:// 等）/ 'capture_error'（captureVisibleTab 例外）
+ *         / 'image_too_large'（縮小しても上限に収まらない）
+ */
+function processScreenshotBlocked(studentId, reason) {
+  try {
+    const sid = String(studentId || '').trim();
+    if (!sid) return { success: false, error: 'student_id is required' };
+
+    // 想定外の文字列がセルに入らないよう、英数字と _ : - だけに制限する
+    let kind = String(reason || 'chrome_protected').trim().replace(/[^A-Za-z0-9_:-]/g, '');
+    if (!kind) kind = 'chrome_protected';
+
+    const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+    let updated = false;
+
+    withWriteLock(function () {
+      const dSheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+      // 既存シートに『画面情報状態』列が無ければ末尾へ追加する（後方互換）
+      try { if (typeof ensureDeviceHeaders === 'function') ensureDeviceHeaders(dSheet); } catch (eEns) {}
+      const dMap = getHeaderMap(dSheet, CONFIG.DEVICE_COLUMNS);
+      const stateCol = dMap['画面情報状態'];
+      if (!stateCol) throw new Error('『画面情報状態』列がありません。setupSpreadsheet を実行してください。');
+
+      const dRows = dSheet.getDataRange().getValues();
+      const dIdCol = dMap['児童ID'] - 1;
+      for (let i = 1; i < dRows.length; i++) {
+        if (String(dRows[i][dIdCol] || '').trim() !== sid) continue;
+        // 形式: "capture_blocked:<理由>|YYYY/MM/DD HH:mm:ss"
+        //   日時はシート時計（GAS が書く）なので、要求日時とそのまま比較できる。
+        dSheet.getRange(i + 1, stateCol).setValue('capture_blocked:' + kind + '|' + now);
+        updated = true;
+        break;
+      }
+    });
+
+    Logger.log('[SCREENSHOT] blocked: student=' + sid + ' kind=' + kind + ' updated=' + updated);
+    return { success: true, blocked: true, student_id: sid, kind: kind, at: now, updated: updated };
+
+  } catch (err) {
+    // 【R43.2 の方針】未捕捉例外を HTTP 500 にせず JSON で返す。
+    const msg = (err && err.message) ? err.message : String(err);
+    try {
+      Logger.log('[SCREENSHOT] blocked failed: student=' + String(studentId || '') + ' error=' + msg);
+    } catch (eLog) {}
+    return { success: false, error: msg, error_code: 'blocked_write_failed' };
+  }
+}
+
+/**
  * 要求済み児童のスクリーンショット一覧を取得（console の「画面情報取得」で使用）。
  * status: 'all' | 'ready' | 'pending'
  *  - 各児童について、端末一覧側の要求／更新日時と、画面情報シートの画像有無を突き合わせる。
@@ -3618,6 +3702,31 @@ function getScreenshots(filterSchool, teacher, includeUnassigned, status, studen
     const lastSeenStr = lastSeenRaw ? String(lastSeenRaw) : '';
     const lastSeenMs = sheetTsToMs(lastSeenRaw);
 
+    // 【R43.3】『画面情報状態』を解釈する。
+    //   端末が chrome://newtab/ 等の特権ページを表示していて撮影できなかった場合、
+    //   "capture_blocked:<理由>|YYYY/MM/DD HH:mm:ss" が入っている。
+    //   ブラウザはこれを受けて「更新待ち」を解除し、
+    //   「保護されたページを表示中」と表示する（撮れないことは Chrome の仕様）。
+    //   ※ 列が無い（旧シート）場合は空文字のまま＝従来と完全に同じ挙動。
+    const stateRaw = dMap['画面情報状態']
+      ? String(row[dMap['画面情報状態'] - 1] || '').trim() : '';
+    const stateIsBlocked = /^capture_blocked:/.test(stateRaw);
+    const stateBlockedAt = stateIsBlocked ? String(stateRaw.split('|')[1] || '') : '';
+    const stateBlockedMs = stateIsBlocked ? sheetTsToMs(stateBlockedAt) : 0;
+    //   ブロック状態の自動解消（読み取り時に判定する。書き戻しはしない）:
+    //     「撮れない」と報告した時刻より後に撮影に成功していれば、
+    //     そのブロックはもう古い（端末は普通のページに戻って撮影できた）。
+    //   端末は撮影成功時に『画面情報状態』を消さないため、ここで比較して
+    //   実効値を決める。これにより余計な書き込み経路を増やさずに解消できる。
+    const shotMsForBlock = sheetTsToMs(shotAt);
+    const captureBlockedOn = !!(stateIsBlocked &&
+      !(ready && shotMsForBlock > 0 && shotMsForBlock >= stateBlockedMs));
+    const captureBlockedReason = captureBlockedOn
+      ? (String(stateRaw.split('|')[0]).replace(/^capture_blocked:/, '') || 'chrome_protected')
+      : '';
+    const captureBlockedAt = captureBlockedOn ? stateBlockedAt : '';
+    const captureBlockedMs = captureBlockedOn ? stateBlockedMs : 0;
+
     out.push({
       student_id: studentId,
       school_name: schoolName,
@@ -3644,6 +3753,16 @@ function getScreenshots(filterSchool, teacher, includeUnassigned, status, studen
       //   ブラウザは 'device' 由来の値を「撮影時刻」として信用しない。
       screenshot_from: useSheetAt ? 'sheet' : 'device',
       has_image: ready,
+      // 【R43.3】撮影不可（chrome://newtab/ 等の特権ページ表示中）の状態通知。
+      //   capture_blocked = true のとき、端末は「撮れなかった」ことを報告済み。
+      //   ブラウザはこの行の「更新待ち」を解除し、
+      //   「保護されたページ（設定/新しいタブ等）を表示中」と表示する。
+      capture_blocked: captureBlockedOn,
+      capture_blocked_reason: captureBlockedReason,
+      //   シート時計（GAS が書いた日時）をミリ秒で返す。要求日時と同じ時計どうしの
+      //   比較になるため、ブラウザの時計とのズレで誤判定しない（R43.1 と同じ方針）。
+      capture_blocked_at: captureBlockedAt,
+      capture_blocked_ms: captureBlockedMs,
       // 【R43】メタのみ取得のときは画像本体を返さない（転送量を 1/100 以下に）。
       image_data_url: (!__metaOnly && ready && shot && shot.b64)
         ? ('data:' + shot.mime + ';base64,' + shot.b64)
