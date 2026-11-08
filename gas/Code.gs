@@ -14,6 +14,13 @@ const CONFIG = {
   // ※ この定数が欠けると getTargetSheet(undefined) が毎回 insertSheet して
   //    空シートが増え続けるため、必ず定義しておくこと。
   SCREENSHOT_SHEET_NAME: '画面情報',
+
+  // スケジュール管理（タイマー）用シート。
+  //   放課後・休日・家庭持ち帰り端末で「指定した時間帯だけ」URL規制/画面ロックを
+  //   自動で ON にし、時間が来たら自動で解除するための予約を 1 行 1 件で保持する。
+  //   ※ この定数が欠けると getTargetSheet(undefined) が毎回 insertSheet して
+  //      空シートが増え続けるため、必ず定義しておくこと。
+  SCHEDULE_SHEET_NAME: 'スケジュール管理',
   
   // 美作市 14校
   SCHOOL_LIST: [
@@ -114,7 +121,56 @@ const CONFIG = {
     '個別ホワイトリスト',
     '個別ブラックリスト',
     '最終ログイン日時'
-  ]
+  ],
+
+  // ==========================================================
+  // スケジュール管理 列定義（22列）
+  //
+  //   【設計意図】日付と時刻を別列に分ける。
+  //     端末一覧では「2026/11/05 20:39:25」形式の文字列をシートに書いているが、
+  //     getValues() が「日付型セル」を返すと
+  //       "Tue Nov 10 2026 19:00:00 GMT+0900 (日本標準時)"
+  //     のような英語表記になり、文字列比較では月名順（Nov < Oct）で
+  //     並んでしまい新しいデータが負ける。ここでは
+  //       ① 列を数値書式 '@'（書式なしテキスト）に固定
+  //       ② 日付と時刻を別列に分割
+  //       ③ 読むときは sheetTsToMs() で JST 決め打ちに変換
+  //     の三重で防御する。
+  //
+  //   有効/手動解除 は R38 の教訓（Boolean("false") === true）に従い
+  //   必ず parseBoolean() で判定する。
+  // ==========================================================
+  SCHEDULE_COLUMNS: [
+    'スケジュールID',        // 1  sch_<epochms>_<rand>
+    '対象種別',              // 2  class / student
+    '学校名',                // 3
+    'クラス名',              // 4  対称種別が class のとき
+    '児童ID',                // 5  カンマ区切り（複数可）
+    '制限タイプ',            // 6  url_block / screen_lock
+    'URL規制モード',         // 7  BLACKLIST / WHITELIST（url_block のみ）
+    '許可URLリスト',         // 8
+    '規制URLリスト',         // 9
+    '開始日',                // 10 yyyy/MM/dd（日付のみ）
+    '終了日',                // 11 yyyy/MM/dd（日付のみ）
+    '繰り返し',              // 12 NONE / DAILY / WEEKLY
+    '開始時刻',              // 13 HH:mm
+    '終了時刻',              // 14 HH:mm（開始より前なら翌日跨ぎ）
+    '曜日',                  // 15 WEEKLY のみ "1,2,3,4,5"（0=日 … 6=土）
+    '有効',                  // 16 TRUE / FALSE（取消＝FALSE）
+    '手動解除',              // 17 TRUE / FALSE（今回だけ解除）
+    '手動解除日時',          // 18
+    '作成者',                // 19 教員メール
+    '作成日時',              // 20
+    '更新日時',              // 21
+    '備考'                   // 22
+  ],
+
+  // スケジュールの「監査ログ」方針:
+  //   終了した予約は削除しない（自動削除もしない）。教員が「解除」「取消」を
+  //   押した履歴（列17/18/16）もそのまま残す。シートはそのまま監査証跡になる。
+  SCHEDULE_HORIZON_DAYS: 14,     // 端末へ先出しする将来分の日数
+  SCHEDULE_MAX_ACTIVE: 5,        // 1端末あたり同時に配る有効スケジュール上限
+  SCHEDULE_MAX_WINDOWS: 20       // 1予約あたり展開する時間窓の上限
 };
 
 /**
@@ -534,6 +590,8 @@ function getTargetSheet(sheetName) {
       initializeDeviceHeaders(sheet); // 卒業生アーカイブは端末一覧と同一の列構成
     } else if (sheetName === CONFIG.SCREENSHOT_SHEET_NAME) {
       initializeScreenshotHeaders(sheet);
+    } else if (sheetName === CONFIG.SCHEDULE_SHEET_NAME) {
+      initializeScheduleHeaders(sheet);
     }
   } else if (sheetName === CONFIG.TEACHER_SHEET_NAME) {
     // 既存教員マスタシートの場合、不足列（対象クラス、登録URL情報等）があれば自動補完
@@ -543,6 +601,9 @@ function getTargetSheet(sheetName) {
     ensureDeviceHeaders(sheet);
   } else if (sheetName === CONFIG.SCREENSHOT_SHEET_NAME) {
     ensureScreenshotHeaders(sheet);
+  } else if (sheetName === CONFIG.SCHEDULE_SHEET_NAME) {
+    // 既存のスケジュール管理シートに不足列があれば末尾へ自動補完（後方互換）
+    ensureScheduleHeaders(sheet);
   }
   __execSheetPut(__ck, sheet);
   return sheet;
@@ -617,6 +678,71 @@ function ensureScreenshotHeaders(sheet) {
         .setFontWeight('bold');
     }
   });
+}
+
+/**
+ * スケジュール管理シートの日付・時刻列を「書式なしテキスト」に固定する。
+ *   これが無いと Google スプレッドシートが "2026/11/10" を日付型として解釈し、
+ *   getValues() が "Tue Nov 10 2026 00:00:00 GMT+0900 (日本標準時)" を返す。
+ *   文字列比較では月名順に並ぶため新しいデータが負ける（既知の罠）。
+ *   ※ テストハーネスの makeSheet には setNumberFormat が無いため必ず握りつぶす。
+ */
+function freezeScheduleTextColumns_(sheet) {
+  try {
+    if (!sheet || typeof sheet.getRange !== 'function') return;
+    const map = getHeaderMap(sheet, CONFIG.SCHEDULE_COLUMNS);
+    const names = ['開始日', '終了日', '開始時刻', '終了時刻', '手動解除日時', '作成日時', '更新日時', 'スケジュールID'];
+    const lastRow = Math.max(sheet.getLastRow() || 1, 2);
+    names.forEach(function (n) {
+      const c = map[n];
+      if (!c) return;
+      try { sheet.getRange(2, c, lastRow, 1).setNumberFormat('@'); } catch (e1) {}
+    });
+  } catch (e) { /* 書式固定は本質ではない。失敗しても読む側で吸収する */ }
+}
+
+function initializeScheduleHeaders(sheet) {
+  const range = sheet.getRange(1, 1, 1, CONFIG.SCHEDULE_COLUMNS.length);
+  range.setValues([CONFIG.SCHEDULE_COLUMNS]);
+  range.setBackground('#7c3aed'); // バイオレット（端末一覧=藍 / 画面情報=空 / 教員=緑 と区別）
+  range.setFontColor('#ffffff');
+  range.setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  freezeScheduleTextColumns_(sheet);
+}
+
+/**
+ * 既存のスケジュール管理シートに不足列があれば末尾へ自動補完（後方互換）。
+ * ensureDeviceHeaders と同じ「同一実行内1回」の実行キャッシュを使う。
+ */
+function ensureScheduleHeaders(sheet) {
+  let __ok = false;
+  try { __ok = (typeof __execSheetCache !== 'undefined') && !!__execSheetCache; } catch (e) { __ok = false; }
+  if (__ok && __execEnsureDone(sheet)) return;
+
+  const lastCol = sheet.getLastColumn();
+  if (lastCol === 0) {
+    initializeScheduleHeaders(sheet);
+    if (__ok) { __execEnsureMark(sheet); __execHeaderDrop(sheet); }
+    return;
+  }
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h).trim());
+  let added = false;
+  CONFIG.SCHEDULE_COLUMNS.forEach(col => {
+    if (!headers.includes(col)) {
+      const newCol = sheet.getLastColumn() + 1;
+      sheet.getRange(1, newCol).setValue(col)
+        .setBackground('#7c3aed')
+        .setFontColor('#ffffff')
+        .setFontWeight('bold');
+      added = true;
+    }
+  });
+  if (__ok) {
+    __execEnsureMark(sheet);
+    if (added) __execHeaderDrop(sheet);
+  }
+  if (added) freezeScheduleTextColumns_(sheet);
 }
 
 function initializeTeacherHeaders(sheet) {
@@ -741,6 +867,12 @@ function setupSpreadsheet() {
     ];
     teacherSheet.getRange(2, 1, sampleTeachers.length, sampleTeachers[0].length).setValues(sampleTeachers);
   }
+
+  // 3. スケジュール管理シート（タイマー機能）
+  //    ヘッダーのみ作成する。予約は教員コンソールから追加する運用のため、
+  //    サンプル行は入れない（実データと誤認されるのを避ける）。
+  const scheduleSheet = getTargetSheet(CONFIG.SCHEDULE_SHEET_NAME);
+  initializeScheduleHeaders(scheduleSheet);
 
   Logger.log('14校対応スプレッドシートのセットアップが完了しました。');
 }
@@ -1061,6 +1193,28 @@ function doPost(e) {
         }
       }
       return jsonResponse({ success: true, message: `URL規制モードを ${payload.filter_mode} に更新しました`, shard: shardFilter });
+    }
+
+    // G2. 【スケジュール／タイマー】予約の登録（教員トークン必須）
+    //   ここに到達している時点で payload.token は検証済み（認証ブロック通過）。
+    //   さらに handleSaveSchedule_ の中で「自校のクラス／自校の児童」かを再確認する。
+    if (action === 'save_schedule' || action === 'schedule_save') {
+      return jsonResponse(handleSaveSchedule_(payload, currentTeacher));
+    }
+
+    // G3. 予約の一覧取得（自校スコープのみ返す）
+    if (action === 'list_schedules' || action === 'schedule_list') {
+      return jsonResponse(handleListSchedules_(payload, currentTeacher));
+    }
+
+    // G4. 予約の取消（予約そのものを止める。行は監査ログとして残す）
+    if (action === 'cancel_schedule' || action === 'schedule_cancel') {
+      return jsonResponse(handleCancelSchedule_(payload, currentTeacher));
+    }
+
+    // G5. 今回だけの解除（予約は残す。次回以降の時間帯は再び適用される）
+    if (action === 'override_schedule' || action === 'schedule_override') {
+      return jsonResponse(handleOverrideSchedule_(payload, currentTeacher));
     }
 
     // H. 単一児童端末の更新（他校の児童は更新不可）
@@ -3266,6 +3420,14 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
   const results = [];
   const now = new Date().getTime();
 
+  // 【スケジュール】一覧に「いま時間制限が効いている端末」を出すための材料。
+  //   予約シートは 1 回だけ読み、全端末ぶんをメモリ上で判定する。
+  //   シートが無い・読めない環境（テスト等）では空配列のままで従来どおり動く。
+  let schRows = [];
+  try {
+    if (typeof readScheduleRows_ === 'function') schRows = readScheduleRows_();
+  } catch (eSch) { schRows = []; }
+
   // 教員の所属学校スコープ（管理者は全校）
   const scopeInfo = getTeacherScopeInfo(teacher);
   const restrictToOwnSchool = scopeInfo.type === 'school' || scopeInfo.type === 'unknown';
@@ -3345,7 +3507,15 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
       monitor_flag: monFlagIdx ? parseBoolean(row[monFlagIdx - 1]) : false,
       monitor_reason: monReasonIdx ? String(row[monReasonIdx - 1] || '') : '',
       monitor_url: monUrlIdx ? String(row[monUrlIdx - 1] || '') : '',
-      monitor_at: monAtIdx ? String(row[monAtIdx - 1] || '') : ''
+      monitor_at: monAtIdx ? String(row[monAtIdx - 1] || '') : '',
+      // 【スケジュール】いま時間制限（タイマー）が効いている端末か。
+      //   教員一覧に「予約により制限中」を出すための読み取り専用フラグ。
+      //   シートへの書き戻しは一切しない（集計は読み取り時のみ）。
+      schedule_active: (function () {
+        try {
+          return isAnyScheduleActive_(schRows, studentId, String(row[headerMap['クラス'] - 1] || ''), schoolName, now);
+        } catch (e) { return false; }
+      })()
     });
   }
 
@@ -6850,5 +7020,807 @@ function api_saveMonitorSettings(token, settings) {
     return { success: false, error: err.toString() };
   }
 }
+
+// ============================================================================
+// スケジュール管理（タイマー機能）  ―  フェーズ1: データ層
+//
+//   放課後・休日・家庭持ち帰り端末で「指定した時間帯だけ」URL規制/画面ロックを
+//   自動で ON にし、時間が来たら自動で解除するための予約を『スケジュール管理』
+//   シートに保持する。
+//
+//   【このモジュールの最重要原則】
+//     1) 日付と時刻は必ず別列。日付型セルが
+//        "Tue Nov 10 2026 19:00:00 GMT+0900 (日本標準時)"
+//        に化けても壊れないよう、読むときは必ず
+//        scheduleDatePart_ / scheduleTimePart_ を通す。
+//     2) 日時→ms の変換は必ず sheetTsToMs()（JST 決め打ち）。
+//        実行環境のタイムゾーンに依存させない（9時間ずれ事故の防止）。
+//     3) 有効/手動解除 は必ず parseBoolean()（Boolean("false")===true の罠）。
+//     4) 1校=1スプレッドシート（R41）。このシートは自校の予約だけを持つ。
+// ============================================================================
+
+/** 2桁ゼロ詰め（null/不正は 0 として扱う） */
+function schPad2_(v) {
+  const n = Math.floor(Number(v));
+  const num = (isNaN(n) || n < 0) ? 0 : n;
+  const s = String(num);
+  return s.length >= 2 ? s : ('0' + s);
+}
+
+/**
+ * クロスレルムでも安全な Date 判定。
+ * （vm サンドボックスから渡された Date は instanceof Date が false になるため）
+ */
+function schIsDate_(v) {
+  try {
+    return !!v && typeof v === 'object' &&
+      typeof v.getTime === 'function' && !isNaN(v.getTime());
+  } catch (e) { return false; }
+}
+
+/**
+ * 日付セル → "yyyy/MM/dd"
+ *   Date でも "2026/11/10" でも "Tue Nov 10 2026 ..." でも受け付ける。
+ *   Date はローカル getter（GAS のスクリプトTZ＝シートTZ）で壁時計を取り出す。
+ */
+const SCH_MONTHS_ = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+
+/**
+ * シートの日付型セル（Date）を JST の壁時計へ直す。
+ *   セルは「日本時間の 0:00」を絶対時刻として持つため、+9h してから
+ *   getUTC* で読めば、実行環境のタイムゾーンに一切依存しない。
+ *   （getFullYear()/getMonth() は実行TZ依存で、UTC環境では9時間ずれる）
+ */
+function schJstParts_(d) {
+  const j = new Date(d.getTime() + SHEET_TZ_OFFSET_MS);
+  return {
+    y: j.getUTCFullYear(),
+    mo: j.getUTCMonth() + 1,
+    da: j.getUTCDate(),
+    h: j.getUTCHours(),
+    mi: j.getUTCMinutes(),
+    dow: j.getUTCDay()
+  };
+}
+
+function scheduleDatePart_(val) {
+  if (val === null || val === undefined || val === '') return '';
+  if (schIsDate_(val)) {
+    const p = schJstParts_(val);
+    return p.y + '/' + schPad2_(p.mo) + '/' + schPad2_(p.da);
+  }
+  const s = String(val).trim();
+  if (!s) return '';
+  // "2026/11/10" / "2026-11-10"
+  const m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (m) return m[1] + '/' + schPad2_(m[2]) + '/' + schPad2_(m[3]);
+  // 英語表記（シートの日付型セルが String() されたもの）
+  //   "Tue Nov 10 2026 00:00:00 GMT+0900 (日本標準時)"
+  //   ※ new Date(s) に投げると実行TZで壁時計がずれるため、月名を直接引く。
+  const e = s.match(/^(?:[A-Za-z]{3}\s+)?([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})/);
+  if (e) {
+    const moIdx = SCH_MONTHS_.indexOf(e[1].toUpperCase());
+    if (moIdx >= 0) return e[3] + '/' + schPad2_(moIdx + 1) + '/' + schPad2_(e[2]);
+  }
+  return '';
+}
+
+/**
+ * 時刻セル → "HH:mm"
+ *   Date（時刻型セル）/ "19:00" / "7:00 PM" を受け付ける。
+ */
+function scheduleTimePart_(val) {
+  if (val === null || val === undefined || val === '') return '00:00';
+  if (schIsDate_(val)) {
+    const p = schJstParts_(val);
+    return schPad2_(p.h) + ':' + schPad2_(p.mi);
+  }
+  const s = String(val).trim();
+  if (!s) return '00:00';
+
+  // ① 12時間制（"7:00 PM"）を必ず最初に処理する。
+  //    素の HH:mm 判定を先に置くと "7:00 PM" が "07:00" に化ける（実測で踏んだ）。
+  const ap = s.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)/i);
+  if (ap) {
+    let h = Number(ap[1]);
+    const mi = ap[2];
+    const mer = ap[3].toUpperCase();
+    if (mer === 'PM' && h < 12) h += 12;
+    if (mer === 'AM' && h === 12) h = 0;
+    return schPad2_(h) + ':' + mi;
+  }
+  // ② 先頭が時刻（"19:00" / "19:00:00"）
+  const m = s.match(/^(\d{1,2}):(\d{2})/);
+  if (m) return schPad2_(m[1]) + ':' + m[2];
+  // ③ 英語表記に埋め込まれた時刻
+  //    "Tue Nov 10 2026 19:00:00 GMT+0900 (日本標準時)"
+  //    ※ 先頭アンカーだと取れないため、ここだけ非アンカーで探す。
+  //      タイムゾーン表記 "+09:00" より前の時刻が先に一致するので取り違えない。
+  const em = s.match(/(\d{1,2}):(\d{2})/);
+  if (em) return schPad2_(em[1]) + ':' + em[2];
+  return '00:00';
+}
+
+/**
+ * 日付列 + 時刻列 -> epoch ms（JST基準・実行TZ非依存）
+ *   これがフェーズ1の変換の唯一の入口。日付と時刻が別列であることが前提。
+ */
+function schedulePartsToMs_(dateVal, timeVal) {
+  const d = scheduleDatePart_(dateVal);
+  if (!d) return 0;
+  const t = scheduleTimePart_(timeVal);
+  const ms = sheetTsToMs(d + ' ' + t);
+  return ms > 0 ? ms : 0;
+}
+
+/** epoch ms -> JST の "yyyy/MM/dd HH:mm"（表示・配信用） */
+function schMsToJstStr_(ms) {
+  const n = Number(ms);
+  if (!n || isNaN(n)) return '';
+  const j = new Date(n + SHEET_TZ_OFFSET_MS);
+  return j.getUTCFullYear() + '/' + schPad2_(j.getUTCMonth() + 1) + '/' + schPad2_(j.getUTCDate()) +
+    ' ' + schPad2_(j.getUTCHours()) + ':' + schPad2_(j.getUTCMinutes());
+}
+
+/** "HH:mm" -> その日の 0:00 からの経過ms */
+function schTimeOfDayMs_(hhmm) {
+  const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return 0;
+  return (Number(m[1]) * 60 + Number(m[2])) * 60 * 1000;
+}
+
+/** 曜日列 "1,2,3,4,5" -> [1,2,3,4,5]（0=日 … 6=土） */
+function parseWeekdays_(raw) {
+  if (Array.isArray(raw)) {
+    return raw.map(function (x) { return Number(x); })
+      .filter(function (n) { return !isNaN(n) && n >= 0 && n <= 6; });
+  }
+  const s = String(raw === null || raw === undefined ? '' : raw).trim();
+  if (!s) return [];
+  return s.split(/[,\u3001\/\s]+/).map(function (x) { return Number(String(x).trim()); })
+    .filter(function (n) { return !isNaN(n) && n >= 0 && n <= 6; });
+}
+
+/** epoch ms（JST基準の表現） -> JST の日付文字列 */
+function schJstDateStr_(ms) {
+  const j = new Date(Number(ms) + SHEET_TZ_OFFSET_MS);
+  return j.getUTCFullYear() + '/' + schPad2_(j.getUTCMonth() + 1) + '/' + schPad2_(j.getUTCDate());
+}
+
+/** epoch ms（JST基準の表現） -> 曜日 0..6 */
+function schJstDow_(ms) {
+  return new Date(Number(ms) + SHEET_TZ_OFFSET_MS).getUTCDay();
+}
+
+/**
+ * 1つの予約を実際の「時間窓」の配列へ展開する。
+ *
+ *   入力 sched:
+ *     { dateFrom:'2026/11/10', dateTo:'2026/11/14', repeat:'WEEKLY',
+ *       startTimeOfDayMs, endTimeOfDayMs, weekdays:[1,2,3,4,5] }
+ *
+ *   戻り値: [{ start_ms, end_ms }, ...]  （最大 CONFIG.SCHEDULE_MAX_WINDOWS 件）
+ *
+ *   - 終了時刻 <= 開始時刻 のときは「翌日跨ぎ」として +24h する
+ *     （設計上は表現可能。検証はフェーズ6で行う）
+ *   - now から見て「1日前〜先14日」の範囲だけを返す（無駄な展開をしない）
+ */
+function expandScheduleWindows_(sched, nowMs, horizonMs) {
+  const out = [];
+  if (!sched) return out;
+  const DAY = 24 * 60 * 60 * 1000;
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const horizon = (typeof horizonMs === 'number' && horizonMs > 0)
+    ? horizonMs : ((CONFIG.SCHEDULE_HORIZON_DAYS || 14) * DAY);
+  const maxN = CONFIG.SCHEDULE_MAX_WINDOWS || 20;
+
+  const fromStr = scheduleDatePart_(sched.dateFrom);
+  if (!fromStr) return out;
+  const fromMs = sheetTsToMs(fromStr + ' 00:00');
+  if (!fromMs) return out;
+
+  let toMs = sheetTsToMs(scheduleDatePart_(sched.dateTo) + ' 00:00');
+  if (!toMs || toMs < fromMs) toMs = fromMs;
+
+  const startOfDay = Number(sched.startTimeOfDayMs) || 0;
+  const endOfDay = Number(sched.endTimeOfDayMs) || 0;
+  const repeat = String(sched.repeat || 'NONE').trim().toUpperCase();
+  const weekdays = Array.isArray(sched.weekdays) ? sched.weekdays : [];
+
+  const lo = Math.max(fromMs, now - DAY);
+  const hi = Math.min(toMs, now + horizon);
+  if (hi < lo) return out;
+
+  // lo を JST の 0:00 に丸めてから 24h ずつ進める（JST は DST 無しなので安全）
+  let d = sheetTsToMs(schJstDateStr_(lo) + ' 00:00');
+  for (; d <= hi && out.length < maxN; d += DAY) {
+    if (repeat === 'WEEKLY') {
+      if (weekdays.indexOf(schJstDow_(d)) < 0) continue;
+    } else if (repeat === 'NONE') {
+      // 単発: 開始日当日のみ
+      if (d !== fromMs) continue;
+    }
+    // repeat === 'DAILY' は全日
+    const start = d + startOfDay;
+    let end = d + endOfDay;
+    if (end <= start) end += DAY; // 翌日跨ぎ
+    out.push({ start_ms: start, end_ms: end });
+  }
+  return out;
+}
+
+/** 予約がこの端末（児童ID / クラス / 学校）に該当するか */
+function deviceMatchesSchedule_(row, studentId, normClassName, schoolName) {
+  if (!row) return false;
+  const sid = String(studentId || '').trim();
+  const tt = String(row.targetType || '').trim().toLowerCase();
+  if (tt === 'class') {
+    const rc = String(row.className || '').trim();
+    if (!rc) return false;
+    if (normalizeClassName(rc) !== String(normClassName || '')) return false;
+    // 学校名が入っていれば一致確認（表記ゆれは schoolNamesMatch で吸収）
+    if (row.schoolName && schoolName && !schoolNamesMatch(row.schoolName, schoolName)) return false;
+    return true;
+  }
+  if (tt === 'student') {
+    return Array.isArray(row.studentIds) && row.studentIds.indexOf(sid) >= 0;
+  }
+  // 対象種別が空（手入力行の保険）→ 児童ID一致で判定
+  return !!(sid && Array.isArray(row.studentIds) && row.studentIds.indexOf(sid) >= 0);
+}
+
+/**
+ * 『スケジュール管理』シートを全行読み、正規化した予約オブジェクトの配列を返す。
+ *   ※ 行番号(rowIndex)も返す（更新時に使う）
+ */
+function readScheduleRows_() {
+  const sheet = getTargetSheet(CONFIG.SCHEDULE_SHEET_NAME);
+  try { if (typeof ensureScheduleHeaders === 'function') ensureScheduleHeaders(sheet); } catch (eEns) {}
+  const map = getHeaderMap(sheet, CONFIG.SCHEDULE_COLUMNS);
+  const rows = sheet.getDataRange().getValues();
+  const out = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i] || [];
+    const get = function (name) {
+      const c = map[name];
+      if (!c) return '';
+      const v = row[c - 1];
+      return (v === null || v === undefined) ? '' : v;
+    };
+    const id = String(get('スケジュールID') || '').trim();
+    if (!id) continue;
+
+    // 有効: 空欄は「有効」とみなす（列を後から足した既存行の後方互換）。
+    //       明示的な FALSE/false/0 のときだけ無効（R38の罠を踏まない）。
+    const enabledRaw = get('有効');
+    const enabled = (String(enabledRaw).trim() === '') ? true : parseBoolean(enabledRaw);
+
+    const idsRaw = String(get('児童ID') || '');
+    out.push({
+      rowIndex: i + 1,
+      id: id,
+      targetType: String(get('対象種別') || '').trim().toLowerCase(),
+      schoolName: String(get('学校名') || '').trim(),
+      className: String(get('クラス名') || '').trim(),
+      studentIds: idsRaw.split(/[,\u3001\s]+/).map(function (s) { return s.trim(); }).filter(Boolean),
+      type: String(get('制限タイプ') || 'url_block').trim().toLowerCase(),
+      filterMode: String(get('URL規制モード') || '').trim().toUpperCase(),
+      whitelist: String(get('許可URLリスト') || '').trim(),
+      blacklist: String(get('規制URLリスト') || '').trim(),
+      dateFrom: scheduleDatePart_(get('開始日')),
+      dateTo: scheduleDatePart_(get('終了日')),
+      repeat: String(get('繰り返し') || 'NONE').trim().toUpperCase(),
+      startTime: scheduleTimePart_(get('開始時刻')),
+      endTime: scheduleTimePart_(get('終了時刻')),
+      weekdaysRaw: String(get('曜日') || '').trim(),
+      enabled: enabled,
+      overridden: parseBoolean(get('手動解除')),
+      overrideAt: String(get('手動解除日時') || '').trim(),
+      createdBy: String(get('作成者') || '').trim(),
+      createdAt: String(get('作成日時') || '').trim(),
+      updatedAt: String(get('更新日時') || '').trim(),
+      note: String(get('備考') || '').trim()
+    });
+  }
+  return out;
+}
+
+/** 端末のハートビートに載せる「有効/予定/解除済み」の塊を作る */
+function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs) {
+  const payload = { active: [], upcoming: [], overridden_ids: [] };
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  let rows = [];
+  try { rows = readScheduleRows_(); } catch (e) { return payload; }
+  if (!rows.length) return payload;
+
+  const sid = String(studentId || '').trim();
+  const cn = normalizeClassName(className);
+  const upcoming = [];
+  const maxActive = CONFIG.SCHEDULE_MAX_ACTIVE || 5;
+
+  rows.forEach(function (r) {
+    if (!deviceMatchesSchedule_(r, sid, cn, schoolName)) return;
+    // 解除済み（今回だけ停止）は台帳に残すが配信しない
+    if (r.overridden) { payload.overridden_ids.push(r.id); return; }
+    if (!r.enabled) return;
+
+    const sched = {
+      dateFrom: r.dateFrom, dateTo: r.dateTo, repeat: r.repeat,
+      startTimeOfDayMs: schTimeOfDayMs_(r.startTime),
+      endTimeOfDayMs: schTimeOfDayMs_(r.endTime),
+      weekdays: parseWeekdays_(r.weekdaysRaw)
+    };
+    const wins = expandScheduleWindows_(sched, now, (CONFIG.SCHEDULE_HORIZON_DAYS || 14) * 86400000);
+    wins.forEach(function (w) {
+      const item = {
+        id: r.id,
+        type: r.type,
+        filter_mode: r.filterMode,
+        whitelist: r.whitelist,
+        blacklist: r.blacklist,
+        start_ms: w.start_ms,
+        end_ms: w.end_ms,
+        start_jst: schMsToJstStr_(w.start_ms),
+        end_jst: schMsToJstStr_(w.end_ms)
+      };
+      if (w.start_ms <= now && now < w.end_ms) {
+        if (payload.active.length < maxActive) payload.active.push(item);
+      } else if (w.start_ms > now) {
+        upcoming.push(item);
+      }
+    });
+  });
+
+  upcoming.sort(function (a, b) { return a.start_ms - b.start_ms; });
+  if (upcoming.length) payload.upcoming = [upcoming[0]]; // 直近の1件だけ先出し
+  return payload;
+}
+
+/**
+ * 一覧表示用の軽量判定（予約行を1回読んだだけで全端末ぶんを判定する）。
+ * getAllDevices から呼ぶため、シート読みは呼び出し側で1回に畳む。
+ */
+function isAnyScheduleActive_(rows, studentId, className, schoolName, nowMs) {
+  if (!rows || !rows.length) return false;
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const sid = String(studentId || '').trim();
+  const cn = normalizeClassName(className);
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || !r.enabled || r.overridden) continue;
+    if (!deviceMatchesSchedule_(r, sid, cn, schoolName)) continue;
+    const sched = {
+      dateFrom: r.dateFrom, dateTo: r.dateTo, repeat: r.repeat,
+      startTimeOfDayMs: schTimeOfDayMs_(r.startTime),
+      endTimeOfDayMs: schTimeOfDayMs_(r.endTime),
+      weekdays: parseWeekdays_(r.weekdaysRaw)
+    };
+    const wins = expandScheduleWindows_(sched, now, 2 * 86400000);
+    for (let k = 0; k < wins.length; k++) {
+      if (wins[k].start_ms <= now && now < wins[k].end_ms) return true;
+    }
+  }
+  return false;
+}
+
+// ============================================================================
+// スケジュール管理（タイマー機能）  ―  フェーズ2: GAS API (CRUD)
+//
+//   save_schedule / list_schedules / cancel_schedule / override_schedule
+//
+//   【認可の原則】
+//     これらはすべて教員操作なので doPost の認証ブロック通過後に到達する
+//     （＝ payload.token は検証済み）。加えて行ごとに
+//     「自校のクラス／自校の児童」だけを触れるよう再確認する。
+//     他校のIDを混ぜて送っても 1 件も書けない（denied で落とす）。
+//
+//   【解除 と 取消 は別物】
+//     解除(override) … 今回の時間帯だけ止める。列17=TRUE/列18=日時。
+//                      予約自体は残るので、次回以降の時間帯はまた効く。
+//     取消(cancel)   … 予約そのものを止める。列16=有効 FALSE。配信対象外。
+//     どちらも行を削除しない（監査ログとして残す）。
+// ============================================================================
+
+/** JST の "yyyy/MM/dd HH:mm:ss"（シートの他の日時列と書式を揃える） */
+function schNowJstSec_() {
+  const d = new Date();
+  const ms = d.getTime();
+  const j = new Date(ms + SHEET_TZ_OFFSET_MS);
+  return j.getUTCFullYear() + '/' + schPad2_(j.getUTCMonth() + 1) + '/' + schPad2_(j.getUTCDate()) +
+    ' ' + schPad2_(j.getUTCHours()) + ':' + schPad2_(j.getUTCMinutes()) + ':' + schPad2_(j.getUTCSeconds());
+}
+
+/** スケジュールID採番（衝突しない・並べ替え可能） */
+function generateScheduleId_() {
+  const rand = Math.random().toString(36).slice(2, 6);
+  return 'sch_' + new Date().getTime() + '_' + rand;
+}
+
+/**
+ * 入力の正規化と検証。
+ *   戻り値 { ok, errors:[], norm:{...} }
+ */
+function validateScheduleInput_(p) {
+  const src = p || {};
+  const errs = [];
+  const norm = {
+    targetType: String(src.target_type || src.targetType || '').trim().toLowerCase(),
+    schoolName: String(src.school_name || src.schoolName || '').trim(),
+    className: String(src.class_name || src.className || '').trim(),
+    studentIds: [],
+    type: String(src.type || src.restriction_type || 'url_block').trim().toLowerCase(),
+    filterMode: String(src.filter_mode || src.filterMode || 'BLACKLIST').trim().toUpperCase(),
+    whitelist: String(src.whitelist_urls || src.whitelist || '').trim(),
+    blacklist: String(src.blacklist_urls || src.blacklist || '').trim(),
+    dateFrom: '',
+    dateTo: '',
+    repeat: String(src.repeat || 'NONE').trim().toUpperCase(),
+    startTime: '',
+    endTime: '',
+    weekdays: [],
+    note: String(src.note || '').trim()
+  };
+
+  // --- 対象種別 ---
+  if (norm.targetType !== 'class' && norm.targetType !== 'student') {
+    errs.push('対象種別は class か student を指定してください');
+  }
+
+  // --- 児童ID（student のとき） ---
+  const rawIds = src.student_ids || src.studentIds || [];
+  if (Array.isArray(rawIds)) {
+    norm.studentIds = rawIds.map(function (s) { return String(s || '').trim(); }).filter(Boolean);
+  } else {
+    norm.studentIds = String(rawIds || '').split(/[,\u3001\s]+/)
+      .map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+  if (norm.targetType === 'student' && norm.studentIds.length === 0) {
+    errs.push('児童IDを1つ以上指定してください');
+  }
+  if (norm.targetType === 'class' && !norm.className) {
+    errs.push('クラス名を指定してください');
+  }
+
+  // --- 制限タイプ ---
+  if (norm.type !== 'url_block' && norm.type !== 'screen_lock') {
+    errs.push('制限タイプは url_block か screen_lock を指定してください');
+  }
+  // --- URL規制モード（url_block のときだけ意味を持つ） ---
+  if (norm.type === 'url_block') {
+    if (norm.filterMode !== 'BLACKLIST' && norm.filterMode !== 'WHITELIST') {
+      errs.push('URL規制モードは BLACKLIST か WHITELIST を指定してください');
+    }
+    if (norm.filterMode === 'BLACKLIST' && !norm.blacklist) {
+      errs.push('BLACKLIST を選んだ場合は規制URLリストが必要です');
+    }
+    if (norm.filterMode === 'WHITELIST' && !norm.whitelist) {
+      errs.push('WHITELIST を選んだ場合は許可URLリストが必要です');
+    }
+  }
+
+  // --- 日付 ---
+  norm.dateFrom = scheduleDatePart_(src.date_from || src.dateFrom || '');
+  if (!norm.dateFrom) errs.push('開始日を yyyy/MM/dd で指定してください');
+  norm.dateTo = scheduleDatePart_(src.date_to || src.dateTo || '') || norm.dateFrom;
+
+  // --- 時刻 ---
+  const stRaw = src.start_time || src.startTime || '';
+  const etRaw = src.end_time || src.endTime || '';
+  norm.startTime = stRaw === '' ? '' : scheduleTimePart_(stRaw);
+  norm.endTime = etRaw === '' ? '' : scheduleTimePart_(etRaw);
+  if (!/^\d{2}:\d{2}$/.test(norm.startTime)) errs.push('開始時刻を HH:mm で指定してください');
+  if (!/^\d{2}:\d{2}$/.test(norm.endTime)) errs.push('終了時刻を HH:mm で指定してください');
+  if (norm.startTime && norm.endTime && norm.startTime === norm.endTime) {
+    errs.push('開始時刻と終了時刻が同じです（0分の予約は作成できません）');
+  }
+
+  // --- 繰り返し ---
+  if (['NONE', 'DAILY', 'WEEKLY'].indexOf(norm.repeat) < 0) {
+    norm.repeat = 'NONE';
+  }
+  if (norm.repeat === 'WEEKLY') {
+    norm.weekdays = parseWeekdays_(src.weekdays || src.week_days || '');
+    if (!norm.weekdays.length) {
+      errs.push('毎週(WEEKLY)の場合は曜日を1つ以上指定してください');
+    }
+  }
+  if (norm.repeat === 'NONE' && norm.dateFrom && norm.dateTo && norm.dateTo !== norm.dateFrom) {
+    // 単発なのに期間が複数日 → 開始日のみに寄せる
+    norm.dateTo = norm.dateFrom;
+  }
+  if (norm.dateFrom && norm.dateTo && sheetTsToMs(norm.dateTo + ' 00:00') < sheetTsToMs(norm.dateFrom + ' 00:00')) {
+    errs.push('終了日は開始日以降にしてください');
+  }
+
+  return { ok: errs.length === 0, errors: errs, norm: norm };
+}
+
+/**
+ * 予約の対象が教員の権限内かを確認する（書き込み直前に必ず通す）。
+ *   norm は破壊的に補正される（schoolName を自校へ寄せる等）。
+ */
+function authorizeScheduleTarget_(norm, teacher) {
+  if (!teacher) return { ok: false, error: '認証情報がありません' };
+  const scope = getTeacherScopeInfo(teacher);
+
+  if (norm.targetType === 'class') {
+    // 学校境界
+    if (scope.type === 'school' || scope.type === 'unknown') {
+      if (!norm.schoolName) {
+        norm.schoolName = scope.school || '';
+      } else if (!schoolNamesMatch(norm.schoolName, scope.school)) {
+        return { ok: false, error: '自校以外のクラスは予約できません' };
+      } else {
+        norm.schoolName = scope.school;
+      }
+    }
+    // クラス境界（「対象クラス」は権限の境界）
+    if (!isClassInTeacherScope(norm.className, teacher)) {
+      return { ok: false, error: '対象クラスの権限がありません: ' + norm.className };
+    }
+    return { ok: true };
+  }
+
+  // student: 指定された児童IDがすべて自校スコープ内であること
+  if (!norm.studentIds.length) return { ok: false, error: '児童IDが空です' };
+  const scoped = scopeStudentIdsForTeacher(norm.studentIds, teacher);
+  if (!Array.isArray(scoped.ids) || scoped.ids.length === 0) {
+    return { ok: false, error: '操作対象の児童がありません（自校の児童のみ予約できます）' };
+  }
+  if (scoped.ids.length !== norm.studentIds.length) {
+    return { ok: false, error: '自校以外の児童が含まれています（全員が自校の児童である必要があります）' };
+  }
+  norm.studentIds = scoped.ids;
+  return { ok: true };
+}
+
+/**
+ * シートの1行を書き込む。ヘッダー名→列番号で詰めるので、
+ * 列の増減（ensureScheduleHeaders の自動補完）にも追従する。
+ */
+function appendScheduleRow_(obj) {
+  const sheet = getTargetSheet(CONFIG.SCHEDULE_SHEET_NAME);
+  try { ensureScheduleHeaders(sheet); } catch (eEns) {}
+  const map = getHeaderMap(sheet, CONFIG.SCHEDULE_COLUMNS);
+  const lastCol = Math.max(sheet.getLastColumn() || 0, CONFIG.SCHEDULE_COLUMNS.length);
+  const values = [];
+  for (let i = 0; i < lastCol; i++) values.push('');
+
+  const set = function (name, val) {
+    const c = map[name];
+    if (!c) return;
+    values[c - 1] = (val === undefined || val === null) ? '' : val;
+  };
+  set('スケジュールID', obj.id);
+  set('対象種別', obj.targetType);
+  set('学校名', obj.schoolName);
+  set('クラス名', obj.className);
+  set('児童ID', Array.isArray(obj.studentIds) ? obj.studentIds.join(',') : String(obj.studentIds || ''));
+  set('制限タイプ', obj.type);
+  set('URL規制モード', obj.type === 'url_block' ? obj.filterMode : '');
+  set('許可URLリスト', obj.type === 'url_block' ? obj.whitelist : '');
+  set('規制URLリスト', obj.type === 'url_block' ? obj.blacklist : '');
+  set('開始日', obj.dateFrom);
+  set('終了日', obj.dateTo);
+  set('繰り返し', obj.repeat);
+  set('開始時刻', obj.startTime);
+  set('終了時刻', obj.endTime);
+  set('曜日', Array.isArray(obj.weekdays) && obj.weekdays.length ? obj.weekdays.join(',') : '');
+  set('有効', true);          // 新規は必ず有効（文字列 "TRUE" ではなく真偽値で書く）
+  set('手動解除', false);
+  set('手動解除日時', '');
+  set('作成者', obj.createdBy);
+  set('作成日時', obj.createdAt);
+  set('更新日時', obj.updatedAt);
+  set('備考', obj.note);
+
+  sheet.appendRow(values);
+  return sheet.getLastRow();
+}
+
+/** 特定行の指定列だけを更新する（監査ログを壊さない） */
+function updateScheduleCells_(rowIndex, patch) {
+  const sheet = getTargetSheet(CONFIG.SCHEDULE_SHEET_NAME);
+  try { ensureScheduleHeaders(sheet); } catch (eEns) {}
+  const map = getHeaderMap(sheet, CONFIG.SCHEDULE_COLUMNS);
+  Object.keys(patch).forEach(function (name) {
+    const c = map[name];
+    if (!c) return;
+    sheet.getRange(rowIndex, c).setValue(patch[name]);
+  });
+}
+
+/**
+ * 予約行が教員の権限内か（list / cancel / override の共通判定）。
+ *  class   → 学校一致 ＋ 対象クラス境界
+ *  student → 児童が1人でも自校スコープ内なら「触れる」（取消は自校分に限る）
+ */
+function isScheduleRowInTeacherScope_(row, teacher) {
+  if (!row || !teacher) return false;
+  if (isAdminTeacher(teacher)) return true;
+  const scope = getTeacherScopeInfo(teacher);
+
+  if (row.schoolName && (scope.type === 'school' || scope.type === 'unknown')) {
+    if (!schoolNamesMatch(row.schoolName, scope.school)) return false;
+  }
+  if (row.targetType === 'class') {
+    return isClassInTeacherScope(row.className, teacher);
+  }
+  if (row.targetType === 'student') {
+    const scoped = scopeStudentIdsForTeacher(row.studentIds || [], teacher);
+    return Array.isArray(scoped.ids) && scoped.ids.length > 0;
+  }
+  return true;
+}
+
+/** 予約1件をクライアント向けのJSONへ整形する */
+function scheduleRowToJson_(r, nowMs) {
+  const sched = {
+    dateFrom: r.dateFrom, dateTo: r.dateTo, repeat: r.repeat,
+    startTimeOfDayMs: schTimeOfDayMs_(r.startTime),
+    endTimeOfDayMs: schTimeOfDayMs_(r.endTime),
+    weekdays: parseWeekdays_(r.weekdaysRaw)
+  };
+  const wins = expandScheduleWindows_(sched, nowMs, (CONFIG.SCHEDULE_HORIZON_DAYS || 14) * 86400000);
+  let activeNow = false;
+  let nextStart = 0;
+  for (let i = 0; i < wins.length; i++) {
+    if (wins[i].start_ms <= nowMs && nowMs < wins[i].end_ms) activeNow = true;
+    if (!nextStart && wins[i].start_ms > nowMs) nextStart = wins[i].start_ms;
+  }
+  return {
+    id: r.id,
+    target_type: r.targetType,
+    school_name: r.schoolName,
+    class_name: r.className,
+    student_ids: r.studentIds,
+    type: r.type,
+    filter_mode: r.filterMode,
+    whitelist_urls: r.whitelist,
+    blacklist_urls: r.blacklist,
+    date_from: r.dateFrom,
+    date_to: r.dateTo,
+    repeat: r.repeat,
+    start_time: r.startTime,
+    end_time: r.endTime,
+    weekdays: parseWeekdays_(r.weekdaysRaw),
+    enabled: r.enabled,
+    overridden: r.overridden,
+    override_at: r.overrideAt,
+    created_by: r.createdBy,
+    created_at: r.createdAt,
+    updated_at: r.updatedAt,
+    note: r.note,
+    is_active_now: activeNow,
+    next_start_ms: nextStart,
+    next_start_jst: nextStart ? schMsToJstStr_(nextStart) : '',
+    window_count: wins.length
+  };
+}
+
+/** save_schedule */
+function handleSaveSchedule_(payload, teacher) {
+  const v = validateScheduleInput_(payload);
+  if (!v.ok) {
+    return { success: false, error: v.errors.join(' / '), error_code: 'validation_failed', errors: v.errors };
+  }
+  const authz = authorizeScheduleTarget_(v.norm, teacher);
+  if (!authz.ok) {
+    return { success: false, error: authz.error, error_code: 'forbidden' };
+  }
+
+  const nowStr = schNowJstSec_();
+  const obj = {
+    id: generateScheduleId_(),
+    targetType: v.norm.targetType,
+    schoolName: v.norm.schoolName,
+    className: v.norm.targetType === 'class' ? v.norm.className : '',
+    studentIds: v.norm.targetType === 'student' ? v.norm.studentIds : [],
+    type: v.norm.type,
+    filterMode: v.norm.filterMode,
+    whitelist: v.norm.whitelist,
+    blacklist: v.norm.blacklist,
+    dateFrom: v.norm.dateFrom,
+    dateTo: v.norm.dateTo,
+    repeat: v.norm.repeat,
+    startTime: v.norm.startTime,
+    endTime: v.norm.endTime,
+    weekdays: v.norm.weekdays,
+    note: v.norm.note,
+    createdBy: String((teacher && teacher.email) || ''),
+    createdAt: nowStr,
+    updatedAt: nowStr
+  };
+
+  let rowIndex = 0;
+  withWriteLock(function () { rowIndex = appendScheduleRow_(obj); });
+
+  const nowMs = new Date().getTime();
+  const rows = readScheduleRows_();
+  let saved = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].id === obj.id) { saved = rows[i]; break; }
+  }
+
+  Logger.log('[SCHEDULE] saved id=' + obj.id + ' target=' + obj.targetType +
+    ' by=' + obj.createdBy + ' row=' + rowIndex);
+  return {
+    success: true,
+    message: 'スケジュールを登録しました',
+    schedule: saved ? scheduleRowToJson_(saved, nowMs) : null,
+    row_index: rowIndex
+  };
+}
+
+/** list_schedules */
+function handleListSchedules_(payload, teacher) {
+  const nowMs = new Date().getTime();
+  const wantId = String((payload && (payload.schedule_id || payload.id)) || '').trim();
+  let rows = readScheduleRows_();
+
+  const out = [];
+  rows.forEach(function (r) {
+    if (wantId && r.id !== wantId) return;
+    if (!isScheduleRowInTeacherScope_(r, teacher)) return;
+    out.push(scheduleRowToJson_(r, nowMs));
+  });
+  out.sort(function (a, b) { return String(a.created_at).localeCompare(String(b.created_at)); });
+
+  return { success: true, data: out, count: out.length, server_time_ms: nowMs, server_time: schNowJstSec_() };
+}
+
+/** cancel_schedule … 予約そのものを止める（有効=FALSE／行は残す） */
+function handleCancelSchedule_(payload, teacher) {
+  const id = String((payload && (payload.schedule_id || payload.id)) || '').trim();
+  if (!id) return { success: false, error: 'スケジュールIDが必要です', error_code: 'validation_failed' };
+
+  const rows = readScheduleRows_();
+  let target = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].id === id) { target = rows[i]; break; }
+  }
+  if (!target) return { success: false, error: 'スケジュールが見つかりません: ' + id, error_code: 'not_found' };
+  if (!isScheduleRowInTeacherScope_(target, teacher)) {
+    return { success: false, error: 'この予約を操作する権限がありません', error_code: 'forbidden' };
+  }
+
+  const nowStr = schNowJstSec_();
+  withWriteLock(function () {
+    updateScheduleCells_(target.rowIndex, { '有効': false, '更新日時': nowStr });
+  });
+
+  Logger.log('[SCHEDULE] cancelled id=' + id + ' by=' + String((teacher && teacher.email) || ''));
+  return { success: true, message: '予約を取り消しました（履歴は残ります）', schedule_id: id, enabled: false, updated_at: nowStr };
+}
+
+/** override_schedule … 今回の時間帯だけ解除（予約は残す） */
+function handleOverrideSchedule_(payload, teacher) {
+  const id = String((payload && (payload.schedule_id || payload.id)) || '').trim();
+  if (!id) return { success: false, error: 'スケジュールIDが必要です', error_code: 'validation_failed' };
+
+  const rows = readScheduleRows_();
+  let target = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].id === id) { target = rows[i]; break; }
+  }
+  if (!target) return { success: false, error: 'スケジュールが見つかりません: ' + id, error_code: 'not_found' };
+  if (!isScheduleRowInTeacherScope_(target, teacher)) {
+    return { success: false, error: 'この予約を操作する権限がありません', error_code: 'forbidden' };
+  }
+
+  const nowStr = schNowJstSec_();
+  withWriteLock(function () {
+    updateScheduleCells_(target.rowIndex, {
+      '手動解除': true,
+      '手動解除日時': nowStr,
+      '更新日時': nowStr
+    });
+  });
+
+  Logger.log('[SCHEDULE] overridden id=' + id + ' by=' + String((teacher && teacher.email) || ''));
+  return { success: true, message: 'この予約を今回だけ解除しました（次回以降は再び適用されます）', schedule_id: id, overridden: true, override_at: nowStr };
+}
+
 
 
