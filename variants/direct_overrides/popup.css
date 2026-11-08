@@ -1,0 +1,143 @@
+/**
+ * 直接読み込み版（検証用）ポップアップ スタイル
+ * 外部CDNは使用せず自己完結（Chrome拡張のCSP制約に対応）。
+ */
+
+/* ---- リセット / ベース ---- */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  width: 340px;
+  padding: 14px;
+  background: #f8fafc;
+  color: #1e293b;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif;
+  font-size: 12px;
+  line-height: 1.5;
+}
+button { font: inherit; cursor: pointer; border: none; }
+input, select { font: inherit; }
+h1, h2, p { margin: 0; }
+
+/* ---- レイアウト ---- */
+.flex { display: flex; }
+.flex-1 { flex: 1 1 0%; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.block { display: block; }
+.hidden { display: none !important; }
+.space-y-1 > * + * { margin-top: 4px; }
+.space-y-2 > * + * { margin-top: 8px; }
+.space-y-3 > * + * { margin-top: 12px; }
+.space-y-4 > * + * { margin-top: 16px; }
+.space-x-2 > * + * { margin-left: 8px; }
+.w-full { width: 100%; }
+
+/* ---- 余白 ---- */
+.p-2 { padding: 8px; }
+.p-3 { padding: 10px; }
+.px-2 { padding-left: 8px; padding-right: 8px; }
+.px-3 { padding-left: 12px; padding-right: 12px; }
+.py-1 { padding-top: 3px; padding-bottom: 3px; }
+.py-2 { padding-top: 7px; padding-bottom: 7px; }
+.pb-2 { padding-bottom: 8px; }
+.pt-2 { padding-top: 8px; }
+.mb-1 { margin-bottom: 4px; }
+.mb-2 { margin-bottom: 8px; }
+.mt-1 { margin-top: 4px; }
+.mt-2 { margin-top: 8px; }
+
+/* ---- 枠線・角丸 ---- */
+.border { border: 1px solid #e2e8f0; }
+.border-b { border-bottom: 1px solid #e2e8f0; }
+.border-t { border-top: 1px solid #e2e8f0; }
+.border-slate-200 { border-color: #e2e8f0; }
+.border-slate-300 { border-color: #cbd5e1; }
+.border-emerald-200 { border-color: #a7f3d0; }
+.border-rose-200 { border-color: #fecdd3; }
+.border-amber-200 { border-color: #fde68a; }
+.rounded { border-radius: 4px; }
+.rounded-lg { border-radius: 8px; }
+.rounded-xl { border-radius: 10px; }
+.rounded-full { border-radius: 9999px; }
+
+/* ---- 背景色 ---- */
+.bg-white { background: #ffffff; }
+.bg-slate-50 { background: #f8fafc; }
+.bg-slate-100 { background: #f1f5f9; }
+.bg-slate-200 { background: #e2e8f0; }
+.bg-indigo-50 { background: #eef2ff; }
+.bg-indigo-600 { background: #4f46e5; }
+.bg-emerald-50 { background: #ecfdf5; }
+.bg-emerald-100 { background: #d1fae5; }
+.bg-rose-50 { background: #fff1f2; }
+.bg-amber-50 { background: #fffbeb; }
+
+/* ---- 文字色 ---- */
+.text-white { color: #ffffff; }
+.text-slate-500 { color: #64748b; }
+.text-slate-600 { color: #475569; }
+.text-slate-700 { color: #334155; }
+.text-slate-800 { color: #1e293b; }
+.text-indigo-700 { color: #4338ca; }
+.text-emerald-600 { color: #059669; }
+.text-emerald-700 { color: #047857; }
+.text-rose-600 { color: #e11d48; }
+.text-rose-700 { color: #be123c; }
+.text-amber-700 { color: #b45309; }
+.text-center { text-align: center; }
+.text-left { text-align: left; }
+
+/* ---- 文字スタイル ---- */
+.font-bold { font-weight: 700; }
+.font-semibold { font-weight: 600; }
+.font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.text-9 { font-size: 9px; }
+.text-10 { font-size: 10px; }
+.text-11 { font-size: 11px; }
+.text-xs { font-size: 12px; }
+.text-sm { font-size: 13px; }
+.leading-relaxed { line-height: 1.6; }
+.break-all { word-break: break-all; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- 効果 ---- */
+.shadow-sm { box-shadow: 0 1px 2px rgba(15, 23, 42, .08); }
+.transition { transition: background-color .15s ease, color .15s ease, border-color .15s ease; }
+.select-none { -webkit-user-select: none; user-select: none; }
+.cursor-pointer { cursor: pointer; }
+
+/* ---- 状態 ---- */
+.hover\:bg-indigo-700:hover { background: #4338ca; }
+.hover\:bg-slate-300:hover { background: #cbd5e1; }
+.focus\:border-indigo-500:focus { border-color: #6366f1; outline: none; }
+.focus\:ring-indigo-500:focus { outline: none; box-shadow: 0 0 0 3px rgba(99, 102, 241, .35); }
+
+/* ---- 部品 ---- */
+.icon-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 5px; background: #4f46e5; color: #fff; border-radius: 7px;
+}
+.icon-badge svg { width: 14px; height: 14px; }
+
+.banner {
+  border-radius: 8px; padding: 8px 10px; font-size: 11px; font-weight: 600;
+  line-height: 1.5; border: 1px solid transparent;
+}
+.banner.ok { background: #d1fae5; color: #065f46; border-color: #a7f3d0; }
+.banner.info { background: #eef2ff; color: #3730a3; border-color: #c7d2fe; }
+.banner.warn { background: #fffbeb; color: #92400e; border-color: #fde68a; }
+.banner.ng { background: #fff1f2; color: #9f1239; border-color: #fecdd3; }
+
+.sec-title {
+  font-size: 10px; font-weight: 700; color: #64748b;
+  letter-spacing: .04em; margin: 0 0 6px;
+}
+
+.kv {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; padding: 2px 0;
+}
+.kv > .k { color: #64748b; }
+.kv > .v { font-weight: 700; color: #1e293b; max-width: 200px; }

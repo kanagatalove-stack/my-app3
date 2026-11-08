@@ -19,6 +19,8 @@ const lock=fs.readFileSync('/home/user/webapp/extension/lock.js','utf8');
 const blocked=fs.readFileSync('/home/user/webapp/extension/blocked.js','utf8');
 const codeGs=fs.readFileSync('/home/user/webapp/gas/Code.gs','utf8');
 const manifest=JSON.parse(fs.readFileSync('/home/user/webapp/extension/manifest.json','utf8'));
+// 直接読み込み版（実機検証用）は差分オーバーレイ側の manifest を検査する。
+const directManifest=JSON.parse(fs.readFileSync('/home/user/webapp/variants/direct_overrides/manifest.json','utf8'));
 
 function extract(src,name){
   const re=new RegExp('^[ \\t]*function '+name+'\\s*\\(','m');
@@ -45,7 +47,10 @@ vm.runInContext(
   "const KA_KEY='ka_console';const KA_PROP_KEY='KA_LAST_TOUCH';const KA_SESS_KEY='ka_sessions';"+
   "const KA_SESS_PROP_KEY='KA_SESSIONS';const KA_ACTIVE_WINDOW_MS=120000;const KA_MAX_SESSIONS=200;"+
   "const KA_IDLE_DRIFT_SEC=20;const ACTIVE_SYNC_INTERVAL_SEC=1.5;let __now=0;\n"+
+  // 緊急呼び出しフラグ（wake_epoch）関連。touchTeacherConsole が参照するため注入する。
+  "const WAKE_CACHE_KEY='wake_epoch';const WAKE_PROP_KEY='WAKE_EPOCH_V1';\n"+
   extract(codeGs,'readKaSessions')+'\n'+extract(codeGs,'writeKaSessions')+'\n'+extract(codeGs,'pruneKaSessions')+'\n'+
+  extract(codeGs,'readWakeEpoch')+'\n'+extract(codeGs,'bumpWakeEpoch')+'\n'+
   extract(codeGs,'touchTeacherConsole')+'\n'+extract(codeGs,'releaseTeacherConsole')+'\n'+extract(codeGs,'isTeacherConsoleActive')+'\n'+
   extract(codeGs,'computeKaInterval')+
   '\n__touch=touchTeacherConsole;__release=releaseTeacherConsole;__active=isTeacherConsoleActive;__interval=computeKaInterval;', gctx);
@@ -137,12 +142,24 @@ check('CP5 manifest に devtools_page / omnibox 等の露出面が無い',
   !('devtools_page' in manifest) && !('omnibox' in manifest) && !('options_page' in manifest));
 check('CP5 content script は console/詳細情報を一切表示しない（注入IDはロック関連のみ）',
   !/chrome\.runtime\.getManifest|id="chrome"|詳細情報/.test(content) && /edu-screen-lock-overlay/.test(content));
-check('CP5 manifest に default_popup が無い（アイコンを押しても何も出ない）',
+// --- 2ビルド体制（v1.6.4〜） ---------------------------------------------
+//  ストア版  : extension/            … 児童がアイコンを押しても何も出ないこと（従来どおり必須）
+//  検証用版  : variants/direct_overrides/ … 実機検証のため default_popup を必ず持つこと
+//  ※ chrome://extensions が使えない環境では、検証用版のポップアップが唯一の設定/診断窓口になる。
+check('CP5【ストア版】manifest に default_popup が無い（アイコンを押しても何も出ない）',
   !(manifest.action && manifest.action.default_popup), manifest.action);
-check('CP5 manifest に options_ui / options_page が無い（児童が設定画面を開けない）',
+check('CP5【ストア版】manifest に options_ui / options_page が無い（児童が設定画面を開けない）',
   !('options_ui' in manifest) && !('options_page' in manifest));
-check('CP5 popup は web_accessible_resources に含まれない（外部・児童から到達不可）',
+check('CP5【ストア版】popup は web_accessible_resources に含まれない（外部・児童から到達不可）',
   !(manifest.web_accessible_resources || []).some(r => (r.resources || []).some(x => /popup/.test(x))));
+check('CP5【検証用版】manifest は default_popup: popup.html を持つ（設定/診断の窓口）',
+  (directManifest.action && directManifest.action.default_popup) === 'popup.html', directManifest.action);
+check('CP5【検証用版】検証用であることが名称から判別できる',
+  /検証用/.test(directManifest.name || ''), directManifest.name);
+check('CP5【検証用版】version はストア版と一致する',
+  directManifest.version === manifest.version, [manifest.version, directManifest.version]);
+check('CP5【検証用版】options_ui / options_page は持たない（設定はポップアップに一本化）',
+  !('options_ui' in directManifest) && !('options_page' in directManifest));
 check('CP5 自動構成（管理ポリシー）で動作し、手動操作を要さない実装である',
   /chrome\.storage\.managed/.test(bg) && /managed_schema/.test(fs.readFileSync('/home/user/webapp/extension/manifest.json','utf8')));
 

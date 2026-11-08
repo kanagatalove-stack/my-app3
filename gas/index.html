@@ -216,6 +216,15 @@
             <span id="teacherSettingsBtnLabel">設定 (クラス・URL)</span>
           </button>
 
+          <!-- AI監視設定ボタン（管理者のみ） -->
+          <button id="monitorSettingsBtn" onclick="openMonitoringModal()" title="学習に関係のないサイトの監視設定（管理者のみ）" class="hidden flex items-center space-x-1.5 bg-rose-700 hover:bg-rose-800 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-rose-500">
+            <svg class="w-4 h-4 text-rose-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+            </svg>
+            <span>監視設定</span>
+          </button>
+
           <!-- ログアウトボタン -->
           <button onclick="logout()" title="ログアウト" class="flex items-center space-x-1 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1084,6 +1093,81 @@
     </div>
   </div>
 
+  <!-- ==================== モーダル: AI監視設定（管理者のみ・システム全体） ==================== -->
+  <div id="monitorModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[65] hidden flex items-center justify-center p-3 sm:p-4">
+    <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden">
+      <div class="p-5 border-b flex items-center justify-between bg-slate-50 shrink-0">
+        <h3 class="text-lg font-bold text-slate-800 flex items-center space-x-2">
+          <span class="p-1.5 bg-rose-100 text-rose-600 rounded-lg">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+            </svg>
+          </span>
+          <span>AI監視設定（システム全体）</span>
+        </h3>
+        <button onclick="closeModal('monitorModal')" class="text-slate-400 hover:text-slate-600">✕</button>
+      </div>
+
+      <div class="p-5 space-y-4 text-xs overflow-y-auto flex-1">
+        <!-- システム全体のON/OFF -->
+        <div class="bg-rose-50 border border-rose-200 rounded-xl p-4 flex items-start space-x-3">
+          <input type="checkbox" id="monitorEnabledToggle" class="w-5 h-5 mt-0.5 text-rose-600 rounded shrink-0">
+          <label for="monitorEnabledToggle" class="cursor-pointer select-none">
+            <span class="block text-sm font-bold text-rose-900">AI監視を有効にする（システム全体）</span>
+            <span class="block text-[11px] text-rose-700 mt-1 leading-relaxed">
+              有効にすると、児童が学習に関係のないサイトを開いたときに、端末一覧の氏名の横へ
+              <span class="font-bold">⚠ 注意</span> マークが表示されます。<br>
+              無効にすると注意マークは全端末で即座に非表示になります（記録は保持されます）。
+            </span>
+          </label>
+        </div>
+
+        <!-- 非学習ドメイン辞書 -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <label class="font-semibold text-slate-700">非学習ドメイン辞書（開いたら注意マークを出す）</label>
+            <span class="text-[11px] text-slate-400">1行に1ドメイン</span>
+          </div>
+          <div class="text-[11px] text-slate-500 mb-1 leading-relaxed">
+            YouTube・SNS・ゲーム等のドメインを列挙します。<code class="bg-slate-100 px-1 rounded">youtube.com</code> のように
+            書くとサブドメイン（<code class="bg-slate-100 px-1 rounded">www.youtube.com</code>）も対象になります。
+          </div>
+          <textarea id="monitorBlockedDomains" rows="8" spellcheck="false"
+            class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs font-mono focus:ring-rose-500 focus:border-rose-500"
+            placeholder="youtube.com&#10;tiktok.com&#10;roblox.com"></textarea>
+        </div>
+
+        <!-- 学習ドメイン辞書 -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <label class="font-semibold text-slate-700">学習ドメイン辞書（注意マークを出さない）</label>
+            <span class="text-[11px] text-slate-400">1行に1ドメイン</span>
+          </div>
+          <div class="text-[11px] text-slate-500 mb-1 leading-relaxed">
+            授業で使うサイトを列挙します。ここに登録したサイトは非学習辞書より<strong>優先</strong>されます。
+            各端末の「許可URLリスト」はさらに優先されます（先生が明示的に許可したサイトは注意しません）。
+          </div>
+          <textarea id="monitorLearningDomains" rows="8" spellcheck="false"
+            class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs font-mono focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="google.com&#10;nhk.or.jp&#10;scratch.mit.edu"></textarea>
+        </div>
+
+        <div id="monitorUpdatedInfo" class="text-[11px] text-slate-400"></div>
+
+        <div class="bg-slate-50 border border-slate-200 rounded-lg p-3 text-[11px] text-slate-600 leading-relaxed">
+          <span class="font-bold text-slate-700">判定の優先順位</span><br>
+          ① 端末の許可URLリスト → ② 学習ドメイン辞書 → ③ 端末の規制URLリスト → ④ 非学習ドメイン辞書 → ⑤ 未知のサイト<br>
+          ⑤の未知のサイトは注意マークを出しません（誤検知を避けるため）。
+        </div>
+      </div>
+
+      <div class="flex justify-end space-x-2 p-4 border-t bg-slate-50 shrink-0">
+        <button onclick="closeModal('monitorModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition">閉じる</button>
+        <button onclick="saveMonitoringSettingsFromModal()" class="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white rounded-lg shadow-sm transition">保存する</button>
+      </div>
+    </div>
+  </div>
+
   <!-- モーダル: 注意喚起（確認ダイアログ） -->
   <div id="alertModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[60] hidden flex items-center justify-center p-4">
     <div class="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-sm w-full p-6 text-center space-y-4">
@@ -1430,6 +1514,8 @@
         // サーバから最新の教員情報を取得して上書きする。
         await refreshCurrentTeacher();
         showDashboard();
+        // 【R41】再読み込み後も並列直送できるよう、子GAS設定を取り直す
+        try { syncShardClientConfig(true); } catch (eSC2) {}
       } else {
         showLoginView();
       }
@@ -1551,6 +1637,727 @@
       } catch (e) {}
     }
 
+    // =====================================================================
+    // 子GAS伝達のフラッシュ（R34）
+    //   教員のロック/配信/規制は、応答を返す瞬間にサーバ側で「保留」に積まれる。
+    //   その保留分を子GASへ送る仕事を、このビーコンで別リクエストとして起動する。
+    //   ビーコンは応答を読まないので、子GASの応答を待つ時間が
+    //   教員の画面に出ない（＝体感の速度が落ちない）。
+    //   もしブラウザが落ちても、コンソールの稼働通知（15秒ごと）で
+    //   サーバ側が自動回収するため、指示が永久に消えることはない。
+    // =====================================================================
+    let eduShardFlushTimer = null;
+
+    // 子GAS伝達が発生する操作か（これ以外はビーコンを飛ばさない）
+    function isShardFlushAction(act) {
+      return act === 'bulk_lock' || act === 'bulk_broadcast' ||
+             act === 'bulk_filter' || act === 'update_single';
+    }
+
+    // ==================================================================
+    // 【R43】/exec 直送の対象と、タイムアウト付き fetch
+    //
+    //   画面情報（get_screens / request_screens）は R36 以降も google.script.run を
+    //   通っていた。google.script.run は裏で callback?nocache_id= をポーリングするため、
+    //   往復に 3.6〜7.1 秒かかる（R36 の実測）。これが
+    //     「1回の取得に数秒かかる」「待っている間ボタンが固まる」
+    //   の直接原因だった。書き込み系（ロック/配信）は既に /exec 直送へ移して
+    //   効果が出ているので、画面情報も同じ経路へ揃える。
+    //
+    //   併せて AbortController で上限時間を設ける。GAS が無応答のとき
+    //   Promise が永久に残り、ボタンが押せないまま固まるのを防ぐ。
+    // ==================================================================
+    const SCREEN_FETCH_TIMEOUT_MS = 12000;  // 画面情報（子GAS・親/exec 共通）
+    const WRITE_FETCH_TIMEOUT_MS = 25000;   // 書き込み系（従来の挙動を壊さない余裕）
+    function isDirectFetchAction(act) {
+      return act === 'get_screens' || act === 'request_screens';
+    }
+
+    // fetch に上限時間を付ける。AbortController が無い環境では素の fetch。
+    //   ※ テスト環境などで setTimeout が同期実行される場合に備え、
+    //     settled フラグで「解決済みなら abort しない」ようにする。
+    function eduFetchWithTimeout(url, options, timeoutMs) {
+      const ms = (typeof timeoutMs === 'number' && timeoutMs > 0) ? timeoutMs : SCREEN_FETCH_TIMEOUT_MS;
+      let ctrl = null;
+      try {
+        if (typeof AbortController === 'function') ctrl = new AbortController();
+      } catch (eC) { ctrl = null; }
+      if (!ctrl) return fetch(url, options);
+      const opt = Object.assign({}, options || {});
+      opt.signal = ctrl.signal;
+      let settled = false;
+      const timer = setTimeout(function () {
+        if (settled) return;
+        try { ctrl.abort(); } catch (eA) {}
+      }, ms);
+      const clear = function () {
+        settled = true;
+        try { clearTimeout(timer); } catch (eT) {}
+      };
+      return fetch(url, opt).then(function (r) { clear(); return r; },
+        function (e) { clear(); throw e; });
+    }
+
+    // 子GASへの伝達を促すビーコンを送る（応答は読まない）。
+    function sendShardFlushBeacon() {
+      try {
+        const url = getApiUrl();
+        if (!url || !authToken) return;
+        const body = JSON.stringify({ action: 'shard_flush', token: authToken });
+        if (typeof navigator !== 'undefined' && navigator && typeof navigator.sendBeacon === 'function') {
+          try {
+            const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
+            if (navigator.sendBeacon(url, blob)) return;
+          } catch (e) {}
+        }
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: body,
+          redirect: 'follow', keepalive: true
+        }).catch(() => {});
+      } catch (e) {}
+    }
+
+    // 連続操作（ロックON→解除など）でビーコンが連打されないよう、
+    // 直前の予約を上書きして 1 本にまとめる。上書きされても内容は
+    // サーバ側の保留（スクリプトプロパティ）に溜まっているので取りこぼしは無い。
+    function requestShardFlush(delayMs) {
+      try {
+        if (eduShardFlushTimer) clearTimeout(eduShardFlushTimer);
+        eduShardFlushTimer = setTimeout(() => {
+          eduShardFlushTimer = null;
+          sendShardFlushBeacon();
+        }, typeof delayMs === 'number' ? delayMs : 300);
+      } catch (e) {}
+    }
+
+    // 【R38】R37 の5段連射（0 / 400 / 900 / 1500ms + 応答直後）を廃止し、1本だけに戻す。
+    //
+    //   実測: callback?nocache_id= が 33〜35 秒 Pending になる通信詰まりが発生した。
+    //   原因は、1操作あたり最大5本のビーコンが GAS の同時実行枠とブラウザの
+    //   ホストあたり接続枠（HTTP/1.1 で 6 本）を食い潰し、本命の /exec と
+    //   後続通信を巻き込んで待たせていたこと。便益より害が大きいため撤回する。
+    //
+    //   空振り（親の書き込み完了前に発火して保留が空）は、15秒周期の
+    //   console_touch が必ず shardFlushPending を呼ぶため、そこで回収される。
+    //
+    //   SHARD_FLUSH_BEACON_AT:
+    //     'delayed'  … 送出から 750ms 後に1本だけ撃つ（既定）
+    //     'send'     … 送出と同時（0ms）に1本だけ撃つ（R39 の設定）
+    //     'response' … 親の応答が返ってから1本だけ撃つ（空振りゼロ・ただし約3.8秒後）
+    //
+    // 【R40】既定を 'delayed'（750ms）にした理由（実機 DevTools 実測）。
+    //   R39 の 'send'（0ms）は、親がシートへ書き終える前（echo 実測 345〜533ms）に
+    //   届いてしまい「保留なし（空振り）」になっていた。空振りすると次の
+    //   15秒周期 console_touch まで待つことになり、子シートの連動が遅れていた。
+    //   750ms は「echo の実測上限 533ms ＋ 余裕 約200ms」で、
+    //   ご依頼の「書き込み完了後 150〜200ms で届く」に一致する。
+    //
+    //   再試行は行わない（1操作＝1本）。
+    //     理由: ビーコンの結果を読んで再試行すると、/exec の応答自体が
+    //           3.3〜4.9秒かかるため「1.5秒後に再試行」のつもりが実際には
+    //           5〜8秒後に発火してしまい、15秒周期の回収と大差なくなる。
+    //           それでいて /exec を余計に消費するため、害の方が大きい。
+    //   取りこぼしは 15秒周期の console_touch が回収する（従来どおり）。
+    var SHARD_FLUSH_BEACON_AT = 'delayed';
+    var SHARD_FLUSH_DELAY_MS = 750;
+
+    // R37 のタイマー予約は廃止。呼び出し側との互換のため関数は残す。
+    function clearShardFlushRetries() {}
+
+    // 即時発火（0ms）。押下と同じ tick で撃つ＝親 fetch と並列。1本だけ。
+    function fireShardFlushNow() {
+      try { sendShardFlushBeacon(); } catch (e) {}
+    }
+
+    function scheduleShardFlushRetries() {
+      // 【R41】ブラウザ直送（並列 shard_apply）が有効なら、親経由のビーコンは撃たない。
+      //   親が UrlFetchApp で子へ送る経路を復活させないため（/exec を遅くしない）。
+      //   直送に失敗した分は親の保留に残り、15秒周期の console_touch が回収する。
+      try {
+        if (shardClientCfg && shardClientCfg.enabled) return;
+      } catch (eC) {}
+      if (SHARD_FLUSH_BEACON_AT === 'response') return;   // 応答後に1本撃つ
+      if (SHARD_FLUSH_BEACON_AT === 'send') { fireShardFlushNow(); return; }
+      try { scheduleShardFlushDelayed(); } catch (e) {}    // 既定 'delayed'
+    }
+
+    // 【R40】送出から 750ms 後に1本だけ撃つ（親の書き込み完了を待つ）。
+    //   連続操作では直前の予約を上書きするので、同時に走るビーコンは常に1本。
+    //   R37 で問題になった「同時多発ビーコンによる接続枠の枯渇」は起きない。
+    var shardFlushDelayTimer = null;
+    var shardFlushDelaySeq = 0;
+
+    function scheduleShardFlushDelayed() {
+      const mySeq = ++shardFlushDelaySeq;
+      try { if (shardFlushDelayTimer) clearTimeout(shardFlushDelayTimer); } catch (e0) {}
+      shardFlushDelayTimer = setTimeout(function () {
+        shardFlushDelayTimer = null;
+        if (mySeq !== shardFlushDelaySeq) return;   // 追い越された
+        fireShardFlushNow();
+      }, (typeof SHARD_FLUSH_DELAY_MS === 'number') ? SHARD_FLUSH_DELAY_MS : 750);
+    }
+
+    // ==================================================================
+    // 【R41】ブラウザから親GAS・子GASへ「並列」で直接 POST する。
+    //
+    //   GAS の UrlFetchApp は応答まで必ずブロックするため、親の中で子へ送ると
+    //   親の /exec に子の待ち時間が加算される（実測 6.62〜7.41 秒）。
+    //   そこで親からは送らず、ブラウザから
+    //     ・親 /exec（親シート書き込み）
+    //     ・子 /exec（shard_apply で子シート書き込み）
+    //   を同じ tick で並列に投げる。Google のリダイレクト待ち（約3.8秒）を
+    //   親・子で同時に消化するので、双方がほぼ同時刻に確定する。
+    //
+    //   1校独立運用（自校のブラウザは自校のGASにしか到達しない）を前提に、
+    //   子GASのURLと共有シークレットは親の shard_config から受け取る。
+    //   SHARD_MODE が無効なら enabled:false が返り、何もしない（従来動作）。
+    // ==================================================================
+    var shardClientCfg = null;          // { enabled, secret, classes:[{normalized,url}], empty_default, default_url }
+    var shardClientCfgPromise = null;
+
+    // 【R41.1】並列直送が「実際に走っているか」をコンソールで一目で分かるようにする。
+    //   観測専用。送信の順序・待ち方・ヘッダには一切影響しない。
+    //   調査が済んだら SHARD_PARALLEL_LOG を false にすれば出力だけ止まる。
+    var SHARD_PARALLEL_LOG = true;
+    function plog(msg) {
+      try {
+        if (!SHARD_PARALLEL_LOG) return;
+        if (typeof console !== 'undefined' && console && typeof console.log === 'function') {
+          console.log('[R41-PARALLEL] ' + String(msg));
+        }
+      } catch (e) {}
+    }
+
+    // GAS 側 normalizeShardClass と完全に同じ規則（キーがずれると子へ届かない）。
+    function normalizeShardClassJs(raw) {
+      // GAS 側と一字一句同じ式にする（差があるとキーがずれて子へ届かない）
+      let s = String(raw || '').trim();
+      if (!s) return '';
+      s = s.replace(/[０-９]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
+      s = s.replace(/[Ａ-Ｚａ-ｚ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
+      s = s.replace(/[\s\u3000]+/g, '');
+      if (!s || s === '未設定') return '';
+      let m = s.match(/^(\d{1,2})\s*[年\-ー/／]\s*(\d{1,2})/);
+      if (m) return Number(m[1]) + '-' + Number(m[2]);
+      m = s.match(/^(\d{1,2})組?$/);
+      if (m) return Number(m[1]) + '-1';
+      return s;
+    }
+
+    // GAS 側 parseBoolean と同じ意味（"false" を true にしない）。
+    function parseBoolJs(v) {
+      if (v === true || v === false) return v;
+      if (typeof v === 'number') return v !== 0;
+      const s = String(v === undefined || v === null ? '' : v).trim().toLowerCase();
+      if (!s) return false;
+      return s === 'true' || s === '1' || s === 'on' || s === 'yes' || s === 'する' || s === 'あり';
+    }
+
+    // shard_config を直接 fetch で取得する（google.script.run の runner 表に無いため）。
+    function fetchShardConfigDirect() {
+      let url = '';
+      try { url = getApiUrl(); } catch (e0) { url = ''; }
+      if (!url || !authToken) {
+        plog('shard_config 取得スキップ: ' + (!url ? 'API URL が未設定' : '未ログイン') +
+          '（並列直送は行わず従来のビーコン経路になります）');
+        return Promise.resolve({ enabled: false });
+      }
+      return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'shard_config', token: authToken }),
+        redirect: 'follow'
+      }).then(function (r) { return r.json(); })
+        .then(function (d) {
+          const ok = !!(d && d.enabled);
+          if (ok) {
+            const nCls = (d.classes && d.classes.length) ? d.classes.length : 0;
+            plog('shard_config 取得: enabled=true / クラス対応=' + nCls + '件' +
+              ' / secret=' + (d.secret ? 'あり' : 'なし') +
+              ' / 既定URL=' + (d.default_url || d.empty_default || 'なし'));
+          } else {
+            plog('shard_config 取得: enabled=false（親GASがSHARD_MODE無効、または子GAS未登録）');
+          }
+          return ok ? d : { enabled: false };
+        })
+        .catch(function (e) {
+          plog('shard_config 取得失敗: ' + String(e) + '（並列直送は行わず従来経路になります）');
+          return { enabled: false };
+        });
+    }
+
+    // ログイン直後・セッション復元後に1回だけ取得する（以降はメモリを使う）。
+    function syncShardClientConfig(force) {
+      if (!authToken) return Promise.resolve(null);
+      if (!force && shardClientCfg) return Promise.resolve(shardClientCfg);
+      if (shardClientCfgPromise) return shardClientCfgPromise;
+      shardClientCfgPromise = fetchShardConfigDirect().then(function (cfg) {
+        shardClientCfg = cfg || { enabled: false };
+        shardClientCfgPromise = null;
+        return shardClientCfg;
+      }, function () {
+        shardClientCfg = { enabled: false };
+        shardClientCfgPromise = null;
+        return shardClientCfg;
+      });
+      return shardClientCfgPromise;
+    }
+
+    // 操作アクション → 子GASへ渡す patch（GAS 側 shardPropagatePolicy と同じ形）。
+    function shardPatchFromPayload(act, p) {
+      const patch = {};
+      const src = p || {};
+      if (act === 'bulk_lock') {
+        patch.screen_lock = parseBoolJs(src.locked);
+      } else if (act === 'bulk_broadcast') {
+        patch.broadcast_url = String(src.url === undefined ? '' : src.url);
+      } else if (act === 'bulk_filter') {
+        if (src.filter_mode !== undefined) patch.filter_mode = src.filter_mode;
+        if (src.whitelist_urls !== undefined) patch.whitelist_urls = src.whitelist_urls;
+        if (src.blacklist_urls !== undefined) patch.blacklist_urls = src.blacklist_urls;
+      } else if (act === 'update_single') {
+        const d = src.data || {};
+        if (d.screen_lock !== undefined) patch.screen_lock = parseBoolJs(d.screen_lock);
+        if (d.filter_mode !== undefined) patch.filter_mode = d.filter_mode;
+        if (d.whitelist_urls !== undefined) patch.whitelist_urls = d.whitelist_urls;
+        if (d.blacklist_urls !== undefined) patch.blacklist_urls = d.blacklist_urls;
+        if (d.broadcast_url !== undefined) patch.broadcast_url = d.broadcast_url;
+      }
+      return patch;
+    }
+
+    // 児童ID → 子GAS URL に振り分ける（GAS 側 shardPropagatePolicy と同じ順序）。
+    function shardResolveTargets(studentIds) {
+      const cfg = shardClientCfg;
+      if (!cfg || !cfg.enabled) return null;
+      const idx = {};
+      const list = Array.isArray(cfg.classes) ? cfg.classes : [];
+      for (let i = 0; i < list.length; i++) {
+        if (list[i] && list[i].normalized) idx[list[i].normalized] = String(list[i].url || '');
+      }
+      const emptyDefault = String(cfg.empty_default || '');
+      const defUrl = String(cfg.default_url || '');
+      const groups = {};   // url -> { ids:[], classMap:{} }
+      const ids = Array.isArray(studentIds) ? studentIds : [];
+      for (let k = 0; k < ids.length; k++) {
+        const id = String(ids[k] || '');
+        if (!id) continue;
+        let dev = null;
+        try { dev = (devicesData || []).find(function (x) { return x && x.student_id === id; }) || null; } catch (e) {}
+        const rawCls = dev ? String(dev.class_name || '') : '';
+        const key = normalizeShardClassJs(rawCls);
+        const url = idx[key] || emptyDefault || defUrl;
+        if (!url) continue;
+        if (!groups[url]) groups[url] = { ids: [], classMap: {} };
+        groups[url].ids.push(id);
+        groups[url].classMap[id] = rawCls;
+      }
+      return groups;
+    }
+
+    // 子GASへ並列 POST する。戻り値の Promise は await しない（fire-and-forget）。
+    //   親 /exec と同じ tick で呼ぶことで、リダイレクト待ちを完全に重ねる。
+    function fireShardApplyParallel(act, p) {
+      try {
+        if (typeof isShardFlushAction === 'function' && !isShardFlushAction(act)) return null;
+        const cfg = shardClientCfg;
+        if (!cfg || !cfg.enabled) {
+          // まだ設定を取れていなければ取りに行く（この操作には間に合わないが次回以降効く）
+          plog('直送スキップ(action=' + String(act) + '): 子GAS設定が未取得/無効。取得を試みます');
+          try { syncShardClientConfig(); } catch (e0) {}
+          return null;
+        }
+        const src = p || {};
+        const patch = shardPatchFromPayload(act, src);
+        if (!Object.keys(patch).length) return null;
+        const ids = (act === 'update_single') ? [src.student_id] : (src.student_ids || []);
+        const groups = shardResolveTargets(ids);
+        if (!groups) return null;
+        const urls = Object.keys(groups);
+        if (!urls.length) {
+          plog('直送スキップ(action=' + String(act) + '): 児童' + ids.length +
+            '件のうち子GASの宛先を解決できませんでした（SHARD_MAP_V1 のクラスキーをご確認ください）');
+          return null;
+        }
+        plog('子GASへ直接POST開始: ' + urls.length + '件 / action=' + String(act) +
+          ' / 対象児童=' + ids.length + '件');
+
+        const tasks = urls.map(function (u) {
+          let body = '';
+          try {
+            body = JSON.stringify({
+              action: 'shard_apply',
+              shard_secret: cfg.secret,
+              student_ids: groups[u].ids,
+              class_map: groups[u].classMap,
+              patch: patch
+            });
+          } catch (eB) { return Promise.resolve(null); }
+          // text/plain は CORS プリフライトを起こさない（GAS は OPTIONS を扱わない）。
+          plog('  → POST ' + u + '（児童' + groups[u].ids.length + '件）');
+          try {
+            const __t0 = (typeof performance !== 'undefined' && performance && performance.now)
+              ? performance.now() : Date.now();
+            const __now = function () {
+              return (typeof performance !== 'undefined' && performance && performance.now)
+                ? performance.now() : Date.now();
+            };
+            return fetch(u, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+              body: body,
+              redirect: 'follow'
+            }).then(function (r) {
+              plog('  ← 完了 ' + u + ' / HTTP ' + r.status +
+                ' / ' + Math.round(__now() - __t0) + 'ms');
+              return r;
+            }).catch(function (e) {
+              plog('  ← 失敗 ' + u + ': ' + String(e) +
+                '（親の保留に残るため15秒周期で回収されます）');
+              return null;
+            });
+          } catch (eF) {
+            plog('  ← 送出失敗 ' + u + ': ' + String(eF));
+            return Promise.resolve(null);
+          }
+        });
+        return Promise.all(tasks).catch(function () { return null; });
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // ==================================================================
+    // 【R42】画面情報のマルチスプレッドシート対応。
+    //
+    //   これまで「画面情報取得」は親スプレッドシートだけを見ていたため、
+    //   子GAS（子スプレッドシート）を参照しているクラスの端末には
+    //   要求が届かず、子に保存された画像も表示できなかった。
+    //
+    //   R41 の書き込み系と同じ方式で、ブラウザから親 /exec と子 /exec へ
+    //   「並列」に投げる。親の中で UrlFetchApp を使うと応答までブロックして
+    //   /exec が遅くなるため、子との送受信はブラウザが担う。
+    // ==================================================================
+    var SHARD_SCREEN_LOG = true;
+    function slog(msg) {
+      try {
+        if (!SHARD_SCREEN_LOG) return;
+        if (typeof console !== 'undefined' && console && typeof console.log === 'function') {
+          console.log('[R42-SCREEN] ' + String(msg));
+        }
+      } catch (e) {}
+    }
+
+    // 児童ID → 子GAS URL（R41 の shardResolveTargets をそのまま使う）
+    function shardScreenTargets(studentIds) {
+      try {
+        const cfg = shardClientCfg;
+        if (!cfg || !cfg.enabled) return null;
+        if (typeof shardResolveTargets !== 'function') return null;
+        const ids = Array.isArray(studentIds) ? studentIds : [];
+        if (!ids.length) return null;
+        return shardResolveTargets(ids);
+      } catch (e) { return null; }
+    }
+
+    // 子GASへ「画面情報取得の要求」を並列送出する（戻り値は await しない）。
+    //   児童端末が撮影・送信するきっかけは子シートの『画面情報要求日時』なので、
+    //   ここが届かないと子担当の端末は永久に撮影しない。
+    function fireShardRequestScreensParallel(studentIds) {
+      try {
+        const groups = shardScreenTargets(studentIds);
+        if (!groups) {
+          slog('子GASへの画面取得要求: スキップ（子GAS設定が未取得/無効、または宛先未解決）');
+          try { syncShardClientConfig(); } catch (e0) {}
+          return null;
+        }
+        const cfg = shardClientCfg;
+        const urls = Object.keys(groups);
+        if (!urls.length) return null;
+        slog('子GASへ画面取得要求を並列送出: ' + urls.length + '件');
+
+        const tasks = urls.map(function (u) {
+          const body = JSON.stringify({
+            action: 'shard_request_screens',
+            shard_secret: cfg.secret,
+            student_ids: groups[u].ids,
+            class_map: groups[u].classMap
+          });
+          slog('  → request_screens ' + u + '（児童' + groups[u].ids.length + '件）');
+          try {
+            return fetch(u, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+              body: body,
+              redirect: 'follow'
+            }).then(function (r) {
+              slog('  ← request_screens 完了 ' + u + ' / HTTP ' + r.status);
+              return r;
+            }).catch(function (e) {
+              slog('  ← request_screens 失敗 ' + u + ': ' + String(e));
+              return null;
+            });
+          } catch (eF) {
+            return Promise.resolve(null);
+          }
+        });
+        return Promise.all(tasks).catch(function () { return null; });
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // 子GASから「画面情報」を並列取得し、平坦な配列で返す。
+    function fetchShardScreensParallel(studentIds, metaOnly) {
+      let groups = null;
+      try { groups = shardScreenTargets(studentIds); } catch (e) { groups = null; }
+      if (!groups) return Promise.resolve([]);
+      const cfg = shardClientCfg;
+      const urls = Object.keys(groups);
+      if (!urls.length) return Promise.resolve([]);
+
+      slog('子GASから画面情報を並列取得: ' + urls.length + '件' + (metaOnly ? '（メタのみ）' : ''));
+      const tasks = urls.map(function (u) {
+        const req = {
+          action: 'shard_get_screens',
+          shard_secret: cfg.secret,
+          student_ids: groups[u].ids
+        };
+        // 【R43】メタのみ（Base64 を除く）で問い合わせる。ポーリング用。
+        if (metaOnly) req.meta_only = true;
+        const body = JSON.stringify(req);
+        // 【R43】上限時間つき fetch。無応答時に Promise が残り続けるのを防ぐ。
+        //   テスト環境などで補助関数が無い場合は素の fetch にそのまま落とす。
+        const __fetch = (typeof eduFetchWithTimeout === 'function') ? eduFetchWithTimeout : fetch;
+        const __to = (typeof SCREEN_FETCH_TIMEOUT_MS === 'number') ? SCREEN_FETCH_TIMEOUT_MS : 12000;
+        try {
+          return __fetch(u, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: body,
+            redirect: 'follow'
+          }, __to).then(function (r) { return r.json(); })
+            .then(function (d) {
+              const arr = (d && Array.isArray(d.data)) ? d.data : [];
+              slog('  ← get_screens 完了 ' + u + ' / ' + arr.length + '件');
+              return arr;
+            })
+            .catch(function (e) {
+              slog('  ← get_screens 失敗 ' + u + ': ' + String(e));
+              return [];
+            });
+        } catch (eF) {
+          return Promise.resolve([]);
+        }
+      });
+      return Promise.all(tasks).then(function (lists) {
+        const out = [];
+        (lists || []).forEach(function (arr) {
+          if (Array.isArray(arr)) {
+            for (let i = 0; i < arr.length; i++) out.push(arr[i]);
+          }
+        });
+        return out;
+      }).catch(function () { return []; });
+    }
+
+    // ==================================================================
+    // 【R42.1】日時の数値化と表示書式の統一
+    //
+    //   同じ「撮影日時」でも、入手経路によって書式が違う。
+    //     ・シート書式            "2026/11/05 20:39:25"
+    //     ・日付型セルの String() "Wed Oct 28 2026 09:44:57 GMT+0900 (日本標準時)"
+    //   生の文字列で大小比較すると月名の辞書順になり
+    //     "Nov" < "Oct" / "Dec" < "Feb" / "Mar" < "May"
+    //   と、実際には新しい子のデータが古い親のデータに負ける。
+    //   必ずミリ秒へ直してから比較する（GAS の sheetTsToMs と同一規則）。
+    //
+    //   シート書式はタイムゾーン表記を持たないため、実行環境の TZ に任せると
+    //   9 時間ずれる（＝常時オフライン判定になる）。日本時間と決め打ちする。
+    // ==================================================================
+    const SCREEN_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+    function screenTsToMs(v) {
+      if (v === null || v === undefined || v === '') return 0;
+      if (v instanceof Date) {
+        const t0 = v.getTime();
+        return isNaN(t0) ? 0 : t0;
+      }
+      if (typeof v === 'number') return v > 0 ? v : 0;
+      const str = String(v).trim();
+      if (!str) return 0;
+      const m = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+      if (m) {
+        const utc = Date.UTC(
+          Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+          Number(m[4] || 0), Number(m[5] || 0), Number(m[6] || 0));
+        if (!isNaN(utc)) return utc - SCREEN_TZ_OFFSET_MS;
+      }
+      const t = new Date(str).getTime();
+      return isNaN(t) ? 0 : t;
+    }
+
+    // 画面カードの「撮影:」表示を常に "YYYY/MM/DD HH:mm:ss"（日本時間）へ揃える。
+    function formatStampJst(v) {
+      const ms = screenTsToMs(v);
+      if (!ms) return '';
+      const d = new Date(ms + SCREEN_TZ_OFFSET_MS);
+      const p = function (n) { return (n < 10 ? '0' : '') + n; };
+      return d.getUTCFullYear() + '/' + p(d.getUTCMonth() + 1) + '/' + p(d.getUTCDate()) +
+        ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds());
+    }
+
+    // 親の行を正とし、子の行からは「画像」だけを取り込む。
+    //   氏名・学校・クラスは親（名簿の正）を保つため上書きしない。
+    //
+    // 【R42.3】撮影日時の参照先を統一する。
+    //   親の screenshot_at が『端末一覧』シートの列（screenshot_from === 'device'）に
+    //   由来する場合、それは撮影時刻ではない（過去の要求や別経路の書き込みが残る）。
+    //   画像の実体を持つ子の値を正とし、親の古い値で上書きしない。
+    //
+    // 【R43.1】「新着かどうか」の判定は“シート側の時計どうし”で行う。
+    //
+    //   R43 の欠陥：
+    //     押下時刻 … ブラウザの Date.now()（ミリ秒まで）
+    //     撮影時刻 … GAS が書いた "YYYY/MM/DD HH:mm:ss" を ms 化（秒未満は切り捨て）
+    //   を比較していたため  screenshot_at < 押下時刻  が永久に成立し、
+    //   pending_new が解除されず、しかも hasFresh がその行を除外するので
+    //   画像を取りに行く条件も永久に偽 → 「更新待ち」のまま固まった（実機症状）。
+    //
+    //   R43.1 の判定：
+    //     screenBaseMs = 押した瞬間に手元にあった「最新の撮影時刻（シート時計）」
+    //     新着 = screenshot_ms > screenBaseMs
+    //   基準も比較対象も同じ GAS が書いた値なので、精度差は原理的に生じない。
+    function mergeScreenRows(parentRows, childRows) {
+      // 押下時に観測した最新の撮影時刻（シート時計）。未押下なら 0。
+      const baseMs = (typeof screenBaseMs === 'number' && screenBaseMs > 0) ? screenBaseMs : 0;
+      // 【R43.1】児童ごとの基準（押した瞬間の最新撮影時刻）。全体の最大値より優先する。
+      const baseById = (typeof screenBaseById === 'object' && screenBaseById) ? screenBaseById : {};
+      // ポーリング稼働中だけ「更新待ち」を出す（終了後は必ず解除される）。
+      const reqActive = (typeof screenFetchActive !== 'undefined') ? !!screenFetchActive : false;
+      // 【R43.1】保険の期限。これを超えたら「更新待ち」を出さない（固着の最終防壁）。
+      const pendSince = (typeof screenPendingSince === 'number' && screenPendingSince > 0) ? screenPendingSince : 0;
+      const pendTtl = (typeof SCREEN_PENDING_TTL_MS === 'number' && SCREEN_PENDING_TTL_MS > 0)
+        ? SCREEN_PENDING_TTL_MS : 45000;
+      const pendExpired = pendSince > 0 && (Date.now() - pendSince) > pendTtl;
+      const byId = {};
+      const order = [];
+      (Array.isArray(parentRows) ? parentRows : []).forEach(function (r) {
+        if (!r || !r.student_id) return;
+        const id = String(r.student_id);
+        if (!(id in byId)) { byId[id] = Object.assign({}, r); order.push(id); }
+      });
+      (Array.isArray(childRows) ? childRows : []).forEach(function (c) {
+        if (!c || !c.student_id) return;
+        const id = String(c.student_id);
+        if (!(id in byId)) {
+          const row = Object.assign({}, c);
+          if (row.has_image === undefined) row.has_image = !!(row.image_data_url || row.has_image);
+          byId[id] = row; order.push(id);
+          return;
+        }
+        const cur = byId[id];
+        // 【R42.1】書式の異なる撮影日時をミリ秒へ直して比較する（生の文字列比較は廃止）。
+        const curMs = screenTsToMs(cur.screenshot_at);
+        const newMs = screenTsToMs(c.screenshot_at);
+        // 【R42.3】親の日時が『端末一覧』列由来（screenshot_from==='device'）なら
+        //   撮影時刻として信用しない。子が画像を持つなら無条件で子を採用する。
+        const parentAtUntrusted = (cur.screenshot_from === 'device');
+        const childHasImage = !!c.has_image;
+        const childIsNewer = newMs > curMs;
+        if (childHasImage && (!cur.has_image || childIsNewer || parentAtUntrusted)) {
+          cur.has_image = true;
+          cur.image_data_url = c.image_data_url || cur.image_data_url || '';
+          cur.screenshot_at = c.screenshot_at;
+          cur.screenshot_from = 'sheet';
+          cur.screenshot_ms = newMs;
+          if (!cur.screen_request_at && c.screen_request_at) cur.screen_request_at = c.screen_request_at;
+        } else if (!cur.has_image && !cur.screen_request_at && c.screen_request_at) {
+          cur.screen_request_at = c.screen_request_at;
+        }
+        // 【R43.1】要求日時（ミリ秒）は新しい方を採る。
+        //   子GASの『画面情報要求日時』は押下のたびにその子が書き換えるため、
+        //   親の値より新しいことがある。ここを取りこぼすと、子担当の端末だけ
+        //   要求時刻の基準が古いままになり「更新待ち」判定が狂う。
+        const curReqMs = (typeof cur.screen_request_ms === 'number') ? cur.screen_request_ms : 0;
+        const newReqMs = (typeof c.screen_request_ms === 'number') ? c.screen_request_ms : 0;
+        if (newReqMs > curReqMs) {
+          cur.screen_request_ms = newReqMs;
+          if (c.screen_request_at) cur.screen_request_at = c.screen_request_at;
+        }
+        // 【R42.1】最終同期日時も新しい方を採る。
+        //   端末は割り当て後「子GAS」にしかハートビートしないため、親シートの
+        //   最終同期日時は切り替え時点で止まる。親だけ見ると誤ってオフラインになる。
+        if (screenTsToMs(c.last_seen) > screenTsToMs(cur.last_seen)) {
+          cur.last_seen = c.last_seen;
+        }
+        // 【R43.3】「撮影不可」の状態も新しい方を採る。
+        //   子GAS担当の端末の報告は子シートにしか入らないため、親だけ見ていると
+        //   「保護されたページを表示中」が表示されない（端末が子担当の場合）。
+        const curBlkMs = (typeof cur.capture_blocked_ms === 'number') ? cur.capture_blocked_ms : 0;
+        const newBlkMs = (typeof c.capture_blocked_ms === 'number') ? c.capture_blocked_ms : 0;
+        if (c.capture_blocked && newBlkMs > curBlkMs) {
+          cur.capture_blocked = true;
+          cur.capture_blocked_reason = c.capture_blocked_reason || 'chrome_protected';
+          cur.capture_blocked_at = c.capture_blocked_at || '';
+          cur.capture_blocked_ms = newBlkMs;
+        }
+      });
+
+      // 【R42.1】ここで表示書式を揃え、オンライン判定を作り直す。
+      //   is_online は「親・子の最終同期のうち新しい方」から 60 秒以内かで決める。
+      //   子シート側の通信ログを参照しないと、実際に通信している端末が
+      //   オフライン表示のままになる（R42 の実機症状）。
+      const nowMs = new Date().getTime();
+      order.forEach(function (id) {
+        const r = byId[id];
+        if (!r) return;
+        const rawShotMs = screenTsToMs(r.screenshot_at);
+        r.screenshot_at = formatStampJst(r.screenshot_at) || String(r.screenshot_at || '');
+        const seenMs = screenTsToMs(r.last_seen);
+        r.is_online = seenMs ? ((nowMs - seenMs) < 60000) : false;
+        // 【R43.1】「更新待ち」の判定（シート時計どうしで比較）。
+        //   優先順位:
+        //     1) シートの『画面情報要求日時』(screen_request_ms) があればそれを使う
+        //        → 同じGASが書いた要求時刻なので精度差が無い（最も確実）
+        //     2) 無ければ“その児童の”押下時の最新撮影時刻 (screenBaseById) を基準にする
+        //     3) それも無ければ全体の最大値 (screenBaseMs)
+        //   すべて 0 なら判定しない（＝通常表示）。ブラウザ時計は一切使わない。
+        const sheetReqMs = (typeof r.screen_request_ms === 'number' && r.screen_request_ms > 0)
+          ? r.screen_request_ms : 0;
+        //   ※ 児童ごとの基準が無い＝押下時にその児童の画像が無かった、ということなので
+        //     基準 0 のままにする（全体の最大値を流用すると、他児童の新しい画像が
+        //     基準を押し上げて新着を「古い」と誤判定する＝R43 と同じ固着の温床）。
+        //     基準 0 では pending にならないため、安全側（固着しない側）に倒れる。
+        const ownBaseMs = (baseById && typeof baseById[id] === 'number' && baseById[id] > 0)
+          ? baseById[id] : 0;
+        const refMs = sheetReqMs > 0 ? sheetReqMs : ownBaseMs;
+        // 新着 = 撮影時刻が要求時刻以降（同一秒は新着とみなす＝切捨て誤差を吸収）
+        const isFresh = rawShotMs > 0 && refMs > 0 && rawShotMs >= refMs;
+        // 【R43.3】端末が「撮影できなかった」と報告している場合は、
+        //   要求より新しい画像が無くても「更新待ち」にしない。
+        //   chrome://newtab/ 等の特権ページは Chrome の仕様上撮影できず、
+        //   待っても永久に画像は来ない。ここで解除し、代わりに
+        //   「保護されたページを表示中」を出す（renderScreens）。
+        //   ブロック報告が古い（＝その後撮影に成功した）場合は
+        //   GAS 側（getScreenshots）で capture_blocked=false に落としてあるので、
+        //   ここでは素直に従ってよい。
+        const isBlocked = !!r.capture_blocked;
+        // ポーリング稼働中に限り、古い画像は「更新待ち」として明示する。
+        //   ・ポーリングが終われば reqActive=false になり必ず解除される
+        //   ・万一の時計ズレでも TTL 超過で解除される
+        //   → R43 のような「永久に更新待ち」の固着は原理的に起こらない。
+        r.pending_new = !!(reqActive && !pendExpired && !isBlocked &&
+                           r.has_image && refMs > 0 && !isFresh);
+        r.shot_is_fresh = !!(r.has_image && isFresh);
+        r.screenshot_ms = rawShotMs;
+      });
+
+      return order.map(function (id) { return byId[id]; });
+    }
+
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
     function consoleTouch(sessionId) {
       const sid = sessionId || eduKeepaliveSessionId || getKeepaliveSessionId();
@@ -1641,6 +2448,10 @@
       const settingsLabel = document.getElementById('teacherSettingsBtnLabel');
       if (settingsLabel) settingsLabel.textContent = isAdminUser() ? '設定 (クラス・URL)' : '設定 (URL・規制)';
 
+      // AI監視設定は「システム全体」に効くため、管理者(ADMIN)のみに表示する。
+      const monitorBtn = document.getElementById('monitorSettingsBtn');
+      if (monitorBtn) monitorBtn.classList.toggle('hidden', !isAdminUser());
+
       const classBadge = document.getElementById('currentTeacherClassBadge');
       if (currentTeacher.target_class && currentTeacher.target_class.trim()) {
         classBadge.textContent = '対象クラス: ' + currentTeacher.target_class.trim();
@@ -1678,6 +2489,8 @@
           localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
           showToast(`ようこそ、${currentTeacher.name} 先生`, 'success');
           showDashboard();
+          // 【R41】子GASのURLと共有シークレットを取得しておく（並列直送の準備）
+          try { syncShardClientConfig(true); } catch (eSC) {}
         } else {
           errBox.textContent = res.error || 'ログインに失敗しました';
           errBox.classList.remove('hidden');
@@ -1701,13 +2514,34 @@
         localStorage.removeItem('edu_teacher_info');
         authToken = null;
         currentTeacher = null;
+        // 【R41】子GAS設定（URL・シークレット）も破棄する
+        shardClientCfg = null;
+        shardClientCfgPromise = null;
         showLoginView();
       }
     }
 
     // ==================== ハイブリッド API リクエスト ====================
     async function apiRequest(payload, method = 'POST') {
-      if (typeof google !== 'undefined' && google.script && google.script.run) {
+      // 【R36】書き込み操作（ロック/一斉配信/規制/単一更新）は google.script.run を迂回し、
+      //   /exec へ直接 fetch する。
+      //   実測: callback?nocache_id= のポーリング往復が 3.6〜7.1秒かかっていた。
+      //   GAS 内部は 1.38秒で完了しているため、この往復待ちが体感6秒の正体だった。
+      // 【R37】個別操作（update_single）も一括と同じ経路に統一した。
+      //   isShardFlushAction が4アクションすべてを対象にするため、
+      //   個別・一括で挙動差は生じない。
+      const __directFetch = (typeof isShardFlushAction === 'function') &&
+                            isShardFlushAction(payload && payload.action);
+      // 【R43】画面情報（get_screens / request_screens）も /exec 直送にする。
+      //   google.script.run の callback ポーリング往復（3.6〜7.1秒）を無くすため。
+      const __screenAction = isDirectFetchAction(payload && payload.action);
+      if (__directFetch) {
+        // 【R37】応答を待たず、送信と「完全同時（0ms）」に子GASビーコンを撃つ。
+        //   親シートの書き込みと子シートの書き込みを時間軸で重ねるため。
+        try { scheduleShardFlushRetries(); } catch (e0) {}
+      }
+
+      if (!__directFetch && !__screenAction && typeof google !== 'undefined' && google.script && google.script.run) {
         return new Promise((resolve, reject) => {
           const runner = google.script.run
             .withSuccessHandler(res => {
@@ -1723,6 +2557,9 @@
                 reject(new Error(res.error || 'リクエストに失敗しました'));
                 return;
               }
+              // 【R34】子GAS伝達が発生する操作なら、応答を返す直前に
+              //   フラッシュビーコンを予約する（待たない）。
+              try { if (isShardFlushAction(payload.action)) requestShardFlush(); } catch (e) {}
               resolve(res);
             })
             .withFailureHandler(err => {
@@ -1768,6 +2605,10 @@
             runner.api_runAnnualRollover(authToken, payload.data || payload);
           } else if (act === 'get_archived_students') {
             runner.api_getArchivedStudents(authToken);
+          } else if (act === 'get_monitor_settings') {
+            runner.api_getMonitorSettings(authToken);
+          } else if (act === 'save_monitor_settings') {
+            runner.api_saveMonitorSettings(authToken, payload.settings || {});
           } else {
             reject(new Error('未対応のアクション: ' + act));
           }
@@ -1783,12 +2624,15 @@
         payload.token = authToken;
       }
 
-      const res = await fetch(apiUrl, {
+      // 【R43】上限時間を設けて fetch する。GAS が無応答のとき Promise が
+      //   永久に残り、「取得中」のままボタンが固まる現象を防ぐ。
+      const __timeoutMs = __screenAction ? SCREEN_FETCH_TIMEOUT_MS : WRITE_FETCH_TIMEOUT_MS;
+      const res = await eduFetchWithTimeout(apiUrl, {
         method: 'POST',
         body: JSON.stringify(payload),
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         redirect: 'follow'
-      });
+      }, __timeoutMs);
       const data = await res.json();
 
       if (data && data.need_auth) {
@@ -1797,6 +2641,18 @@
       }
       if (data && data.success === false) {
         throw new Error(data.error || 'リクエスト処理に失敗しました');
+      }
+
+      if (__directFetch) {
+        // 【R40】応答直後の発火は SHARD_FLUSH_BEACON_AT==='response' のときだけ。
+        //   既定 'delayed' は送出後 750ms に1本撃つので、ここでは撃たない
+        //   （撃つと二重になり、接続枠を無駄に使う）。
+        if (SHARD_FLUSH_BEACON_AT === 'response') {
+          try { sendShardFlushBeacon(); } catch (e4) {}
+        }
+      } else {
+        // google.script.run 経路（一括操作以外）は従来どおり予約する。
+        try { if (isShardFlushAction(payload.action)) requestShardFlush(); } catch (e) {}
       }
 
       return data;
@@ -1911,6 +2767,35 @@
     let screenPollTimer = null;
     let screenRevealTime = {};
     let screenFetchActive = false;
+    // 【R43.1】空振り判定の基準値。
+    //   R43 は「押した時刻 = ブラウザの壁時計(Date.now)」と
+    //   「シートの撮影日時 = JST文字列のミリ秒」を比較していた。
+    //   両者は時計の出どころが違い、秒未満も切り捨てられるため
+    //     screenshot_at < 押した時刻
+    //   が永久に成立し、カードが「更新待ち」のまま固まっていた（実機の症状）。
+    //
+    //   対策：判定はすべて「シート側の時計」で行う。
+    //     ・要求時刻 … 端末一覧の『画面情報要求日時』（GAS が書く）
+    //     ・撮影時刻 … 画面情報シートの『更新日時』（GAS が書く）
+    //   同じGASが同じ時計で書くので必ず整合する。
+    //   screenBaseMs は「押した瞬間に手元にあった最新の撮影時刻」で、
+    //   これより新しい撮影が来た＝新着、と判定する。
+    let screenReqTs = 0;      // 押した時刻（ブラウザ時計・表示用の目安のみ）
+    let screenBaseMs = 0;     // 押した瞬間の最新撮影時刻（シート時計・全体の控え）
+    // 【R43.1】児童ごとの「押した瞬間に手元にあった最新の撮影時刻（シート時計）」。
+    //   全体の最大値（screenBaseMs）だけだと、ある児童の新しい画像が基準を
+    //   押し上げてしまい、別の児童の新着を「古い」と誤判定する。
+    //   児童ごとに控えることで「前回取得したタイムスタンプより新しいか」を
+    //   そのまま判定できる（ユーザー指定の方式）。
+    let screenBaseById = {};
+    let screenPendingSince = 0; // 更新待ちが始まった時刻（ブラウザ時計・期限切れ用）
+    // 【R43.1】保険：この時間を超えたら「更新待ち」表示を強制解除する。
+    //   時計の不整合が万一あっても永久に固まらないようにする最終防壁。
+    const SCREEN_PENDING_TTL_MS = 45000;
+    // 【R43】ポーリングの多重実行を防ぐ番号（中止・再実行で古いループを捨てる）。
+    let screenPollGen = 0;
+    // 【R43】直近に描画した画像の署名（同じ画像でDOMを作り直さない）。
+    let screenRenderedSig = '';
 
     // ビュー切替（端末一覧 / 画面一覧）
     function switchMainView(view) {
@@ -1957,11 +2842,44 @@
       if (spinner) spinner.classList.remove('hidden');
       if (icon) icon.classList.add('hidden');
       if (text) text.textContent = '取得中...';
+      // 【R43.1】「いつ要求したか」の基準を“シート時計”で控える。
+      //   R43 は Date.now() を基準にしていたため、シートの撮影日時（秒未満切捨て）と
+      //   永久に噛み合わず「更新待ち」が解除されないデッドロックになっていた。
+      //   ここでは「押した瞬間に手元にある最新の撮影時刻（シート時計）」を
+      //   児童ごとに控え、それより新しい撮影が来た＝新着、と判定する
+      //   （基準も比較対象も同じGASが書いたシート時計なので精度差が生じない）。
+      screenReqTs = new Date().getTime();  // 表示用の目安（判定には使わない）
+      let __base = 0;
+      const __baseById = {};
+      try {
+        (screensData || []).forEach(function (d) {
+          if (!d || !d.student_id) return;
+          const ms = (typeof d.screenshot_ms === 'number' && d.screenshot_ms > 0)
+            ? d.screenshot_ms : screenTsToMs(d.screenshot_at);
+          if (ms <= 0) return;
+          __baseById[String(d.student_id)] = ms;
+          if (ms > __base) __base = ms;
+        });
+      } catch (eB) { __base = 0; }
+      // 手元に画像が無い児童は基準 0（＝最初の取得は常に新着扱い）
+      screenBaseById = __baseById;
+      screenBaseMs = __base;
+      screenPendingSince = new Date().getTime();
+      screenRenderedSig = '';
+      // 押した瞬間に中止ボタンを出す（応答待ちの間も操作できる）。
+      if (cancelBtn) cancelBtn.classList.remove('hidden');
+      screenFetchActive = true;
 
       try {
+        // 【R42】親 /exec と「同じ tick」で子GASへも取得要求を出す。
+        //   子シートの『画面情報要求日時』が更新されないと、子担当の端末は
+        //   撮影を始めない（これが「押しても更新されない」の直接原因だった）。
+        try { fireShardRequestScreensParallel(ids); } catch (eRq) {}
+
         await apiRequest({ action: 'request_screens', student_ids: ids });
         // 要求後は必ず一覧を表示（「送信待ち」のまま何も出ない状態を避ける）
-        await loadScreens({ silent: true });
+        //   【R43】画像本体まで取る（新着があればこの時点で表示できる）。
+        await loadScreens({ silent: true, wantImages: true });
         showToast(`${ids.length} 台に画面情報の取得を要求しました。端末の送信を待っています...`, 'info');
         // 取得中止ボタンを表示してポーリング開始
         screenFetchActive = true;
@@ -1969,10 +2887,12 @@
         startScreenPolling();
       } catch (err) {
         showToast('画面情報の要求に失敗しました: ' + err.message, 'error');
+        screenFetchActive = false;
         if (btn) btn.disabled = false;
         if (spinner) spinner.classList.add('hidden');
         if (icon) icon.classList.remove('hidden');
         if (text) text.textContent = '画面情報取得';
+        if (cancelBtn) cancelBtn.classList.add('hidden');
       }
     }
 
@@ -1987,29 +2907,87 @@
     // 「取得中止」ボタンでいつでも止められる。
     // ※ 1 秒間隔にして、端末が送信してから数秒以内に画面が出るようにする。
     const SCREEN_POLL_MAX = 30; // 1秒 × 30 = 約30秒
+    let screenPollTries = 0;
+
+    // 【R43】ポーリングを「1本ずつ順番に回す setTimeout 連鎖」へ変更する。
+    //   旧実装は setInterval + async だったため、応答が遅いと前の通信が終わる前に
+    //   次の通信が積み上がり、ブラウザの接続枠（HTTP/1.1 で 6 本）を食い潰して
+    //   /exec が待たされ、UI が固まって見えた（実機の「26s 停止」）。
+    //   1本ずつ直列に回せば、遅いときは自然に間隔が延びるだけで詰まらない。
     function startScreenPolling() {
+      // stopScreenPolling は後片付けで screenPendingSince を 0 に戻すため、
+      // 【R43.1】期限の基準はその“後”で必ず引き直す（ここで上書きする）。
       stopScreenPolling();
-      let tries = 0;
+      screenPollGen++;
+      screenPollTries = 0;
+      screenFetchActive = true;
+      screenPendingSince = new Date().getTime();  // TTL の起点
       updateScreenFetchButton(true, SCREEN_POLL_MAX);
-      screenPollTimer = setInterval(async () => {
-        tries++;
-        const changed = await loadScreens({ silent: true });
-        const remaining = SCREEN_POLL_MAX - tries;
-        if (changed || tries >= SCREEN_POLL_MAX) {
+      scheduleScreenPollTick(1000);
+    }
+
+    // 1 回分のポーリング。軽量メタ取得（画像なし）→ 新着があれば画像を取り直す。
+    function scheduleScreenPollTick(delayMs) {
+      const gen = screenPollGen;
+      if (screenPollTimer) {
+        try { clearTimeout(screenPollTimer); } catch (eT0) {}
+        screenPollTimer = null;
+      }
+      screenPollTimer = setTimeout(async () => {
+        if (gen !== screenPollGen || !screenFetchActive) return;
+        screenPollTimer = null;
+        screenPollTries++;
+        let changed = false;
+        try {
+          // 画像を含まない軽量取得。撮影日時が進んだ児童だけを検出する。
+          changed = await loadScreens({ silent: true, metaOnly: true });
+        } catch (eP) {
+          changed = false;
+        }
+        if (gen !== screenPollGen || !screenFetchActive) return;
+        if (changed) {
+          // 新しい撮影が届いた瞬間だけ、画像本体を取り直して描画する。
+          try { await loadScreens({ silent: true, wantImages: true }); } catch (eI) {}
+          if (gen !== screenPollGen) return;
           stopScreenPolling();
           return;
         }
+        if (screenPollTries >= SCREEN_POLL_MAX) {
+          stopScreenPolling();
+          return;
+        }
+        const remaining = SCREEN_POLL_MAX - screenPollTries;
+        if (screenFetchActive) scheduleScreenPollTick(1000);
         updateScreenFetchButton(true, remaining);
       }, 1000);
     }
 
     function stopScreenPolling() {
       if (screenPollTimer) {
-        clearInterval(screenPollTimer);
+        try { clearTimeout(screenPollTimer); } catch (eT1) {}
+        try { clearInterval(screenPollTimer); } catch (eT2) {}
         screenPollTimer = null;
       }
+      const wasActive = !!screenFetchActive;
       screenFetchActive = false;
+      screenPendingSince = 0;   // 期限の基準もリセット（次回押下で引き直す）
       updateScreenFetchButton(false, 0);
+      // 【R43.1】ポーリング終了時に「更新待ち」を必ず解除して描き直す。
+      //   R43 は screenFetchActive を false にしたまま再描画しなかったため、
+      //   最後に描いた「更新待ち」チップが画面に残り続けた（実機の固着症状）。
+      //   ここでフラグを落として再描画すれば、取得できなかった場合でも
+      //   「取得済（前回の画像）」表示に戻り、操作不能に見えることがなくなる。
+      //   ※ 実際にチップを消したときだけ描き直す（無駄な再描画でちらつかせない）。
+      if (wasActive) {
+        let dirty = false;
+        (screensData || []).forEach(function (d) {
+          if (d && d.pending_new) { d.pending_new = false; dirty = true; }
+        });
+        if (dirty) {
+          screenRenderedSig = '';
+          try { renderScreens(); } catch (eRS) {}
+        }
+      }
     }
 
     // 「取得中(n)」表示・中止ボタンの表示切替・取得ボタンの有効/無効をまとめて更新
@@ -2035,8 +3013,16 @@
     }
 
     // 取得済み画面情報の読み込み（「取得済みを表示」ボタン・ポーリングから呼ぶ）
+    //
+    // 【R43】2段構えにする。
+    //   opts.metaOnly  = true  … 画像(Base64)を含めず「誰の画面がいつ撮られたか」だけ取る。
+    //                             ポーリングはこれだけを 1 秒間隔で回す（軽い）。
+    //   opts.wantImages = true … 画像本体まで取る（新着を検出したときだけ）。
+    //   旧実装は毎秒 30 人分の Base64（最大 1MB 超）を取得・JSON解析しており、
+    //   それ自体が数秒かかって UI を止めていた。これが「極端な遅延」の主因。
     async function loadScreens(opts) {
       const silent = opts && opts.silent;
+      const metaOnly = !!(opts && opts.metaOnly);
       try {
         const scopeSchool = getTeacherScopeSchool();
         const includeUnassigned = document.getElementById('includeUnassignedCheckbox')?.checked ?? true;
@@ -2045,36 +3031,171 @@
           : (document.getElementById('schoolFilter')?.value || 'ALL');
         const targetIds = (opts && Array.isArray(opts.ids)) ? opts.ids : resolveBulkTargetIds().ids;
 
-        const res = await apiRequest({
+        // 【R42】親 /exec と「同じ tick」で子GASへも問い合わせる。
+        //   親は自スプレッドシートしか読まないため、これが無いと
+        //   子GAS配下のクラスの画面は永久に「未取得」のままになる。
+        let childP = null;
+        try { childP = fetchShardScreensParallel(targetIds, metaOnly); } catch (eCh) { childP = null; }
+
+        const reqPayload = {
           action: 'get_screens',
           school_name: schoolFilter,
           include_unassigned: scopeSchool ? true : includeUnassigned,
           status: 'all',
           student_ids: targetIds
+        };
+        if (metaOnly) reqPayload.meta_only = true;
+        const res = await apiRequest(reqPayload);
+
+        let data = (res && Array.isArray(res.data)) ? res.data : [];
+        // 【R42.1】子GASの結果を併合（撮影日時をミリ秒で比較し、新しい方を採用）。
+        //   子が0件でも併合を通す。表示書式の統一と is_online の再計算は
+        //   子の有無に関係なく必要（親シートだけでも日時書式が揺れるため）。
+        let childRows = [];
+        if (childP) {
+          try { childRows = (await childP) || []; } catch (eMg) { childRows = []; }
+        }
+        {
+          const before = data.filter(d => d.has_image).length;
+          const beforeOnline = data.filter(d => d.is_online).length;
+          data = mergeScreenRows(data, childRows);
+          const after = data.filter(d => d.has_image).length;
+          const afterOnline = data.filter(d => d.is_online).length;
+          if (after !== before) {
+            slog('子GASの画面情報を併合: 取得済 ' + before + '件 → ' + after + '件');
+          }
+          if (afterOnline !== beforeOnline) {
+            slog('オンライン判定を再計算: ' + beforeOnline + '台 → ' + afterOnline + '台');
+          }
+        }
+
+        // 【R43.1】「新しく撮れた」＝ 要求時刻以降の撮影が存在するか。
+        //   判定は mergeScreenRows が「シート時計どうし」で済ませており、
+        //   その結果が shot_is_fresh / pending_new に入っている。
+        //   ここでブラウザ時計(screenReqTs)を混ぜると R43 のデッドロックが再発するため、
+        //   フォールバックも必ずシート時計（screen_request_ms → screenBaseMs）で行う。
+        const hasFresh = data.some(function (d) {
+          if (!d || !d.has_image) return false;
+          if (d.shot_is_fresh === true) return true;
+          if (d.pending_new) return false;
+          const ms = (typeof d.screenshot_ms === 'number' && d.screenshot_ms > 0)
+            ? d.screenshot_ms : screenTsToMs(d.screenshot_at);
+          const reqMs = (typeof d.screen_request_ms === 'number' && d.screen_request_ms > 0)
+            ? d.screen_request_ms : 0;
+          if (reqMs > 0 && ms > 0) return ms >= reqMs;   // シートの要求日時と比較
+          if (screenBaseMs > 0 && ms > 0) return ms > screenBaseMs; // 押下時の最新より新しい
+          return true;  // 基準が無い（未要求の単純表示）なら「取得済み」として扱う
         });
 
-        const data = (res && Array.isArray(res.data)) ? res.data : [];
-        const prevReady = screensData.filter(d => d.has_image).length;
+        // メタ取得のときは、既に持っている画像を消さない（画像本体は返ってこないため）。
+        if (metaOnly) {
+          const prevById = {};
+          (screensData || []).forEach(function (p) {
+            if (p && p.student_id) prevById[String(p.student_id)] = p;
+          });
+          data.forEach(function (d) {
+            if (!d || !d.student_id) return;
+            const prev = prevById[String(d.student_id)];
+            if (!prev) return;
+            // 新着（要求時刻以降に撮れた）でなければ、手元の画像を維持する。
+            if (!d.pending_new && prev.has_image && !d.image_data_url) {
+              d.image_data_url = prev.image_data_url;
+            }
+            if (d.pending_new && prev.has_image) {
+              // 要求後にまだ撮れていない → 旧画像は残すが「更新待ち」として描く。
+              d.image_data_url = prev.image_data_url;
+            }
+          });
+        }
+
         screensData = data;
-        renderScreens();
-        const nowReady = screensData.filter(d => d.has_image).length;
-        return nowReady > prevReady;
+        // 【R43】画像本体を持たないメタ取得の途中では DOM を作り直さない
+        //   （毎秒の再構築はスクロール位置やクリックを妨げ、重い）。
+        //   ただし状態（オンライン・更新待ち）だけは反映させる。
+        renderScreens({ light: metaOnly });
+        return hasFresh;
       } catch (err) {
         if (!silent) showToast('画面一覧の取得に失敗しました: ' + err.message, 'error');
         return false;
       }
     }
 
-    function renderScreens() {
+    // オンライン／オフラインのバッジ HTML（描画と部分更新で共用）
+    function onlineBadgeHtml(on) {
+      return on
+        ? '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200"><span class="w-1.5 h-1.5 mr-1 rounded-full bg-emerald-500"></span>オンライン</span>'
+        : '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-100 text-slate-500 border border-slate-200"><span class="w-1.5 h-1.5 mr-1 rounded-full bg-slate-400"></span>オフライン</span>';
+    }
+
+    // 【R43】ポーリング中の軽量更新。カードの DOM を作り直さず、
+    //   オンライン表示と撮影日時だけを差し替える（クリック・スクロールを壊さない）。
+    function updateScreenCardStates() {
+      const grid = document.getElementById('screenGrid');
+      if (!grid) return;
+      const cards = grid.querySelectorAll('[data-sid]');
+      if (!cards.length) { renderScreens(); return; }
+      const byId = {};
+      (screensData || []).forEach(function (d) {
+        if (d && d.student_id) byId[String(d.student_id)] = d;
+      });
+      for (let i = 0; i < cards.length; i++) {
+        const card = cards[i];
+        const d = byId[card.getAttribute('data-sid')];
+        if (!d) continue;
+        const badge = card.querySelector('[data-online-badge]');
+        if (badge) badge.innerHTML = onlineBadgeHtml(d.is_online);
+        const st = card.querySelector('[data-shot-at]');
+        if (st) st.textContent = '撮影: ' + (d.screenshot_at || '-');
+      }
+    }
+
+    function renderScreens(opts) {
       const grid = document.getElementById('screenGrid');
       const statusBar = document.getElementById('screenStatusBar');
       if (!grid) return;
+      // 【R43】light=true は「状態だけ更新」（ポーリングのメタ取得時）。
+      //   カードを毎秒作り直すと、スクロール位置・クリック・画像デコードが
+      //   すべてやり直しになり、重くて操作できない（実機の固まり）。
+      const light = !!(opts && opts.light);
 
       const ready = screensData.filter(d => d.has_image).length;
-      const pending = screensData.filter(d => !d.has_image && d.screen_request_at).length;
-      const none = screensData.filter(d => !d.has_image && !d.screen_request_at).length;
+      // 【R43】要求より前に撮れた旧画像 = 「更新待ち」（取得済みだが最新ではない）
+      const waiting = screensData.filter(d => d.has_image && d.pending_new).length;
+      // 【R43.3】「保護されたページ表示中」＝端末は応答したが撮影できなかった。
+      //   更新待ち／取得待ちとは別枠で数える（待っても来ないため）。
+      //   画像が既にある端末（更新待ちの旧画像表示）は取得済み側に残す。
+      const blocked = screensData.filter(d => d.capture_blocked && !d.has_image).length;
+      const pending = screensData.filter(d => !d.has_image && !d.capture_blocked && d.screen_request_at).length;
+      const none = screensData.filter(d => !d.has_image && !d.capture_blocked && !d.screen_request_at).length;
       if (statusBar) {
-        statusBar.innerHTML = `対象 <b>${screensData.length}</b> 台 ／ 取得済 <span class="text-emerald-600 font-bold">${ready}</span> ／ 取得待ち <span class="text-amber-600 font-bold">${pending}</span> ／ 未取得 <span class="text-slate-500 font-bold">${none}</span>`;
+        statusBar.innerHTML = `対象 <b>${screensData.length}</b> 台 ／ 取得済 <span class="text-emerald-600 font-bold">${ready}</span> ／ 更新待ち <span class="text-amber-600 font-bold">${waiting}</span> ／ 取得待ち <span class="text-amber-600 font-bold">${pending}</span> ／ 保護ページ <span class="text-sky-600 font-bold">${blocked}</span> ／ 未取得 <span class="text-slate-500 font-bold">${none}</span>`;
+      }
+
+      // カード内容の署名。変わっていなければ作り直さない（無駄な再描画を防ぐ）。
+      //   【R43.3】capture_blocked を署名に含める。含めないと、
+      //   「更新待ち → 保護ページ表示中」の切り替えが同一署名と判定され、
+      //   カードが描き直されずに古い表示のまま残ってしまう。
+      const sig = screensData.map(function (d) {
+        return [d.student_id, d.screenshot_at || '', d.has_image ? 1 : 0,
+                d.pending_new ? 1 : 0, d.is_online ? 1 : 0,
+                d.capture_blocked ? 1 : 0,
+                d.capture_blocked_reason || ''].join('~');
+      }).join('|');
+
+      if (light && screenRenderedSig) {
+        // 【R43.3】ポーリング中でも、内容が変わったときは作り直す。
+        //   これが無いと「更新待ち → 保護ページ表示中」への切り替えが
+        //   light 経路で握り潰され、カードが古い表示のまま残ってしまう
+        //   （ポーリングは最大 30 秒続くため、実質その間ずっと誤表示になる）。
+        //   内容が同じときだけ軽量更新に留める（R43 の重さ対策は維持）。
+        if (sig === screenRenderedSig) {
+          updateScreenCardStates();
+          return;
+        }
+      } else if (!light && sig === screenRenderedSig) {
+        // 内容が同じなら再構築しない（画像の再デコードによるちらつきを避ける）
+        updateScreenCardStates();
+        return;
       }
 
       if (screensData.length === 0) {
@@ -2083,20 +3204,42 @@
           '  <span class="text-sm font-semibold text-slate-600">対象の児童がいません</span>',
           '</div>'
         ].join('');
+        screenRenderedSig = '';
         return;
       }
 
       grid.innerHTML = screensData.map(d => {
-        const onlineBadge = d.is_online
-          ? '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200"><span class="w-1.5 h-1.5 mr-1 rounded-full bg-emerald-500"></span>オンライン</span>'
-          : '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-100 text-slate-500 border border-slate-200"><span class="w-1.5 h-1.5 mr-1 rounded-full bg-slate-400"></span>オフライン</span>';
+        const onlineBadge = onlineBadgeHtml(d.is_online);
 
         let body;
         if (d.has_image) {
-          const isNew = screenRevealTime[d.student_id];
-          body = `<div class="relative bg-slate-900 aspect-video overflow-hidden group">
+          const isNew = screenRevealTime[d.student_id] && !d.pending_new;
+          // 【R43】要求後にまだ撮れていない場合は「更新待ち」と明示する
+          //   （古い画像を最新として見せない＝空振りの防止）。
+          // 【R43.3】保護ページ表示中（撮れなかった）は、旧画像は残しつつ
+          //   「更新待ち」ではなく「保護ページ」と表示する（待っても来ないため）。
+          const chip = d.capture_blocked
+            ? '<span class="absolute top-1.5 left-1.5 bg-sky-600/95 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">保護ページ</span>'
+            : (d.pending_new
+              ? '<span class="absolute top-1.5 left-1.5 bg-amber-500/95 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">更新待ち</span>'
+              : `<span class="absolute top-1.5 left-1.5 bg-emerald-600/90 text-white text-[10px] font-bold px-2 py-0.5 rounded-full ${isNew ? 'animate-pulse-subtle' : ''}">取得済</span>`);
+          body = `<div class="relative bg-slate-900 aspect-video overflow-hidden group ${d.pending_new ? 'opacity-60' : ''}">
             <img src="${d.image_data_url}" alt="${escapeHtml(d.student_id)} の画面" class="w-full h-full object-contain cursor-zoom-in" onclick="openScreenPreview('${escapeHtml(d.student_id)}')">
-            <span class="absolute top-1.5 left-1.5 bg-emerald-600/90 text-white text-[10px] font-bold px-2 py-0.5 rounded-full ${isNew ? 'animate-pulse-subtle' : ''}">取得済</span>
+            ${chip}
+          </div>`;
+        } else if (d.capture_blocked) {
+          // 【R43.3】端末は応答したが撮影できなかった（chrome://newtab/ 等の特権ページ）。
+          //   「端末の送信待ち」のまま放置すると教員は待ち続けてしまうため、
+          //   撮れない理由を明示する（Chrome の仕様であり、待っても来ない）。
+          const why = (d.capture_blocked_reason === 'image_too_large')
+            ? '画面が大きすぎて送信できませんでした'
+            : (d.capture_blocked_reason === 'capture_error'
+              ? '画面のキャプチャに失敗しました'
+              : '保護されたページ（設定/新しいタブ等）を表示中');
+          body = `<div class="bg-sky-50 aspect-video flex flex-col items-center justify-center text-sky-400">
+            <svg class="w-7 h-7 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+            <span class="text-xs mt-2 font-semibold text-sky-700 text-center px-2 leading-snug">${escapeHtml(why)}</span>
+            <span class="text-[10px] text-slate-400 mt-0.5">${escapeHtml(d.capture_blocked_at || '')}</span>
           </div>`;
         } else if (d.screen_request_at) {
           body = `<div class="bg-slate-100 aspect-video flex flex-col items-center justify-center text-slate-400">
@@ -2111,12 +3254,14 @@
           </div>`;
         }
 
-        return `<div class="bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden flex flex-col">
+        // 【R43】data-sid / data-online-badge / data-shot-at を付けておくと、
+        //   ポーリング中にカード全体を作り直さず、この2点だけ差し替えられる。
+        return `<div data-sid="${escapeHtml(d.student_id)}" class="bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden flex flex-col">
           ${body}
           <div class="p-3 space-y-1.5">
             <div class="flex items-center justify-between gap-2">
               <span class="font-bold text-slate-800 text-sm truncate">${escapeHtml(d.student_name || '氏名未設定')}</span>
-              ${onlineBadge}
+              <span data-online-badge>${onlineBadge}</span>
             </div>
             <div class="flex items-center space-x-1.5 text-[11px] text-slate-500 flex-wrap gap-y-1">
               <span class="font-mono truncate max-w-[140px]" title="${escapeHtml(d.student_id)}">${escapeHtml(d.student_id)}</span>
@@ -2124,10 +3269,13 @@
               <span>${escapeHtml(d.class_name || 'クラス未設定')}</span>
             </div>
             <div class="text-[10px] text-slate-400 truncate" title="${escapeHtml(d.current_url || '')}">URL: ${escapeHtml(d.current_url || '-')}</div>
-            <div class="text-[10px] text-slate-400">撮影: ${escapeHtml(d.screenshot_at || '-')}</div>
+            <div data-shot-at class="text-[10px] text-slate-400">撮影: ${escapeHtml(d.screenshot_at || '-')}</div>
           </div>
         </div>`;
       }).join('');
+
+      // 描画済みの署名を控える（次回以降、同内容なら作り直さない）
+      screenRenderedSig = sig;
     }
 
     // 画面の拡大プレビュー（クリックで原寸表示）
@@ -2539,6 +3687,16 @@
           ? `<span class="text-slate-400 text-[11px]">クラス未設定</span>`
           : `<span class="text-slate-700 font-semibold text-[11px]">${escapeHtml(d.class_name)}</span>`;
 
+        // AI監視: 学習に関係のないサイトを開いている児童の氏名の横に注意マークを出す。
+        // 監視がOFFのときは GAS 側が monitor_flag=false を返すため、ここには表示されない
+        // （＝システム全体のON/OFFがそのまま表示に反映される）。
+        const monitorBadge = d.monitor_flag
+          ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-300 cursor-help" title="${escapeHtml(d.monitor_reason || '学習に関係のないサイトを開いています')}">⚠ 注意</span>`
+          : '';
+        const monitorDetail = d.monitor_flag && d.monitor_at
+          ? `<span class="text-[10px] text-rose-500 font-mono">${escapeHtml(d.monitor_at)}</span>`
+          : '';
+
         html += `
           <tr class="hover:bg-slate-50/80 transition ${isChecked ? 'bg-indigo-50/40' : ''}">
             <td class="p-3.5 w-4 text-center">
@@ -2557,8 +3715,10 @@
                 }
                 ${schoolBadge}
               </div>
-              <div class="flex items-center space-x-2 text-xs">
+              <div class="flex items-center space-x-2 text-xs flex-wrap gap-y-1">
                 <span class="font-bold text-slate-800 text-sm">${escapeHtml(d.student_name || '氏名未設定')}</span>
+                ${monitorBadge}
+                ${monitorDetail}
                 <span class="text-slate-300">•</span>
                 ${classBadge}
                 ${d.notes ? `<span class="text-[10px] text-slate-400 truncate max-w-xs">(${escapeHtml(d.notes)})</span>` : ''}
@@ -2702,6 +3862,110 @@
       }
     }
 
+    // ==================== 書き込み操作の共通ランナー ====================
+    //  一括（bulk_lock / bulk_broadcast / bulk_filter）と個別（update_single）を
+    //  同じ1本の経路に通す。挙動差を作らないための土台。
+    //
+    //  【R39】画面側処理を通信から完全に切り離した（fire-and-forget）。
+    //
+    //  実測: GAS 本体（echo）は 264〜388ms で完了しているのに、
+    //        /exec の応答は Google のリダイレクトを挟むため 3.81〜3.89秒かかる。
+    //        つまり「速くできないのは Google 側の転送」であり、
+    //        await して待つ限り体感は必ず 3.8 秒になる。
+    //
+    //  そこで、await を廃止した:
+    //    1. 押下と同一 tick で楽観的UIを確定（0.1 秒以内）
+    //    2. 同じ tick で完了トーストを表示（通信を待たない）
+    //    3. /exec へは投げっぱなし（Promise を await しない）
+    //    4. 応答は background で受け、成功なら静かに再取得、
+    //       失敗したときだけ revert ＋ エラートーストで嘘を残さない
+    //  これにより教員の操作は通信時間に一切引きずられない。
+    //
+    //  ・後続操作に追い越されたら、古い応答では画面を触らない（mutationSeq）
+    let mutationSeq = 0;
+
+    function runMutation(opts) {
+      const o = opts || {};
+      const payload = o.payload || {};
+      const seq = ++mutationSeq;
+      let applied = false;
+
+      // 1) 楽観的UI（押下と同値・0.1秒以内）
+      if (typeof o.apply === 'function') {
+        try { o.apply(); applied = true; } catch (e) {}
+      }
+      // 2) 完了トーストも即時（通信を待たない）
+      if (o.successMessage) { try { showToast(o.successMessage, 'success'); } catch (e) {} }
+      // 3) 連打防止（画面は確定済みなので、ボタンの見た目だけ止める）
+      if (o.busy) { try { setBulkActionBusy(true); } catch (e) {} }
+
+      // 4) 送信。apiRequest は呼び出した瞬間に fetch を開始し、
+      //    同じ tick で子GASビーコンも撃つ。戻り値の Promise は await しない。
+      // 【R41】親 /exec と「同じ tick」で子GASへも並列 POST する。
+      //   ここで待たないので画面は即時のまま。子シートは親と同時刻に確定する。
+      let shardPush = null;
+      try { shardPush = fireShardApplyParallel(payload.action, payload); } catch (eP) {}
+
+      let pending = null;
+      try {
+        pending = apiRequest(payload);
+      } catch (eStart) {
+        // 同期的に落ちた場合（URL未設定など）はその場で巻き戻す
+        if (applied && typeof o.revert === 'function') {
+          try { o.revert(); } catch (e) {}
+        }
+        const m0 = (eStart && eStart.message) ? eStart.message : String(eStart);
+        try { showToast((o.errorPrefix || 'エラー') + ': ' + m0, 'error'); } catch (e) {}
+        if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
+        return true;
+      }
+
+      // 5) 応答はバックグラウンドで処理する（画面はもう確定している）
+      Promise.resolve(pending).then(function () {
+        if (seq !== mutationSeq) return;   // 追い越された（画面は触らない）
+        refreshSuppressedUntil = 0;
+        if (typeof o.afterSuccess === 'function') {
+          try { o.afterSuccess(); } catch (e) {}
+        }
+        // 付随情報の再取得は「裏で・遅れて」。UI は既に確定している。
+        if (o.refreshDelay !== false) {
+          const delay = (typeof o.refreshDelay === 'number') ? o.refreshDelay : 1500;
+          setTimeout(function () {
+            if (seq !== mutationSeq) return;
+            try { loadDevices(true); } catch (e) {}
+          }, delay);
+        }
+      }).catch(function (err) {
+        if (seq !== mutationSeq) return;
+        // ここに来るのは本当に失敗したときだけ（ネットワーク断・認証切れ等）
+        if (applied && typeof o.revert === 'function') {
+          try { o.revert(); } catch (e) {}
+        }
+        refreshSuppressedUntil = 0;
+        const msg = (err && err.message) ? err.message : String(err);
+        try { showToast((o.errorPrefix || '通信失敗') + ': ' + msg, 'error'); } catch (e) {}
+      }).then(function () {
+        if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
+      }, function () {
+        if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
+      });
+
+      return true;   // 呼び出し元へは即座に返す（await しても待たされない）
+    }
+
+    // 【R36】一括操作中はボタンを押せなくする（連打・二重送信の防止）。
+    function setBulkActionBusy(busy) {
+      try {
+        const btns = document.querySelectorAll(
+          '[onclick^="executeBulkLock"], [onclick="openBroadcastModal()"]');
+        for (let i = 0; i < btns.length; i++) {
+          btns[i].disabled = !!busy;
+          btns[i].style.opacity = busy ? '0.6' : '';
+          btns[i].style.pointerEvents = busy ? 'none' : '';
+        }
+      } catch (e) {}
+    }
+
     async function executeBulkLock(locked) {
       // 対象: チェック済みがあればその児童、なければ「現在表示中の児童」のみ
       const target = resolveBulkTargetIds();
@@ -2737,15 +4001,37 @@
 
       if (!confirm(`${countLabel}の画面ロックを ${locked ? 'ON' : 'OFF'} にしますか？`)) return;
 
-      try {
-        showToast('画面ロック更新中...', 'info');
-        await apiRequest({ action: 'bulk_lock', student_ids: ids, locked: locked });
-        showToast(`画面ロックを ${locked ? 'ON' : 'OFF'} にしました`, 'success');
-        refreshSuppressedUntil = Date.now() + 2500; // 反映前の古い状態を一瞬表示しない
-        await loadDevices();
-      } catch (err) {
-        showToast('エラー: ' + err.message, 'error');
-      }
+      // 【R37】一括ロックも個別操作と同じ共通ランナーを通す。
+      //   押下 0.1 秒以内に表示とトーストを確定し、通信は裏で続ける。
+      const prevLocks = {};
+      ids.forEach(id => {
+        const d = devicesData.find(x => x.student_id === id);
+        if (d) prevLocks[id] = !!d.screen_lock;
+      });
+      const applyOptimisticLock = (state) => {
+        ids.forEach(id => {
+          const d = devicesData.find(x => x.student_id === id);
+          if (d) d.screen_lock = state;
+        });
+        try { renderDevices(); updateStatistics(); } catch (e) {}
+      };
+      const revertOptimisticLock = () => {
+        ids.forEach(id => {
+          const d = devicesData.find(x => x.student_id === id);
+          if (d && Object.prototype.hasOwnProperty.call(prevLocks, id)) d.screen_lock = prevLocks[id];
+        });
+        try { renderDevices(); updateStatistics(); } catch (e) {}
+      };
+
+      await runMutation({
+        payload: { action: 'bulk_lock', student_ids: ids, locked: locked },
+        apply: () => applyOptimisticLock(locked),
+        revert: revertOptimisticLock,
+        successMessage: `画面ロックを ${locked ? 'ON' : 'OFF'} にしました`,
+        errorPrefix: 'エラー',
+        busy: true,
+        refreshDelay: 1500
+      });
     }
 
     async function toggleSingleLock(studentId, newLockState) {
@@ -2766,18 +4052,29 @@
         return;
       }
 
-      try {
-        await apiRequest({
+      // 【R37】個別操作も一括とまったく同じ経路（/exec 直接 fetch +
+      //   楽観的UI + ビーコン0ms並列 + バックグラウンド継続）に統一する。
+      const prevLock = dev ? !!dev.screen_lock : false;
+      await runMutation({
+        payload: {
           action: 'update_single',
           student_id: studentId,
           data: { screen_lock: newLockState }
-        });
-        showToast('画面ロック設定を更新しました', 'success');
-        refreshSuppressedUntil = Date.now() + 2500;
-        await loadDevices();
-      } catch (err) {
-        showToast('更新失敗: ' + err.message, 'error');
-      }
+        },
+        apply: () => {
+          const d = devicesData.find(x => x.student_id === studentId);
+          if (d) d.screen_lock = !!newLockState;
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        revert: () => {
+          const d = devicesData.find(x => x.student_id === studentId);
+          if (d) d.screen_lock = prevLock;
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        successMessage: '画面ロック設定を更新しました',
+        errorPrefix: '更新失敗',
+        refreshDelay: 1500
+      });
     }
 
     function openBroadcastModal() {
@@ -2815,16 +4112,33 @@
         return;
       }
 
-      try {
-        closeModal('broadcastModal');
-        showToast('URLを一斉配信中...', 'info');
-        await apiRequest({ action: 'bulk_broadcast', student_ids: ids, url: url });
-        showToast('URLを配信しました', 'success');
-        refreshSuppressedUntil = Date.now() + 2500;
-        await loadDevices();
-      } catch (err) {
-        showToast('配信エラー: ' + err.message, 'error');
-      }
+      // 【R37】一斉配信も個別・一括ロックと同じ共通ランナーへ統一。
+      try { closeModal('broadcastModal'); } catch (e0) {}
+      const prevUrls = {};
+      ids.forEach(id => {
+        const d = devicesData.find(x => x.student_id === id);
+        if (d) prevUrls[id] = d.broadcast_url || '';
+      });
+      await runMutation({
+        payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
+        apply: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d) d.broadcast_url = url;
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        revert: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d && Object.prototype.hasOwnProperty.call(prevUrls, id)) d.broadcast_url = prevUrls[id];
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        successMessage: 'URLを配信しました',
+        errorPrefix: '配信エラー',
+        refreshDelay: 1500
+      });
     }
 
     // ==================== 教員個別設定 & マイURL & 個別規制URL管理 ====================
@@ -2843,24 +4157,34 @@
       });
       return out;
     }
-
-    // 「すでに登録しているアドレス」の候補集合を作る
-    //  - 教員の個別設定（許可/規制）
-    //  - マイURL（ホスト名に正規化）
-    //  - 端末一覧に現在設定されている許可/規制リスト
-    function collectKnownAddresses() {
+    // 「すでに登録しているアドレス」の候補集合を作る。
+    // 許可リストと規制リストの情報源を1つの集合に混ぜると、両方のリストに
+    // 同じURLが並んでしまい「どちらが許可でどちらが規制か」が分からなくなる。
+    // そのため種別ごとに、その種別に属する情報源だけから候補を作る。
+    //   white（許可URLリスト）: 教員の個別許可設定 / マイURL / 端末の許可URLリスト
+    //   black（規制URLリスト）: 教員の個別規制設定 / 端末の規制URLリスト
+    function collectKnownAddresses(type) {
+      const isWhite = type === 'white';
       const set = new Set();
       const add = (v) => { const s = String(v || '').trim(); if (s) set.add(s); };
-      parseAddressList(currentTeacher?.filter_whitelist).forEach(add);
-      parseAddressList(currentTeacher?.filter_blacklist).forEach(add);
-      (currentTeacher?.urls || []).forEach(u => {
-        try { add(new URL(u.url).hostname.replace(/^www\./, '')); } catch (e) { add(u.url); }
-      });
-      devicesData.forEach(d => {
-        parseAddressList(d.whitelist_urls).forEach(add);
-        parseAddressList(d.blacklist_urls).forEach(add);
-      });
-      return Array.from(set);
+
+      if (isWhite) {
+        parseAddressList(currentTeacher?.filter_whitelist).forEach(add);
+        // マイURL（教員がよく使うURL）は「許可」の候補として扱う
+        (currentTeacher?.urls || []).forEach(u => {
+          try { add(new URL(u.url).hostname.replace(/^www\./, '')); } catch (e) { add(u.url); }
+        });
+        devicesData.forEach(d => parseAddressList(d.whitelist_urls).forEach(add));
+      } else {
+        parseAddressList(currentTeacher?.filter_blacklist).forEach(add);
+        devicesData.forEach(d => parseAddressList(d.blacklist_urls).forEach(add));
+      }
+
+      // 反対側のリストで選択済みのアドレスは候補から除外し、
+      // 同一URLが許可と規制の両方に現れないようにする。
+      const otherKey = isWhite ? 'black' : 'white';
+      const otherSelected = new Set(filterModalState[otherKey] || []);
+      return Array.from(set).filter(a => !otherSelected.has(a));
     }
 
     function renderFilterAddressList(type) {
@@ -2872,7 +4196,7 @@
 
       const selected = filterModalState[key];
       // 選択済みアドレスは必ず表示し、候補（登録済み）と統合する
-      const known = collectKnownAddresses();
+      const known = collectKnownAddresses(key);
       const all = Array.from(new Set([...known, ...selected])).sort();
 
       if (countEl) countEl.textContent = `${selected.length}件 選択中`;
@@ -2993,30 +4317,46 @@
         return;
       }
 
-      try {
-        closeModal('filterModal');
-        showToast('URL規制を更新中...', 'info');
-
-        await apiRequest({
+      // 【R37】URL規制も同じ共通ランナーへ統一。
+      try { closeModal('filterModal'); } catch (e0) {}
+      const prevModes = {};
+      ids.forEach(id => {
+        const d = devicesData.find(x => x.student_id === id);
+        if (d) prevModes[id] = d.filter_mode || '';
+      });
+      await runMutation({
+        payload: {
           action: 'bulk_filter',
           student_ids: ids,
           filter_mode: mode,
           whitelist_urls: whitelist,
           blacklist_urls: blacklist
-        });
-
-        if (saveAsPref && currentTeacher) {
-          currentTeacher.filter_whitelist = whitelist;
-          currentTeacher.filter_blacklist = blacklist;
-          localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
-        }
-
-        showToast(`URL規制を ${mode} に更新しました（教員個別設定も保持）`, 'success');
-        refreshSuppressedUntil = Date.now() + 2500;
-        await loadDevices();
-      } catch (err) {
-        showToast('設定エラー: ' + err.message, 'error');
-      }
+        },
+        apply: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d) d.filter_mode = mode;
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        revert: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d && Object.prototype.hasOwnProperty.call(prevModes, id)) d.filter_mode = prevModes[id];
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        afterSuccess: () => {
+          if (saveAsPref && currentTeacher) {
+            currentTeacher.filter_whitelist = whitelist;
+            currentTeacher.filter_blacklist = blacklist;
+            try { localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher)); } catch (e) {}
+          }
+        },
+        successMessage: `URL規制を ${mode} に更新しました（教員個別設定も保持）`,
+        errorPrefix: '設定エラー',
+        refreshDelay: 1500
+      });
     }
 
     function openTeacherSettingsModal() {
@@ -3269,21 +4609,119 @@
 
       if (!confirm(`現在表示中の児童（未選択時）または選択児童 [ ${title || url} ] を一斉配信しますか？`)) return;
 
-      try {
-        showToast('URLを配信中...', 'info');
-        await apiRequest({ action: 'bulk_broadcast', student_ids: ids, url: url });
-        showToast(`「${title || url}」を配信しました`, 'success');
-        refreshSuppressedUntil = Date.now() + 2500;
-        await loadDevices();
-      } catch (err) {
-        showToast('配信エラー: ' + err.message, 'error');
-      }
+      // 【R37b】マイURLの即時配信も、一括・個別と同じ共通ランナーへ統一する。
+      //   ここだけ旧実装（応答待ち→再取得）が残ると、同じ「一斉配信」でも
+      //   押したボタンによって体感速度が変わってしまう。
+      const prevUrlsQuick = {};
+      ids.forEach(id => {
+        const d = devicesData.find(x => x.student_id === id);
+        if (d) prevUrlsQuick[id] = d.broadcast_url || '';
+      });
+      await runMutation({
+        payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
+        apply: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d) d.broadcast_url = url;
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        revert: () => {
+          ids.forEach(id => {
+            const d = devicesData.find(x => x.student_id === id);
+            if (d && Object.prototype.hasOwnProperty.call(prevUrlsQuick, id)) {
+              d.broadcast_url = prevUrlsQuick[id];
+            }
+          });
+          try { renderDevices(); updateStatistics(); } catch (e) {}
+        },
+        successMessage: `「${title || url}」を配信しました`,
+        errorPrefix: '配信エラー',
+        refreshDelay: 1500
+      });
     }
 
     function toggleBroadcastTitleInput(checked) {
       const container = document.getElementById('broadcastSaveTitleContainer');
       if (checked) container.classList.remove('hidden');
       else container.classList.add('hidden');
+    }
+
+    // ==================== AI監視設定（システム全体・管理者のみ） ====================
+    // 監視は「システム全体」の設定なので、ON/OFF とドメイン辞書は管理者だけが変更できる。
+    // 一般教員が呼び出してもサーバー側(saveMonitoringSettings)で拒否される（二重の防御）。
+
+    async function openMonitoringModal() {
+      if (!isAdminUser()) {
+        showAlertModal('権限がありません', '監視設定を変更できるのは管理者のみです。', 'error');
+        return;
+      }
+      openModal('monitorModal');
+
+      const infoEl = document.getElementById('monitorUpdatedInfo');
+      if (infoEl) infoEl.textContent = '読み込み中...';
+
+      try {
+        const res = await apiRequest({ action: 'get_monitor_settings' });
+        const s = (res && res.settings) || {};
+
+        const toggle = document.getElementById('monitorEnabledToggle');
+        const blockedEl = document.getElementById('monitorBlockedDomains');
+        const learningEl = document.getElementById('monitorLearningDomains');
+
+        if (toggle) toggle.checked = (s.enabled === true);
+        if (blockedEl) blockedEl.value = (Array.isArray(s.blocked_domains) ? s.blocked_domains : []).join('\n');
+        if (learningEl) learningEl.value = (Array.isArray(s.learning_domains) ? s.learning_domains : []).join('\n');
+
+        if (infoEl) {
+          infoEl.textContent = s.updated_at
+            ? `最終更新: ${s.updated_at}${s.updated_by ? '（' + s.updated_by + '）' : ''}`
+            : '初期設定のままです（未保存）';
+        }
+      } catch (err) {
+        if (infoEl) infoEl.textContent = '設定の取得に失敗しました: ' + err.message;
+        showToast('監視設定の取得に失敗しました: ' + err.message, 'error');
+      }
+    }
+
+    async function saveMonitoringSettingsFromModal() {
+      if (!isAdminUser()) {
+        showAlertModal('権限がありません', '監視設定を変更できるのは管理者のみです。', 'error');
+        return;
+      }
+
+      const toggle = document.getElementById('monitorEnabledToggle');
+      const blockedEl = document.getElementById('monitorBlockedDomains');
+      const learningEl = document.getElementById('monitorLearningDomains');
+
+      // 改行／カンマ区切りを配列へ（parseAddressList を再利用）
+      const blocked = parseAddressList(blockedEl ? blockedEl.value : '');
+      const learning = parseAddressList(learningEl ? learningEl.value : '');
+      const enabled = !!(toggle && toggle.checked);
+
+      if (enabled && blocked.length === 0) {
+        showAlertModal('設定を確認してください', 'AI監視を有効にするには、非学習ドメイン辞書に1件以上のドメインを登録してください。', 'warning');
+        return;
+      }
+
+      try {
+        showToast('監視設定を保存中...', 'info');
+        await apiRequest({
+          action: 'save_monitor_settings',
+          settings: {
+            enabled: enabled,
+            blocked_domains: blocked,
+            learning_domains: learning
+          }
+        });
+        showToast(enabled ? 'AI監視を有効にしました' : 'AI監視を無効にしました', 'success');
+        closeModal('monitorModal');
+        // 注意マークの表示／非表示を即座に反映する
+        refreshSuppressedUntil = 0;
+        await loadDevices();
+      } catch (err) {
+        showToast('監視設定の保存に失敗しました: ' + err.message, 'error');
+      }
     }
 
     // ユーティリティ関数

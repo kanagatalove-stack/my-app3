@@ -4,7 +4,7 @@
 **Chrome ウェブストアに「限定公開（Unlisted）」で提出する際に、開発者ダッシュボードへ
 そのまま入力できる文言と設定値**をまとめたものです。
 
-- 対象バージョン: **1.6.1**（`extension/manifest.json`）
+- 対象バージョン: **1.6.3**（`extension/manifest.json`）
 - 提出用パッケージ: `dist/extension.zip`（`bash scripts/package_extension.sh` で生成）
 - 画像アセット: `dist/store_assets/` 配下
 
@@ -76,8 +76,15 @@ Chromebook 児童端末管理クライアントは、教育委員会が管理す
 |---|---|
 | コンテンツレーティング（Mature content） | **OFF** |
 | 公式URL（Official URL） | 任意（自ドメインを Search Console で確認済みの場合のみ） |
-| ホームページURL（Homepage URL） | `https://kanagatalove-stack.github.io/my-app3/` |
-| サポートURL（Support URL） | `https://kanagatalove-stack.github.io/my-app3/privacy-policy.html`（連絡先を記載） |
+| ホームページURL（Homepage URL） | Google サイトのトップページ（任意） |
+| サポートURL（Support URL） | Google サイトのプライバシーポリシーページ（連絡先を記載） |
+
+> ⚠️ **2026-10-21 更新**: GitHub アカウント停止により `kanagatalove-stack.github.io` は
+> **404** となりました。プライバシーポリシーは **Google サイトへ移設**してください。
+> 移設手順と貼り付け用の原稿は `docs/google-sites/` に用意しています
+> （`README.md` / `privacy-policy-embed.html` / `privacy-policy-plaintext.txt`）。
+> 移設後の URL（`https://sites.google.com/view/<サイト名>/privacy-policy`）を
+> 下記 §2-5 に記入してください。
 
 ---
 
@@ -163,12 +170,17 @@ No, I am not using remote code.（リモートコードは使用していませ�
 
 ### 2-5. プライバシーポリシーURL（必須）
 - 公開URLに設置したプライバシーポリシーの URL を貼ります。
-- **公開済みURL（確定）**：
+- **現在の登録先候補（Google サイト）**：
   ```
-  https://kanagatalove-stack.github.io/my-app3/privacy-policy.html
+  https://sites.google.com/view/<サイト名>/privacy-policy
   ```
-  - 配信元ファイル: 本リポジトリ直下の **`privacy-policy.html`**（GitHub Pages・main:/ 配信）
-  - ランディング: `https://kanagatalove-stack.github.io/my-app3/`（`index.html`）
+  - 原稿: `docs/google-sites/privacy-policy-embed.html`（埋め込み用）／
+    `docs/google-sites/privacy-policy-plaintext.txt`（テキスト用）
+  - 手順: `docs/google-sites/README.md`
+  - 配信元ファイル（原本）: 本リポジトリ直下の **`privacy-policy.html`**
+- ~~旧URL: `https://kanagatalove-stack.github.io/my-app3/privacy-policy.html`~~
+  → **2026-10-21 時点で 404（GitHub アカウント停止中）**。審査前に必ず差し替えること。
+  GitHub が復旧した場合は旧URLへ戻しても構いません。
 - ※ 連絡先は**開発・運営者（片岡 靖貴／noiringhost@gmail.com）**を記載。本拡張機能は導入先（教育委員会・学校）の管理下で運用されます。
 
 ---

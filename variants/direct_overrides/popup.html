@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>端末管理クライアント（検証用）</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="space-y-3">
+
+    <!-- ヘッダー -->
+    <div class="flex items-center justify-between border-b pb-2">
+      <div class="flex items-center space-x-2">
+        <div class="icon-badge">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+          </svg>
+        </div>
+        <span class="text-sm font-bold">端末クライアント</span>
+      </div>
+      <span id="connectionBadge"
+        class="text-10 px-2 py-1 rounded-full font-semibold bg-slate-200 text-slate-600">未接続</span>
+    </div>
+
+    <!-- 検証版であることの明示 -->
+    <div class="banner warn">
+      検証用ビルドです。管理ポリシーは使いません。<br>
+      下の欄に <b>GAS WebアプリURL</b> を入力して「保存して同期」を押してください。
+    </div>
+
+    <!-- 端末ステータス -->
+    <div class="bg-white p-3 rounded-xl border border-slate-200 space-y-1">
+      <p class="sec-title">端末の状態</p>
+      <div class="kv"><span class="k">所属学校</span><span id="statusSchool" class="v">-</span></div>
+      <div class="kv"><span class="k">児童ID / アカウント</span><span id="statusId" class="v font-mono text-10 truncate">-</span></div>
+      <div class="kv"><span class="k">児童氏名</span><span id="statusName" class="v">-</span></div>
+      <div class="kv"><span class="k">画面ロック</span><span id="statusLock" class="v">-</span></div>
+      <div class="kv"><span class="k">URL規制モード</span><span id="statusFilter" class="v">-</span></div>
+      <div class="kv"><span class="k">最終同期</span><span id="statusLastSync" class="v font-mono">-</span></div>
+      <div class="kv"><span class="k">同期の宛先URL</span><span id="statusGasUrl" class="v font-mono text-10 truncate">-</span></div>
+    </div>
+
+    <!-- 通信の稼働状態 -->
+    <div class="bg-white p-3 rounded-xl border border-slate-200 space-y-1">
+      <p class="sec-title">通信の状態</p>
+      <div class="kv"><span class="k">教員コンソール</span><span id="statusKa" class="v">-</span></div>
+      <div class="kv"><span class="k">同期周期</span><span id="statusInterval" class="v">-</span></div>
+      <div class="kv"><span class="k">起こし確認</span><span id="statusProbe" class="v">-</span></div>
+    </div>
+
+    <!-- 設定 -->
+    <div class="bg-white p-3 rounded-xl border border-slate-200 space-y-2">
+      <p class="sec-title">設定（直接入力）</p>
+
+      <div>
+        <label for="gasUrlInput" class="block font-semibold text-11 mb-1">
+          GAS WebアプリURL <span class="text-rose-600">（必須）</span>
+        </label>
+        <input type="url" id="gasUrlInput"
+          placeholder="https://script.google.com/macros/s/…/exec"
+          class="w-full bg-white border border-slate-300 rounded-lg p-2 text-11 font-mono focus:border-indigo-500 focus:ring-indigo-500">
+        <p class="text-10 text-slate-500 mt-1">
+          「/exec」で終わる<b>デプロイ済みURL</b>を貼り付けてください（「/dev」は不可）。
+        </p>
+      </div>
+
+      <div>
+        <label for="schoolNameSelect" class="block font-semibold text-11 mb-1">
+          所属学校 <span class="text-slate-500 text-10">（任意・一覧から選択）</span>
+        </label>
+        <select id="schoolNameSelect"
+          class="w-full bg-white border border-slate-300 rounded-lg p-2 text-11 focus:border-indigo-500 focus:ring-indigo-500">
+          <option value="">（未選択）</option>
+        </select>
+      </div>
+
+      <div>
+        <label for="studentIdInput" class="block font-semibold text-11 mb-1">
+          児童ID（Googleアカウント）
+        </label>
+        <input type="text" id="studentIdInput" placeholder="（Googleアカウントを自動取得します）"
+          class="w-full bg-white border border-slate-300 rounded-lg p-2 text-11 font-mono focus:border-indigo-500 focus:ring-indigo-500">
+        <p class="text-10 text-slate-500 mt-1">
+          空欄のままにすると、ログイン中のGoogleアカウントを自動で使います。
+        </p>
+      </div>
+
+      <div class="flex space-x-2 pt-2">
+        <button id="saveBtn"
+          class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 rounded-lg transition text-11 shadow-sm">
+          保存して同期
+        </button>
+        <button id="testBtn"
+          class="px-3 bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold py-2 rounded-lg transition text-11">
+          疎通確認
+        </button>
+      </div>
+
+      <button id="syncBtn"
+        class="w-full bg-white border border-slate-300 hover:bg-slate-300 text-slate-700 font-semibold py-2 rounded-lg transition text-11">
+        手動同期のみ
+      </button>
+    </div>
+
+    <!-- 診断 -->
+    <div class="bg-white p-3 rounded-xl border border-slate-200 space-y-2">
+      <div class="flex items-center justify-between">
+        <p class="sec-title" style="margin:0;">診断（直近の結果）</p>
+        <button id="clearDiagBtn" class="text-10 text-slate-500 cursor-pointer"
+          style="background:none;padding:0;">クリア</button>
+      </div>
+      <div id="diagBadge" class="banner info">まだ同期していません。</div>
+      <pre id="diagDetail"
+        class="bg-slate-100 rounded-lg p-2 text-10 font-mono leading-relaxed break-all"
+        style="margin:0;white-space:pre-wrap;max-height:170px;overflow:auto;">-</pre>
+      <p class="text-10 text-slate-500">
+        この画面が唯一の診断窓口です（chrome://extensions は使用できません）。
+      </p>
+    </div>
+
+    <div id="msgBox" class="text-center text-11 hidden font-semibold"></div>
+
+    <p class="text-9 text-slate-500 text-center">
+      検証用ビルド / v1.6.4
+    </p>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

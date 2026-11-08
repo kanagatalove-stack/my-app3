@@ -41,6 +41,9 @@ const gctx={ console, JSON, String, Number, Object, Array, RegExp, Error, Boolea
 vm.createContext(gctx);
 vm.runInContext(
   'const KA_KEY="ka_console";const KA_PROP_KEY="KA_LAST_TOUCH";const KA_ACTIVE_WINDOW_MS=120000;\n'+
+  // 緊急呼び出しフラグ（wake_epoch）関連。touchTeacherConsole が参照するため注入する。
+  'const WAKE_CACHE_KEY="wake_epoch";const WAKE_PROP_KEY="WAKE_EPOCH_V1";\n'+
+  extract(codeGs,'readWakeEpoch')+'\n'+extract(codeGs,'bumpWakeEpoch')+'\n'+
   extract(codeGs,'touchTeacherConsole')+'\n'+extract(codeGs,'releaseTeacherConsole')+'\n'+extract(codeGs,'isTeacherConsoleActive')+
   '\n__touch=touchTeacherConsole;__release=releaseTeacherConsole;__active=isTeacherConsoleActive;', gctx);
 
