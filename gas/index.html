@@ -4,10 +4,12 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Chromebook 児童端末管理システム</title>
+  <!-- キャッシュ破棄用のバージョン（リリースごとに更新する） -->
+  <meta name="app-asset-version" content="20261108">
   <!-- Tailwind CSS CDN -->
-  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.tailwindcss.com?v=20261108"></script>
   <!-- SheetJS (Excel/CSV .xlsx/.xls/.csv インポート解析用) -->
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js?v=20261108"></script>
   <script>
     // GASテンプレートから注入されるWeb App URL (GAS実行時)
     const EMBEDDED_WEB_APP_URL = "<?= (typeof webAppUrl !== 'undefined') ? webAppUrl : '' ?>";
@@ -239,7 +241,7 @@
     <!-- メインコンテンツ -->
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full space-y-5">
 
-      <!-- ビュー切替タブ（端末一覧 / 画面一覧） -->
+      <!-- ビュー切替タブ（端末一覧 / 画面一覧 / スケジュール管理） -->
       <div class="flex items-center space-x-1 bg-white p-1 rounded-xl shadow-sm border border-slate-200/80 w-full sm:w-auto sm:inline-flex">
         <button id="tabDevicesViewBtn" onclick="switchMainView('devices')" class="flex items-center space-x-1.5 px-4 py-2 text-xs font-bold rounded-lg bg-indigo-600 text-white shadow-sm transition">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
@@ -248,6 +250,10 @@
         <button id="tabScreensViewBtn" onclick="switchMainView('screens')" class="flex items-center space-x-1.5 px-4 py-2 text-xs font-bold rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
           <span>画面一覧</span>
+        </button>
+        <button id="tabScheduleViewBtn" onclick="switchMainView('schedule')" class="flex items-center space-x-1.5 px-4 py-2 text-xs font-bold rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+          <span>スケジュール管理</span>
         </button>
       </div>
 
@@ -499,11 +505,208 @@
           </div>
         </div>
       </div><!-- /screensView 画面一覧ビュー -->
+
+      <!-- ===== スケジュール管理ビュー（時間制限タイマー） ===== -->
+      <div id="scheduleView" class="space-y-5 hidden">
+        <!-- 操作バー -->
+        <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200/80 flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-start space-x-3">
+            <div class="p-2.5 bg-violet-100 text-violet-700 rounded-xl shrink-0">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+            </div>
+            <div>
+              <h2 class="text-sm font-bold text-slate-800">スケジュール管理（時間制限タイマー）</h2>
+              <p class="text-[11px] text-slate-500 leading-relaxed">
+                指定した期間・時間帯のあいだだけ、児童端末のURL制限や画面ロックを自動で有効にします。
+                <b>「手動解除」</b>は今回の時間帯だけ停止（次回以降は再適用）、<b>「取消」</b>は予約そのものを停止します（記録は残ります）。
+              </p>
+            </div>
+          </div>
+          <div class="flex items-center space-x-2 flex-wrap gap-y-2">
+            <span class="text-[11px] text-slate-500 font-medium">予約: <span id="scheduleCount" class="font-bold text-violet-600">0</span> 件</span>
+            <button id="scheduleReloadBtn" onclick="loadSchedules(true)" class="flex items-center space-x-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold px-3 py-2 rounded-lg border border-slate-300 transition">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+              <span>再読込</span>
+            </button>
+            <button id="scheduleNewBtn" onclick="openScheduleModal()" class="flex items-center space-x-1.5 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold px-3.5 py-2 rounded-lg shadow-sm transition">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+              <span>新規予約作成</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 xl:grid-cols-3 gap-5">
+          <!-- 月表示カレンダー -->
+          <div class="xl:col-span-2 bg-white rounded-xl shadow-sm border border-slate-200/80 overflow-hidden">
+            <div class="px-4 py-3 border-b border-slate-200/80 flex items-center justify-between gap-2">
+              <div class="flex items-center space-x-1.5">
+                <button onclick="shiftScheduleMonth(-1)" class="px-2.5 py-1.5 rounded-lg text-[11px] font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 transition">前月</button>
+                <button onclick="goScheduleToday()" class="px-2.5 py-1.5 rounded-lg text-[11px] font-bold text-violet-700 bg-violet-100 hover:bg-violet-200 transition">今日</button>
+                <button onclick="shiftScheduleMonth(1)" class="px-2.5 py-1.5 rounded-lg text-[11px] font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 transition">翌月</button>
+              </div>
+              <div id="scheduleMonthLabel" class="text-sm font-bold text-slate-800">----年--月</div>
+            </div>
+            <div class="grid grid-cols-7 bg-slate-50 border-b border-slate-200/80 text-[11px] font-bold">
+              <div class="py-2 text-center text-rose-500">日</div>
+              <div class="py-2 text-center text-slate-500">月</div>
+              <div class="py-2 text-center text-slate-500">火</div>
+              <div class="py-2 text-center text-slate-500">水</div>
+              <div class="py-2 text-center text-slate-500">木</div>
+              <div class="py-2 text-center text-slate-500">金</div>
+              <div class="py-2 text-center text-sky-600">土</div>
+            </div>
+            <div id="scheduleCalendarGrid" class="grid grid-cols-7"></div>
+            <div class="px-4 py-2 border-t border-slate-200/80 flex items-center space-x-3 text-[10px] text-slate-500">
+              <span class="flex items-center space-x-1"><span class="w-1.5 h-1.5 rounded-full bg-violet-500 inline-block"></span><span>予約あり</span></span>
+              <span class="flex items-center space-x-1"><span class="w-1.5 h-1.5 rounded-full bg-amber-500 inline-block"></span><span>今回解除済</span></span>
+              <span>自動取得は行いません（タブを開いたとき／「再読込」押下時に取得）</span>
+            </div>
+          </div>
+
+          <!-- 選択日の予約一覧 -->
+          <div class="bg-white rounded-xl shadow-sm border border-slate-200/80 flex flex-col">
+            <div class="px-4 py-3 border-b border-slate-200/80">
+              <h3 class="text-sm font-bold text-slate-800">選択日の予約</h3>
+              <p id="scheduleDayLabel" class="text-[11px] text-slate-500">日付を選択してください</p>
+            </div>
+            <div id="scheduleDayList" class="p-3 space-y-2 flex-1 overflow-y-auto max-h-[560px]">
+              <p class="text-xs text-slate-400 text-center py-8">カレンダーの日付を選択してください。</p>
+            </div>
+          </div>
+        </div>
+      </div><!-- /scheduleView スケジュール管理ビュー -->
     </main>
   </div>
 
   <!-- トースト通知コンテナ -->
   <div id="toastContainer" class="fixed bottom-5 right-5 z-50 space-y-2 pointer-events-none"></div>
+
+  <!-- ===== モーダル: スケジュール（時間制限タイマー）の新規予約 ===== -->
+  <div id="scheduleModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[70] hidden flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-2xl w-full max-h-[92vh] overflow-y-auto">
+      <div class="sticky top-0 bg-white px-6 py-4 border-b border-slate-200 flex items-center justify-between rounded-t-2xl">
+        <h3 class="text-base font-bold text-slate-800 flex items-center space-x-2">
+          <span class="p-1.5 bg-violet-100 text-violet-700 rounded-lg">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+          </span>
+          <span>スケジュール（時間制限タイマー）の新規予約</span>
+        </h3>
+        <button onclick="closeModal('scheduleModal')" class="text-slate-400 hover:text-slate-600 text-lg leading-none">✕</button>
+      </div>
+
+      <div class="p-6 space-y-4 text-xs">
+        <!-- 対象 -->
+        <div class="space-y-2">
+          <p class="text-[11px] font-bold text-slate-500 uppercase tracking-wide">対象</p>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">対象種別</label>
+              <select id="scheduleTargetType" onchange="toggleScheduleTargetFields()" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
+                <option value="class">クラス全体</option>
+                <option value="student">個別の児童</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">学校</label>
+              <select id="scheduleSchool" onchange="refreshScheduleClasses()" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2"></select>
+              <p class="text-[10px] text-slate-400 mt-1">所属校以外は選べません（管理者は全校から選択可）。</p>
+            </div>
+          </div>
+          <div id="scheduleClassWrap">
+            <label class="block text-[11px] font-semibold text-slate-600 mb-1">クラス</label>
+            <select id="scheduleClass" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2"></select>
+          </div>
+          <div id="scheduleStudentWrap" class="hidden">
+            <label class="block text-[11px] font-semibold text-slate-600 mb-1">児童（複数選択可）</label>
+            <div id="scheduleStudentBox" class="max-h-40 overflow-y-auto border border-slate-200 rounded-lg p-1.5 bg-slate-50/60"></div>
+          </div>
+        </div>
+
+        <!-- 制限内容 -->
+        <div class="space-y-2 pt-2 border-t border-slate-100">
+          <p class="text-[11px] font-bold text-slate-500 uppercase tracking-wide">制限内容</p>
+          <div>
+            <label class="block text-[11px] font-semibold text-slate-600 mb-1">制限タイプ</label>
+            <select id="scheduleRestrictionType" onchange="toggleScheduleTargetFields()" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
+              <option value="url_block">URL制限（指定URLのみ許可／指定URLを規制）</option>
+              <option value="screen_lock">画面ロック（利用そのものを停止）</option>
+            </select>
+          </div>
+          <div id="scheduleUrlWrap" class="space-y-2">
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">URL規制モード</label>
+              <select id="scheduleFilterMode" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
+                <option value="BLACKLIST">BLACKLIST（指定URLを規制する）</option>
+                <option value="WHITELIST">WHITELIST（指定URLだけ許可する）</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">許可URLリスト（WHITELIST時に使用・1行1件）</label>
+              <textarea id="scheduleWhitelist" rows="2" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2 font-mono" placeholder="https://www.example.com"></textarea>
+            </div>
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">規制URLリスト（BLACKLIST時に使用・1行1件）</label>
+              <textarea id="scheduleBlacklist" rows="2" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2 font-mono" placeholder="https://www.example.com"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- 期間・時間帯 -->
+        <div class="space-y-2 pt-2 border-t border-slate-100">
+          <p class="text-[11px] font-bold text-slate-500 uppercase tracking-wide">期間・時間帯</p>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">開始日</label>
+              <input id="scheduleDateFrom" type="date" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
+            </div>
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">終了日</label>
+              <input id="scheduleDateTo" type="date" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
+            </div>
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">開始時刻</label>
+              <input id="scheduleStartTime" type="time" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
+            </div>
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">終了時刻</label>
+              <input id="scheduleEndTime" type="time" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
+            </div>
+          </div>
+          <p class="text-[10px] text-slate-400">終了時刻が開始時刻より前の場合は「翌日またぎ」として扱います。</p>
+        </div>
+
+        <!-- 繰り返し -->
+        <div class="space-y-2 pt-2 border-t border-slate-100">
+          <p class="text-[11px] font-bold text-slate-500 uppercase tracking-wide">繰り返し</p>
+          <select id="scheduleRepeat" onchange="toggleScheduleTargetFields()" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
+            <option value="NONE">単発（開始日のみ）</option>
+            <option value="DAILY">毎日（開始日〜終了日）</option>
+            <option value="WEEKLY">毎週（指定曜日）</option>
+          </select>
+          <div id="scheduleWeekdayWrap" class="hidden flex flex-wrap gap-2 pt-1">
+            <label class="flex items-center space-x-1 text-[11px] text-slate-600"><input id="scheduleWeekday0" type="checkbox" class="rounded border-slate-300"><span>日</span></label>
+            <label class="flex items-center space-x-1 text-[11px] text-slate-600"><input id="scheduleWeekday1" type="checkbox" class="rounded border-slate-300"><span>月</span></label>
+            <label class="flex items-center space-x-1 text-[11px] text-slate-600"><input id="scheduleWeekday2" type="checkbox" class="rounded border-slate-300"><span>火</span></label>
+            <label class="flex items-center space-x-1 text-[11px] text-slate-600"><input id="scheduleWeekday3" type="checkbox" class="rounded border-slate-300"><span>水</span></label>
+            <label class="flex items-center space-x-1 text-[11px] text-slate-600"><input id="scheduleWeekday4" type="checkbox" class="rounded border-slate-300"><span>木</span></label>
+            <label class="flex items-center space-x-1 text-[11px] text-slate-600"><input id="scheduleWeekday5" type="checkbox" class="rounded border-slate-300"><span>金</span></label>
+            <label class="flex items-center space-x-1 text-[11px] text-slate-600"><input id="scheduleWeekday6" type="checkbox" class="rounded border-slate-300"><span>土</span></label>
+          </div>
+        </div>
+
+        <!-- 備考 -->
+        <div class="pt-2 border-t border-slate-100">
+          <label class="block text-[11px] font-semibold text-slate-600 mb-1">備考（任意）</label>
+          <input id="scheduleNote" type="text" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2" placeholder="例: 家庭学習の時間帯">
+        </div>
+      </div>
+
+      <div class="sticky bottom-0 bg-slate-50 px-6 py-4 border-t border-slate-200 flex items-center justify-end space-x-2 rounded-b-2xl">
+        <button onclick="closeModal('scheduleModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 bg-white border border-slate-300 rounded-lg hover:bg-slate-100 transition">キャンセル</button>
+        <button id="scheduleSaveBtn" onclick="saveSchedule()" class="px-4 py-2 text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 rounded-lg shadow-sm transition">予約を登録</button>
+      </div>
+    </div>
+  </div>
 
   <!-- モーダル: 児童情報編集（Googleアカウントに氏名・クラス・学校を紐付け） -->
   <div id="editStudentModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[70] hidden flex items-center justify-center p-4">
@@ -2797,23 +3000,503 @@
     // 【R43】直近に描画した画像の署名（同じ画像でDOMを作り直さない）。
     let screenRenderedSig = '';
 
-    // ビュー切替（端末一覧 / 画面一覧）
+    // ==================== 【フェーズ4】スケジュール管理 ====================
+    //   設計方針（承認済み）
+    //   ・取得は「タブを開いたとき」と「再読込」押下時のみ。常時ポーリングしない。
+    //   ・日付は必ず JST の壁時計で扱う。new Date('yyyy/MM/dd') は実行環境の
+    //     タイムゾーンに依存して 9 時間ズレるため使わず、UTC 演算で日付・曜日を求める。
+    //   ・判定・描画はサーバから返った date_from / date_to / repeat / weekdays だけで行う。
+    const SCHEDULE_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;
+    const SCHEDULE_WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
+    let scheduleLoaded = false;        // 一度でも取得できたか
+    let scheduleLoading = false;       // 二重取得の防止
+    let scheduleData = [];             // list_schedules の data 配列
+    let scheduleServerMs = 0;          // サーバ時計（表示の目安）
+    let scheduleCursorYear = 0;        // カレンダーの表示年
+    let scheduleCursorMonth = 0;       // カレンダーの表示月（0-11）
+    let scheduleSelectedDate = '';     // 選択日 'yyyy/MM/dd'
+    let scheduleSelectedStudentIds = new Set(); // 個別指定時の選択児童
+
+    // JST の壁時計パーツ（epoch ms → y/mo/da）
+    function schJstParts(ms) {
+      const j = new Date((isFinite(ms) ? ms : 0) + SCHEDULE_TZ_OFFSET_MS);
+      return { y: j.getUTCFullYear(), mo: j.getUTCMonth() + 1, da: j.getUTCDate() };
+    }
+    function schPad2(n) { return ('0' + n).slice(-2); }
+    function schKeyFromParts(y, mo, da) { return y + '/' + schPad2(mo) + '/' + schPad2(da); }
+    function schTodayKey() {
+      const p = schJstParts(Date.now());
+      return schKeyFromParts(p.y, p.mo, p.da);
+    }
+    // 'yyyy/MM/dd' / 'yyyy-MM-dd' → {y,mo,da}（失敗は null）
+    function schParseKey(key) {
+      const m = /^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/.exec(String(key || '').trim());
+      if (!m) return null;
+      return { y: Number(m[1]), mo: Number(m[2]), da: Number(m[3]) };
+    }
+    // 曜日（0=日）2 実行TZ非依存。UTC 正午固定で計算する。
+    function schDowOfKey(key) {
+      const p = schParseKey(key);
+      if (!p) return -1;
+      return new Date(Date.UTC(p.y, p.mo - 1, p.da)).getUTCDay();
+    }
+    function schAddDays(key, n) {
+      const p = schParseKey(key);
+      if (!p) return '';
+      const t = new Date(Date.UTC(p.y, p.mo - 1, p.da + n));
+      return schKeyFromParts(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+    }
+    function schDaysInMonth(y, mo1to12) { return new Date(Date.UTC(y, mo1to12, 0)).getUTCDate(); }
+
+    // 承認済み設計（docs/SCHEDULE_TIMER_PLAN.md §3）の 7×6 グリッド生成。
+    //   month は 0-11。先頭の空白と末尾の埋めで必ず 42 セルになる。
+    function buildMonthGrid(year, month) {
+      const first = new Date(Date.UTC(year, month, 1));
+      const last = new Date(Date.UTC(year, month + 1, 0));
+      const cells = [];
+      for (let i = 0; i < first.getUTCDay(); i++) cells.push(null);
+      for (let d = 1; d <= last.getUTCDate(); d++) cells.push(d);
+      while (cells.length % 7 !== 0) cells.push(null);
+      while (cells.length < 42) cells.push(null);
+      return cells;
+    }
+
+    // その予約が「表示月のどの日に当たるか」を列挙する。
+    //   NONE  = 開始日のみ / DAILY = 全日 / WEEKLY = weekdays のみ。
+    function scheduleDatesInMonth(row, year, month) {
+      const out = [];
+      if (!row) return out;
+      const from = schParseKey(row.date_from);
+      if (!from) return out;
+      const to = schParseKey(row.date_to) || from;
+      const fromKey = schKeyFromParts(from.y, from.mo, from.da);
+      const toKey = schKeyFromParts(to.y, to.mo, to.da);
+      const mStart = schKeyFromParts(year, month + 1, 1);
+      const mEnd = schKeyFromParts(year, month + 1, schDaysInMonth(year, month + 1));
+      let cur = fromKey < mStart ? mStart : fromKey;
+      const stop = toKey < mEnd ? toKey : mEnd;
+      const repeat = String(row.repeat || 'NONE').toUpperCase();
+      const wds = Array.isArray(row.weekdays) ? row.weekdays.map(Number) : [];
+      let guard = 0;
+      while (_scheduleKeyLe(cur, stop) && guard < 400) {
+        guard++;
+        const dow = schDowOfKey(cur);
+        let hit;
+        if (repeat === 'WEEKLY') hit = wds.indexOf(dow) >= 0;
+        else if (repeat === 'DAILY') hit = true;
+        else hit = (cur === fromKey);
+        if (hit) out.push(cur);
+        cur = schAddDays(cur, 1);
+      }
+      return out;
+    }
+    // 'yyyy/MM/dd' のゼロ埋め固定長比較（文字列比較で正しく並ぶ）
+    function _scheduleKeyLe(a, b) { return String(a) <= String(b); }
+
+    function scheduleRowSummary(row) {
+      const t = String((row && row.type) || '');
+      return {
+        typeLabel: t === 'screen_lock' ? '画面ロック' : 'URL制限',
+        times: String((row && row.start_time) || '') + ((row && row.end_time) ? '〜' + String(row.end_time) : ''),
+        repLabel: (function (r) {
+          const v = String(r || 'NONE').toUpperCase();
+          if (v === 'DAILY') return '毎日';
+          if (v === 'WEEKLY') return '毎週';
+          return '単発';
+        })(row && row.repeat)
+      };
+    }
+
+    // 予約 1 件分のカード（選択日一覧の中身）
+    function scheduleCardHtml(r, dateKey) {
+      const id = escapeHtml(String((r && r.id) || ''));
+      const sum = scheduleRowSummary(r);
+      const enabled = !!(r && r.enabled);
+      const overridden = !!(r && r.overridden);
+      const targetLabel = (r && r.target_type === 'student')
+        ? ('個別 ' + ((r.student_ids && r.student_ids.length) || 0) + '名')
+        : ('クラス ' + escapeHtml(String((r && r.class_name) || '—')));
+      let badge = '<span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">有効</span>';
+      if (!enabled) badge = '<span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-200 text-slate-600">取消済</span>';
+      else if (overridden) badge = '<span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">今回解除済</span>';
+      const dis = enabled ? '' : ' disabled';
+      const disCls = enabled ? '' : ' opacity-40 cursor-not-allowed';
+      return [
+        '<div class="border border-slate-200 rounded-xl p-3 space-y-2 bg-white hover:shadow-sm transition" data-schedule-id="' + id + '">',
+        '  <div class="flex items-center justify-between gap-2">',
+        '    <div class="flex items-center space-x-1.5 min-w-0">',
+        '      <span class="text-[11px] font-bold text-slate-800">' + escapeHtml(sum.times) + '</span>',
+        '      ' + badge,
+        '    </div>',
+        '    <span class="text-[10px] text-slate-400 shrink-0">' + escapeHtml(sum.repLabel) + '</span>',
+        '  </div>',
+        '  <div class="text-[11px] text-slate-600 flex flex-wrap gap-x-3 gap-y-0.5">',
+        '    <span>制限: <b>' + escapeHtml(sum.typeLabel) + '</b></span>',
+        '    <span>対象: <b>' + targetLabel + '</b></span>',
+        '  </div>',
+        '  <div class="text-[10px] text-slate-400">' + escapeHtml(String((r && r.school_name) || '')) + ' / 期間 ' + escapeHtml(String((r && r.date_from) || '')) + '〜' + escapeHtml(String((r && r.date_to) || '')) + '</div>',
+        '  <div class="flex flex-wrap gap-1.5 pt-1">',
+        '    <button onclick="overrideSchedule(\'' + id + '\')"' + dis + ' class="text-[10px] font-bold px-2 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-800 transition' + disCls + '">手動解除（今回のみ停止）</button>',
+        '    <button onclick="cancelSchedule(\'' + id + '\')"' + dis + ' class="text-[10px] font-bold px-2 py-1.5 rounded-lg bg-rose-100 hover:bg-rose-200 text-rose-700 transition' + disCls + '">取消（設定破棄）</button>',
+        '  </div>',
+        '</div>'
+      ].join('');
+    }
+
+    // 月表示カレンダーの描画
+    function renderScheduleCalendar() {
+      const grid = document.getElementById('scheduleCalendarGrid');
+      const label = document.getElementById('scheduleMonthLabel');
+      if (!scheduleCursorYear) {
+        const p = schJstParts(Date.now());
+        scheduleCursorYear = p.y;
+        scheduleCursorMonth = p.mo - 1;
+      }
+      if (label) label.textContent = scheduleCursorYear + '年' + (scheduleCursorMonth + 1) + '月';
+      if (!grid) return;
+
+      const byDate = {};
+      (scheduleData || []).forEach(function (row) {
+        if (!row) return;
+        scheduleDatesInMonth(row, scheduleCursorYear, scheduleCursorMonth).forEach(function (k) {
+          (byDate[k] = byDate[k] || []).push(row);
+        });
+      });
+
+      const todayKey = schTodayKey();
+      const cells = buildMonthGrid(scheduleCursorYear, scheduleCursorMonth);
+      grid.innerHTML = cells.map(function (day, idx) {
+        const dow = idx % 7;
+        if (!day) return '<div class="min-h-[86px] border-b border-r border-slate-100 bg-slate-50/40"></div>';
+        const key = schKeyFromParts(scheduleCursorYear, scheduleCursorMonth + 1, day);
+        const rows = byDate[key] || [];
+        const isToday = (key === todayKey);
+        const isSel = (key === scheduleSelectedDate);
+        let cls = 'min-h-[86px] border-b border-r border-slate-100 p-1.5 cursor-pointer transition hover:bg-violet-50/60 ';
+        if (isSel) cls += 'bg-violet-50 ring-2 ring-inset ring-violet-400 ';
+        else if (isToday) cls += 'bg-indigo-50/50 ';
+        const numCls = (dow === 0) ? 'text-rose-500' : ((dow === 6) ? 'text-sky-600' : 'text-slate-700');
+        let dots = '';
+        if (rows.length) {
+          const shown = rows.slice(0, 4).map(function (r) {
+            const c = r.overridden ? 'bg-amber-500' : (r.enabled ? 'bg-violet-500' : 'bg-slate-300');
+            return '<span class="w-1.5 h-1.5 rounded-full inline-block ' + c + '"></span>';
+          }).join('');
+          const more = (rows.length > 4) ? '<span class="text-[9px] text-slate-400 ml-0.5">+' + (rows.length - 4) + '</span>' : '';
+          dots = '<div class="flex items-center space-x-0.5 mt-1">' + shown + more + '</div>';
+        }
+        return '<div class="' + cls + '" onclick="selectScheduleDay(\'' + key + '\')">'
+          + '<div class="flex items-center justify-between">'
+          +   '<span class="text-[11px] font-bold ' + numCls + '">' + day + '</span>'
+          +   (isToday ? '<span class="text-[8px] font-bold text-indigo-600 bg-indigo-100 px-1 rounded">今日</span>' : '')
+          + '</div>' + dots + '</div>';
+      }).join('');
+    }
+
+    // 選択日の予約一覧を描画
+    function renderScheduleDayList() {
+      const box = document.getElementById('scheduleDayList');
+      const label = document.getElementById('scheduleDayLabel');
+      if (!box) return;
+      if (!scheduleSelectedDate) {
+        if (label) label.textContent = '日付を選択してください';
+        box.innerHTML = '<p class="text-xs text-slate-400 text-center py-8">カレンダーの日付を選択してください。</p>';
+        return;
+      }
+      const key = scheduleSelectedDate;
+      const p = schParseKey(key);
+      const dow = schDowOfKey(key);
+      if (label) label.textContent = key + '（' + (dow >= 0 ? SCHEDULE_WEEKDAY_LABELS[dow] : '') + '）';
+      const rows = (scheduleData || []).filter(function (r) {
+        if (!r || !p) return false;
+        return scheduleDatesInMonth(r, p.y, p.mo - 1).indexOf(key) >= 0;
+      });
+      if (!rows.length) {
+        box.innerHTML = '<p class="text-xs text-slate-400 text-center py-8">この日の予約はありません。</p>';
+        return;
+      }
+      box.innerHTML = rows.map(function (r) { return scheduleCardHtml(r, key); }).join('');
+    }
+
+    function selectScheduleDay(key) {
+      scheduleSelectedDate = key || '';
+      renderScheduleCalendar();
+      renderScheduleDayList();
+    }
+
+    function shiftScheduleMonth(delta) {
+      if (!scheduleCursorYear) {
+        const p = schJstParts(Date.now());
+        scheduleCursorYear = p.y;
+        scheduleCursorMonth = p.mo - 1;
+      }
+      let y = scheduleCursorYear;
+      let m = scheduleCursorMonth + (Number(delta) || 0);
+      while (m < 0) { m += 12; y -= 1; }
+      while (m > 11) { m -= 12; y += 1; }
+      scheduleCursorYear = y;
+      scheduleCursorMonth = m;
+      renderScheduleCalendar();
+    }
+
+    function goScheduleToday() {
+      const p = schJstParts(Date.now());
+      scheduleCursorYear = p.y;
+      scheduleCursorMonth = p.mo - 1;
+      scheduleSelectedDate = schKeyFromParts(p.y, p.mo, p.da);
+      renderScheduleCalendar();
+      renderScheduleDayList();
+    }
+
+    // 予約一覧の取得（タブを開いたとき / 再読込押下時のみ）
+    async function loadSchedules(force) {
+      if (scheduleLoading) return;
+      scheduleLoading = true;
+      try {
+        const res = await apiRequest({ action: 'list_schedules' });
+        scheduleData = Array.isArray(res && res.data) ? res.data : [];
+        scheduleServerMs = Number(res && res.server_time_ms) || 0;
+        scheduleLoaded = true;
+        if (!scheduleSelectedDate) scheduleSelectedDate = schTodayKey();
+        const cnt = document.getElementById('scheduleCount');
+        if (cnt) cnt.textContent = String(scheduleData.length);
+        renderScheduleCalendar();
+        renderScheduleDayList();
+        if (force) showToast('スケジュールを再読込しました（' + scheduleData.length + '件）', 'success');
+      } catch (e) {
+        showToast('スケジュールの取得に失敗しました: ' + (e && e.message ? e.message : e), 'error');
+      } finally {
+        scheduleLoading = false;
+      }
+    }
+
+    // 対象校の選択肢を作る（非管理者は自校で固定・変更不可＝承認済み仕様）
+    function renderScheduleModalTargets() {
+      const scope = (typeof getTeacherScopeSchool === 'function') ? getTeacherScopeSchool() : '';
+      const schSel = document.getElementById('scheduleSchool');
+      if (schSel) {
+        const schools = scope ? [scope] : SCHOOLS.slice();
+        schSel.innerHTML = schools.map(function (s) {
+          return '<option value="' + escapeHtml(s) + '">' + escapeHtml(s) + '</option>';
+        }).join('');
+        if (!schSel.value || schools.indexOf(schSel.value) < 0) schSel.value = scope || schools[0] || '';
+        schSel.disabled = !!scope;
+        schSel.className = scope
+          ? 'w-full bg-slate-100 border border-slate-300 text-slate-500 text-xs rounded-lg p-2 cursor-not-allowed'
+          : 'w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2';
+        schSel.title = scope ? '所属校に固定されています（変更できません）' : '';
+      }
+      refreshScheduleClasses();
+    }
+
+    // 学校に応じたクラス一覧と個別児童リスト（既存 devicesData を流用＝承認済み）
+    function refreshScheduleClasses() {
+      const schSel = document.getElementById('scheduleSchool');
+      const clsSel = document.getElementById('scheduleClass');
+      const school = schSel ? String(schSel.value || '') : '';
+      const devs = (devicesData || []).filter(function (d) {
+        if (!d) return false;
+        if (typeof isDeviceInScope === 'function' && !isDeviceInScope(d)) return false;
+        if (!school) return true;
+        if (typeof schoolNamesMatch === 'function') return schoolNamesMatch(String(d.school_name || ''), school);
+        return String(d.school_name || '') === school;
+      });
+      const classes = [];
+      devs.forEach(function (d) {
+        const c = String(d.class_name || '').trim();
+        if (c && classes.indexOf(c) < 0) classes.push(c);
+      });
+      classes.sort();
+      if (clsSel) {
+        clsSel.innerHTML = classes.length
+          ? classes.map(function (c) { return '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>'; }).join('')
+          : '<option value="">（クラス未割当）</option>';
+      }
+      const box = document.getElementById('scheduleStudentBox');
+      if (box) {
+        box.innerHTML = devs.length
+          ? devs.map(function (d) {
+              const id = String(d.student_id || '');
+              const cls = String(d.class_name || '未割当');
+              const nm = String(d.student_name || id);
+              return '<label class="flex items-center space-x-1.5 text-[11px] text-slate-600 px-1 py-0.5">'
+                + '<input type="checkbox" value="' + escapeHtml(id) + '" onchange="toggleScheduleStudent(this.value, this.checked)" class="rounded border-slate-300">'
+                + '<span class="truncate">' + escapeHtml(nm) + ' <span class="text-slate-400">(' + escapeHtml(cls) + ')</span></span>'
+                + '</label>';
+            }).join('')
+          : '<p class="text-[11px] text-slate-400">対象児童がいません（端末一覧を先に読み込んでください）。</p>';
+      }
+      scheduleSelectedStudentIds = new Set();
+      toggleScheduleTargetFields();
+    }
+
+    function toggleScheduleStudent(id, on) {
+      if (!id) return;
+      if (on) scheduleSelectedStudentIds.add(id);
+      else scheduleSelectedStudentIds.delete(id);
+    }
+
+    // 対象種別・制限タイプに応じて入力欄の表示/必須を切り替える
+    function toggleScheduleTargetFields() {
+      const tt = document.getElementById('scheduleTargetType');
+      const isStudent = !!tt && String(tt.value) === 'student';
+      const clsWrap = document.getElementById('scheduleClassWrap');
+      const stuWrap = document.getElementById('scheduleStudentWrap');
+      if (clsWrap) clsWrap.classList.toggle('hidden', isStudent);
+      if (stuWrap) stuWrap.classList.toggle('hidden', !isStudent);
+
+      const rt = document.getElementById('scheduleRestrictionType');
+      const isUrl = !rt || String(rt.value) !== 'screen_lock';
+      const urlWrap = document.getElementById('scheduleUrlWrap');
+      if (urlWrap) urlWrap.classList.toggle('hidden', !isUrl);
+
+      const rp = document.getElementById('scheduleRepeat');
+      const isWeekly = !!rp && String(rp.value) === 'WEEKLY';
+      const wdWrap = document.getElementById('scheduleWeekdayWrap');
+      if (wdWrap) wdWrap.classList.toggle('hidden', !isWeekly);
+    }
+
+    // 新規予約モーダルを開く（初期値を今日・19:00〜20:00 で埋める）
+    function openScheduleModal() {
+      scheduleSelectedStudentIds = new Set();
+      const today = schTodayKey();
+      const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
+      set('scheduleTargetType', 'class');
+      set('scheduleRestrictionType', 'url_block');
+      set('scheduleFilterMode', 'BLACKLIST');
+      set('scheduleWhitelist', '');
+      set('scheduleBlacklist', '');
+      set('scheduleDateFrom', today);
+      set('scheduleDateTo', today);
+      set('scheduleStartTime', '19:00');
+      set('scheduleEndTime', '20:00');
+      set('scheduleRepeat', 'NONE');
+      set('scheduleNote', '');
+      for (let i = 0; i < 7; i++) {
+        const cb = document.getElementById('scheduleWeekday' + i);
+        if (cb) cb.checked = (i >= 1 && i <= 5);
+      }
+      renderScheduleModalTargets();
+      openModal('scheduleModal');
+    }
+
+    // 新規予約の保存
+    async function saveSchedule() {
+      const val = function (id) { const e = document.getElementById(id); return e ? String(e.value || '').trim() : ''; };
+      const targetType = val('scheduleTargetType') || 'class';
+      const restrictionType = val('scheduleRestrictionType') || 'url_block';
+      const dateFrom = val('scheduleDateFrom');
+      const dateTo = val('scheduleDateTo') || dateFrom;
+      const startTime = val('scheduleStartTime');
+      const endTime = val('scheduleEndTime');
+
+      if (!dateFrom) { showToast('開始日を指定してください', 'error'); return; }
+      if (!startTime || !endTime) { showToast('開始時刻と終了時刻を指定してください', 'error'); return; }
+      if (startTime === endTime) { showToast('開始時刻と終了時刻が同じです（0分の予約は作成できません）', 'error'); return; }
+      if (targetType === 'student' && scheduleSelectedStudentIds.size === 0) {
+        showToast('個別指定の場合は児童を1名以上選択してください', 'error'); return;
+      }
+
+      const payload = {
+        action: 'save_schedule',
+        target_type: targetType,
+        school_name: val('scheduleSchool'),
+        class_name: val('scheduleClass'),
+        student_ids: Array.from(scheduleSelectedStudentIds),
+        type: restrictionType,
+        filter_mode: val('scheduleFilterMode') || 'BLACKLIST',
+        whitelist_urls: val('scheduleWhitelist'),
+        blacklist_urls: val('scheduleBlacklist'),
+        date_from: dateFrom,
+        date_to: dateTo,
+        start_time: startTime,
+        end_time: endTime,
+        repeat: val('scheduleRepeat') || 'NONE',
+        note: val('scheduleNote')
+      };
+      if (payload.repeat === 'WEEKLY') {
+        const wds = [];
+        for (let i = 0; i < 7; i++) {
+          const cb = document.getElementById('scheduleWeekday' + i);
+          if (cb && cb.checked) wds.push(i);
+        }
+        payload.weekdays = wds;
+        if (!wds.length) { showToast('毎週の場合は曜日を1つ以上選択してください', 'error'); return; }
+      }
+      if (restrictionType === 'url_block') {
+        const mode = payload.filter_mode;
+        if (mode === 'BLACKLIST' && !payload.blacklist_urls) { showToast('規制URLリストを入力してください', 'error'); return; }
+        if (mode === 'WHITELIST' && !payload.whitelist_urls) { showToast('許可URLリストを入力してください', 'error'); return; }
+      }
+
+      const btn = document.getElementById('scheduleSaveBtn');
+      if (btn) { btn.disabled = true; btn.classList.add('opacity-60', 'cursor-not-allowed'); }
+      try {
+        await apiRequest(payload);
+        closeModal('scheduleModal');
+        showToast('予約を登録しました', 'success');
+        await loadSchedules(true);
+      } catch (e) {
+        showToast('予約の登録に失敗しました: ' + (e && e.message ? e.message : e), 'error');
+      } finally {
+        if (btn) { btn.disabled = false; btn.classList.remove('opacity-60', 'cursor-not-allowed'); }
+      }
+    }
+
+    // 「取消」＝予約そのものを停止（有効=FALSE。行は監査ログとして残る）
+    async function cancelSchedule(id) {
+      if (!id) return;
+      const ok = confirm('「取消」は予約そのものを停止します。\n記録は残りますが、以後この時間帯は適用されません。\nよろしいですか？');
+      if (!ok) return;
+      try {
+        await apiRequest({ action: 'cancel_schedule', schedule_id: id });
+        showToast('予約を取り消しました', 'success');
+        await loadSchedules(false);
+      } catch (e) {
+        showToast('取消に失敗しました: ' + (e && e.message ? e.message : e), 'error');
+      }
+    }
+
+    // 「手動解除」＝今回の時間帯だけ停止（予約は残り、次回以降は再適用）
+    async function overrideSchedule(id) {
+      if (!id) return;
+      const ok = confirm('「手動解除」は今回の時間帯だけ停止します。\n予約は残り、次回以降の時間帯は再び適用されます。\nよろしいですか？');
+      if (!ok) return;
+      try {
+        await apiRequest({ action: 'override_schedule', schedule_id: id });
+        showToast('今回の時間帯を解除しました', 'success');
+        await loadSchedules(false);
+      } catch (e) {
+        showToast('手動解除に失敗しました: ' + (e && e.message ? e.message : e), 'error');
+      }
+    }
+
+    // ビュー切替（端末一覧 / 画面一覧 / スケジュール管理）
+    //   【フェーズ4】2ビュー前提の真偽値から3ビュー前提へ変更した。
+    //   未知の値は端末一覧へフォールバックし、どのビューも表示されない事故を防ぐ。
     function switchMainView(view) {
-      const isScreens = view === 'screens';
-      const dv = document.getElementById('devicesView');
-      const sv = document.getElementById('screensView');
-      if (dv) dv.classList.toggle('hidden', isScreens);
-      if (sv) sv.classList.toggle('hidden', !isScreens);
+      const cur = (view === 'screens' || view === 'schedule') ? view : 'devices';
+      const viewIds = { devices: 'devicesView', screens: 'screensView', schedule: 'scheduleView' };
+      Object.keys(viewIds).forEach(function (k) {
+        const el = document.getElementById(viewIds[k]);
+        if (el) el.classList.toggle('hidden', k !== cur);
+      });
       const activeCls = 'flex items-center space-x-1.5 px-4 py-2 text-xs font-bold rounded-lg bg-indigo-600 text-white shadow-sm transition';
       const idleCls = 'flex items-center space-x-1.5 px-4 py-2 text-xs font-bold rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition';
-      const dBtn = document.getElementById('tabDevicesViewBtn');
-      const sBtn = document.getElementById('tabScreensViewBtn');
-      if (dBtn) dBtn.className = isScreens ? idleCls : activeCls;
-      if (sBtn) sBtn.className = isScreens ? activeCls : idleCls;
-      if (isScreens) {
+      const btnIds = { devices: 'tabDevicesViewBtn', screens: 'tabScreensViewBtn', schedule: 'tabScheduleViewBtn' };
+      Object.keys(btnIds).forEach(function (k) {
+        const b = document.getElementById(btnIds[k]);
+        if (b) b.className = (k === cur) ? activeCls : idleCls;
+      });
+      if (cur === 'screens') {
         // 画面一覧タブを開いた時点では取得しない（押下時のみ）。
         // 直前の取得結果があればそのまま表示を維持する。
         updateScreenTargetCount();
+      }
+      if (cur === 'schedule') {
+        // スケジュールタブも同様に、開いた時点で一度だけ取得する。
+        if (!scheduleLoaded) loadSchedules(false);
+        else { renderScheduleCalendar(); renderScheduleDayList(); }
       }
     }
 
