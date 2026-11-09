@@ -8131,25 +8131,53 @@ function handleSaveSchedule_(payload, teacher) {
   withWriteLock(function () { rowIndex = appendScheduleRow_(obj); });
 
   const nowMs = new Date().getTime();
-  const rows = readScheduleRows_();
-  let saved = null;
-  for (let i = 0; i < rows.length; i++) {
-    if (rows[i].id === obj.id) { saved = rows[i]; break; }
-  }
+
+  // 【性能】書き込み直後に readScheduleRows_() でシート全体を読み直していた。
+  //   予約シートが 1,000〜2,000 行に育つと、この 1 回の往復だけで
+  //   「予約を登録」→「完了表示」が数秒遅れていた（追加した行は obj に
+  //   そのまま在るので、読み直す必要が無い）。
+  //   appendScheduleRow_ が書く値と readScheduleRows_ が返す正規化済みの形を
+  //   ここで 1:1 に再現する（条件付きで空になる列も同じ条件で落とす）。
+  const isUrlBlock = obj.type === 'url_block';
+  const saved = {
+    rowIndex: rowIndex,
+    id: obj.id,
+    targetType: obj.targetType,
+    schoolName: String(obj.schoolName || '').trim(),
+    className: String(obj.className || '').trim(),
+    studentIds: Array.isArray(obj.studentIds) ? obj.studentIds : [],
+    type: obj.type,
+    // 規制モード／URL リストは url_block のときだけ列に載る（appendScheduleRow_ と同じ）
+    filterMode: isUrlBlock ? String(obj.filterMode || '').trim().toUpperCase() : '',
+    whitelist: isUrlBlock ? String(obj.whitelist || '').trim() : '',
+    blacklist: isUrlBlock ? String(obj.blacklist || '').trim() : '',
+    dateFrom: obj.dateFrom,
+    dateTo: obj.dateTo,
+    repeat: obj.repeat,
+    startTime: obj.startTime,
+    endTime: obj.endTime,
+    weekdaysRaw: (Array.isArray(obj.weekdays) && obj.weekdays.length) ? obj.weekdays.join(',') : '',
+    enabled: true,          // 新規は必ず有効（appendScheduleRow_ が true を書く）
+    overridden: false,      // 新規は必ず未解除
+    overrideAt: '',
+    createdBy: obj.createdBy,
+    createdAt: obj.createdAt,
+    updatedAt: obj.updatedAt,
+    note: obj.note
+  };
 
   Logger.log('[SCHEDULE] saved id=' + obj.id + ' target=' + obj.targetType +
     ' by=' + obj.createdBy + ' row=' + rowIndex);
 
   // 【フェーズ5】子GASへ即時伝播（保留キューを使わない同期送信）。
-  const shardProp = propagateScheduleToChildren_(saved || {
-    targetType: obj.targetType, className: obj.className,
-    schoolName: obj.schoolName, studentIds: obj.studentIds
-  });
+  //   saved は上のとおり必ず非 null。propagateScheduleToChildren_ が参照するのは
+  //   targetType / className / schoolName / studentIds のみ。
+  const shardProp = propagateScheduleToChildren_(saved);
 
   return {
     success: true,
     message: 'スケジュールを登録しました',
-    schedule: saved ? scheduleRowToJson_(saved, nowMs) : null,
+    schedule: scheduleRowToJson_(saved, nowMs),
     row_index: rowIndex,
     shard: shardProp
   };
@@ -8233,5 +8261,79 @@ function handleOverrideSchedule_(payload, teacher) {
   return { success: true, message: 'この予約を今回だけ解除しました（次回以降は再び適用されます）', schedule_id: id, overridden: true, override_at: nowStr, shard: shardProp };
 }
 
+/**
+ * スケジュール機能用 Web API エントリーポイント（google.script.run 用）
+ *
+ * 【確定仕様】teacher オブジェクトの正しいプロパティ
+ *     email … 教員ID（メールアドレス）  ← これが空だと by= が空になり監査ログが壊れる
+ *     school … 所属学校（school_name ではない）
+ *   認証検証は既存の verifyToken(authToken) のみを信頼する。
+ *   存在しないヘルパー（getTeacherByToken_ / authenticateToken_ /
+ *   getSessionUserEmail_）は一切呼び出さない。
+ *
+ * 【過去の不具合】存在しないヘルパーを呼んでいたため teacher が常に null になり、
+ *   isScheduleRowInTeacherScope_ が全行 false を返して一覧が 0 件（カレンダーが空）
+ *   になっていた。また by= が空文字になっていた。
+ */
+function extractTeacherFromToken_(authToken) {
+  if (!authToken) return null;
+  var res = null;
+  try { res = (typeof verifyToken === 'function') ? verifyToken(authToken) : null; } catch (e) { res = null; }
+  if (!res || !res.valid || !res.teacher) return null;
+  // トークンは発行時点のスナップショット。教員マスタの最新レコードで解決し直す
+  // （api_getAllDevices と同じ鎖。所属校・権限の変更を即座に反映させる）。
+  try {
+    if (typeof resolveCurrentTeacher === 'function') return resolveCurrentTeacher(res.teacher);
+  } catch (e2) { /* 最新化に失敗してもトークン内容で続行する */ }
+  return res.teacher;
+}
 
+/**
+ * 認証できなかったときの共通応答。
+ *   null のまま内部ハンドラへ渡すと「権限外＝0件」として黙って空になるため、
+ *   ここで明示的に失敗させてフロントを再ログインへ誘導する。
+ */
+function apiNeedAuth_() {
+  return { success: false, need_auth: true, error: '認証セッションが無効です。再ログインしてください。' };
+}
 
+function api_listSchedules(authToken, schoolName) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  var payload = {
+    school_name: schoolName || (teacher.school || ''),
+    token: authToken
+  };
+  return handleListSchedules_(payload, teacher);
+}
+
+function api_saveSchedule(authToken, scheduleData) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  var payload = (scheduleData && typeof scheduleData === 'object') ? scheduleData : {};
+  payload.token = authToken;
+  // 学校名が未指定なら教員の所属校で補う（スコープ判定の取りこぼしを防ぐ）
+  if (!payload.schoolName && !payload.school_name && teacher.school) {
+    payload.schoolName = teacher.school;
+    payload.school_name = teacher.school;
+  }
+  return handleSaveSchedule_(payload, teacher);
+}
+
+function api_cancelSchedule(authToken, scheduleId) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  return handleCancelSchedule_({ schedule_id: scheduleId, id: scheduleId, token: authToken }, teacher);
+}
+
+function api_overrideSchedule(authToken, scheduleId, actionType) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  return handleOverrideSchedule_({
+    schedule_id: scheduleId,
+    id: scheduleId,
+    action_type: actionType,
+    override_type: actionType,
+    token: authToken
+  }, teacher);
+}

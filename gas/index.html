@@ -2812,6 +2812,14 @@
             runner.api_getMonitorSettings(authToken);
           } else if (act === 'save_monitor_settings') {
             runner.api_saveMonitorSettings(authToken, payload.settings || {});
+          } else if (act === 'list_schedules') {
+            runner.api_listSchedules(authToken, payload.school_name);
+          } else if (act === 'save_schedule') {
+            runner.api_saveSchedule(authToken, payload);
+          } else if (act === 'cancel_schedule') {
+            runner.api_cancelSchedule(authToken, payload.schedule_id || payload.id);
+          } else if (act === 'override_schedule') {
+            runner.api_overrideSchedule(authToken, payload.schedule_id || payload.id, payload.action_type || payload.override_type);
           } else {
             reject(new Error('未対応のアクション: ' + act));
           }
@@ -3010,6 +3018,7 @@
     const SCHEDULE_WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
     let scheduleLoaded = false;        // 一度でも取得できたか
     let scheduleLoading = false;       // 二重取得の防止
+    let scheduleLoadPending = null;    // 実行中の取得（後続の要求を合流させる）
     let scheduleData = [];             // list_schedules の data 配列
     let scheduleServerMs = 0;          // サーバ時計（表示の目安）
     let scheduleCursorYear = 0;        // カレンダーの表示年
@@ -3248,11 +3257,32 @@
       renderScheduleDayList();
     }
 
-    // 予約一覧の取得（タブを開いたとき / 再読込押下時のみ）
-    async function loadSchedules(force) {
-      if (scheduleLoading) return;
-      scheduleLoading = true;
+    // 【性能】登録・取消・解除の直後に一覧を取り直すが、その完了を待たせない。
+    //   google.script.run は往復に数秒かかるため、await すると
+    //   「完了トーストは出ているのにボタンが押せない」時間が残る。
+    //   取り直し自体は必ず走らせる（表示は数秒後に追いつく）。
+    function refreshSchedulesAfterChange() {
       try {
+        const p = loadSchedules(false);
+        if (p && typeof p.catch === 'function') p.catch(function () {});
+      } catch (e) { /* 再取得の失敗で操作結果を壊さない */ }
+    }
+
+    // 予約一覧の取得（タブを開いたとき / 再読込押下時のみ）
+    //   【性能】取得中に来た要求は「捨てる」のではなく「合流」させる。
+    //     捨てると、登録直後の裏取得が走っている数秒間に再読込ボタンを押しても
+    //     何も起きず「ボタンが無反応」に見える。合流なら必ず1回は取得が走る。
+    async function loadSchedules(force) {
+      // 取得中に来た要求は「捨てる」のではなく「順番待ち」にする。
+      //   捨てると、登録直後の裏取得が走っている数秒間に再読込を押しても
+      //   何も起きず「ボタンが無反応」に見える。待ってから自分の分を必ず取得する。
+      if (scheduleLoading) {
+        try {
+          await scheduleLoadPending;
+        } catch (eJ) { /* 進行中の取得の失敗はそちらで通知済み */ }
+      }
+      scheduleLoading = true;
+      scheduleLoadPending = (async function () {
         const res = await apiRequest({ action: 'list_schedules' });
         scheduleData = Array.isArray(res && res.data) ? res.data : [];
         scheduleServerMs = Number(res && res.server_time_ms) || 0;
@@ -3263,10 +3293,14 @@
         renderScheduleCalendar();
         renderScheduleDayList();
         if (force) showToast('スケジュールを再読込しました（' + scheduleData.length + '件）', 'success');
+      })();
+      try {
+        await scheduleLoadPending;
       } catch (e) {
         showToast('スケジュールの取得に失敗しました: ' + (e && e.message ? e.message : e), 'error');
       } finally {
         scheduleLoading = false;
+        scheduleLoadPending = null;
       }
     }
 
@@ -3435,7 +3469,8 @@
         await apiRequest(payload);
         closeModal('scheduleModal');
         showToast('予約を登録しました', 'success');
-        await loadSchedules(true);
+        // 【性能】一覧の取り直しを待たない（完了表示のあとボタンを即座に戻す）
+        refreshSchedulesAfterChange();
       } catch (e) {
         showToast('予約の登録に失敗しました: ' + (e && e.message ? e.message : e), 'error');
       } finally {
@@ -3451,7 +3486,7 @@
       try {
         await apiRequest({ action: 'cancel_schedule', schedule_id: id });
         showToast('予約を取り消しました', 'success');
-        await loadSchedules(false);
+        refreshSchedulesAfterChange();
       } catch (e) {
         showToast('取消に失敗しました: ' + (e && e.message ? e.message : e), 'error');
       }
@@ -3465,7 +3500,7 @@
       try {
         await apiRequest({ action: 'override_schedule', schedule_id: id });
         showToast('今回の時間帯を解除しました', 'success');
-        await loadSchedules(false);
+        refreshSchedulesAfterChange();
       } catch (e) {
         showToast('手動解除に失敗しました: ' + (e && e.message ? e.message : e), 'error');
       }

@@ -447,6 +447,223 @@ check('不変条件: 予約シートへの書き込みは CRUD 経由のみ',
   check('不変条件: スケジュール実装は行削除しない（監査ログ保全）', bad.length === 0, bad);
 })();
 
+// ================================================================ M. Web API ラッパー
+//   背景（実害）: 過去のラッパーは存在しないヘルパー（getTeacherByToken_ /
+//     authenticateToken_ / getSessionUserEmail_）を呼んでいたため teacher が
+//     常に null になり、
+//        ・isScheduleRowInTeacherScope_ が全行 false → 一覧 0 件（カレンダーが空）
+//        ・createdBy（by=）が空文字 → 監査ログが壊れる
+//     という 2 つの不具合を同時に起こしていた。
+//   再発防止として「認証は verifyToken のみ」「架空ヘルパー禁止」
+//   「teacher.school_name 禁止（正は teacher.school）」を機械的に固定する。
+console.log('===== M. Web API ラッパー（認証チェーン） =====');
+{
+  const API_FNS = [
+    'extractTeacherFromToken_', 'api_listSchedules', 'api_saveSchedule',
+    'api_cancelSchedule', 'api_overrideSchedule'
+  ];
+  const bodies = {};
+  API_FNS.forEach(function (n) { bodies[n] = extractFn(n); });
+
+  // ① 認証の入口は verifyToken だけ
+  check('extractTeacherFromToken_ は verifyToken で検証する',
+    /verifyToken\s*\(/.test(bodies.extractTeacherFromToken_));
+  check('extractTeacherFromToken_ は res.valid と res.teacher を確認する',
+    /\.valid/.test(bodies.extractTeacherFromToken_) && /\.teacher/.test(bodies.extractTeacherFromToken_));
+
+  // ② 架空ヘルパーの呼び出しが無い（関数本体だけを見る＝説明コメントは対象外）
+  const PHANTOM = ['getTeacherByToken_', 'authenticateToken_', 'getSessionUserEmail_'];
+  const phantomHits = [];
+  API_FNS.forEach(function (n) {
+    PHANTOM.forEach(function (p) {
+      if (bodies[n].indexOf(p) >= 0) phantomHits.push(n + ' -> ' + p);
+    });
+  });
+  check('架空ヘルパーを一切呼ばない', phantomHits.length === 0, phantomHits);
+
+  // ③ teacher.school_name を使わない（verifyToken が返す正しいキーは school）
+  const wrongProp = [];
+  API_FNS.forEach(function (n) {
+    if (/teacher\s*\.\s*school_name/.test(bodies[n])) wrongProp.push(n);
+  });
+  check('teacher.school_name を使わない', wrongProp.length === 0, wrongProp);
+  check('Code.gs 全体でも teacher.school_name を参照しない',
+    !/teacher\s*\.\s*school_name/.test(src));
+
+  // ④ 4 本すべてが既存ハンドラへ委譲する（ロジックを二重実装しない）
+  check('api_listSchedules は handleListSchedules_ に委譲',
+    /handleListSchedules_\s*\(/.test(bodies.api_listSchedules));
+  check('api_saveSchedule は handleSaveSchedule_ に委譲',
+    /handleSaveSchedule_\s*\(/.test(bodies.api_saveSchedule));
+  check('api_cancelSchedule は handleCancelSchedule_ に委譲',
+    /handleCancelSchedule_\s*\(/.test(bodies.api_cancelSchedule));
+  check('api_overrideSchedule は handleOverrideSchedule_ に委譲',
+    /handleOverrideSchedule_\s*\(/.test(bodies.api_overrideSchedule));
+}
+
+// ================================================================ N. 実行: 認証チェーン
+//   ソース検査だけでは「teacher が実際に解決されるか」は分からないため、
+//   verifyToken / resolveCurrentTeacher / handle*_ を差し替えた小さな VM で
+//   ラッパーを実際に走らせ、引数の中身まで確認する。
+console.log('===== N. Web API ラッパーの実行 =====');
+{
+  const vmMod = require('vm');
+  const API_SRC_FNS = [
+    'extractTeacherFromToken_', 'apiNeedAuth_', 'api_listSchedules',
+    'api_saveSchedule', 'api_cancelSchedule', 'api_overrideSchedule'
+  ];
+  const apiSrc = API_SRC_FNS.map(function (n) { return extractFn(n); }).join('\n');
+
+  function buildApi(o) {
+    o = o || {};
+    const stash = { tokens: [], calls: [], list: null, save: null, cancel: null, override: null };
+    const sandbox = {
+      __stash: stash,
+      __verifyRes: o.verifyRes === undefined ? null : o.verifyRes,
+      __verifyThrows: !!o.verifyThrows,
+      __resolved: o.resolved || null,
+      __resolveThrows: !!o.resolveThrows,
+      Logger: { log: function () {} }
+    };
+    const pre = [
+      'function verifyToken(t){ __stash.tokens.push(t); if (__verifyThrows) throw new Error("boom"); return __verifyRes; }',
+      'function resolveCurrentTeacher(t){ if (__resolveThrows) throw new Error("boom"); return __resolved || t; }',
+      'function handleListSchedules_(p, t){ __stash.list = p; __stash.calls.push({fn:"list", teacher:t}); return {success:true, data:[], src:"list"}; }',
+      'function handleSaveSchedule_(p, t){ __stash.save = p; __stash.calls.push({fn:"save", teacher:t}); return {success:true, src:"save"}; }',
+      'function handleCancelSchedule_(p, t){ __stash.cancel = p; __stash.calls.push({fn:"cancel", teacher:t}); return {success:true, src:"cancel"}; }',
+      'function handleOverrideSchedule_(p, t){ __stash.override = p; __stash.calls.push({fn:"override", teacher:t}); return {success:true, src:"override"}; }'
+    ].join('\n');
+    const tail = '\n__API = { extract: extractTeacherFromToken_, list: api_listSchedules,' +
+      ' save: api_saveSchedule, cancel: api_cancelSchedule, override: api_overrideSchedule };';
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(pre + '\n' + apiSrc + '\n' + tail, sandbox);
+    return sandbox;
+  }
+
+  const TCH = { email: 't@example.com', name: '担任', school: '第一小学校', role: 'TEACHER', target_class: '5年1組' };
+
+  // ① トークン無し → null
+  check('トークン無しは teacher を返さない', buildApi({ verifyRes: { valid: true, teacher: TCH } }).__API.extract('') === null);
+
+  // ② 無効トークン → null
+  check('valid=false は teacher を返さない', buildApi({ verifyRes: { valid: false } }).__API.extract('bad.token') === null);
+
+  // ③ 有効トークン → teacher
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    const t = ctx.__API.extract('a.b');
+    check('有効トークンは teacher を返す', !!t && t.email === 't@example.com', t);
+    check('有効トークンは school を保持する', !!t && t.school === '第一小学校', t && t.school);
+    check('トークンが verifyToken へ渡る', ctx.__stash.tokens[0] === 'a.b', ctx.__stash.tokens);
+  })();
+
+  // ④ verifyToken が例外を投げても落ちない
+  (function () {
+    const ctx = buildApi({ verifyThrows: true });
+    let threw = false, out = 'unset';
+    try { out = ctx.__API.extract('a.b'); } catch (e) { threw = true; }
+    check('verifyToken の例外で落ちない', threw === false && out === null, out);
+  })();
+
+  // ⑤ resolveCurrentTeacher が最新レコードで上書きする
+  (function () {
+    const ctx = buildApi({
+      verifyRes: { valid: true, teacher: TCH },
+      resolved: { email: 't@example.com', name: '担任', school: '英田小学校', role: 'ADMIN' }
+    });
+    const t = ctx.__API.extract('a.b');
+    check('最新の所属校で解決し直す', t.school === '英田小学校', t.school);
+    check('最新の権限で解決し直す', t.role === 'ADMIN', t.role);
+  })();
+
+  // ⑥ resolveCurrentTeacher が例外 → トークン内容で続行
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH }, resolveThrows: true });
+    const t = ctx.__API.extract('a.b');
+    check('最新化に失敗してもトークン内容で続行', !!t && t.school === '第一小学校', t && t.school);
+  })();
+
+  // ⑦ 認証できないときは need_auth を返す（黙って空配列を返さない）
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: false } });
+    ['list', 'save', 'cancel', 'override'].forEach(function (k) {
+      const r = ctx.__API[k]('bad.token', 'x', 'y');
+      check('api_' + k + ' は未認証なら need_auth', !!r && r.success === false && r.need_auth === true, r);
+    });
+    check('未認証ではハンドラへ到達しない', ctx.__stash.calls.length === 0, ctx.__stash.calls.length);
+  })();
+
+  // ⑧ list: teacher.school が school_name に載り、teacher がそのまま渡る
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    const r = ctx.__API.list('a.b', '');
+    check('api_listSchedules はハンドラへ委譲する', r && r.src === 'list', r);
+    check('api_listSchedules は school_name を所属校で補う',
+      ctx.__stash.list && ctx.__stash.list.school_name === '第一小学校', ctx.__stash.list);
+    check('api_listSchedules は解決済み teacher を渡す',
+      ctx.__stash.calls[0] && ctx.__stash.calls[0].teacher && ctx.__stash.calls[0].teacher.email === 't@example.com');
+  })();
+
+  // ⑨ save: schoolName が補われ、token が載る
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    const r = ctx.__API.save('a.b', { target_type: 'class', class_name: '5年1組' });
+    check('api_saveSchedule はハンドラへ委譲する', r && r.src === 'save', r);
+    check('api_saveSchedule は schoolName を所属校で補う',
+      ctx.__stash.save && ctx.__stash.save.schoolName === '第一小学校', ctx.__stash.save);
+    check('api_saveSchedule は token を載せる',
+      ctx.__stash.save && ctx.__stash.save.token === 'a.b', ctx.__stash.save && ctx.__stash.save.token);
+    check('api_saveSchedule は解決済み teacher を渡す',
+      ctx.__stash.calls[0] && ctx.__stash.calls[0].teacher && ctx.__stash.calls[0].teacher.school === '第一小学校');
+  })();
+
+  // ⑩ save: 既に学校名が入っていれば上書きしない
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    ctx.__API.save('a.b', { schoolName: '英田小学校' });
+    check('api_saveSchedule は明示された学校名を尊重する',
+      ctx.__stash.save && ctx.__stash.save.schoolName === '英田小学校', ctx.__stash.save);
+  })();
+
+  // ⑪ cancel / override: schedule_id を載せて委譲する
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    const rc = ctx.__API.cancel('a.b', 'sch_1');
+    const ro = ctx.__API.override('a.b', 'sch_2', 'manual');
+    check('api_cancelSchedule はハンドラへ委譲する', rc && rc.src === 'cancel', rc);
+    check('api_cancelSchedule は schedule_id を載せる',
+      ctx.__stash.cancel && (ctx.__stash.cancel.schedule_id === 'sch_1' || ctx.__stash.cancel.id === 'sch_1'), ctx.__stash.cancel);
+    check('api_overrideSchedule はハンドラへ委譲する', ro && ro.src === 'override', ro);
+    check('api_overrideSchedule は schedule_id を載せる',
+      ctx.__stash.override && (ctx.__stash.override.schedule_id === 'sch_2' || ctx.__stash.override.id === 'sch_2'), ctx.__stash.override);
+  })();
+}
+
+// ================================================================ O. 保存の性能
+//   実害: 「予約を登録」→「完了表示」までが数秒かかっていた。原因の 1 つが
+//     書き込み直後の readScheduleRows_()（予約シート全読み）だった。
+//     追加した行は obj にそのまま在るので読み直す必要が無い。
+console.log('===== O. 保存の性能（全読み回帰） =====');
+{
+  const saveBody = extractFn('handleSaveSchedule_');
+  // コメントは「説明」であって「呼び出し」ではない。
+  //   （実装の意図を残すためコメントには関数名を書いているので、
+  //     判定の前にコメントを落として“実際の呼び出し”だけを見る）
+  const codeOnly = saveBody
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+  check('保存時に予約シートを全読みしない', codeOnly.indexOf('readScheduleRows_') < 0,
+    codeOnly.indexOf('readScheduleRows_'));
+  check('保存時に appendScheduleRow_ で追記する', /appendScheduleRow_\s*\(/.test(codeOnly));
+  check('保存時に保存行を自前で組み立てる（saved）', /var\s+saved\s*=|const\s+saved\s*=/.test(codeOnly));
+  check('保存時に子GAS伝播を呼ぶ', codeOnly.indexOf('propagateScheduleToChildren_') >= 0);
+  check('保存行は新規＝有効で作られる', /enabled\s*:\s*true/.test(codeOnly));
+  check('保存行は新規＝未解除で作られる', /overridden\s*:\s*false/.test(codeOnly));
+  // appendScheduleRow_ が書く条件付き列を、saved 側でも同じ条件で落としていること
+  check('URL規制モードは url_block のときだけ載せる',
+    /filterMode\s*:\s*isUrlBlock/.test(codeOnly) && /isUrlBlock\s*=\s*obj\.type\s*===\s*'url_block'/.test(codeOnly));
+}
+
 console.log('');
 console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
 process.exit(fail > 0 ? 1 : 0);
