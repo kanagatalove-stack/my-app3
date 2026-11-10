@@ -114,6 +114,17 @@ function makeSheet(cols, rows) {
 }
 
 const CONFIG_SRC = extractConst('CONFIG');
+// セクション R で使うシート名（製品コードの CONFIG から解決する）
+const CONFIG_SCHEDULE_NAME = (function () {
+  const m = CONFIG_SRC.match(/SCHEDULE_SHEET_NAME:\s*'([^']+)'/);
+  if (!m) throw new Error('SCHEDULE_SHEET_NAME not found');
+  return m[1];
+})();
+const CONFIG_DEVICE_NAME = (function () {
+  const m = CONFIG_SRC.match(/DEVICE_SHEET_NAME:\s*'([^']+)'/);
+  if (!m) throw new Error('DEVICE_SHEET_NAME not found');
+  return m[1];
+})();
 const sandboxStub = 'var __CFG = ' + CONFIG_SRC.replace('const CONFIG = ', '') + ';';
 
 const sheets = {};
@@ -1083,6 +1094,188 @@ console.log('===== Q. 伝播経路（宛先解決とフォールバック） ===
     /if\s*\(\s*!entries\s*\|\|\s*!entries\.length\s*\)/.test(propBody));
   check('Q15 宛先解決に unique子GAS フォールバックが入っている',
     /singleChildUrl/.test(propBody) && /idxKeys\.length === 1/.test(propBody));
+}
+
+
+// ================================================================ R. 保存→伝播の発火保証
+//   実害: 親の保存ログ [SCHEDULE] saved ... だけが出て、[SHARD] ログが 1 行も無い。
+//         しかし shardPropagatePolicy の成功経路には元々ログが無かったため、
+//         「無言の成功」と「無言のスキップ」が区別できなかった。
+//   ここでは handleSaveSchedule_ を実際に走らせ、保存と同時に伝播が
+//   必ず発火すること、およびスキップ時は理由がログと戻り値に残ることを検証する。
+console.log('===== R. 保存→伝播の発火保証 =====');
+{
+  const vmMod = require('vm');
+
+  const SAVE_FNS = [
+    'getHeaderMap',
+    'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
+    'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
+    'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_',
+    'normalizeSchoolName', 'schoolNamesMatch', 'resolveCanonicalSchool',
+    'isAllSchoolsName', 'normalizeClassName', 'isAdminTeacher',
+    'getTeacherScopeInfo', 'getTeacherTargetClasses', 'isClassInTeacherScope',
+    'scopeStudentIdsForTeacher', 'parseBoolean',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'deviceMatchesSchedule_', 'readScheduleRows_', 'isAnyScheduleActive_',
+    'schNowJstSec_', 'generateScheduleId_', 'validateScheduleInput_',
+    'authorizeScheduleTarget_', 'appendScheduleRow_', 'updateScheduleCells_',
+    'isScheduleRowInTeacherScope_', 'scheduleRowToJson_',
+    'handleSaveSchedule_', 'propagateScheduleToChildren_'
+  ];
+
+  function buildSave(o) {
+    o = o || {};
+    const logs = [];
+    const propCalls = [];
+    const schedSheet = makeSheet([], []);
+    const devSheet = makeSheet(DEVICE_COLUMNS, [
+      DEVICE_COLUMNS.slice(),
+      ['s1', '第一小学校', '第一 一郎', '5年1組', false, 'OFF', '', '', '', '', '', '', '', '', '']
+    ]);
+    const targetSheets = {};
+    targetSheets[CONFIG_SCHEDULE_NAME] = schedSheet;
+    targetSheets[CONFIG_DEVICE_NAME] = devSheet;
+
+    const sandbox = {
+      // CONFIG は src 側で `var CONFIG = {...}` として評価する。
+      //   （CONFIG_SRC は JS オブジェクトリテラルなので JSON.parse では落ちる）
+      SCHEDULE_COLUMNS: SCHEDULE_COLUMNS,
+      SHEET_TZ_OFFSET_MS: 9 * 60 * 60 * 1000,
+      __logs: logs,
+      __propCalls: propCalls,
+      console: { log: function () {} },
+      Logger: { log: function (m) { logs.push(String(m)); } },
+      Utilities: { formatDate: function (d, tz, fmt) { return '2026/11/10 12:36:15'; } },
+      LockService: {
+        getScriptLock: function () {
+          return { waitLock: function () {}, releaseLock: function () {} };
+        }
+      },
+      getTargetSheet: function (name) { return targetSheets[name]; },
+      ensureScheduleHeaders: function (sheet) {
+        if (sheet.getLastColumn() === 0) {
+          sheet._cols = SCHEDULE_COLUMNS.slice();
+          sheet._rows[0] = SCHEDULE_COLUMNS.slice();
+          return;
+        }
+        const hdr = sheet._rows[0].map(function (h) { return String(h).trim(); });
+        SCHEDULE_COLUMNS.forEach(function (col) {
+          if (hdr.indexOf(col) < 0) { sheet._cols.push(col); sheet._rows[0].push(col); }
+        });
+      },
+      withWriteLock: function (fn) { return fn(); },
+      invalidateDevicesCache: function () {},
+      shardDeviceEntries: function () { return [['s1', '第一小学校', '5年1組']]; },
+      shardWarnOnce: function () {},
+      // 親か子かはテスト側で切り替える（既定は親）
+      isShardParent: function () { return o.isParent !== false; },
+      // shardPropagatePolicy を差し替えて「呼ばれたか」と「引数」を捕捉する
+      shardPropagatePolicy: function (ids, patch, forceSync) {
+        propCalls.push({ ids: (ids || []).slice(), patch: patch, forceSync: forceSync });
+        if (o.propResult) return o.propResult;
+        return { sent: [{ url: 'https://child1.example/exec', count: (ids || []).length, status: 200 }] };
+      }
+    };
+
+    const src = [CONFIG_SRC.replace('const CONFIG = ', 'var CONFIG = ')]
+      .concat(SAVE_FNS.map(function (n) { return extractFn(n); }))
+      .join('\n');
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(src + '\n__R = { save: handleSaveSchedule_ };', sandbox);
+    return { sandbox: sandbox, logs: logs, propCalls: propCalls, schedSheet: schedSheet };
+  }
+
+  const TEACHER = {
+    email: 'teacher.daiichi@school.ed.jp', name: '第一小', school: '第一小学校',
+    role: 'TEACHER', target_class: '5年1組'
+  };
+  const STUDENT_PAYLOAD = {
+    target_type: 'student', student_ids: ['s1'],
+    type: 'screen_lock',
+    date_from: '2026/11/10', date_to: '2026/11/10', repeat: 'NONE',
+    start_time: '12:02', end_time: '12:03',
+    note: '実機再現'
+  };
+
+  // ① 親GAS: 保存と同時に伝播が必ず発火する
+  (function () {
+    const b = buildSave({ isParent: true });
+    const res = b.sandbox.__R.save(STUDENT_PAYLOAD, TEACHER);
+
+    check('R1 保存が成功する', res.success === true, res.error);
+    check('R2 親シートへ 1 行追記される', b.schedSheet.getLastRow() === 2, b.schedSheet.getLastRow());
+    check('R3 保存ログが出る', b.logs.some(function (m) { return m.indexOf('[SCHEDULE] saved') >= 0; }), b.logs);
+    check('R4 伝播が 1 回だけ発火する', b.propCalls.length === 1, b.propCalls.length);
+    check('R5 伝播に児童IDが渡る',
+      b.propCalls.length === 1 && JSON.stringify(b.propCalls[0].ids) === JSON.stringify(['s1']),
+      b.propCalls[0] && b.propCalls[0].ids);
+    check('R6 伝播は即時同期（forceSync=true）',
+      b.propCalls.length === 1 && b.propCalls[0].forceSync === true,
+      b.propCalls[0] && b.propCalls[0].forceSync);
+    check('R7 戻り値 shard に sent が入る（画面から確認できる）',
+      !!res.shard && Array.isArray(res.shard.sent) && res.shard.sent.length === 1, res.shard);
+    check('R8 伝播ログ [SHARD] が出る', b.logs.some(function (m) { return m.indexOf('[SHARD]') >= 0; }), b.logs);
+  })();
+
+  // ② クラス指定でも同じく発火する
+  (function () {
+    const b = buildSave({ isParent: true });
+    const res = b.sandbox.__R.save({
+      target_type: 'class', school_name: '第一小学校', class_name: '5年1組',
+      type: 'url_block', filter_mode: 'BLACKLIST', blacklist_urls: 'youtube.com',
+      date_from: '2026/11/10', date_to: '2026/11/10', repeat: 'NONE',
+      start_time: '12:06', end_time: '12:07'
+    }, TEACHER);
+    check('R9 class: 保存が成功する', res.success === true, res.error);
+    check('R10 class: 伝播が発火する', b.propCalls.length === 1, b.propCalls.length);
+    check('R11 class: クラスの児童が対象になる',
+      b.propCalls.length === 1 && b.propCalls[0].ids.indexOf('s1') >= 0,
+      b.propCalls[0] && b.propCalls[0].ids);
+  })();
+
+  // ③ 親でない場合は「無言でスキップ」せず理由が残る
+  (function () {
+    const b = buildSave({ isParent: false });
+    const res = b.sandbox.__R.save(STUDENT_PAYLOAD, TEACHER);
+    check('R12 親でなくても保存自体は成功する', res.success === true, res.error);
+    check('R13 親でない場合は理由付きでスキップされる',
+      !!res.shard && res.shard.skipped === true && res.shard.reason === 'not_parent', res.shard);
+    check('R14 スキップ理由がログに残る（無言にしない）',
+      b.logs.some(function (m) { return m.indexOf('親GASではありません') >= 0; }), b.logs);
+    check('R15 親でない場合は伝播ポリシーを呼ばない', b.propCalls.length === 0, b.propCalls.length);
+  })();
+
+  // ④ 伝播が例外を投げても保存は成立する（予約を失わない）
+  (function () {
+    const b = buildSave({
+      isParent: true,
+      propResult: null
+    });
+    // shardPropagatePolicy が例外を投げる版で上書き
+    let threw = false;
+    b.sandbox.shardPropagatePolicy = function () { threw = true; throw new Error('child unreachable'); };
+    const res = b.sandbox.__R.save(STUDENT_PAYLOAD, TEACHER);
+    check('R16 伝播が例外でも保存は成功する', res.success === true, res.error);
+    check('R17 伝播が例外でも呼ばれている', threw === true);
+    // 表示は "Error:" を含めない（run_all.sh は Error: を失敗シグナルとして拾う）
+    check('R18 例外は戻り値に載る',
+      !!res.shard && typeof res.shard.error === 'string' && res.shard.error.indexOf('child unreachable') >= 0,
+      res.shard && String(res.shard.error).replace(/Error:\s*/g, ''));
+    check('R19 例外がログに残る',
+      b.logs.some(function (m) { return m.indexOf('propagate: 例外') >= 0; }), b.logs);
+  })();
+
+  // ⑤ ソース検査: 保存直後に無条件で伝播を呼んでいる
+  (function () {
+    const body = extractFn('handleSaveSchedule_');
+    const code = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+    check('R20 保存直後に propagateScheduleToChildren_ を呼ぶ',
+      /const\s+shardProp\s*=\s*propagateScheduleToChildren_\s*\(/.test(code));
+    check('R21 伝播呼び出しに if ガードが無い（無条件で発火）',
+      !/if\s*\([^)]*\)\s*\{?\s*const\s+shardProp\s*=/.test(code));
+    check('R22 shard を戻り値に載せている', /shard\s*:\s*shardProp/.test(code));
+  })();
 }
 
 console.log('');

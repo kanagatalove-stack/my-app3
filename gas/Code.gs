@@ -6446,7 +6446,10 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
   const __bt = function (label) {
     try { if (typeof bulkTraceMark === 'function') bulkTraceMark(label); } catch (e) {}
   };
-  if (!isShardParent()) return { skipped: true };
+  if (!isShardParent()) {
+    try { Logger.log('[SHARD] policy: skip（親GASではありません）'); } catch (eL0) {}
+    return { skipped: true, reason: 'not_parent' };
+  }
   try {
     const cfg = shardConfigCached();
     __bt('shardPropagatePolicy:設定読込(CacheService/Properties)');
@@ -6455,7 +6458,10 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
     // SHARD_MAP_V1 の空キー（""）で指定された既定の子GAS。
     // これを見落とすと、クラス未設定の児童にコマンドが一切届かない。
     const emptyDef = shardMapDefaultFromEmptyKey(cfg.map);
-    if (!Object.keys(idx).length && !defUrl && !emptyDef) return { skipped: true, reason: 'no_child' };
+    if (!Object.keys(idx).length && !defUrl && !emptyDef) {
+      try { Logger.log('[SHARD] policy: skip（子GASが1つも登録されていません。SHARD_MAP_V1 / SHARD_DEFAULT_URL を設定してください）'); } catch (eL1) {}
+      return { skipped: true, reason: 'no_child' };
+    }
 
     // 【R35】索引（CacheService）だけで解決する。
     //   【重要】ここで openById / getDataRange を呼んではいけない。
@@ -6534,6 +6540,11 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
     }
 
     const urls = Object.keys(groups);
+    try {
+      Logger.log('[SHARD] policy: 宛先=' + urls.length + '件 児童=' +
+        (function () { var n = 0; for (var k in groups) n += groups[k].length; return n; })() +
+        '名 forceSync=' + !!forceSync);
+    } catch (eL2) {}
 
     // 【フェーズ5】スケジュール（タイマー）の同封。
     //   確定仕様:
@@ -6644,6 +6655,7 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
       }
     }
     __bt('shardPropagatePolicy:応答解析(完了)');
+    try { Logger.log('[SHARD] policy: 送信完了 ' + JSON.stringify(results)); } catch (eL3) {}
     return { sent: results };
   } catch (e) {
     // 子への伝達に失敗しても、親のシート更新（＝コンソール表示）は成立させる
@@ -7808,9 +7820,20 @@ function resolveSchedulePayloadForDevice_(studentId, className, schoolName, nowM
  *   対象校の児童が1人もいない（子GAS未設定など）ときは何もしない。
  */
 function propagateScheduleToChildren_(schedRow) {
+  // 【可観測性】この関数は無言で成功もスキップもできてしまうため、実機で
+  //   「伝播が走ったのか」をログから切り分けられなかった。どの分岐を通ったかを
+  //   必ず 1 行残す（無言の成功／無言のスキップを作らない）。
+  const __plog = function (msg) { try { Logger.log('[SHARD] ' + msg); } catch (eL) {} };
   try {
-    if (typeof isShardParent !== 'function' || !isShardParent()) return { skipped: true };
-    if (!schedRow) return { skipped: true, reason: 'no_row' };
+    if (typeof isShardParent !== 'function' || !isShardParent()) {
+      __plog('propagate: skip（このスクリプトは親GASではありません。' +
+        'スクリプトプロパティ SHARD_MODE=true を確認してください）');
+      return { skipped: true, reason: 'not_parent' };
+    }
+    if (!schedRow) {
+      __plog('propagate: skip（予約行がありません）');
+      return { skipped: true, reason: 'no_row' };
+    }
 
     const ids = [];
     if (schedRow.targetType === 'student') {
@@ -7835,13 +7858,21 @@ function propagateScheduleToChildren_(schedRow) {
         ids.push(sid);
       }
     }
-    if (!ids.length) return { skipped: true, reason: 'no_target' };
+    if (!ids.length) {
+      __plog('propagate: skip（対象児童が見つかりません target=' + schedRow.targetType +
+        ' class=' + String(schedRow.className || '') + '）。' +
+        '端末一覧に児童が居るか、クラス表記が一致するかを確認してください');
+      return { skipped: true, reason: 'no_target' };
+    }
+    __plog('propagate: 開始 target=' + schedRow.targetType + ' ids=' + ids.length);
 
     // patch は空（ロック・配信・規制には触れない）。スケジュールだけを運ぶ。
-    return shardPropagatePolicy(ids, {}, true);
+    const __res = shardPropagatePolicy(ids, {}, true);
+    __plog('propagate: 完了 ' + JSON.stringify(__res));
+    return __res;
   } catch (e) {
     // 伝播に失敗しても予約自体は成立させる（次回の伝播で追いつく）
-    try { Logger.log('[SCHEDULE] propagate failed: ' + e); } catch (eL) {}
+    __plog('propagate: 例外 ' + String((e && e.message) ? e.message : e));
     return { error: String(e) };
   }
 }
