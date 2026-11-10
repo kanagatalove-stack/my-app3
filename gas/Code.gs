@@ -2720,6 +2720,12 @@ function hbResolveRowByStudentId(sheet, headerMap, studentId) {
   let foundRowNum = -1;
   let foundRow = null;
   let foundRawId = '';
+  // 【表記ゆれの相互吸収】端末によっては student_id がメール全体で届くことも
+  //   ローカル部だけで届くこともある。完全一致を第一とし、見つからない
+  //   場合に限りローカル部一致の候補を1件だけ採用する。
+  //   候補が複数あるときは別児童の可能性があるため解決せず、
+  //   新規登録に回す（誤って別の児童の行へ書くより安全）。
+  const looseRowNums = [];
   for (let i = 1; i < total; i++) {
     const rawId = data[i] ? data[i][idColIdx] : '';
     const key = normalizeIdKey(rawId);
@@ -2731,7 +2737,19 @@ function hbResolveRowByStudentId(sheet, headerMap, studentId) {
       foundRowNum = i + 1;
       foundRow = data[i];
       foundRawId = rawId;
+      continue;
     }
+    if (idKeysMatch_(rawId, studentId)) looseRowNums.push(i + 1);
+  }
+  if (foundRowNum < 0 && looseRowNums.length === 1) {
+    const ln = looseRowNums[0];
+    foundRowNum = ln;
+    foundRow = data[ln - 1];
+    foundRawId = data[ln - 1] ? data[ln - 1][idColIdx] : '';
+    hbLog('resolve: ローカル部一致で解決 row=' + ln + ' id=' + String(foundRawId) +
+      ' 要求=' + studentId);
+  } else if (foundRowNum < 0 && looseRowNums.length > 1) {
+    hbLog('resolve: ローカル部一致が複数(' + looseRowNums.length + '件)のため解決しません id=' + studentId);
   }
 
   if (foundRowNum >= 0) {
@@ -4476,6 +4494,48 @@ function normalizeIdKey(value) {
 }
 
 /**
+ * 児童IDの「ローカル部（@より前）」を正規化して返す。
+ *   端末は Google アカウントのメール（1607002@city-mimasaka.ed.jp）を送ることも、
+ *   ローカル部だけ（1607002）を送ることもある。@ が無い場合は全体をローカル部とみなす。
+ */
+function normalizeUserLocalPart_(value) {
+  const key = normalizeIdKey(value);
+  if (!key) return '';
+  const at = key.indexOf('@');
+  return at >= 0 ? key.slice(0, at) : key;
+}
+
+/**
+ * 児童IDの同一性判定（表記ゆれの相互吸収）。
+ *   ① 正規化した完全一致 → true
+ *   ② 片方だけがメール形式のとき、ローカル部が一致すれば true
+ *      「1607002」と「1607002@city-mimasaka.ed.jp」→ 同一児童
+ *   ③ 双方がメール形式でドメインが違う場合は false（別児童の可能性）
+ *      「1607002@a.ed.jp」と「1607002@b.ed.jp」→ 別人として扱う
+ */
+function idKeysMatch_(a, b) {
+  const ka = normalizeIdKey(a);
+  const kb = normalizeIdKey(b);
+  if (!ka || !kb) return false;
+  if (ka === kb) return true;
+  if (ka.indexOf('@') >= 0 && kb.indexOf('@') >= 0) return false;
+  const la = normalizeUserLocalPart_(ka);
+  const lb = normalizeUserLocalPart_(kb);
+  return !!(la && lb && la === lb);
+}
+
+/** 児童IDの配列に対象の児童が含まれるかを idKeysMatch_ で判定する。 */
+function idMatchesAny_(list, studentId) {
+  if (!Array.isArray(list) || !list.length) return false;
+  const sid = String(studentId || '').trim();
+  if (!sid) return false;
+  for (let i = 0; i < list.length; i++) {
+    if (idKeysMatch_(list[i], sid)) return true;
+  }
+  return false;
+}
+
+/**
  * 児童IDから端末一覧の行を探す（親・子のどちらでも使える）。
  * 見つかれば { row_number, student_id, school_name, student_name, class_name } を返す。
  *
@@ -4505,8 +4565,7 @@ function findStudentById(studentId) {
     return String(row[c - 1] === null || row[c - 1] === undefined ? '' : row[c - 1]).trim();
   };
 
-  for (let i = 1; i < data.length; i++) {
-    if (normalizeIdKey(data[i][idCol - 1]) !== want) continue;
+  const __pick = function (i) {
     return {
       row_number: i + 1,
       student_id: cell(data[i], '児童ID'),
@@ -4514,7 +4573,15 @@ function findStudentById(studentId) {
       student_name: cell(data[i], '氏名'),
       class_name: cell(data[i], 'クラス')
     };
+  };
+  // 【表記ゆれの相互吸収】完全一致 → ローカル部一致（候補が1件のときだけ）。
+  //   子GASからの名簿照会が「@の有無」だけの差異で失敗するのを防ぐ。
+  const looseIdx = [];
+  for (let i = 1; i < data.length; i++) {
+    if (normalizeIdKey(data[i][idCol - 1]) === want) return __pick(i);
+    if (idKeysMatch_(data[i][idCol - 1], studentId)) looseIdx.push(i);
   }
+  if (looseIdx.length === 1) return __pick(looseIdx[0]);
   return null;
 }
 
@@ -7524,10 +7591,13 @@ function deviceMatchesSchedule_(row, studentId, normClassName, schoolName) {
     return true;
   }
   if (tt === 'student') {
-    return Array.isArray(row.studentIds) && row.studentIds.indexOf(sid) >= 0;
+    // 【表記ゆれの相互吸収】予約シートの対象児童IDは教員の手入力で、
+    //   メール形式とローカル部の両方が存在し得る。indexOf の生比較だけだと
+    //   「@の有無」だけの差異で対象から外れ、子GASの by_student が空になる。
+    return idMatchesAny_(row.studentIds, sid);
   }
   // 対象種別が空（手入力行の保険）→ 児童ID一致で判定
-  return !!(sid && Array.isArray(row.studentIds) && row.studentIds.indexOf(sid) >= 0);
+  return !!(sid && idMatchesAny_(row.studentIds, sid));
 }
 
 /**
@@ -7823,8 +7893,48 @@ function shardSchedulePayloadFromCache_(studentId, nowMs) {
   if (!cache || !cache.by_student) return payload;
   const sid = String(studentId || '').trim();
   if (!sid) return payload;
-  const rec = cache.by_student[sid];
-  if (!rec) return payload;
+
+  // 【二段構えの照合】端末の student_id は「メール全体」と「@より前のローカル部」の
+  //   両方が届く。生の完全一致（cache.by_student[sid]）だけで引くと、「@の有無」だけの
+  //   差異で無言の空配列になり、「親→子は saved:1 なのに端末で規制が効かない」
+  //   という最も厄介な壊れ方をする（実機で発生した断線の正体）。
+  //   ① 正規化した完全一致 → ② ローカル部一致（片方だけメール形式のとき）の順で解決する。
+  let rec = null;
+  let hitKey = '';
+  try {
+    const want = normalizeIdKey(sid);
+    const keys = Object.keys(cache.by_student || {});
+    for (let i = 0; i < keys.length; i++) {
+      if (normalizeIdKey(keys[i]) === want) { hitKey = keys[i]; break; }
+    }
+    if (!hitKey) {
+      // 候補が1件に絞れたときだけ採用する。
+      //   複数候補＝別児童の同名ローカル部。誤配信して無実の児童を
+      //   止めるより、配信しないほうが安全なので採用しない。
+      const cands = [];
+      for (let j = 0; j < keys.length; j++) {
+        if (idKeysMatch_(keys[j], sid)) cands.push(keys[j]);
+      }
+      if (cands.length === 1) {
+        hitKey = cands[0];
+      } else if (cands.length > 1) {
+        try {
+          Logger.log('[SHARD] heartbeat: ID照合が曖昧 sid=' + sid +
+            ' 候補=' + cands.length + '（配信を見送り）');
+        } catch (eA) {}
+      }
+    }
+    if (hitKey) rec = cache.by_student[hitKey];
+  } catch (eM) {
+    rec = null;
+  }
+  if (!rec) {
+    try {
+      Logger.log('[SHARD] heartbeat: 照合なし sid=' + sid +
+        ' 保持キー数=' + Object.keys(cache.by_student || {}).length);
+    } catch (eN) {}
+    return payload;
+  }
 
   const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
   const active = [];

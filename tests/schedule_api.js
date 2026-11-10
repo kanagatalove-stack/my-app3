@@ -200,6 +200,8 @@ const FNS = [
   'scopeStudentIdsForTeacher', 'parseBoolean',
   // --- URLリストの配列化（シートは文字列 / 端末契約は string[]） ---
   'normalizeHostListToArray_', 'hostListToSheetString_',
+  // --- 児童IDの表記ゆれ吸収（メール全体 / @より前のローカル部） ---
+  'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
   // --- スケジュール中核 ---
   'deviceMatchesSchedule_', 'readScheduleRows_', 'isAnyScheduleActive_',
   // --- CRUD ---
@@ -823,6 +825,10 @@ console.log('===== P. URLリストの配列化（文字列 → string[]） =====
       'const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;',
       extractFn('normalizeHostListToArray_'),
       extractFn('hostListToSheetString_'),
+      // 児童IDの表記ゆれ吸収（メール全体 / ローカル部）— shardSchedulePayloadFromCache_ が使う
+      extractFn('normalizeIdKey'),
+      extractFn('normalizeUserLocalPart_'),
+      extractFn('idKeysMatch_'),
       extractFn('emptySchedulePayload_'),
       extractFn('shardLoadScheduleCache_'),
       extractFn('shardSchedulePayloadFromCache_'),
@@ -970,6 +976,7 @@ console.log('===== Q. 伝播経路（宛先解決とフォールバック） ===
     'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
     'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_', 'parseBoolean',
     'normalizeHostListToArray_', 'hostListToSheetString_',
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
     'deviceMatchesSchedule_', 'shardBuildWindowsForStudent_', 'shardBuildScheduleByStudent_',
     'shardMapIndexFromMap', 'shardMapDefaultFromEmptyKey',
     'shardPropagatePolicy', 'propagateScheduleToChildren_'
@@ -1117,6 +1124,7 @@ console.log('===== R. 保存→伝播の発火保証 =====');
     'getTeacherScopeInfo', 'getTeacherTargetClasses', 'isClassInTeacherScope',
     'scopeStudentIdsForTeacher', 'parseBoolean',
     'normalizeHostListToArray_', 'hostListToSheetString_',
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
     'deviceMatchesSchedule_', 'readScheduleRows_', 'isAnyScheduleActive_',
     'schNowJstSec_', 'generateScheduleId_', 'validateScheduleInput_',
     'authorizeScheduleTarget_', 'appendScheduleRow_', 'updateScheduleCells_',
@@ -1297,6 +1305,7 @@ console.log('===== S. 子GASの自動判別（設定漏れの救済） =====');
     'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
     'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_', 'parseBoolean',
     'normalizeClassName', 'schoolNamesMatch', 'normalizeSchoolName',
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
     'deviceMatchesSchedule_', 'shardBuildWindowsForStudent_', 'shardBuildScheduleByStudent_',
     'emptySchedulePayload_',
     'shardLoadScheduleCache_', 'shardSaveScheduleCache_',
@@ -1470,6 +1479,242 @@ console.log('===== S. 子GASの自動判別（設定漏れの救済） =====');
       body.indexOf('SHARD_SECRET') < 0);
     check('S23 受信痕跡 SHARD_INBOX_SEEN を材料にしている',
       body.indexOf('SHARD_INBOX_SEEN') >= 0);
+  })();
+}
+
+// ================================================================ T. 児童IDの表記ゆれ
+//   実害: シートの児童IDは「1607002@city-mimasaka.ed.jp」形式だが、端末が送る
+//         student_id は環境によって「1607002（@より前）」のこともある。
+//         shardSchedulePayloadFromCache_ が cache.by_student[sid] の生完全一致だけ
+//         だったため、@ の有無の差だけで無言の空配列になり、端末で規制が動かなかった。
+//   ここでは「メール全体 ⇄ ローカル部」の双方向の吸収と、誤配信しない安全側の
+//   挙動（別ドメインの同名ローカル部）まで固定する。
+console.log('===== T. 児童IDの表記ゆれ吸収（メール全体 ⇄ ローカル部） =====');
+{
+  const vmMod = require('vm');
+
+  const T_FNS = [
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'normalizeClassName', 'normalizeSchoolName', 'schoolNamesMatch',
+    'deviceMatchesSchedule_',
+    'emptySchedulePayload_', 'shardLoadScheduleCache_', 'shardSchedulePayloadFromCache_',
+    'schPad2_', 'schMsToJstStr_'
+  ];
+
+  const T_NOW = Date.UTC(2026, 10, 10, 10, 30); // 11/10 19:30 JST
+
+  function buildT(o) {
+    o = o || {};
+    const store = {};
+    const memo = {};
+    const logs = [];
+    const cache = { updated_ms: T_NOW, by_student: o.byStudent || {} };
+    store['SHARD_SCHEDULES_CACHE'] = JSON.stringify(cache);
+
+    const sandbox = {
+      console: { log: function () {} },
+      Logger: { log: function (m) { logs.push(String(m)); } },
+      CONFIG: { SCHEDULE_HORIZON_DAYS: 14, SCHEDULE_MAX_ACTIVE: 5, SCHEDULE_MAX_WINDOWS: 20 },
+      SHEET_TZ_OFFSET_MS: 9 * 60 * 60 * 1000,
+      SHARD_SCHEDULES_PROP: 'SHARD_SCHEDULES_CACHE',
+      SHARD_SCHEDULES_MEMO_SEC: 30,
+      SHARD_SCHEDULES_MEMO_KEY: 'shard_sched_memo1',
+      PropertiesService: {
+        getScriptProperties: function () {
+          return {
+            getProperty: function (k) {
+              return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null;
+            },
+            setProperty: function (k, v) { store[k] = String(v); }
+          };
+        }
+      },
+      CacheService: {
+        getScriptCache: function () {
+          return {
+            get: function (k) { return Object.prototype.hasOwnProperty.call(memo, k) ? memo[k] : null; },
+            put: function (k, v) { memo[k] = String(v); },
+            remove: function (k) { delete memo[k]; }
+          };
+        }
+      }
+    };
+
+    const src = T_FNS.map(function (n) { return extractFn(n); }).join('\n');
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(src +
+      '\n__T = { fromCache: shardSchedulePayloadFromCache_,' +
+      ' localOf: normalizeUserLocalPart_, match: idKeysMatch_,' +
+      ' matchesAny: idMatchesAny_, device: deviceMatchesSchedule_,' +
+      ' normalizeIdKey: normalizeIdKey };', sandbox);
+    return { sandbox: sandbox, logs: logs, __T: sandbox.__T };
+  }
+
+  // 窓 1 件（19:30 JST の内側）を持つ by_student を作る
+  function rec(id) {
+    return {
+      windows: [{
+        id: 'sch_' + id, type: 'screen_lock', filter_mode: '',
+        whitelist: ['allow.example'], blacklist: ['game.example'],
+        start_ms: T_NOW - 600000, end_ms: T_NOW + 600000
+      }],
+      overridden_ids: []
+    };
+  }
+
+  const EMAIL = '1607002@city-mimasaka.ed.jp';
+  const LOCAL = '1607002';
+
+  // ----------------------------------------------------------- ① 正規化ヘルパー単体
+  (function () {
+    const t = buildT({ byStudent: {} });
+    check('T1 normalizeUserLocalPart_: メール → @より前', t.__T.localOf(EMAIL) === LOCAL,
+      t.__T.localOf(EMAIL));
+    check('T2 normalizeUserLocalPart_: @無しはそのまま', t.__T.localOf(LOCAL) === LOCAL,
+      t.__T.localOf(LOCAL));
+    check('T3 normalizeUserLocalPart_: 空は空', t.__T.localOf('') === '');
+    check('T4 normalizeUserLocalPart_: 全角の@も半角化して分解',
+      t.__T.localOf('１６０７００２＠city-mimasaka.ed.jp') === LOCAL,
+      t.__T.localOf('１６０７００２＠city-mimasaka.ed.jp'));
+
+    check('T5 idKeysMatch_: メールと一致', t.__T.match(EMAIL, EMAIL) === true);
+    check('T6 idKeysMatch_: メール vs ローカル部は同一とみなす',
+      t.__T.match(EMAIL, LOCAL) === true);
+    check('T7 idKeysMatch_: ローカル部 vs メールも同一とみなす',
+      t.__T.match(LOCAL, EMAIL) === true);
+    check('T8 idKeysMatch_: 別ドメインの同名ローカル部は別人',
+      t.__T.match('1607002@a.ed.jp', '1607002@b.ed.jp') === false);
+    check('T9 idKeysMatch_: 別IDは不一致', t.__T.match('1607003', '1607002') === false);
+    check('T10 idKeysMatch_: 空は不一致', t.__T.match('', '') === false);
+    check('T11 idKeysMatch_: 大文字・前後空白を吸収',
+      t.__T.match('  1607002@CITY-MIMASAKA.ed.jp  ', LOCAL) === true);
+  })();
+
+  // ----------------------------------------------------------- ② ストア=メール / 端末=ローカル部
+  (function () {
+    const t = buildT({ byStudent: (function () {
+      const o = {}; o[EMAIL] = rec('email'); return o;
+    })() });
+
+    const pl = t.__T.fromCache(LOCAL, T_NOW);
+    check('T12 ストア=メール / 端末=ローカル部 でも active が 1 件返る',
+      !!pl && Array.isArray(pl.active) && pl.active.length === 1,
+      pl && pl.active.length);
+    check('T13 その窓はストア側の予約IDを持つ',
+      !!pl && pl.active.length === 1 && pl.active[0].id === 'sch_email',
+      pl && pl.active[0] && pl.active[0].id);
+    check('T14 窓は数値の start_ms/end_ms を持つ（v1.6.4 の判定契約）',
+      !!pl && pl.active.length === 1 &&
+      typeof pl.active[0].start_ms === 'number' && typeof pl.active[0].end_ms === 'number' &&
+      pl.active[0].end_ms > pl.active[0].start_ms, pl && pl.active[0]);
+    check('T15 whitelist/blacklist が配列のまま（端末の normalizeHostList 契約）',
+      !!pl && pl.active.length === 1 &&
+      Array.isArray(pl.active[0].whitelist) && Array.isArray(pl.active[0].blacklist) &&
+      pl.active[0].whitelist[0] === 'allow.example', pl && pl.active[0]);
+  })();
+
+  // ----------------------------------------------------------- ③ ストア=ローカル部 / 端末=メール
+  (function () {
+    const t = buildT({ byStudent: (function () {
+      const o = {}; o[LOCAL] = rec('local'); return o;
+    })() });
+
+    const pl = t.__T.fromCache(EMAIL, T_NOW);
+    check('T16 ストア=ローカル部 / 端末=メール でも active が 1 件返る',
+      !!pl && Array.isArray(pl.active) && pl.active.length === 1,
+      pl && pl.active.length);
+    check('T17 その窓はストア側の予約IDを持つ',
+      !!pl && pl.active.length === 1 && pl.active[0].id === 'sch_local',
+      pl && pl.active[0] && pl.active[0].id);
+    check('T18 大文字・前後空白付きのメールでも届く',
+      (function () {
+        const p2 = t.__T.fromCache('  1607002@CITY-MIMASAKA.ED.JP ', T_NOW);
+        return !!p2 && p2.active.length === 1;
+      })());
+  })();
+
+  // ----------------------------------------------------------- ④ 完全一致が最優先
+  (function () {
+    // 同じローカル部の別ドメインが併存するケース。
+    //   端末がメール全体で来たときは、その完全一致だけを選ぶ（他へ漏らさない）。
+    const o = {};
+    o['1607002@a.ed.jp'] = rec('a');
+    o['1607002@b.ed.jp'] = rec('b');
+    const t = buildT({ byStudent: o });
+
+    const pa = t.__T.fromCache('1607002@a.ed.jp', T_NOW);
+    check('T19 完全一致が優先される（別ドメインへ漏れない）',
+      !!pa && pa.active.length === 1 && pa.active[0].id === 'sch_a',
+      pa && pa.active[0] && pa.active[0].id);
+
+    const pb = t.__T.fromCache('1607002@b.ed.jp', T_NOW);
+    check('T20 もう一方のドメインも自分の窓だけを受け取る',
+      !!pb && pb.active.length === 1 && pb.active[0].id === 'sch_b',
+      pb && pb.active[0] && pb.active[0].id);
+  })();
+
+  // ----------------------------------------------------------- ⑤ 曖昧なときは配信しない（安全側）
+  (function () {
+    const o = {};
+    o['1607002@a.ed.jp'] = rec('a');
+    o['1607002@b.ed.jp'] = rec('b');
+    const t = buildT({ byStudent: o });
+
+    // 端末がローカル部だけを送ってきた → どちらの児童か決められない
+    const pl = t.__T.fromCache(LOCAL, T_NOW);
+    check('T21 候補が複数のときは配信しない（誤配信より無配信を選ぶ）',
+      !!pl && Array.isArray(pl.active) && pl.active.length === 0,
+      pl && pl.active.length);
+    check('T22 曖昧だった事実をログに残す（実機で切り分け可能）',
+      t.logs.some(function (m) { return m.indexOf('曖昧') >= 0; }), t.logs);
+  })();
+
+  // ----------------------------------------------------------- ⑥ 未知のIDは空（従来どおり）
+  (function () {
+    const t = buildT({ byStudent: (function () {
+      const o = {}; o[EMAIL] = rec('email'); return o;
+    })() });
+    const pl = t.__T.fromCache('9999999', T_NOW);
+    check('T23 無関係なIDは空配列（誤配信しない）',
+      !!pl && pl.active.length === 0, pl && pl.active.length);
+    check('T24 照合できなかった事実をログに残す',
+      t.logs.some(function (m) { return m.indexOf('照合なし') >= 0; }), t.logs);
+  })();
+
+  // ----------------------------------------------------------- ⑦ 予約の対象判定も同じ吸収を通る
+  (function () {
+    const t = buildT({ byStudent: {} });
+    const cn = '';
+    const rowEmail = {
+      targetType: 'student', className: '', schoolName: '第一小学校',
+      studentIds: [EMAIL]
+    };
+    const rowLocal = {
+      targetType: 'student', className: '', schoolName: '第一小学校',
+      studentIds: [LOCAL]
+    };
+    check('T25 対象判定: 予約=メール / 端末=ローカル部 で一致',
+      t.__T.device(rowEmail, LOCAL, cn, '第一小学校') === true);
+    check('T26 対象判定: 予約=ローカル部 / 端末=メール で一致',
+      t.__T.device(rowLocal, EMAIL, cn, '第一小学校') === true);
+    check('T27 対象判定: 別ドメインの同名ローカル部は不一致',
+      t.__T.device(rowEmail, '1607002@other.ed.jp', cn, '第一小学校') === false);
+    check('T28 対象判定: 無関係な児童は不一致',
+      t.__T.device(rowEmail, '9999999', cn, '第一小学校') === false);
+  })();
+
+  // ----------------------------------------------------------- ⑧ ソース検査（生の添字引きに戻っていない）
+  (function () {
+    const body = extractFn('shardSchedulePayloadFromCache_');
+    check('T29 キャッシュ引照が idKeysMatch_ を用いている（生の完全一致へ戻っていない）',
+      body.indexOf('idKeysMatch_') >= 0);
+    check('T30 ローカル部比較のヘルパーを経由している',
+      body.indexOf('normalizeIdKey') >= 0);
+    const devBody = extractFn('deviceMatchesSchedule_');
+    check('T31 対象判定が idMatchesAny_ を用いている（indexOf の生比較へ戻っていない）',
+      devBody.indexOf('idMatchesAny_') >= 0 &&
+      devBody.indexOf('studentIds.indexOf') < 0);
   })();
 }
 

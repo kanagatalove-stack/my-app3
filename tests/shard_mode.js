@@ -196,7 +196,8 @@ async function main() {
     // 親子の突き合わせ統合（split-brain 解消の本体）
     'shardMergeDeviceRow',
     // 児童ID照合と親名簿照会（クラス未取得の端末を救う経路）
-    'normalizeIdKey','findStudentById','shardLookupStudent','readShardParentUrl',
+    'normalizeIdKey','normalizeUserLocalPart_','idKeysMatch_','idMatchesAny_',
+    'findStudentById','shardLookupStudent','readShardParentUrl',
     'shardLookupFromParent','hbChildIdentityLookup','hbApplyChildIdentity'
   ].forEach(n => { gasBundle += extract(gasSrc, n) + '\n'; });
 

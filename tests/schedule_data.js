@@ -65,6 +65,7 @@ const FNS = [
   'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
   'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
   'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_',
+  'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
   'normalizeSchoolName', 'normalizeClassName', 'schoolNamesMatch', 'deviceMatchesSchedule_'
 ];
 

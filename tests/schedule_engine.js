@@ -384,7 +384,9 @@ function runIn(expr) { return vm.runInContext(expr, M); }
     'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
     'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_',
     'normalizeSchoolName', 'schoolNamesMatch', 'resolveCanonicalSchool', 'isAllSchoolsName',
-    'normalizeClassName', 'deviceMatchesSchedule_', 'readScheduleRows_',
+    'normalizeClassName',
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'deviceMatchesSchedule_', 'readScheduleRows_',
     // 【フェーズ5】buildHeartbeatResponse は resolveSchedulePayloadForDevice_ を経由する。
     //   子GAS判定（isShardChild）が false ならローカル読みにフォールバックする。
     'resolveSchedulePayloadForDevice_',

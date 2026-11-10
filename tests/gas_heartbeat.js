@@ -80,6 +80,8 @@ let code = '';
   'getHeaderMap','withWriteLock','parseBoolean','parseUrlList','shouldWriteSyncTime',
   // 児童IDの照合を正規化する（processHeartbeat / hbRegisterDevice が無条件に呼ぶ）
   'normalizeIdKey',
+  // 表記ゆれ吸収（メール全体 / @より前のローカル部）を hbResolveRowByStudentId が使う
+  'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
   // 学校名の解決に必要なヘルパー群（processHeartbeat が school_name を検証するため）
   'normalizeSchoolName','resolveCanonicalSchool','canonicalizeIncomingSchool',
   // ---- 行解決（行番号キャッシュは廃止。毎回シートから引き直す） ----

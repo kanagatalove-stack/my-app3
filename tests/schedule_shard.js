@@ -212,6 +212,8 @@ const FNS = [
   'normalizeShardClass',
   // URLリストの配列化（シートは文字列 / 端末契約は string[]）
   'normalizeHostListToArray_', 'hostListToSheetString_',
+  // 児童IDの表記ゆれ吸収（メール全体 / ローカル部）— deviceMatchesSchedule_ が使う
+  'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
   // スケジュール中核（子）
   'deviceMatchesSchedule_', 'readScheduleRows_',
   'buildSchedulePayloadForDevice_', 'buildHeartbeatResponse',
