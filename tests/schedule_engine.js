@@ -379,6 +379,7 @@ function runIn(expr) { return vm.runInContext(expr, M); }
 
   const GAS_FNS = [
     'getHeaderMap', 'parseBoolean', 'parseUrlList',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
     'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
     'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
     'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_',

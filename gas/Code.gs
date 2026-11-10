@@ -3524,8 +3524,11 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
       class_name: String(row[headerMap['クラス'] - 1] || ''),
       screen_lock: parseBoolean(row[headerMap['画面ロック'] - 1]),
       filter_mode: String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase(),
-      whitelist_urls: String(row[headerMap['許可URLリスト'] - 1] || ''),
-      blacklist_urls: String(row[headerMap['規制URLリスト'] - 1] || ''),
+      // 【配列化】シートのセルは "a.com, b.com" の文字列。端末（拡張機能）側の
+      //   normalizeHostList は Array.isArray でない入力を捨てるため、ここで
+      //   string[] に直してから返す（教員コンソールの画面も配列を前提にする）。
+      whitelist_urls: normalizeHostListToArray_(row[headerMap['許可URLリスト'] - 1]),
+      blacklist_urls: normalizeHostListToArray_(row[headerMap['規制URLリスト'] - 1]),
       broadcast_url: String(row[headerMap['一斉表示URL'] - 1] || ''),
       broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || ''),
       current_url: String(row[headerMap['現在開いているURL'] - 1] || ''),
@@ -4159,8 +4162,10 @@ function bulkUpdateFilterMode(studentIds, filterMode, whitelistUrls, blacklistUr
         const id = String(data[firstRow - 1 + r][idColIdx]).trim();
         if (isAll || (idSet && idSet.has(id))) {
           cur[r][0] = filterMode;
-          if (whitelistUrls !== undefined && whitelistUrls !== null) cur[r][1] = whitelistUrls;
-          if (blacklistUrls !== undefined && blacklistUrls !== null) cur[r][2] = blacklistUrls;
+          // 【配列化】呼び出し側は string[] で渡してくる。シートは 1 セルなので
+          //   必ず文字列へ戻す（配列をそのまま setValues するとセルが壊れる）。
+          if (whitelistUrls !== undefined && whitelistUrls !== null) cur[r][1] = hostListToSheetString_(whitelistUrls);
+          if (blacklistUrls !== undefined && blacklistUrls !== null) cur[r][2] = hostListToSheetString_(blacklistUrls);
         }
       }
       range.setValues(cur);
@@ -4191,11 +4196,12 @@ function updateSingleDevice(studentId, updateData) {
     if (updateData.filter_mode !== undefined && headerMap['URL規制モード']) {
       sheet.getRange(targetRow, headerMap['URL規制モード']).setValue(updateData.filter_mode);
     }
+    // 【配列化】string[] が来てもセルは文字列で保つ（次回の読み取りが壊れない）。
     if (updateData.whitelist_urls !== undefined && headerMap['許可URLリスト']) {
-      sheet.getRange(targetRow, headerMap['許可URLリスト']).setValue(updateData.whitelist_urls);
+      sheet.getRange(targetRow, headerMap['許可URLリスト']).setValue(hostListToSheetString_(updateData.whitelist_urls));
     }
     if (updateData.blacklist_urls !== undefined && headerMap['規制URLリスト']) {
-      sheet.getRange(targetRow, headerMap['規制URLリスト']).setValue(updateData.blacklist_urls);
+      sheet.getRange(targetRow, headerMap['規制URLリスト']).setValue(hostListToSheetString_(updateData.blacklist_urls));
     }
     if (updateData.broadcast_url !== undefined && headerMap['一斉表示URL']) {
       sheet.getRange(targetRow, headerMap['一斉表示URL']).setValue(updateData.broadcast_url);
@@ -4243,6 +4249,39 @@ function parseUrlList(val) {
   if (!val) return [];
   if (Array.isArray(val)) return val;
   return String(val).split(/[\r\n,]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+}
+
+/**
+ * 改行・カンマ区切りの文字列、または未知のオブジェクトを文字列配列へ安全に変換する。
+ *
+ * 【なぜ必要か】
+ *   シートの「許可URLリスト」「規制URLリスト」は 1 セルに
+ *   "youtube.com, game.example" のような「文字列」で入っている。
+ *   一方、端末（拡張機能）側の composeFilterRestriction -> normalizeHostList は
+ *   Array.isArray(list) でなければ [] を返す（＝文字列は黙って捨てる）。
+ *   そのため GAS が文字列のまま whitelist/blacklist を配ると、URL規制の
+ *   予約が端末に届いても規制が一切効かなかった。
+ *   ここで配列に正規化してから配る（シートへ書くときは逆向きに戻す）。
+ *
+ *   大文字小文字は変えない（利用者が入れた表記をそのまま見せる）。
+ *   ホスト名の突き合わせは端末側の normalizeHostList が小文字化して行う。
+ */
+function normalizeHostListToArray_(input) {
+  if (Array.isArray(input)) {
+    return input.map(function (item) { return String(item).trim(); }).filter(Boolean);
+  }
+  if (!input || typeof input !== 'string') return [];
+  return input.split(/[\r\n,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+}
+
+/**
+ * normalizeHostListToArray_ の逆方向。配列（または文字列）を 1 セルに書ける
+ * カンマ区切り文字列へ戻す。シートへの書き込みは必ずこれを通す
+ * （配列をそのまま setValue するとセルに配列が入り、次回の読み取りが壊れる）。
+ */
+function hostListToSheetString_(input) {
+  const arr = normalizeHostListToArray_(input);
+  return arr.length ? arr.join(', ') : '';
 }
 
 // ==================== 子GAS分散（SHARD_MODE / ハブ＆スポーク） ====================
@@ -7420,8 +7459,11 @@ function readScheduleRows_() {
       studentIds: idsRaw.split(/[,\u3001\s]+/).map(function (s) { return s.trim(); }).filter(Boolean),
       type: String(get('制限タイプ') || 'url_block').trim().toLowerCase(),
       filterMode: String(get('URL規制モード') || '').trim().toUpperCase(),
-      whitelist: String(get('許可URLリスト') || '').trim(),
-      blacklist: String(get('規制URLリスト') || '').trim(),
+      // 【配列化】シートは "a.com, b.com" の文字列。端末側の normalizeHostList は
+      //   配列以外を捨てるため、読み取り時点で string[] に直しておく
+      //   （シートへ書き戻すときは hostListToSheetString_ で文字列に戻す）。
+      whitelist: normalizeHostListToArray_(get('許可URLリスト')),
+      blacklist: normalizeHostListToArray_(get('規制URLリスト')),
       dateFrom: scheduleDatePart_(get('開始日')),
       dateTo: scheduleDatePart_(get('終了日')),
       repeat: String(get('繰り返し') || 'NONE').trim().toUpperCase(),
@@ -7474,8 +7516,10 @@ function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs,
         id: r.id,
         type: r.type,
         filter_mode: r.filterMode,
-        whitelist: r.whitelist,
-        blacklist: r.blacklist,
+        // 【配列化】端末（拡張機能）の normalizeHostList は配列以外を捨てる。
+        //   文字列のまま配ると URL規制が無効化される。
+        whitelist: normalizeHostListToArray_(r.whitelist),
+        blacklist: normalizeHostListToArray_(r.blacklist),
         start_ms: w.start_ms,
         end_ms: w.end_ms,
         start_jst: schMsToJstStr_(w.start_ms),
@@ -7614,8 +7658,9 @@ function shardBuildWindowsForStudent_(rows, studentId, className, schoolName, no
         id: r.id,
         type: r.type,
         filter_mode: r.filterMode,
-        whitelist: r.whitelist,
-        blacklist: r.blacklist,
+        // 【配列化】親から子GASへ渡す展開済みウィンドウも string[] で運ぶ。
+        whitelist: normalizeHostListToArray_(r.whitelist),
+        blacklist: normalizeHostListToArray_(r.blacklist),
         start_ms: wins[w].start_ms,
         end_ms: wins[w].end_ms
       });
@@ -7684,8 +7729,10 @@ function shardSchedulePayloadFromCache_(studentId, nowMs) {
       id: w.id,
       type: w.type,
       filter_mode: w.filter_mode,
-      whitelist: w.whitelist,
-      blacklist: w.blacklist,
+      // 【配列化】親から受け取った時点で既に配列だが、旧バージョンのキャッシュ
+      //   （文字列で保存された回）が残っている端末を救うため、ここでも正規化する。
+      whitelist: normalizeHostListToArray_(w.whitelist),
+      blacklist: normalizeHostListToArray_(w.blacklist),
       start_ms: w.start_ms,
       end_ms: w.end_ms,
       start_jst: schMsToJstStr_(w.start_ms),
@@ -7845,8 +7892,10 @@ function validateScheduleInput_(p) {
     studentIds: [],
     type: String(src.type || src.restriction_type || 'url_block').trim().toLowerCase(),
     filterMode: String(src.filter_mode || src.filterMode || 'BLACKLIST').trim().toUpperCase(),
-    whitelist: String(src.whitelist_urls || src.whitelist || '').trim(),
-    blacklist: String(src.blacklist_urls || src.blacklist || '').trim(),
+    // 【配列化】入力は「カンマ区切り文字列」でも「配列」でも受ける（後方互換）。
+    //   内部（norm）では string[] に統一する。空判定は .length で行う（下記）。
+    whitelist: normalizeHostListToArray_(src.whitelist_urls || src.whitelist || ''),
+    blacklist: normalizeHostListToArray_(src.blacklist_urls || src.blacklist || ''),
     dateFrom: '',
     dateTo: '',
     repeat: String(src.repeat || 'NONE').trim().toUpperCase(),
@@ -7885,10 +7934,12 @@ function validateScheduleInput_(p) {
     if (norm.filterMode !== 'BLACKLIST' && norm.filterMode !== 'WHITELIST') {
       errs.push('URL規制モードは BLACKLIST か WHITELIST を指定してください');
     }
-    if (norm.filterMode === 'BLACKLIST' && !norm.blacklist) {
+    // 【配列化】norm.* は string[] になった。空配列は truthy なので
+    //   !norm.blacklist では判定できない（必ず .length を見る）。
+    if (norm.filterMode === 'BLACKLIST' && norm.blacklist.length === 0) {
       errs.push('BLACKLIST を選んだ場合は規制URLリストが必要です');
     }
-    if (norm.filterMode === 'WHITELIST' && !norm.whitelist) {
+    if (norm.filterMode === 'WHITELIST' && norm.whitelist.length === 0) {
       errs.push('WHITELIST を選んだ場合は許可URLリストが必要です');
     }
   }
@@ -7993,8 +8044,11 @@ function appendScheduleRow_(obj) {
   set('児童ID', Array.isArray(obj.studentIds) ? obj.studentIds.join(',') : String(obj.studentIds || ''));
   set('制限タイプ', obj.type);
   set('URL規制モード', obj.type === 'url_block' ? obj.filterMode : '');
-  set('許可URLリスト', obj.type === 'url_block' ? obj.whitelist : '');
-  set('規制URLリスト', obj.type === 'url_block' ? obj.blacklist : '');
+  // 【配列化】obj.whitelist / obj.blacklist は string[]（または文字列）で来る。
+  //   シートは 1 セルなので、必ずカンマ区切り文字列へ戻してから書く
+  //   （配列をそのまま setValues するとセルに配列が入り、次回の読み取りが壊れる）。
+  set('許可URLリスト', obj.type === 'url_block' ? hostListToSheetString_(obj.whitelist) : '');
+  set('規制URLリスト', obj.type === 'url_block' ? hostListToSheetString_(obj.blacklist) : '');
   set('開始日', obj.dateFrom);
   set('終了日', obj.dateTo);
   set('繰り返し', obj.repeat);
@@ -8071,8 +8125,9 @@ function scheduleRowToJson_(r, nowMs) {
     student_ids: r.studentIds,
     type: r.type,
     filter_mode: r.filterMode,
-    whitelist_urls: r.whitelist,
-    blacklist_urls: r.blacklist,
+    // 【配列化】一覧APIの応答も string[] で返す（端末/画面側の契約に合わせる）。
+    whitelist_urls: normalizeHostListToArray_(r.whitelist),
+    blacklist_urls: normalizeHostListToArray_(r.blacklist),
     date_from: r.dateFrom,
     date_to: r.dateTo,
     repeat: r.repeat,
@@ -8149,8 +8204,10 @@ function handleSaveSchedule_(payload, teacher) {
     type: obj.type,
     // 規制モード／URL リストは url_block のときだけ列に載る（appendScheduleRow_ と同じ）
     filterMode: isUrlBlock ? String(obj.filterMode || '').trim().toUpperCase() : '',
-    whitelist: isUrlBlock ? String(obj.whitelist || '').trim() : '',
-    blacklist: isUrlBlock ? String(obj.blacklist || '').trim() : '',
+    // 【配列化】readScheduleRows_ が返す形（string[]）を 1:1 で再現する。
+    //   obj.whitelist は norm 由来の配列（または空文字）なので正規化して載せる。
+    whitelist: isUrlBlock ? normalizeHostListToArray_(obj.whitelist) : [],
+    blacklist: isUrlBlock ? normalizeHostListToArray_(obj.blacklist) : [],
     dateFrom: obj.dateFrom,
     dateTo: obj.dateTo,
     repeat: obj.repeat,

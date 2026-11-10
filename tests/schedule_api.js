@@ -187,12 +187,16 @@ const FNS = [
   'isAllSchoolsName', 'normalizeClassName', 'isAdminTeacher',
   'getTeacherScopeInfo', 'getTeacherTargetClasses', 'isClassInTeacherScope',
   'scopeStudentIdsForTeacher', 'parseBoolean',
+  // --- URLリストの配列化（シートは文字列 / 端末契約は string[]） ---
+  'normalizeHostListToArray_', 'hostListToSheetString_',
   // --- スケジュール中核 ---
   'deviceMatchesSchedule_', 'readScheduleRows_', 'isAnyScheduleActive_',
   // --- CRUD ---
   'schNowJstSec_', 'generateScheduleId_', 'validateScheduleInput_',
   'authorizeScheduleTarget_', 'appendScheduleRow_', 'updateScheduleCells_',
   'isScheduleRowInTeacherScope_', 'scheduleRowToJson_',
+  // --- 端末へ配る経路（配列化の検証対象） ---
+  'buildSchedulePayloadForDevice_', 'shardBuildWindowsForStudent_',
   'handleSaveSchedule_', 'handleListSchedules_', 'handleCancelSchedule_', 'handleOverrideSchedule_',
   // --- フェーズ5: 子GAS伝播の入口（isShardParent が false なら即 skipped） ---
   'propagateScheduleToChildren_'
@@ -662,6 +666,281 @@ console.log('===== O. 保存の性能（全読み回帰） =====');
   // appendScheduleRow_ が書く条件付き列を、saved 側でも同じ条件で落としていること
   check('URL規制モードは url_block のときだけ載せる',
     /filterMode\s*:\s*isUrlBlock/.test(codeOnly) && /isUrlBlock\s*=\s*obj\.type\s*===\s*'url_block'/.test(codeOnly));
+}
+
+
+// ================================================================ P. URLリストの配列化
+//   実害: シートの「許可URLリスト」「規制URLリスト」は 1 セルに
+//     "youtube.com, game.example" の「文字列」で入っている。
+//   一方、拡張機能側の normalizeHostList(list) は
+//     if (!Array.isArray(list)) return [];
+//   なので、GAS が文字列のまま配ると URL規制が端末で一切効かない。
+//   ここでは 6 つの経路すべてが string[] を返すことを実測で確かめる。
+console.log('===== P. URLリストの配列化（文字列 → string[]） =====');
+{
+  // 子GASが予約キャッシュを持つプロパティキー（製品コードと同じ値）
+  const SHARD_PROP = 'SHARD_SCHEDULES_CACHE';
+  const WL = 'allow.example, ok.example';
+  const BL = 'youtube.com,game.example';
+  const WL_ARR = ['allow.example', 'ok.example'];
+  const BL_ARR = ['youtube.com', 'game.example'];
+
+  // ---------------------------------------------------------- ① ヘルパー単体
+  check('P1 normalizeHostListToArray_: カンマ区切り文字列を配列化',
+    JSON.stringify(T.normalizeHostListToArray_(BL)) === JSON.stringify(BL_ARR),
+    T.normalizeHostListToArray_(BL));
+  check('P2 normalizeHostListToArray_: 改行区切りも配列化',
+    JSON.stringify(T.normalizeHostListToArray_('a.example\nb.example')) === JSON.stringify(['a.example', 'b.example']));
+  check('P3 normalizeHostListToArray_: 配列はそのまま（trim のみ）',
+    JSON.stringify(T.normalizeHostListToArray_([' a.example ', 'b.example'])) === JSON.stringify(['a.example', 'b.example']));
+  check('P4 normalizeHostListToArray_: null/undefined は空配列',
+    T.normalizeHostListToArray_(null).length === 0 && T.normalizeHostListToArray_(undefined).length === 0);
+  check('P5 normalizeHostListToArray_: 空文字は空配列', T.normalizeHostListToArray_('').length === 0);
+  check('P6 normalizeHostListToArray_: 数値など非文字列は空配列', T.normalizeHostListToArray_(123).length === 0);
+  check('P7 normalizeHostListToArray_: 空要素は落とす',
+    JSON.stringify(T.normalizeHostListToArray_('a,,b,')) === JSON.stringify(['a', 'b']));
+  check('P8 normalizeHostListToArray_: 大文字小文字は保持（表示用）',
+    T.normalizeHostListToArray_('YouTube.com')[0] === 'YouTube.com', T.normalizeHostListToArray_('YouTube.com')[0]);
+  check('P9 hostListToSheetString_: 配列を 1 セル文字列へ戻す',
+    T.hostListToSheetString_(['a.example', 'b.example']) === 'a.example, b.example',
+    T.hostListToSheetString_(['a.example', 'b.example']));
+  check('P10 hostListToSheetString_: 空配列は空文字', T.hostListToSheetString_([]) === '');
+
+  // シート保存 → 読み取りの往復で壊れないこと（1 セルに配列を入れない）
+  (function () {
+    const cell = T.hostListToSheetString_(BL_ARR);
+    check('P11 往復: セル文字列 → 読み取りで元の配列に戻る',
+      JSON.stringify(T.normalizeHostListToArray_(cell)) === JSON.stringify(BL_ARR), cell);
+  })();
+
+  // ---------------------------------------------------------- ② readScheduleRows_
+  const SID = 'sch_arr01';
+  const schSheet = sheets['スケジュール管理'];
+  (function () {
+    const map = T.getHeaderMap(schSheet, SCHEDULE_COLUMNS);
+    const row = new Array(SCHEDULE_COLUMNS.length).fill('');
+    const put = function (k, v) { const c = map[k]; if (c) row[c - 1] = v; };
+    put('スケジュールID', SID);
+    put('対象種別', 'class');
+    put('学校名', '第一小学校');
+    put('クラス名', '5年1組');
+    put('制限タイプ', 'url_block');
+    put('URL規制モード', 'BLACKLIST');
+    put('許可URLリスト', WL);
+    put('規制URLリスト', BL);
+    put('開始日', '2026/11/10');
+    put('終了日', '2026/11/14');
+    put('繰り返し', 'NONE');
+    put('開始時刻', '19:00');
+    put('終了時刻', '21:00');
+    put('有効', 'TRUE');
+    put('手動解除', 'FALSE');
+    schSheet._rows.push(row);
+  })();
+
+  const rowsP = T.readScheduleRows_();
+  const rowP = rowsP.filter(function (r) { return r.id === SID; })[0];
+  check('P12 readScheduleRows_: 行が読める', !!rowP, SID);
+  check('P13 readScheduleRows_: whitelist が string[]',
+    !!rowP && Array.isArray(rowP.whitelist) && JSON.stringify(rowP.whitelist) === JSON.stringify(WL_ARR),
+    rowP && rowP.whitelist);
+  check('P14 readScheduleRows_: blacklist が string[]',
+    !!rowP && Array.isArray(rowP.blacklist) && JSON.stringify(rowP.blacklist) === JSON.stringify(BL_ARR),
+    rowP && rowP.blacklist);
+
+  // ---------------------------------------------------------- ③ scheduleRowToJson_
+  if (rowP) {
+    const j = T.scheduleRowToJson_(rowP, Date.UTC(2026, 10, 10, 10, 30));
+    check('P15 scheduleRowToJson_: whitelist_urls が string[]',
+      Array.isArray(j.whitelist_urls) && JSON.stringify(j.whitelist_urls) === JSON.stringify(WL_ARR), j.whitelist_urls);
+    check('P16 scheduleRowToJson_: blacklist_urls が string[]',
+      Array.isArray(j.blacklist_urls) && JSON.stringify(j.blacklist_urls) === JSON.stringify(BL_ARR), j.blacklist_urls);
+  } else {
+    check('P15 scheduleRowToJson_: whitelist_urls が string[]', false, 'row missing');
+    check('P16 scheduleRowToJson_: blacklist_urls が string[]', false, 'row missing');
+  }
+
+  // ---------------------------------------------------------- ④⑤ 端末へ配る経路
+  //   「文字列のまま」の行を渡しても、出口で必ず配列になること。
+  const legacyRow = {
+    rowIndex: 999, id: 'sch_legacy', targetType: 'class', schoolName: '第一小学校',
+    className: '5年1組', studentIds: [], type: 'url_block', filterMode: 'BLACKLIST',
+    whitelist: WL, blacklist: BL,               // ← 旧データを再現（文字列）
+    dateFrom: '2026/11/10', dateTo: '2026/11/14', repeat: 'NONE',
+    startTime: '19:00', endTime: '21:00', weekdaysRaw: '', enabled: true,
+    overridden: false, overrideAt: '', createdBy: '', createdAt: '', updatedAt: '', note: ''
+  };
+  const NOW_IN = Date.UTC(2026, 10, 10, 10, 30); // 11/10 19:30 JST（窓の内側）
+
+  const p4 = T.buildSchedulePayloadForDevice_('s1', '5年1組', '第一小学校', NOW_IN, [legacyRow]);
+  check('P17 buildSchedulePayloadForDevice_: active に載る', p4.active.length === 1, p4.active.length);
+  check('P18 buildSchedulePayloadForDevice_: whitelist が string[]',
+    p4.active.length === 1 && Array.isArray(p4.active[0].whitelist) &&
+    JSON.stringify(p4.active[0].whitelist) === JSON.stringify(WL_ARR),
+    p4.active[0] && p4.active[0].whitelist);
+  check('P19 buildSchedulePayloadForDevice_: blacklist が string[]',
+    p4.active.length === 1 && Array.isArray(p4.active[0].blacklist) &&
+    JSON.stringify(p4.active[0].blacklist) === JSON.stringify(BL_ARR),
+    p4.active[0] && p4.active[0].blacklist);
+
+  const p5 = T.shardBuildWindowsForStudent_([legacyRow], 's1', '5年1組', '第一小学校', NOW_IN);
+  check('P20 shardBuildWindowsForStudent_: 窓を返す', p5.windows.length > 0, p5.windows.length);
+  check('P21 shardBuildWindowsForStudent_: whitelist が string[]',
+    p5.windows.length > 0 && Array.isArray(p5.windows[0].whitelist) &&
+    JSON.stringify(p5.windows[0].whitelist) === JSON.stringify(WL_ARR),
+    p5.windows[0] && p5.windows[0].whitelist);
+  check('P22 shardBuildWindowsForStudent_: blacklist が string[]',
+    p5.windows.length > 0 && Array.isArray(p5.windows[0].blacklist) &&
+    JSON.stringify(p5.windows[0].blacklist) === JSON.stringify(BL_ARR),
+    p5.windows[0] && p5.windows[0].blacklist);
+
+  // 拡張機能の契約そのもの（Array.isArray でなければ捨てられる）を再現して確認
+  function extNormalizeHostList(list) {
+    if (!Array.isArray(list)) return [];
+    return list.map(function (s) { return String(s).trim().toLowerCase(); })
+      .filter(function (s) { return s.length > 0 && s.indexOf('*') < 0; });
+  }
+  check('P23 端末側 normalizeHostList が GAS の出力を受け付ける',
+    extNormalizeHostList(p4.active[0] && p4.active[0].blacklist).length === 2,
+    extNormalizeHostList(p4.active[0] && p4.active[0].blacklist));
+
+  // ---------------------------------------------------------- ⑥ 子GASのキャッシュ経路
+  //   旧バージョンのキャッシュ（文字列で保存された回）が残っていても救うこと。
+  (function () {
+    const vmMod = require('vm');
+    const srcP = [
+      'const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;',
+      extractFn('normalizeHostListToArray_'),
+      extractFn('hostListToSheetString_'),
+      extractFn('emptySchedulePayload_'),
+      extractFn('shardLoadScheduleCache_'),
+      extractFn('shardSchedulePayloadFromCache_'),
+      extractFn('schPad2_'), extractFn('schMsToJstStr_')
+    ].join('\n');
+    const legacyCache = {
+      updated_ms: NOW_IN,
+      by_student: {
+        s1: {
+          windows: [{
+            id: 'sch_legacy', type: 'url_block', filter_mode: 'BLACKLIST',
+            whitelist: WL, blacklist: BL,                 // ← 文字列で保存された旧キャッシュ
+            start_ms: NOW_IN - 600000, end_ms: NOW_IN + 600000
+          }],
+          overridden_ids: []
+        }
+      }
+    };
+    const store = {};
+    store[SHARD_PROP] = JSON.stringify(legacyCache);
+    const sandbox = {
+      CONFIG: JSON.parse(JSON.stringify(ctx.CONFIG || {})),
+      SHARD_SCHEDULES_PROP: SHARD_PROP,
+      SHARD_SCHEDULES_MEMO_SEC: 30,
+      SHARD_SCHEDULES_MEMO_KEY: 'shard_sched_memo1',
+      CacheService: {
+        getScriptCache: function () {
+          return { get: function () { return null; }, put: function () {}, remove: function () {} };
+        }
+      },
+      PropertiesService: {
+        getScriptProperties: function () {
+          return { getProperty: function (k) { return store[k] || null; }, setProperty: function (k, v) { store[k] = v; } };
+        }
+      }
+    };
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(srcP + '\n__P = { fromCache: shardSchedulePayloadFromCache_ };', sandbox);
+    const out = sandbox.__P.fromCache('s1', NOW_IN);
+    check('P24 shardSchedulePayloadFromCache_: 旧キャッシュでも active に載る', out.active.length === 1, out.active.length);
+    check('P25 shardSchedulePayloadFromCache_: whitelist が string[]',
+      out.active.length === 1 && Array.isArray(out.active[0].whitelist) &&
+      JSON.stringify(out.active[0].whitelist) === JSON.stringify(WL_ARR),
+      out.active[0] && out.active[0].whitelist);
+    check('P26 shardSchedulePayloadFromCache_: blacklist が string[]',
+      out.active.length === 1 && Array.isArray(out.active[0].blacklist) &&
+      JSON.stringify(out.active[0].blacklist) === JSON.stringify(BL_ARR),
+      out.active[0] && out.active[0].blacklist);
+  })();
+
+  // ---------------------------------------------------------- ⑦ 端末一覧の出力部
+  (function () {
+    const vmMod = require('vm');
+    const devCols = ['児童ID', '学校名', '氏名', 'クラス', '画面ロック', 'URL規制モード',
+      '許可URLリスト', '規制URLリスト', '一斉表示URL', '一斉表示実行ID', '現在開いているURL',
+      '最終同期日時', '備考', '画面情報要求日時', '画面情報更新日時'];
+    const devSheet = makeSheet(devCols, [
+      devCols.slice(),
+      ['s1', '第一小学校', '第一 一郎', '5年1組', false, 'BLACKLIST', WL, BL, '', '', '', '', '', '', '']
+    ]);
+    const cfg = extractConst('CONFIG');
+    const srcD = [
+      cfg,
+      extractFn('normalizeHostListToArray_'),
+      extractFn('getHeaderMap'),
+      extractFn('parseBoolean'),
+      extractFn('sheetTsToMs'),
+      extractFn('getAllDevices')
+    ].join('\n');
+    const sandbox = {
+      CacheService: undefined,
+      PropertiesService: undefined,
+      LockService: { getScriptLock: function () { return { waitLock: function () {}, releaseLock: function () {} }; } },
+      console: { log: function () {} },
+      getTargetSheet: function () { return devSheet; },
+      applyMonitorVisibility: function (r) { return r; },
+      getTeacherScopeInfo: function () { return { type: 'admin', school: '' }; },
+      getTeacherTargetClasses: function () { return []; },
+      isClassInTeacherScope: function () { return true; },
+      isAdminTeacher: function () { return true; },
+      normalizeSchoolName: function (s) { return String(s || '').trim(); },
+      schoolNamesMatch: function (a, b) { return String(a).trim() === String(b).trim(); },
+      resolveCanonicalSchool: function (s) { return String(s || '').trim(); },
+      isAllSchoolsName: function () { return false; },
+      normalizeClassName: function (s) { return String(s || '').trim(); },
+      invalidateDevicesCache: function () {},
+      readScheduleRows_: function () { return []; },
+      isAnyScheduleActive_: function () { return false; }
+    };
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(srcD + '\n__D = { all: getAllDevices };', sandbox);
+    const list = sandbox.__D.all('ALL', { email: 'a@b.c', role: 'ADMIN', school: '全校管理' }, false);
+    check('P27 getAllDevices: 1 件返る', list.length === 1, list.length);
+    check('P28 getAllDevices: whitelist_urls が string[]',
+      list.length === 1 && Array.isArray(list[0].whitelist_urls) &&
+      JSON.stringify(list[0].whitelist_urls) === JSON.stringify(WL_ARR),
+      list[0] && list[0].whitelist_urls);
+    check('P29 getAllDevices: blacklist_urls が string[]',
+      list.length === 1 && Array.isArray(list[0].blacklist_urls) &&
+      JSON.stringify(list[0].blacklist_urls) === JSON.stringify(BL_ARR),
+      list[0] && list[0].blacklist_urls);
+  })();
+
+  // ---------------------------------------------------------- ⑧ 書き込み側は文字列に戻す
+  //   配列をそのままセルへ書くと、次回の読み取りが壊れる。
+  check('P30 appendScheduleRow_: 配列をセル文字列へ戻す',
+    /hostListToSheetString_\(obj\.whitelist\)/.test(extractFn('appendScheduleRow_')) &&
+    /hostListToSheetString_\(obj\.blacklist\)/.test(extractFn('appendScheduleRow_')));
+
+  // ---------------------------------------------------------- ⑨ 検証は .length で見る
+  const vArr = T.validateScheduleInput_({
+    target_type: 'class', school_name: '第一小学校', class_name: '5年1組',
+    type: 'url_block', filter_mode: 'BLACKLIST', blacklist_urls: ['youtube.com'],
+    date_from: '2026/11/10', date_to: '2026/11/14', repeat: 'WEEKLY', weekdays: '1,2,3,4,5',
+    start_time: '19:00', end_time: '21:00'
+  });
+  check('P31 validateScheduleInput_: 配列入力を受け付ける', vArr.ok === true, vArr.errors);
+  check('P32 validateScheduleInput_: norm は string[]',
+    vArr.ok === true && Array.isArray(vArr.norm.blacklist) &&
+    JSON.stringify(vArr.norm.blacklist) === JSON.stringify(['youtube.com']),
+    vArr.ok && vArr.norm && vArr.norm.blacklist);
+  // 空配列は truthy なので !norm.blacklist では弾けない（.length で判定する回帰）
+  const vEmpty = T.validateScheduleInput_({
+    target_type: 'class', school_name: '第一小学校', class_name: '5年1組',
+    type: 'url_block', filter_mode: 'BLACKLIST', blacklist_urls: [],
+    date_from: '2026/11/10', date_to: '2026/11/14', repeat: 'WEEKLY', weekdays: '1,2,3,4,5',
+    start_time: '19:00', end_time: '21:00'
+  });
+  check('P33 validateScheduleInput_: 空配列の blacklist は弾く', vEmpty.ok === false, vEmpty.errors);
 }
 
 console.log('');

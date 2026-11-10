@@ -210,6 +210,8 @@ const FNS = [
   'normalizeSchoolName', 'schoolNamesMatch', 'resolveCanonicalSchool', 'isAllSchoolsName',
   'normalizeClassName', 'parseBoolean', 'parseUrlList', 'getHeaderMap',
   'normalizeShardClass',
+  // URLリストの配列化（シートは文字列 / 端末契約は string[]）
+  'normalizeHostListToArray_', 'hostListToSheetString_',
   // スケジュール中核（子）
   'deviceMatchesSchedule_', 'readScheduleRows_',
   'buildSchedulePayloadForDevice_', 'buildHeartbeatResponse',

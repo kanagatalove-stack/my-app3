@@ -115,7 +115,7 @@ const ctx = {
   Logger: { log(){} }
 };
 // load needed functions
-const names = ['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','resolveTeacherScopeSchoolName','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isDeviceInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','withWriteLock','generateBroadcastId','bulkUpdateScreenLock','bulkUpdateBroadcastUrl','bulkUpdateFilterMode','updateSingleDevice','parseBoolean'];
+const names = ['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','resolveTeacherScopeSchoolName','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isDeviceInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','withWriteLock','generateBroadcastId','bulkUpdateScreenLock','bulkUpdateBroadcastUrl','bulkUpdateFilterMode','updateSingleDevice','parseBoolean','normalizeHostListToArray_','hostListToSheetString_'];
 let code = '';
 // constants used by functions
 code += 'const SCHOOL_ALIASES = ' + JSON.stringify({
