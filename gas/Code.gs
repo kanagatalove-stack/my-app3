@@ -4676,8 +4676,52 @@ function isShardParent() {
   try { return shardModeFlags().parent === true; } catch (e) { return false; }
 }
 
+/**
+ * 子GASを「設定漏れがあっても」自動判別する安全網。
+ *
+ * 【なぜ必要か】
+ *   子GASのスクリプトプロパティ SHARD_CHILD_MODE=true を入れ忘れると
+ *   isShardChild() が false になり、resolveSchedulePayloadForDevice_ が
+ *   親用ロジック（buildSchedulePayloadForDevice_）へ落ちて子シートを直接読む。
+ *   ところが「子シートにはスケジュール行を書かない」のが確定仕様なので、
+ *   端末には常に空の schedules が返り、予約が一切効かなくなる。
+ *   実機ではこれが「親→子は HTTP 200 なのに端末で制限が動かない」症状になった。
+ *
+ * 【判定材料に SHARD_SECRET を使わない理由】
+ *   親GASも getOrCreateShardSecret() で SHARD_SECRET を保持している。
+ *   これを子の証拠にすると親が子と誤判定され、全端末のハートビートが
+ *   空キャッシュ参照になって全滅する。よって「親が絶対に書かないキー」だけを見る。
+ *
+ *   ・SHARD_SCHEDULES_CACHE … 親から schedules を受け取ったときだけ書かれる
+ *   ・SHARD_INBOX_SEEN      … shard_apply を受けた痕跡（予約0件でも残す）
+ */
+function shardDetectChildByInbox_() {
+  try {
+    if (typeof PropertiesService === 'undefined') return false;
+    // 明示設定が最優先。明示的に「親」なら絶対に子と判定しない。
+    var explicitChild = false;
+    var explicitParent = false;
+    try { explicitChild = propBool(PROP_SHARD_CHILD_MODE, false); } catch (eC1) {}
+    try { explicitParent = propBool(PROP_SHARD_MODE, false); } catch (eC2) {}
+    if (explicitChild) return true;
+    if (explicitParent) return false;
+
+    var props = PropertiesService.getScriptProperties();
+    var cacheRaw = props.getProperty('SHARD_SCHEDULES_CACHE');
+    if (cacheRaw !== null && cacheRaw !== undefined && String(cacheRaw).trim() !== '') return true;
+    var seen = props.getProperty('SHARD_INBOX_SEEN');
+    if (seen !== null && seen !== undefined && String(seen).trim() !== '') return true;
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
 function isShardChild() {
-  try { return shardModeFlags().child === true; } catch (e) { return false; }
+  try { if (shardModeFlags().child === true) return true; } catch (e) { /* 自動判別へ */ }
+  // 設定漏れの救済（実機で発生した断線の再発防止）
+  try { if (typeof shardDetectChildByInbox_ === 'function' && shardDetectChildByInbox_()) return true; } catch (e2) {}
+  return false;
 }
 
 /**
@@ -5049,6 +5093,27 @@ function shardApplyFromParent(payload) {
       scheduleSaved = { saved: 0, error: String((eSch && eSch.message) ? eSch.message : eSch) };
     }
   }
+
+  // 【子GAS自動判別】shard_apply を受けた痕跡を残す。
+  //   SHARD_CHILD_MODE の設定漏れがあっても、次回以降のハートビートで
+  //   子GASとして判別できるようにする（設定漏れで制限が届かない事故の対策）。
+  //   明示的に「親」と設定されているスクリプトには痕跡を残さない
+  //   （親が子扱いされると全端末が壊れるため）。
+  try {
+    var __explicitParent = false;
+    try { __explicitParent = propBool(PROP_SHARD_MODE, false); } catch (eXP) {}
+    if (!__explicitParent) {
+      PropertiesService.getScriptProperties()
+        .setProperty('SHARD_INBOX_SEEN', String(new Date().getTime()));
+    }
+  } catch (eMark) { /* 記録できなくても本処理は続ける */ }
+
+  // 【可観測性】子側で「実際に何件保存できたか」をログに残す。
+  //   親のログには ensure しか出ておらず、保存件数が見えなかった。
+  try {
+    Logger.log('[SHARD] apply: 受信 schedules=' + JSON.stringify(scheduleSaved) +
+      ' student_ids=' + (((payload && payload.student_ids) || []).length));
+  } catch (eLg) {}
 
   const ids = (payload && payload.student_ids) || [];
   // 【R38】patch の正規化。
@@ -6641,15 +6706,18 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
         const code = res.getResponseCode();
         // 子が「行を用意できなかった」場合は一括操作が効いていない。握りつぶさず伝える。
         let childEnsure = null;
+        let childSchedules = null;
         try {
           const parsed = JSON.parse(res.getContentText() || '{}');
           childEnsure = (parsed && parsed.ensure) || null;
+          childSchedules = (parsed && parsed.schedules) || null;
           if (childEnsure && childEnsure.error) {
             results.push({ url: url, count: groups[url].length, status: code, ensure_error: childEnsure.error });
             continue;
           }
         } catch (e2) { /* 本文が読めなくてもステータスは残す */ }
-        results.push({ url: url, count: groups[url].length, status: code, ensure: childEnsure });
+        results.push({ url: url, count: groups[url].length, status: code,
+          ensure: childEnsure, schedules: childSchedules });
       } catch (e) {
         results.push({ url: url, count: groups[url].length, error: String(e) });
       }
@@ -7800,12 +7868,25 @@ function shardSchedulePayloadFromCache_(studentId, nowMs) {
 function resolveSchedulePayloadForDevice_(studentId, className, schoolName, nowMs) {
   let isChild = false;
   try { isChild = (typeof isShardChild === 'function' && isShardChild()); } catch (eC) { isChild = false; }
+  // 【設定漏れの救済】isShardChild が false でも、親から受け取った痕跡があれば
+  //   子として扱い、空の子シートではなくプロパティストアを読む。
+  if (!isChild) {
+    try { if (typeof shardDetectChildByInbox_ === 'function' && shardDetectChildByInbox_()) isChild = true; } catch (eD) {}
+  }
   if (isChild) {
     // 【確定仕様2】子GASは親から受け取ったキャッシュだけを正とする。
     //   キャッシュが無い＝まだ親から同期されていない＝制限なし。
     //   ここでシート読みへフォールバックすると、子側に残った古い行が復活し
     //   「解除したのに制限が残る」不整合になるため、あえて読みに行かない。
-    try { return shardSchedulePayloadFromCache_(studentId, nowMs); }
+    try {
+      var __pl = shardSchedulePayloadFromCache_(studentId, nowMs);
+      try {
+        Logger.log('[SHARD] heartbeat: 子GASとして配信 sid=' + String(studentId || '') +
+          ' active=' + ((__pl && __pl.active) ? __pl.active.length : 0) +
+          ' upcoming=' + ((__pl && __pl.upcoming) ? __pl.upcoming.length : 0));
+      } catch (eL) {}
+      return __pl;
+    }
     catch (eC2) { return emptySchedulePayload_(); }
   }
   // 親・単体GASは従来どおり自前のシートから組み立てる。

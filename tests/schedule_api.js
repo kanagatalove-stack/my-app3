@@ -1278,6 +1278,201 @@ console.log('===== R. 保存→伝播の発火保証 =====');
   })();
 }
 
+
+// ================================================================ S. 子GASの自動判別
+//   実害: 子GASのスクリプトプロパティ SHARD_CHILD_MODE=true を入れ忘れると
+//         isShardChild() が false になり、resolveSchedulePayloadForDevice_ が
+//         親用ロジック（buildSchedulePayloadForDevice_ → 子シート直読み）へ落ちる。
+//         子シートにスケジュール行は書かない確定仕様のため、端末には常に
+//         空の schedules が返り、予約が一切効かなかった。
+//   ここでは shard_apply 受信 → PropertiesService 保存 → ハートビート配信までを
+//   実際に走らせ、SHARD_CHILD_MODE 未設定でも配給されることを検証する。
+console.log('===== S. 子GASの自動判別（設定漏れの救済） =====');
+{
+  const vmMod = require('vm');
+
+  const CHILD_FNS = [
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
+    'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
+    'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_', 'parseBoolean',
+    'normalizeClassName', 'schoolNamesMatch', 'normalizeSchoolName',
+    'deviceMatchesSchedule_', 'shardBuildWindowsForStudent_', 'shardBuildScheduleByStudent_',
+    'emptySchedulePayload_',
+    'shardLoadScheduleCache_', 'shardSaveScheduleCache_',
+    'shardSchedulePayloadFromCache_',
+    'propRaw', 'propBool',
+    'shardDetectChildByInbox_',
+    'isShardChild', 'resolveSchedulePayloadForDevice_'
+  ];
+
+  // 実際の PropertiesService 相当（スクリプトプロパティの保管庫）
+  function buildChild(o) {
+    o = o || {};
+    const store = {};
+    const keys = o.props || {};
+    Object.keys(keys).forEach(function (k) { store[k] = String(keys[k]); });
+    const memo = {};
+    const logs = [];
+
+    const sandbox = {
+      __store: store,
+      __logs: logs,
+      console: { log: function () {} },
+      Logger: { log: function (m) { logs.push(String(m)); } },
+      CONFIG: { SCHEDULE_HORIZON_DAYS: 14, SCHEDULE_MAX_ACTIVE: 5, SCHEDULE_MAX_WINDOWS: 20 },
+      SHEET_TZ_OFFSET_MS: 9 * 60 * 60 * 1000,
+      SHARD_SCHEDULES_PROP: 'SHARD_SCHEDULES_CACHE',
+      SHARD_SCHEDULES_MEMO_SEC: 30,
+      SHARD_SCHEDULES_MEMO_KEY: 'shard_sched_memo1',
+      PROP_SHARD_MODE: 'SHARD_MODE',
+      PROP_SHARD_CHILD_MODE: 'SHARD_CHILD_MODE',
+      SHARD_MODE_CACHE: 'shard_mode1',
+      PropertiesService: {
+        getScriptProperties: function () {
+          return {
+            getProperty: function (k) {
+              return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null;
+            },
+            setProperty: function (k, v) { store[k] = String(v); }
+          };
+        }
+      },
+      CacheService: {
+        getScriptCache: function () {
+          return {
+            get: function (k) { return Object.prototype.hasOwnProperty.call(memo, k) ? memo[k] : null; },
+            put: function (k, v) { memo[k] = String(v); },
+            remove: function (k) { delete memo[k]; }
+          };
+        }
+      },
+      // shardModeFlags は本物を抽出せず、明示設定だけを反映する最小実装
+      shardModeFlags: function () {
+        var cb = (store['SHARD_CHILD_MODE'] || '').toLowerCase();
+        var pb = (store['SHARD_MODE'] || '').toLowerCase();
+        return { child: (cb === 'true' || cb === '1'), parent: (pb === 'true' || pb === '1') };
+      },
+      // 親用ロジックが呼ばれたら「呼ばれた」ことを記録（＝誤判定の検出）
+      buildSchedulePayloadForDevice_: function () {
+        logs.push('__PARENT_PATH_CALLED__');
+        return { active: [], upcoming: [], overridden_ids: [] };
+      }
+    };
+
+    const src = CHILD_FNS.map(function (n) { return extractFn(n); }).join('\n');
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(src +
+      '\n__S = { save: shardSaveScheduleCache_, detect: shardDetectChildByInbox_,' +
+      ' isChild: isShardChild, resolve: resolveSchedulePayloadForDevice_,' +
+      ' applySave: function(b, u) { return shardSaveScheduleCache_(b, u, true); } };', sandbox);
+    return { sandbox: sandbox, store: store, logs: logs };
+  }
+
+  const NOW = Date.UTC(2026, 10, 10, 3, 2, 30); // 11/10 12:02:30 JST
+
+  // 親が同封してくる by_student（student 予約 1 件ぶん）
+  const BY_STUDENT = {
+    s1: {
+      windows: [{
+        id: 'sch_s1', type: 'screen_lock', filter_mode: '',
+        whitelist: [], blacklist: [],
+        start_ms: NOW - 30000, end_ms: NOW + 30000
+      }],
+      overridden_ids: []
+    }
+  };
+
+  // ① SHARD_CHILD_MODE 未設定でも、保存されたら子として自動判別される
+  (function () {
+    const c = buildChild({ props: {} }); // ← 何も設定されていない子GAS
+    check('S1 設定なしの初期状態では子と判定されない', c.sandbox.__S.isChild() === false);
+    check('S2 痕跡なしでは自動判別も false', c.sandbox.__S.detect() === false);
+
+    // shard_apply の保存処理を実行（= 親から受け取った）
+    const saved = c.sandbox.__S.applySave(BY_STUDENT, NOW);
+    check('S3 保存件数が返る（親が確認できる）', saved && saved.saved === 1, saved);
+    check('S4 PropertiesService に実体が入る',
+      typeof c.store['SHARD_SCHEDULES_CACHE'] === 'string' &&
+      c.store['SHARD_SCHEDULES_CACHE'].indexOf('sch_s1') >= 0,
+      (c.store['SHARD_SCHEDULES_CACHE'] || '').slice(0, 60));
+
+    check('S5 保存後は痕跡により子と自動判定される', c.sandbox.__S.isChild() === true);
+    check('S6 自動判別の理由が PropertiesService の実体である',
+      c.sandbox.__S.detect() === true);
+  })();
+
+  // ② SHARD_CHILD_MODE 未設定でも、ハートビートが空にならない
+  (function () {
+    const c = buildChild({ props: {} });
+    c.sandbox.__S.applySave(BY_STUDENT, NOW);
+    const pl = c.sandbox.__S.resolve('s1', '5年1組', '第一小学校', NOW);
+
+    check('S7 ハートビートで active が 1 件返る（空にならない）',
+      !!pl && Array.isArray(pl.active) && pl.active.length === 1,
+      pl && pl.active.length);
+    check('S8 窓が予約IDを持つ', !!pl && pl.active.length === 1 && pl.active[0].id === 'sch_s1',
+      pl && pl.active[0] && pl.active[0].id);
+    check('S9 窓が数値の start_ms/end_ms を持つ（v1.6.4 の判定契約）',
+      !!pl && pl.active.length === 1 &&
+      typeof pl.active[0].start_ms === 'number' && typeof pl.active[0].end_ms === 'number' &&
+      pl.active[0].end_ms > pl.active[0].start_ms,
+      pl && pl.active[0]);
+    check('S10 窓の type が screen_lock', !!pl && pl.active.length === 1 && pl.active[0].type === 'screen_lock');
+    check('S11 whitelist/blacklist が配列（端末の normalizeHostList 契約）',
+      !!pl && pl.active.length === 1 &&
+      Array.isArray(pl.active[0].whitelist) && Array.isArray(pl.active[0].blacklist),
+      pl && pl.active[0]);
+    check('S12 親用ロジックへ落ちていない（子シートを読んでいない）',
+      c.logs.indexOf('__PARENT_PATH_CALLED__') < 0, c.logs);
+    check('S13 配信ログが残る（実機で切り分け可能）',
+      c.logs.some(function (m) { return m.indexOf('子GASとして配信') >= 0; }), c.logs);
+  })();
+
+  // ③ SHARD_CHILD_MODE=true が明示されていれば従来どおり
+  (function () {
+    const c = buildChild({ props: { SHARD_CHILD_MODE: 'true' } });
+    check('S14 明示設定があれば子と判定される', c.sandbox.__S.isChild() === true);
+    c.sandbox.__S.applySave(BY_STUDENT, NOW);
+    const pl = c.sandbox.__S.resolve('s1', '5年1組', '第一小学校', NOW);
+    check('S15 明示設定でも配給される', !!pl && pl.active.length === 1, pl && pl.active.length);
+  })();
+
+  // ④ 親GASは絶対に子と誤判定されない（最重要の退行防止）
+  (function () {
+    // 親は SHARD_SECRET を持つが、SHARD_SCHEDULES_CACHE は持たない
+    const c = buildChild({ props: { SHARD_MODE: 'true', SHARD_SECRET: 'sk_parent_secret' } });
+    check('S16 明示的な親は子と判定されない', c.sandbox.__S.isChild() === false);
+    check('S17 SHARD_SECRET だけでは子と判定しない（親の誤判定防止）',
+      c.sandbox.__S.detect() === false);
+
+    // 親がシートベースで配給すること（buildSchedulePayloadForDevice_ 側へ行く）
+    const pl = c.sandbox.__S.resolve('s1', '5年1組', '第一小学校', NOW);
+    check('S18 親は親用ロジックを通る', c.logs.indexOf('__PARENT_PATH_CALLED__') >= 0, c.logs);
+  })();
+
+  // ⑤ 予約 0 件でも痕跡を残す（次回の自動判別のため）
+  (function () {
+    const c = buildChild({ props: {} });
+    const r = c.sandbox.__S.applySave({}, NOW); // 空の地図＝全予約取消
+    check('S19 空の保存でも saved=0 で成功する', r && r.saved === 0, r);
+    check('S20 空でも Serializable な実体が残る',
+      typeof c.store['SHARD_SCHEDULES_CACHE'] === 'string',
+      c.store['SHARD_SCHEDULES_CACHE']);
+  })();
+
+  // ⑥ ソース検査: 自動判別が親判定より後ろに置かれている（親を壊さない）
+  (function () {
+    const body = extractFn('shardDetectChildByInbox_');
+    check('S21 自動判別は明示的な親を最優先で除外する',
+      /if\s*\(\s*explicitParent\s*\)\s*return\s+false/.test(body));
+    check('S22 自動判別は SHARD_SECRET を材料にしていない',
+      body.indexOf('SHARD_SECRET') < 0);
+    check('S23 受信痕跡 SHARD_INBOX_SEEN を材料にしている',
+      body.indexOf('SHARD_INBOX_SEEN') >= 0);
+  })();
+}
+
 console.log('');
 console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
 process.exit(fail > 0 ? 1 : 0);
