@@ -6466,8 +6466,10 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
     try {
       if (typeof shardDeviceEntries === 'function') entries = shardDeviceEntries();
     } catch (e) { entries = null; }
-    if (!entries) {
+    if (!entries || !entries.length) {
       // 索引が使えない環境のみ従来通りのシート読み（機能は落とさない）
+      //   ※ [] は truthy なので `if (!entries)` だけでは素通りしてしまう。
+      //     索引キャッシュが空で固まった場合に全児童が脱落するのを防ぐ。
       const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
       const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
       const d = sheet.getDataRange().getValues();
@@ -6487,22 +6489,48 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
     const isAll = (studentIds === 'ALL' || !Array.isArray(studentIds));
     const idSet = Array.isArray(studentIds) ? new Set(studentIds) : null;
 
+    // 【伝播の安全ガード】静かな脱落（sent: []）を根絶する。
+    //   従来、SHARD_MAP_V1 に一致するクラスが無く、空キー既定も SHARD_DEFAULT_URL も
+    //   未設定のとき、この児童は「黙って」捨てられていた。その結果、
+    //   子GASへは 1 件も送られないのに親の予約は正常に見え、子の実行ログも
+    //   HTTP 200 で返るため「成功しているのに端末で規制が効かない」という
+    //   最も厄介な壊れ方をする（本不具合の正体）。
+    //   1校=1子GAS の運用（R41）では、登録が 1 件だけならそれが正しい宛先なので
+    //   それを最終フォールバックに使う。加えて、落とした事実を必ずログに残す。
+    const idxKeys = Object.keys(idx);
+    const singleChildUrl = (idxKeys.length === 1) ? String(idx[idxKeys[0]] || '').trim() : '';
+
     const groups = {}; // url -> [studentId]
     const groupClasses = {}; // url -> { studentId: 元のクラス名 }
+    let droppedCount = 0;
     for (let i = 0; i < entries.length; i++) {
       const id = String(entries[i][0] || '').trim();
       if (!id) continue;
       if (!isAll && !(idSet && idSet.has(id))) continue;
       const rawClass = String(entries[i][2] || '').trim();
       const cls = normalizeShardClass(rawClass);
-      // クラス一致 → 空キー既定 → SHARD_DEFAULT_URL の順で解決する
-      const url = idx[cls] || emptyDef || defUrl;
-      if (!url) continue;
+      // クラス一致 → 空キー既定 → SHARD_DEFAULT_URL → 唯一の子GAS の順で解決する
+      const url = idx[cls] || emptyDef || defUrl || singleChildUrl;
+      if (!url) { droppedCount++; continue; }
+      // 一致しなかった理由を残す（表記揺れ／マップ未登録の切り分け用）。
+      if (!idx[cls] && rawClass) {
+        shardWarnOnce('cls-fb:' + cls + '|' + url,
+          'SHARD_MAP_V1 にクラス「' + rawClass + '」（正規化: ' + cls + '）がありません。' +
+          'フォールバック先へ送ります（' + url + '）。');
+      }
       if (!groups[url]) groups[url] = [];
       groups[url].push(id);
       // 子のシートで行を作るときにクラスを埋めるため、元の表記のまま渡す。
       if (!groupClasses[url]) groupClasses[url] = {};
       groupClasses[url][id] = rawClass;
+    }
+
+    // 宛先が 1 つも無いのに児童が居た＝設定不備。成功に見せず理由を返す。
+    if (droppedCount > 0 && !Object.keys(groups).length) {
+      shardWarnOnce('no-route:' + droppedCount,
+        'SHARD_MAP_V1 のどのクラスにも一致せず、既定URLも無いため伝播先がありません（対象 ' +
+        droppedCount + ' 名）。子GASへは何も送られていません。');
+      return { skipped: true, reason: 'no_route', dropped: droppedCount };
     }
 
     const urls = Object.keys(groups);
@@ -6524,7 +6552,7 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
           for (let i = 0; i < entries.length; i++) {
             const sid0 = String(entries[i][0] || '').trim();
             if (!sid0) continue;
-            const u0 = idx[normalizeShardClass(entries[i][2])] || emptyDef || defUrl;
+            const u0 = idx[normalizeShardClass(entries[i][2])] || emptyDef || defUrl || singleChildUrl;
             if (!u0) continue;
             if (!entriesByUrl[u0]) entriesByUrl[u0] = [];
             entriesByUrl[u0].push([sid0, String(entries[i][1] || ''), String(entries[i][2] || '')]);

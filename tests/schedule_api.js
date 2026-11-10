@@ -943,6 +943,148 @@ console.log('===== P. URLリストの配列化（文字列 → string[]） =====
   check('P33 validateScheduleInput_: 空配列の blacklist は弾く', vEmpty.ok === false, vEmpty.errors);
 }
 
+
+// ================================================================ Q. 伝播経路の静かな脱落
+//   実害: 親の「選択日の予約」は有効に見え、子GASの実行ログも HTTP 200。
+//         しかし子GASへは 1 件も送られておらず（sent: []）、端末で規制が効かない。
+//   原因: shardPropagatePolicy の宛先解決で、端末のクラス表記が SHARD_MAP_V1 の
+//         キーと一致せず、既定URLも未設定だと、その児童を「黙って」捨てていた。
+//         1校=1子GAS（R41）でも同じ脱落が起きていた。
+console.log('===== Q. 伝播経路（宛先解決とフォールバック） =====');
+{
+  const vmMod = require('vm');
+  const CHAIN_FNS = [
+    'normalizeClassName', 'normalizeShardClass', 'normalizeSchoolName', 'schoolNamesMatch',
+    'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
+    'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
+    'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_', 'parseBoolean',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'deviceMatchesSchedule_', 'shardBuildWindowsForStudent_', 'shardBuildScheduleByStudent_',
+    'shardMapIndexFromMap', 'shardMapDefaultFromEmptyKey',
+    'shardPropagatePolicy', 'propagateScheduleToChildren_'
+  ];
+  const chainSrc = ['const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;', 'const SHARD_ASYNC_ENABLED = false;']
+    .concat([extractConst('CONFIG')])
+    .concat(CHAIN_FNS.map(function (n) { return extractFn(n); }))
+    .join('\n');
+
+  const STUDENT_ROW = {
+    rowIndex: 2, id: 'sch_q1', targetType: 'student', schoolName: '第一小学校', className: '',
+    studentIds: ['s1'], type: 'screen_lock', filterMode: '', whitelist: [], blacklist: [],
+    dateFrom: '2026/11/10', dateTo: '2026/11/10', repeat: 'NONE', startTime: '12:02', endTime: '12:03',
+    weekdaysRaw: '', enabled: true, overridden: false, overrideAt: '',
+    createdBy: 't@school.ed.jp', createdAt: '', updatedAt: '', note: ''
+  };
+  const CLASS_ROW = Object.assign({}, STUDENT_ROW, {
+    id: 'sch_q2', targetType: 'class', className: '5年1組', studentIds: [],
+    type: 'url_block', filterMode: 'BLACKLIST',
+    whitelist: [], blacklist: ['youtube.com']
+  });
+
+  // 送信された payload を捕捉して、子GASへ何が渡ったかを実測する
+  function runChain(o) {
+    const sent = [];
+    const warns = [];
+    const sandbox = {
+      __sent: sent, __warns: warns,
+      console: { log: function () {} },
+      Logger: { log: function (m) { warns.push(String(m)); } },
+      isShardParent: function () { return true; },
+      shardConfigCached: function () { return { map: o.map, sec: 'sk_test', def: o.def || '' }; },
+      shardDeviceEntries: function () { return o.entries; },
+      // 予約行は呼び出し側が明示しない限り「今回の 1 行」を返す
+      //   （空配列を返すと schedules が同封されず、テストが無意味になる）
+      readScheduleRows_: function () { return o.rows !== undefined ? o.rows : [o.row]; },
+      shardFetchMany: function (reqs) {
+        for (let i = 0; i < reqs.length; i++) sent.push(JSON.parse(reqs[i].payload));
+        return reqs.map(function () {
+          return { getResponseCode: function () { return 200; }, getContentText: function () { return '{"success":true}'; } };
+        });
+      },
+      shardQueuePending: function () { return false; },
+      shardWarnOnce: function (k, m) { warns.push(String(m)); },
+      bulkTraceMark: function () {}
+    };
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(chainSrc + '\n__Q = { prop: propagateScheduleToChildren_ };', sandbox);
+    return { res: sandbox.__Q.prop(o.row), sent: sent, warns: warns };
+  }
+
+  // 端末一覧のクラスは「5年1組」、SHARD_MAP_V1 のキーは「5-1」（実環境の表記）
+  const ENTRIES = [['s1', '第一小学校', '5年1組']];
+
+  // ① 個別指定（student）: 正規化が効いて宛先が解決する
+  (function () {
+    const r = runChain({ row: STUDENT_ROW, entries: ENTRIES, map: { '5-1': 'https://child1.example/exec' } });
+    check('Q1 student: 子GASへ送信される（脱落しない）', r.sent.length === 1, r.sent.length);
+    check('Q2 student: student_ids に対象児童が入る',
+      r.sent.length === 1 && r.sent[0].student_ids[0] === 's1',
+      r.sent[0] && r.sent[0].student_ids);
+    check('Q3 student: schedules.by_student に児童が載る',
+      r.sent.length === 1 && !!r.sent[0].schedules && !!r.sent[0].schedules.by_student.s1,
+      r.sent[0] && r.sent[0].schedules && Object.keys(r.sent[0].schedules.by_student));
+    check('Q4 student: 窓が数値の start_ms/end_ms を持つ（v1.6.4 の判定契約）',
+      r.sent.length === 1 &&
+      !!r.sent[0].schedules && !!r.sent[0].schedules.by_student.s1 &&
+      Array.isArray(r.sent[0].schedules.by_student.s1.windows) &&
+      r.sent[0].schedules.by_student.s1.windows.length > 0 && (function () {
+        const w = r.sent[0].schedules.by_student.s1.windows[0];
+        return !!w && typeof w.start_ms === 'number' && typeof w.end_ms === 'number' && w.end_ms > w.start_ms;
+      })(), r.sent[0] && r.sent[0].schedules && r.sent[0].schedules.by_student);
+  })();
+
+  // ② クラス指定（class）: 同じく解決する
+  (function () {
+    const r = runChain({ row: CLASS_ROW, entries: ENTRIES, map: { '5-1': 'https://child1.example/exec' } });
+    check('Q5 class: 子GASへ送信される', r.sent.length === 1, r.sent.length);
+    check('Q6 class: blacklist が string[] で届く',
+      r.sent.length === 1 && Array.isArray(r.sent[0].schedules.by_student.s1.windows[0].blacklist) &&
+      r.sent[0].schedules.by_student.s1.windows[0].blacklist[0] === 'youtube.com',
+      r.sent.length === 1 && r.sent[0].schedules.by_student.s1.windows[0].blacklist);
+  })();
+
+  // ③ 表記不一致＋子GASが1つだけ（R41: 1校=1子GAS）→ 唯一の子へフォールバック
+  (function () {
+    const r = runChain({ row: STUDENT_ROW, entries: ENTRIES, map: { '1-1': 'https://child1.example/exec' } });
+    check('Q7 表記不一致でも唯一の子GASへフォールバックする', r.sent.length === 1, r.sent.length);
+    check('Q8 フォールバック時も schedules が同封される',
+      r.sent.length === 1 && !!r.sent[0].schedules && !!r.sent[0].schedules.by_student.s1,
+      r.sent.length === 1 && r.sent[0].schedules && Object.keys(r.sent[0].schedules.by_student));
+    check('Q9 フォールバックした事実をログに残す（静かに落とさない）',
+      r.warns.some(function (m) { return m.indexOf('SHARD_MAP_V1') >= 0 && m.indexOf('フォールバック') >= 0; }),
+      r.warns);
+  })();
+
+  // ④ 宛先が本当に無い（子GAS 2つ・どれも不一致・既定URLなし）→ 明示的に失敗を返す
+  (function () {
+    const r = runChain({
+      row: STUDENT_ROW, entries: ENTRIES,
+      map: { '1-1': 'https://childA.example/exec', '2-1': 'https://childB.example/exec' }
+    });
+    check('Q10 宛先不明は sent:[] のまま', r.sent.length === 0, r.sent.length);
+    check('Q11 宛先不明は黙って成功にせず no_route を返す',
+      !!r.res && r.res.reason === 'no_route' && r.res.dropped === 1, r.res);
+    check('Q12 宛先不明はログにも残す', r.warns.length > 0, r.warns.length);
+  })();
+
+  // ⑤ 既定URLがあればそちらへ送る（従来動作の維持）
+  (function () {
+    const r = runChain({
+      row: STUDENT_ROW, entries: ENTRIES,
+      map: { '1-1': 'https://childA.example/exec' }, def: 'https://def.example/exec'
+    });
+    check('Q13 既定URLがあるときは既定URLへ送る',
+      r.sent.length === 1 && r.res.sent[0].url === 'https://def.example/exec', r.res);
+  })();
+
+  // ⑥ 索引が「空配列」で固まってもシート読みへ落ちる（[] は truthy の罠）
+  const propBody = extractFn('shardPropagatePolicy');
+  check('Q14 空の索引([])でもシート読みへフォールバックする',
+    /if\s*\(\s*!entries\s*\|\|\s*!entries\.length\s*\)/.test(propBody));
+  check('Q15 宛先解決に unique子GAS フォールバックが入っている',
+    /singleChildUrl/.test(propBody) && /idxKeys\.length === 1/.test(propBody));
+}
+
 console.log('');
 console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
 process.exit(fail > 0 ? 1 : 0);
