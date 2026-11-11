@@ -58,6 +58,28 @@ function check(n, c, e) {
   else { console.log('FAIL ' + n, e !== undefined ? '=> ' + JSON.stringify(e) : ''); fail++; }
 }
 
+// ---------------------------------------------------------------- pinned clock
+// 【時刻固定】expandScheduleWindows_ は「実時刻」で窓を切り詰める
+//   （lo = max(開始日, now-1日) / hi = min(終了日, now+horizon)）。
+//   予約のフィクスチャは 2026/11/10 前提で書かれているため、実時刻が
+//   11/11 以降に進むと hi < lo となり窓が 0 件になる（＝テストが期限切れで
+//   静かに壊れる）。ここでは「フィクスチャ執筆時点の now」を固定して、
+//   実行日に関係なく同じ結果になるようにする。
+//   Date を差し替えても sheetTsToMs の Date.UTC / Date.parse と
+//   new Date(s) はそのまま使えるよう、実 Date を継承した最小のサブクラスにする。
+const PINNED_NOW_MS = Date.UTC(2026, 10, 10, 10, 0, 0); // 2026/11/10 19:00 JST
+function makePinnedDate(pinnedMs) {
+  const PIN = pinnedMs;
+  class PinnedDate extends Date {
+    constructor(...args) {
+      if (args.length === 0) super(PIN);
+      else super(...args);
+    }
+    static now() { return PIN; }
+  }
+  return PinnedDate;
+}
+
 // ---------------------------------------------------------------- fake sheet
 function makeSheet(cols, rows) {
   return {
@@ -159,6 +181,9 @@ sheets['スケジュール管理'] = makeSheet([], []); // 空 → ヘッダー�
 const ctx = vm.createContext({
   console: { log: function () {} },
   Logger: { log: function () {} },
+  // 【時刻固定】expandScheduleWindows_ が実時刻で窓を切り詰めるため、
+  //   フィクスチャ執筆時点（2026/11/10 19:00 JST）に固定する。
+  Date: makePinnedDate(PINNED_NOW_MS),
   LockService: {
     getScriptLock: function () {
       return { waitLock: function () {}, releaseLock: function () {} };
@@ -1007,6 +1032,9 @@ console.log('===== Q. 伝播経路（宛先解決とフォールバック） ===
       __sent: sent, __warns: warns,
       console: { log: function () {} },
       Logger: { log: function (m) { warns.push(String(m)); } },
+      // 【時刻固定】expandScheduleWindows_ が実時刻で窓を切り詰めるため
+      //   （予約は 2026/11/10 前提）、フィクスチャ時点に固定する。
+      Date: makePinnedDate(PINNED_NOW_MS),
       isShardParent: function () { return true; },
       shardConfigCached: function () { return { map: o.map, sec: 'sk_test', def: o.def || '' }; },
       shardDeviceEntries: function () { return o.entries; },
@@ -1718,6 +1746,368 @@ console.log('===== T. 児童IDの表記ゆれ吸収（メール全体 ⇄ ロー
   })();
 }
 
-console.log('');
-console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
-process.exit(fail > 0 ? 1 : 0);
+// ================================================================ U. 端末の初回送信トリガー
+//   実害: Managed Storage ポリシー（gas_url / gas_url_map）が未配布の端末では
+//         resolveGasUrl() が '' を返し、initializeClient() が無言で同期を諦め、
+//         maybeSync() も keepaliveActive=false / idleDriftUntil=0 で早期 return していた。
+//         その結果、端末は一度も送信せず assigned_gas_url も永久に未確定のままとなり、
+//         子GASの実行数がゼロ（＝予約も規制も一切届かない）状態になった。
+//   ここでは
+//     ① 初回はガード（keepalive/猶予）に関係なく必ず 1 回送る
+//     ② 送信先が既定の親URLへフォールバックする（無言で空にしない）
+//     ③ 親が返した assigned_gas_url が保存され、以後の送信先になる
+//     ④ 初回ハートビート応答に schedules と assigned_gas_url が同居する
+//   を実挙動で固定する。
+console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
+{
+  const vmMod = require('vm');
+  const bgSrc = fs.readFileSync('/home/user/webapp/extension/background.js', 'utf8');
+
+  function bgExtract(name) {
+    const re = new RegExp('^(?:async\\s+)?function ' + name + '\\s*\\(', 'm');
+    const start = bgSrc.search(re);
+    if (start < 0) throw new Error('bg fn not found: ' + name);
+    let i = bgSrc.indexOf('{', start), depth = 0, end = -1;
+    for (; i < bgSrc.length; i++) {
+      if (bgSrc[i] === '{') depth++;
+      else if (bgSrc[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    return bgSrc.slice(start, end + 1);
+  }
+
+  const PARENT = 'https://script.google.com/macros/s/PARENT_EXEC/exec';
+  const CHILD = 'https://script.google.com/macros/s/CHILD_51_EXEC/exec';
+
+  function buildBg(o) {
+    o = o || {};
+    const clock = { now: o.now || 1000000 };
+    const store = Object.assign({}, o.store || {});
+    const sets = [], syncs = [];
+    const sandbox = {
+      console: { log: function () {}, warn: function () {} },
+      JSON: JSON, String: String, Object: Object, Array: Array, Number: Number,
+      Boolean: Boolean, Math: Math, RegExp: RegExp, Error: Error, Promise: Promise,
+      Date: { now: function () { return clock.now; } },
+      chrome: {
+        storage: {
+          local: {
+            get: function () { return Promise.resolve(Object.assign({}, store)); },
+            set: function (patch) {
+              sets.push(Object.assign({}, patch));
+              Object.assign(store, patch);
+              return Promise.resolve();
+            }
+          }
+        }
+      },
+      syncWithGas: function () { syncs.push(clock.now); return Promise.resolve(); },
+      clearIdleDriftAlarm: function () {}
+    };
+    vmMod.createContext(sandbox);
+    const pre =
+      'const ACTIVE_SYNC_MS = 1500;\n' +
+      'const IDLE_SYNC_MS = 0;\n' +
+      'const IDLE_DRIFT_MS = 1000;\n' +
+      'const SHARD_COOLDOWN_MS = 1800000;\n' +
+      'const DEFAULT_GAS_URL = ' + JSON.stringify(o.defaultGasUrl || '') + ';\n' +
+      'let keepaliveActive = ' + (o.keepaliveActive === true ? 'true' : 'false') + ';\n' +
+      'let activeIntervalMs = 1500;\n' +
+      'let idleDriftUntil = 0;\n' +
+      'let lastSyncMs = 0;\n' +
+      'let hasSyncedOnce = false;\n' +
+      'let shardAssignedCache = "";\n' +
+      'let shardFailCount = 0;\n';
+    const body = ['normalizeSchoolKey', 'resolveGasUrl', 'maybeSync',
+      'shardAssignedUrl', 'applyShardAssignment'].map(bgExtract).join('\n');
+    vmMod.runInContext(pre + body +
+      '\n__bg = { maybeSync: maybeSync, resolveGasUrl: resolveGasUrl,' +
+      ' applyAssign: applyShardAssignment };', sandbox);
+    return {
+      sandbox: sandbox, store: store, sets: sets, syncs: syncs,
+      at: function (v) { clock.now = v; }, __bg: sandbox.__bg
+    };
+  }
+
+  // ----------------------------------------------------------- ① 初回は必ず送る
+  const b1 = buildBg({ defaultGasUrl: PARENT, keepaliveActive: false });
+  b1.__bg.maybeSync(); // ← 初回ブートストラップの実挙動を測る
+  check('U1 管理ポリシー未配布・非稼働（教員コンソール未起動）でも初回の maybeSync で必ず 1 回送信する',
+    b1.syncs.length === 1, b1.syncs.length);
+  check('U2 送信先が既定の親GAS URLへフォールバックして確定する（無言の空文字にしない）',
+    b1.__bg.resolveGasUrl({}) === PARENT, b1.__bg.resolveGasUrl({}));
+
+  b1.at(1000000 + 60000);
+  b1.__bg.maybeSync();
+  check('U3 初回を終えた後は「非稼働＋猶予なし」で送らない（通信量は増やさない）',
+    b1.syncs.length === 1, b1.syncs.length);
+
+  // ----------------------------------------------------------- ② 既定URLが空のときの扱い
+  const b4 = buildBg({ defaultGasUrl: '' });
+  check('U4 既定URLが空なら空文字を返す（勝手に別のURLへ飛ばさない）',
+    b4.__bg.resolveGasUrl({}) === '');
+  check('U5 明示された gas_url は既定URLより優先する',
+    b4.__bg.resolveGasUrl({ gas_url: 'https://direct/exec' }) === 'https://direct/exec');
+
+  // ----------------------------------------------------------- ③ 無言停止しない（診断が必ず出る）
+  check('U6 URL未設定で終わる経路に no_gas_url の診断コードがある（無言停止の根絶）',
+    bgSrc.indexOf("'no_gas_url'") >= 0);
+  check('U7 initializeClient が URL 未設定時に警告と記録を行う',
+    /if \(initialGasUrl\)[\s\S]{0,600}?recordSyncDiag\(false, 'no_gas_url'/.test(bgSrc));
+  check('U8 resolveGasUrl の既定URL参照が単体検証でも落ちない（typeof ガード）',
+    /typeof DEFAULT_GAS_URL === 'string'/.test(bgSrc));
+
+  const maybeBody = bgExtract('maybeSync');
+  // コメント内の語ではなく「実際のガード文」の位置で判定する
+  check('U9 初回ブートストラップ判定が keepalive/猶予の判定より前にある',
+    (function () {
+      const boot = maybeBody.indexOf('if (!hasSyncedOnce)');
+      const gate = maybeBody.indexOf('if (keepaliveActive)');
+      return boot >= 0 && gate >= 0 && boot < gate;
+    })(), {
+      boot: maybeBody.indexOf('if (!hasSyncedOnce)'),
+      gate: maybeBody.indexOf('if (keepaliveActive)')
+    });
+
+  // ④ 保存 → 以後の送信先が子になる検証は、applyShardAssignment が async のため
+  //    直後の非同期ブロック（U22〜U24）で await して行う。
+}
+
+// --- 要件3-1 の後半（保存の確認）と 要件3-2（初回ハートビート）は非同期のため別ブロックで実行 ---
+(async function () {
+  const vmMod = require('vm');
+  const bgSrc = fs.readFileSync('/home/user/webapp/extension/background.js', 'utf8');
+
+  function bgExtract(name) {
+    const re = new RegExp('^(?:async\\s+)?function ' + name + '\\s*\\(', 'm');
+    const start = bgSrc.search(re);
+    if (start < 0) throw new Error('bg fn not found: ' + name);
+    let i = bgSrc.indexOf('{', start), depth = 0, end = -1;
+    for (; i < bgSrc.length; i++) {
+      if (bgSrc[i] === '{') depth++;
+      else if (bgSrc[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    return bgSrc.slice(start, end + 1);
+  }
+
+  const PARENT = 'https://script.google.com/macros/s/PARENT_EXEC/exec';
+  const CHILD = 'https://script.google.com/macros/s/CHILD_51_EXEC/exec';
+
+  function buildBg(o) {
+    o = o || {};
+    const store = Object.assign({}, o.store || {});
+    const sets = [];
+    const sandbox = {
+      console: { log: function () {}, warn: function () {} },
+      JSON: JSON, String: String, Object: Object, Array: Array, Number: Number,
+      Boolean: Boolean, Math: Math, RegExp: RegExp, Error: Error, Promise: Promise,
+      Date: { now: function () { return o.now || 1000000; } },
+      chrome: {
+        storage: {
+          local: {
+            get: function () { return Promise.resolve(Object.assign({}, store)); },
+            set: function (patch) {
+              sets.push(Object.assign({}, patch));
+              Object.assign(store, patch);
+              return Promise.resolve();
+            }
+          }
+        }
+      },
+      syncWithGas: function () { return Promise.resolve(); },
+      clearIdleDriftAlarm: function () {}
+    };
+    vmMod.createContext(sandbox);
+    const pre =
+      'const ACTIVE_SYNC_MS = 1500;\n' +
+      'const IDLE_SYNC_MS = 0;\n' +
+      'const IDLE_DRIFT_MS = 1000;\n' +
+      'const SHARD_COOLDOWN_MS = 1800000;\n' +
+      'const DEFAULT_GAS_URL = ' + JSON.stringify(o.defaultGasUrl || '') + ';\n' +
+      'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\n' +
+      'let idleDriftUntil = 0;\nlet lastSyncMs = 0;\nlet hasSyncedOnce = false;\n' +
+      'let shardAssignedCache = "";\nlet shardFailCount = 0;\n';
+    const body = ['normalizeSchoolKey', 'resolveGasUrl', 'maybeSync',
+      'shardAssignedUrl', 'applyShardAssignment'].map(bgExtract).join('\n');
+    vmMod.runInContext(pre + body +
+      '\n__bg = { maybeSync: maybeSync, resolveGasUrl: resolveGasUrl,' +
+      ' applyAssign: applyShardAssignment };', sandbox);
+    return { sandbox: sandbox, store: store, sets: sets, __bg: sandbox.__bg };
+  }
+
+  // ================================================================
+  // GAS 側: 初回ハートビートの応答（schedules ＋ assigned_gas_url）
+  // ================================================================
+  const U_FNS = [
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'normalizeClassName', 'normalizeSchoolName', 'schoolNamesMatch',
+    'deviceMatchesSchedule_', 'emptySchedulePayload_',
+    'shardLoadScheduleCache_', 'shardSchedulePayloadFromCache_',
+    'schPad2_', 'schMsToJstStr_',
+    'propRaw', 'propBool', 'cfgWarn',
+    'shardHash', 'shardWarnOnce',
+    'shardDetectChildByInbox_', 'isShardChild', 'resolveSchedulePayloadForDevice_',
+    'normalizeShardClass', 'shardMapIndexFromMap', 'shardMapDefaultFromEmptyKey',
+    'resolveShardForHeartbeat'
+  ];
+  const U_NOW = Date.UTC(2026, 10, 10, 3, 2, 30); // 11/10 12:02:30 JST
+  const U_EMAIL = '1607002@city-mimasaka.ed.jp';
+  const U_LOCAL = '1607002';
+
+  function buildU(o) {
+    o = o || {};
+    const store = {};
+    const props = o.props || {};
+    Object.keys(props).forEach(function (k) { store[k] = String(props[k]); });
+    if (o.byStudent) {
+      store['SHARD_SCHEDULES_CACHE'] = JSON.stringify({ updated_ms: U_NOW, by_student: o.byStudent });
+    }
+    const memo = {};
+    const logs = [];
+    const sandbox = {
+      console: { log: function () {} },
+      Logger: { log: function (m) { logs.push(String(m)); } },
+      CONFIG: { SCHEDULE_HORIZON_DAYS: 14, SCHEDULE_MAX_ACTIVE: 5, SCHEDULE_MAX_WINDOWS: 20 },
+      SHEET_TZ_OFFSET_MS: 9 * 60 * 60 * 1000,
+      SHARD_SCHEDULES_PROP: 'SHARD_SCHEDULES_CACHE',
+      SHARD_SCHEDULES_MEMO_SEC: 30,
+      SHARD_SCHEDULES_MEMO_KEY: 'shard_sched_memo1',
+      PROP_SHARD_MODE: 'SHARD_MODE',
+      PROP_SHARD_CHILD_MODE: 'SHARD_CHILD_MODE',
+      PropertiesService: {
+        getScriptProperties: function () {
+          return {
+            getProperty: function (k) {
+              return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null;
+            },
+            setProperty: function (k, v) { store[k] = String(v); }
+          };
+        }
+      },
+      CacheService: {
+        getScriptCache: function () {
+          return {
+            get: function (k) { return Object.prototype.hasOwnProperty.call(memo, k) ? memo[k] : null; },
+            put: function (k, v) { memo[k] = String(v); },
+            remove: function (k) { delete memo[k]; }
+          };
+        }
+      },
+      // 明示設定なし（本物の shardModeFlags と同じ既定 false）
+      shardModeFlags: function () { return { parent: false, child: false }; },
+      isShardParent: function () { return o.isParent === true; },
+      shardConfigCached: function () {
+        return { map: o.map || {}, def: o.def || '', sec: 'sk_test' };
+      },
+      buildSchedulePayloadForDevice_: function () {
+        logs.push('__PARENT_PATH_CALLED__');
+        return { active: [], upcoming: [], overridden_ids: [] };
+      }
+    };
+    const srcU = U_FNS.map(function (n) { return extractFn(n); }).join('\n');
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(srcU +
+      '\n__U = { resolve: resolveSchedulePayloadForDevice_, assign: resolveShardForHeartbeat };', sandbox);
+    return { sandbox: sandbox, logs: logs, store: store, __U: sandbox.__U };
+  }
+
+  function recU(id) {
+    return {
+      windows: [{
+        id: 'sch_' + id, type: 'screen_lock', filter_mode: '',
+        whitelist: ['allow.example'], blacklist: ['game.example'],
+        start_ms: U_NOW - 600000, end_ms: U_NOW + 600000
+      }],
+      overridden_ids: []
+    };
+  }
+
+  // ----------------------------------------------------------- ⑤ 子GAS: 初回で schedules が返る
+  const c1 = buildU({ byStudent: (function () { const m = {}; m[U_EMAIL] = recU('a'); return m; })() });
+  const pl1 = c1.__U.resolve(U_EMAIL, '5-1', '第一小学校', U_NOW);
+  check('U10 子GASの初回ハートビートで schedules.active が 1 件返る（空配列を返さない）',
+    !!pl1 && Array.isArray(pl1.active) && pl1.active.length === 1, pl1 && pl1.active.length);
+  check('U11 その窓は配信元の予約IDを保持している（取り違えていない）',
+    !!pl1 && pl1.active[0] && pl1.active[0].id === 'sch_a', pl1 && pl1.active[0] && pl1.active[0].id);
+  check('U12 初回で親用ロジックへ落ちていない（子シート直読みをしていない）',
+    c1.logs.indexOf('__PARENT_PATH_CALLED__') < 0, c1.logs);
+
+  const c2 = buildU({ byStudent: (function () { const m = {}; m[U_EMAIL] = recU('b'); return m; })() });
+  const pl2 = c2.__U.resolve(U_LOCAL, '5-1', '第一小学校', U_NOW);
+  check('U13 端末がローカル部だけを送っても初回から配信される（表記ゆれで空にしない）',
+    !!pl2 && pl2.active.length === 1 && pl2.active[0].id === 'sch_b', pl2 && pl2.active.length);
+
+  check('U14 子GASは自分に割り当てを返さない（resolveShardForHeartbeat は {}）',
+    (function () {
+      const r = c1.__U.assign(U_EMAIL, '5-1');
+      return r && typeof r === 'object' && !r.assigned_gas_url;
+    })());
+
+  // ----------------------------------------------------------- ⑥ 親GAS: assigned_gas_url の確定
+  const p1 = buildU({
+    isParent: true,
+    map: { '5年1組': CHILD, '6年1組': 'https://script.google.com/macros/s/CHILD_61_EXEC/exec' }
+  });
+  const as1 = p1.__U.assign(U_EMAIL, '５年１組'); // 全角で届いても一致させる
+  check('U15 親GASが初回ハートビートで assigned_gas_url を返す（端末が子へ移れる）',
+    !!as1 && as1.assigned_gas_url === CHILD, as1);
+  check('U16 併せて正規化済みの assigned_class を返す',
+    !!as1 && as1.assigned_class === '5-1', as1 && as1.assigned_class);
+  check('U17 SHARD_MODE 有効を明示して返す', !!as1 && as1.shard_mode === true);
+
+  const p2 = buildU({ isParent: true, map: { '': 'https://script.google.com/macros/s/DEFAULT_EXEC/exec' } });
+  const as2 = p2.__U.assign(U_EMAIL, '3年2組');
+  check('U18 未知クラスは空キーの既定URLへ割り当てる（端末を止めない）',
+    !!as2 && as2.assigned_gas_url === 'https://script.google.com/macros/s/DEFAULT_EXEC/exec', as2);
+
+  const p3 = buildU({ isParent: true, map: {}, def: 'https://script.google.com/macros/s/DEF_EXEC/exec' });
+  const as3 = p3.__U.assign(U_EMAIL, '3年2組');
+  check('U19 既定URL（SHARD_DEFAULT_URL）にも割り当てる',
+    !!as3 && as3.assigned_gas_url === 'https://script.google.com/macros/s/DEF_EXEC/exec', as3);
+
+  const p4 = buildU({ isParent: true, map: {}, def: '' });
+  const as4 = p4.__U.assign(U_EMAIL, '3年2組');
+  check('U20 どこにも繋げないときは空応答（親のまま動かし、端末を止めない）',
+    !!as4 && typeof as4 === 'object' && !as4.assigned_gas_url, as4);
+
+  // ----------------------------------------------------------- ⑦ 応答合成 → 保存 → 以後の送信先
+  const combined = Object.assign({ success: true }, { schedules: pl1 }, as1);
+  check('U21 ハートビート応答に schedules と assigned_gas_url が同居する（1往復で完結）',
+    !!combined.schedules && combined.schedules.active.length === 1 &&
+    combined.assigned_gas_url === CHILD, { a: combined.schedules.active.length, u: combined.assigned_gas_url });
+
+  const b21 = buildBg({ defaultGasUrl: PARENT, store: {} });
+  await b21.__bg.applyAssign(combined, {}, PARENT, true);
+  check('U22 端末が受けた assigned_gas_url を保存する（assigned_gas_url 未確定の解消）',
+    b21.store.assigned_gas_url === CHILD, b21.store.assigned_gas_url);
+  check('U23 保存と同時に assigned_from（どの親から教わったか）も残す',
+    b21.store.assigned_from === PARENT, b21.store.assigned_from);
+  check('U24 同期後の resolveGasUrl は子GASを最優先で返す（以後は子へ直行）',
+    b21.__bg.resolveGasUrl(Object.assign({}, b21.store)) === CHILD,
+    b21.__bg.resolveGasUrl(Object.assign({}, b21.store)));
+
+  // ----------------------------------------------------------- ⑧ 到達の可観測化（doGet/doPost 冒頭ログ）
+  const doGetBody = extractFn('doGet');
+  check('U25 doGet は受け取った時点で received(GET) を必ず記録する',
+    doGetBody.indexOf('received(GET)') >= 0);
+  check('U26 received(GET) のログが heartbeat 分岐より前にある（分岐に入らなくても到達が分かる）',
+    doGetBody.indexOf('received(GET)') >= 0 &&
+    doGetBody.indexOf('received(GET)') < doGetBody.indexOf("api === 'heartbeat'"));
+  const doPostBody = extractFn('doPost');
+  check('U27 doPost は本文形式・パラメータ形式を問わず received(POST) を必ず記録する',
+    doPostBody.indexOf('received(POST)') >= 0);
+  check('U28 received(POST) のログが action 分岐より前にある',
+    doPostBody.indexOf('received(POST)') >= 0 &&
+    doPostBody.indexOf('received(POST)') < doPostBody.indexOf("action === 'heartbeat'"));
+  check('U29 student_id 未設定を無言で返さない（端末側の設定不良を記録する）',
+    doPostBody.indexOf('student_id 未設定') >= 0);
+
+  console.log('');
+  console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
+  process.exit(fail > 0 ? 1 : 0);
+})().catch(function (e) {
+  console.log('FAIL U セクションの実行に失敗しました => ' + String((e && e.message) || e));
+  console.log('');
+  console.log('===== 結果: PASS=' + pass + ' FAIL=' + (fail + 1) + ' =====');
+  process.exit(1);
+});

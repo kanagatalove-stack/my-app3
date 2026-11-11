@@ -50,7 +50,7 @@ const syncCount = () => calls.filter(c=>c.sync).length;
 vm.createContext(ctx);
 vm.runInContext(
   'const ACTIVE_SYNC_MS = 1500;\nconst IDLE_SYNC_MS = 0;\nconst IDLE_DRIFT_MS = 1000;\nconst IDLE_DRIFT_ALARM_MIN = 5/60;\n' +
-  'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\nlet idleDriftUntil = 0;\nlet lastSyncMs = 0;\n' +
+  'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\nlet idleDriftUntil = 0;\nlet lastSyncMs = 0;\nlet hasSyncedOnce = false;\n' +
   extract('maybeSync') + '\n' + extract('ensureSyncLoop') + '\n' + extract('stopSyncLoop') +
   '\n' + extract('scheduleIdleDrift') + '\n' + extract('clearIdleDriftAlarm') +
   '\n__sync=maybeSync; __ensure=ensureSyncLoop; __stop=stopSyncLoop;' +

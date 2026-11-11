@@ -6,6 +6,14 @@
  * ・ロック解除の全タブ高速反映
  */
 
+// 【ブートストラップ用】親GASの Web アプリ URL（/exec）。
+//   Managed Storage ポリシー（gas_url / gas_url_map）が未配布の端末でも、
+//   ここに親の /exec を入れておけば初回同期が成立し、親が assigned_gas_url を
+//   返して以降は子GASへ直接つながる（1校240台を子GASへ分散する R41 構成の入口）。
+//   ※ 空のままなら端末は通信できない。その事実は sync_diag とコンソールへ
+//     必ず出す（無言で停止させない）。
+const DEFAULT_GAS_URL = '';
+
 // デフォルト設定
 const DEFAULT_CONFIG = {
   student_id: '',
@@ -150,9 +158,24 @@ const IDLE_SYNC_MS = 0;         // 非稼働時は定期ポーリングをしな
 const IDLE_DRIFT_MS = 1000;     // 猶予期間中の再確認レート上限（1 秒）
 const IDLE_DRIFT_ALARM_MIN = 5 / 60; // 猶予期間中の再確認アラーム周期（5 秒）
 let lastSyncMs = 0;
+// 【初回ブートストラップの番人】この Service Worker の生存期間で
+//   「一度でも送信を試みたか」。false の間は稼働判定をバイパスして必ず1回送る。
+let hasSyncedOnce = false;
 
 function maybeSync() {
   const now = Date.now();
+
+  // 【初回ブートストラップ】未同期の端末は keepaliveActive / idleDrift の判定より
+  //   先に「必ず1回」送る。教員コンソールを閉じていても、ここで親GASから
+  //   assigned_gas_url を取得しないと、以後の子GASへのハートビートが永久に
+  //   始まらない（実機で「子GASの実行数がゼロ」になった正体）。
+  if (!hasSyncedOnce) {
+    hasSyncedOnce = true;
+    lastSyncMs = now;
+    syncWithGas();
+    return;
+  }
+
   let interval;
   if (keepaliveActive) {
     interval = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
@@ -582,7 +605,18 @@ async function initializeClient() {
 
     // GAS URLが設定されていれば即座に自動同期を実行！
     if (initialGasUrl) {
+      hasSyncedOnce = true; // 初回同期を実行済み（maybeSync の二重発火を防ぐ）
       await syncWithGas();
+    } else {
+      // 【無言停止の根絶】URL が無い＝端末は1件も送信できない。
+      //   旧実装はここで何も出さずに終わっていたため、
+      //   「実行数ゼロ・エラーも出ない」という最悪の切り分け不能状態になった。
+      console.warn('[EduAgent] GAS WebアプリURLが未設定のため同期できません。'
+        + ' 管理ポリシーの gas_url / gas_url_map を配布するか、'
+        + ' background.js の DEFAULT_GAS_URL に親GASの /exec を設定してください。');
+      await recordSyncDiag(false, 'no_gas_url',
+        'GAS WebアプリURLが未設定です（管理ポリシーの gas_url / gas_url_map、'
+        + ' または background.js の DEFAULT_GAS_URL を設定してください）');
     }
 
     // 【フェーズ3】保存済みの予約から制限状態と境界アラームを復元する。
@@ -695,7 +729,13 @@ function resolveGasUrl(data) {
       }
     }
   }
-  return direct;
+  // 4) 最後の砦: 埋め込みの既定（親GASの /exec）。
+  //   Managed Storage ポリシー未配布の端末はここが唯一の通信先になる。
+  //   これが空だと端末は1件も送信できないため、呼び出し側で必ず診断を残す。
+  //   typeof ガードは、この関数だけを単体で切り出して検証するテスト環境
+  //   （DEFAULT_GAS_URL を注入しない sandbox）でも ReferenceError にしないため。
+  const embedded = (typeof DEFAULT_GAS_URL === 'string') ? DEFAULT_GAS_URL.trim() : '';
+  return direct || embedded;
 }
 
 // ==================== 子GAS分散（SHARD_MODE）: 動的ルーティング ====================

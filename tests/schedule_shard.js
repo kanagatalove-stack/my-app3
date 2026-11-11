@@ -179,9 +179,27 @@ const CacheService = {
   }
 };
 
+// 【時刻固定】expandScheduleWindows_ は実時刻で窓を切り詰める
+//   （lo = max(開始日, now-1日) / hi = min(終了日, now+horizon)）。
+//   予約フィクスチャは 2026/11/10 前提のため、実時刻が 11/11 に進むと
+//   hi < lo となり窓が 0 件になる（テストが期限切れで静かに壊れる）。
+//   実行日に関係なく同じ結果になるよう、実 Date を継承した最小サブクラスで固定する。
+const PINNED_NOW_MS = Date.UTC(2026, 10, 10, 10, 0, 0); // 2026/11/10 19:00 JST
+function makePinnedDate(pinnedMs) {
+  class PinnedDate extends Date {
+    constructor(...args) {
+      if (args.length === 0) super(pinnedMs);
+      else super(...args);
+    }
+    static now() { return pinnedMs; }
+  }
+  return PinnedDate;
+}
+
 const ctx = vm.createContext({
   console: { log() {} },
   Logger: { log() {} },
+  Date: makePinnedDate(PINNED_NOW_MS),
   PropertiesService,
   CacheService,
   __SHEETS: sheets,

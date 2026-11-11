@@ -884,6 +884,13 @@ function doGet(e) {
   try {
     const params = (e && e.parameter) || {};
     const api = params.api || '';
+    // 【可観測性】受け取った時点で必ずログを残す。
+    //   「端末が本当に届いているのか」を実行ログだけで100%判定できるようにする。
+    try {
+      Logger.log('[SHARD] heartbeat: received(GET) api=' + String(api || '(none)') +
+        ' student_id=' + String(params.student_id || '(none)') +
+        ' keys=' + Object.keys(params || {}).length);
+    } catch (eRcv) {}
 
     // 1. 児童拡張機能からのハートビート (GET対応)
     if (api === 'heartbeat' || api === 'get_settings') {
@@ -948,11 +955,25 @@ function doPost(e) {
 
     const action = payload.action || payload.api;
 
+    // 【可観測性】受け取った時点で必ずログを残す（本文形式・パラメータ形式を問わない）。
+    //   実機では「子GASの実行数が完全にゼロ」で原因を切り分けられなかったため、
+    //   到達の有無を1行で判別できるようにする。
+    try {
+      Logger.log('[SHARD] heartbeat: received(POST) action=' + String(action || '(none)') +
+        ' student_id=' + String(payload.student_id || '(none)') +
+        ' keys=' + Object.keys(payload || {}).length +
+        ' postData=' + !!(e && e.postData));
+    } catch (eRcvP) {}
+
     // A. 児童拡張機能からのハートビート (認証不要・student_id必須)
     if (action === 'heartbeat') {
       const studentId = payload.student_id;
       const currentUrl = payload.current_url || '';
-      if (!studentId) return jsonResponse({ success: false, error: 'student_id is required' });
+      if (!studentId) {
+        // 端末は届いているが ID が無い＝設定不良。無言で返さず理由を残す。
+        try { Logger.log('[SHARD] heartbeat: student_id 未設定のため配信できません（端末側の児童ID設定を確認）'); } catch (eNoId) {}
+        return jsonResponse({ success: false, error: 'student_id is required' });
+      }
       const hb = processHeartbeat(studentId, currentUrl, payload.school_name);
       // 子GAS分散（SHARD_MODE）: 親は端末のクラスから「子GAS URL」を解決して返す。
       // 親でない場合 resolveShardForHeartbeat は {} を返すため、応答は従来と完全に同一。
