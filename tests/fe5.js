@@ -101,4 +101,29 @@ run('自動更新の抑止（refreshSuppressedUntil）中は静かな更新を�
   return { suppressed:calls===0, skipped };
 });
 
+// ===== 楽観更新保護（optimisticGuard）との整合 =====
+//   fe18 が本丸（先祖返りしないこと）を実挙動で固定する。
+//   ここでは「loadSeq による応答破棄」と「楽観更新保護」が同じ競合対策として
+//   共存していること＝片方を直したときにもう片方が外れていないことを確かめる。
+console.log('===== 競合対策: 楽観更新保護（optimisticGuard）との共存 =====');
+run('保護レジストリ optimisticGuard が宣言されている', ()=>{
+  return { declared: /let\s+optimisticGuard\s*=\s*\{\s*\}/.test(code), hasArm: /function\s+armOptimisticGuard/.test(code) };
+});
+run('loadDevices は devicesData 差し替えの前に保護と突き合わせる', ()=>{
+  const start = code.search(/async\s+function\s+loadDevices\s*\(/);
+  let i = code.indexOf('{', start), depth = 0, end = -1;
+  for (; i < code.length; i++) { if (code[i] === '{') depth++; else if (code[i] === '}') { depth--; if (depth === 0) { end = i; break; } } }
+  const body = code.slice(start, end + 1);
+  const rec = body.indexOf('reconcileOptimisticGuard');
+  const asg = body.indexOf('devicesData = ');
+  return { reconcilesFirst: rec !== -1 && asg !== -1 && rec < asg };
+});
+run('runMutation が操作開始時に世代を進める（loadSeq++）', ()=>{
+  const start = code.search(/function\s+runMutation\s*\(/);
+  let i = code.indexOf('{', start), depth = 0, end = -1;
+  for (; i < code.length; i++) { if (code[i] === '{') depth++; else if (code[i] === '}') { depth--; if (depth === 0) { end = i; break; } } }
+  const body = code.slice(start, end + 1);
+  return { bumpsSeq: /loadSeq\+\+/.test(body) };
+});
+
 setTimeout(()=>{ console.log(`\n===== 結果: PASS=${pass} FAIL=${fail} =====`); process.exit(fail?1:0); }, 50);

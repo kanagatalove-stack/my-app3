@@ -2918,6 +2918,82 @@
     let loadSeq = 0;
     let refreshSuppressedUntil = 0;
 
+    // ==================== 楽観更新保護（ロールバックバウンス対策） ====================
+    //
+    // 【実機症状】ロック解除を押すと即座に「解除中」になるのに、約5秒後に勝手に
+    //   「ロック中」へ先祖返りし、さらに約15秒後にようやく「解除中」で落ち着く。
+    //   URL規制の実行・解除でも同じ。つまり「楽観更新 → 古い応答で上書き →
+    //   本当の応答で復帰」という往復（バウンス）が起きていた。
+    //
+    // 【原因】操作直後も 5 秒間隔の自動更新（startAutoRefresh → loadDevices(true)）が
+    //   止まらない。下の loadSeq は「新しい取得が始まったら古い応答を捨てる」だけで、
+    //   「その応答が【操作より前】に発行されたか」を見ていない。さらにサーバー応答は
+    //   GAS /exec のリダイレクトで 3.8 秒かかるため、操作前に発行された取得が
+    //   操作後に結果を返し、devicesData を丸ごと差し替えて楽観更新を消していた。
+    //   apply は devicesData を直接ミューテートするが、代入で配列ごと入れ替わるため
+    //   楽観更新の痕跡は残らず、「期待値」を別に持っていないので検知もできなかった。
+    //   （refreshSuppressedUntil という抑止の器はあったが、未来時刻で武装された箇所が
+    //     1つも無く、実質デッドコードだった。成功時に 0 へ戻す処理だけが残っていた。）
+    //
+    // 【対策：二段構え】片方だけでは防げないため両方入れる。
+    //   ① optimisticGuard … 児童ID × フィールドごとに「期待値」と「保護期限」を持ち、
+    //      期限内にサーバーから【古い値】が来たら上書きをスキップして楽観値を守る。
+    //      サーバーが期待値と一致した時点でそのフィールドの保護を解除する（＝値の防衛）。
+    //   ② loadSeq++（世代飛ばし）… 操作開始時に世代を進め、操作前に発行された
+    //      取得の応答そのものを破棄する（＝到着の遮断）。
+    //
+    //   保護期限は必ず切れる（期限切れで保護を捨ててサーバー値に従う）ので、
+    //   サーバー側が異常に古いままでも永久に画面が固まることはない。
+    const OPTIMISTIC_GUARD_MS = 12000;   // 保護期間（要件1の 10〜15 秒の範囲内）
+    let optimisticGuard = {};            // { studentId: { field: { expect, until } } }
+
+    // 操作の対象児童について「期待する最新状態」を記録する。
+    //   ids   : ['a1','a2'] のような児童IDの配列
+    //   patch : { screen_lock:false } / { filter_mode:'OFF' } / { broadcast_url:url }
+    function armOptimisticGuard(ids, patch) {
+      const fields = Object.keys(patch || {});
+      if (!fields.length) return;
+      const until = Date.now() + OPTIMISTIC_GUARD_MS;
+      (ids || []).forEach(function (id) {
+        if (!id) return;
+        const cur = optimisticGuard[id] || (optimisticGuard[id] = {});
+        fields.forEach(function (field) {
+          cur[field] = { expect: patch[field], until: until };
+        });
+      });
+    }
+
+    // 保護を明示的に解除する（通信失敗で revert したときなど）。
+    //   revert 後は画面もサーバーも「操作前」に戻るので、保護を残すと
+    //   以後の正当な更新までブロックしてしまう。必ず一緒に消す。
+    function clearOptimisticGuard(ids) {
+      (ids || []).forEach(function (id) {
+        if (id) delete optimisticGuard[id];
+      });
+    }
+
+    // サーバー応答の1件を保護レジストリと突き合わせ、必要なら値を書き換える。
+    //   ・期待値と一致        → 反映済み。保護を解除して以後は素直に従う
+    //   ・期限内かつ古い値    → 上書きをスキップ（楽観値を押し戻す）
+    //   ・期限切れ            → 保護を捨ててサーバー値に従う（永久に固まらせない）
+    function reconcileOptimisticGuard(dev) {
+      if (!dev || !dev.student_id) return;
+      const g = optimisticGuard[dev.student_id];
+      if (!g) return;
+      const now = Date.now();
+      Object.keys(g).forEach(function (field) {
+        const e = g[field];
+        if (!e) return;
+        if (now > e.until) { delete g[field]; return; }              // 期限切れ → 諦める
+        if (String(dev[field]) === String(e.expect)) {               // 一致 → 解除
+          delete g[field];
+        } else {
+          dev[field] = e.expect;                                     // 古い → 楽観値を維持
+        }
+      });
+      if (Object.keys(g).length === 0) delete optimisticGuard[dev.student_id];
+    }
+
     // 端末データの取得
     async function loadDevices(isSilent = false) {
       // 一括操作直後の自動更新は、サーバー反映が完了するまで抑止する
@@ -2949,7 +3025,16 @@
         if (mySeq !== loadSeq) return;
 
         if (res && Array.isArray(res.data)) {
-          devicesData = res.data;
+          // 【ロールバックバウンス対策】届いた配列を採用する前に、保護期間内の
+          //   児童について「サーバー値がまだ操作前のままか」を突き合わせる。
+          //   まだ古ければ楽観更新の値を書き戻してから採用する（要件1）。
+          //   これにより児童行・集計カード・クラスチップ（同じ devicesData から
+          //   描かれる3面すべて）が同時に守られる。
+          const incoming = res.data;
+          try {
+            incoming.forEach(function (dev) { reconcileOptimisticGuard(dev); });
+          } catch (eG) {}
+          devicesData = incoming;
           updateClassFilterOptions();
           renderDevices();
           updateStatistics();
@@ -4626,6 +4711,14 @@
       const seq = ++mutationSeq;
       let applied = false;
 
+      // 【要件2】操作開始の時点で世代を進め、これ以前に発行された loadDevices の
+      //   応答をすべて無効化する。自動更新は操作後も 5 秒間隔で走り続けるため、
+      //   これをしないと「操作前に発行された取得」が操作後に結果を返し、
+      //   楽観更新を古い状態で上書きしてしまう（＝先祖返りの直接原因）。
+      //   loadDevices 側は `mySeq !== loadSeq` で自分の応答を捨てるので、
+      //   ここで 1 進めるだけで、既に飛んでいる取得はすべて破棄される。
+      try { loadSeq++; } catch (eSeq) {}
+
       // 1) 楽観的UI（押下と同値・0.1秒以内）
       if (typeof o.apply === 'function') {
         try { o.apply(); applied = true; } catch (e) {}
@@ -4650,6 +4743,9 @@
         if (applied && typeof o.revert === 'function') {
           try { o.revert(); } catch (e) {}
         }
+        // revert した以上、期待値はもう正しくない。保護を残すと以後の
+        // 正当なサーバー更新までブロックしてしまうので必ず一緒に解除する。
+        try { if (o.guardIds) clearOptimisticGuard(o.guardIds); } catch (e) {}
         const m0 = (eStart && eStart.message) ? eStart.message : String(eStart);
         try { showToast((o.errorPrefix || 'エラー') + ': ' + m0, 'error'); } catch (e) {}
         if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
@@ -4677,6 +4773,8 @@
         if (applied && typeof o.revert === 'function') {
           try { o.revert(); } catch (e) {}
         }
+        // ロールバックしたので保護も解除する（残すと以後の更新を誤って拒む）
+        try { if (o.guardIds) clearOptimisticGuard(o.guardIds); } catch (e) {}
         refreshSuppressedUntil = 0;
         const msg = (err && err.message) ? err.message : String(err);
         try { showToast((o.errorPrefix || '通信失敗') + ': ' + msg, 'error'); } catch (e) {}
@@ -4759,10 +4857,15 @@
         try { refreshDeviceViews(); } catch (e) {}
       };
 
+      // 【保護】この操作の対象児童について「あるべき状態」を記録する。
+      //   以後 12 秒間、サーバーから操作前の値が届いても上書きさせない。
+      armOptimisticGuard(ids, { screen_lock: !!locked });
+
       await runMutation({
         payload: { action: 'bulk_lock', student_ids: ids, locked: locked },
         apply: () => applyOptimisticLock(locked),
         revert: revertOptimisticLock,
+        guardIds: ids,
         successMessage: `画面ロックを ${locked ? 'ON' : 'OFF'} にしました`,
         errorPrefix: 'エラー',
         busy: true,
@@ -4791,12 +4894,14 @@
       // 【R37】個別操作も一括とまったく同じ経路（/exec 直接 fetch +
       //   楽観的UI + ビーコン0ms並列 + バックグラウンド継続）に統一する。
       const prevLock = dev ? !!dev.screen_lock : false;
+      armOptimisticGuard([studentId], { screen_lock: !!newLockState });
       await runMutation({
         payload: {
           action: 'update_single',
           student_id: studentId,
           data: { screen_lock: newLockState }
         },
+        guardIds: [studentId],
         apply: () => {
           const d = devicesData.find(x => x.student_id === studentId);
           if (d) d.screen_lock = !!newLockState;
@@ -4855,6 +4960,7 @@
         const d = devicesData.find(x => x.student_id === id);
         if (d) prevUrls[id] = d.broadcast_url || '';
       });
+      armOptimisticGuard(ids, { broadcast_url: url });
       await runMutation({
         payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
         apply: () => {
@@ -4871,6 +4977,7 @@
           });
           try { refreshDeviceViews(); } catch (e) {}
         },
+        guardIds: ids,
         successMessage: 'URLを配信しました',
         errorPrefix: '配信エラー',
         refreshDelay: 1500
@@ -5060,6 +5167,8 @@
         const d = devicesData.find(x => x.student_id === id);
         if (d) prevModes[id] = d.filter_mode || '';
       });
+      // 【保護】URL規制の実行も解除（mode==='OFF'）も、あるべき状態を記録する。
+      armOptimisticGuard(ids, { filter_mode: mode });
       await runMutation({
         payload: {
           action: 'bulk_filter',
@@ -5068,6 +5177,7 @@
           whitelist_urls: whitelist,
           blacklist_urls: blacklist
         },
+        guardIds: ids,
         apply: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
@@ -5353,6 +5463,7 @@
         const d = devicesData.find(x => x.student_id === id);
         if (d) prevUrlsQuick[id] = d.broadcast_url || '';
       });
+      armOptimisticGuard(ids, { broadcast_url: url });
       await runMutation({
         payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
         apply: () => {
@@ -5371,6 +5482,7 @@
           });
           try { refreshDeviceViews(); } catch (e) {}
         },
+        guardIds: ids,
         successMessage: `「${title || url}」を配信しました`,
         errorPrefix: '配信エラー',
         refreshDelay: 1500
