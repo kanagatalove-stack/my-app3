@@ -4263,6 +4263,24 @@
       document.getElementById('statFiltered').textContent = filtered;
     }
 
+    // 【表示同期】端末データを描く「3つの面」を必ず一緒に更新する共通ヘルパー。
+    //   端末一覧の各行（renderDevices）と上部の集計カード（updateStatistics）に加え、
+    //   クラスチップ（updateClassFilterOptions → renderClassChips）も同時に描き直す。
+    //
+    //   これが無いと、ロック／URL規制を押した瞬間は行と集計だけが楽観更新され、
+    //   クラスチップの🔒・🛡バッジは次回の全件再取得（1.5秒後の遅延 + GAS 応答待ち）
+    //   まで古いまま残る。実機で「児童の行はすぐ変わるのに、クラスの表示だけ遅れる」
+    //   と見えていた正体がこれ。
+    //
+    //   ※ 選択状態は selectedClasses / selectedStudentIds（モジュール変数）が正であり、
+    //     再描画時にその集合から checked を組み立て直すため、チップのチェック状態や
+    //     選択中の児童がこの再描画で崩れることはない。
+    function refreshDeviceViews() {
+      try { renderDevices(); } catch (e) {}
+      try { updateStatistics(); } catch (e) {}
+      try { updateClassFilterOptions(); } catch (e) {}
+    }
+
     function formatRelativeTime(dateStr) {
       if (!dateStr) return '-';
       const dt = new Date(dateStr);
@@ -4731,14 +4749,14 @@
           const d = devicesData.find(x => x.student_id === id);
           if (d) d.screen_lock = state;
         });
-        try { renderDevices(); updateStatistics(); } catch (e) {}
+        try { refreshDeviceViews(); } catch (e) {}
       };
       const revertOptimisticLock = () => {
         ids.forEach(id => {
           const d = devicesData.find(x => x.student_id === id);
           if (d && Object.prototype.hasOwnProperty.call(prevLocks, id)) d.screen_lock = prevLocks[id];
         });
-        try { renderDevices(); updateStatistics(); } catch (e) {}
+        try { refreshDeviceViews(); } catch (e) {}
       };
 
       await runMutation({
@@ -4782,12 +4800,12 @@
         apply: () => {
           const d = devicesData.find(x => x.student_id === studentId);
           if (d) d.screen_lock = !!newLockState;
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         revert: () => {
           const d = devicesData.find(x => x.student_id === studentId);
           if (d) d.screen_lock = prevLock;
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         successMessage: '画面ロック設定を更新しました',
         errorPrefix: '更新失敗',
@@ -4844,14 +4862,14 @@
             const d = devicesData.find(x => x.student_id === id);
             if (d) d.broadcast_url = url;
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         revert: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
             if (d && Object.prototype.hasOwnProperty.call(prevUrls, id)) d.broadcast_url = prevUrls[id];
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         successMessage: 'URLを配信しました',
         errorPrefix: '配信エラー',
@@ -5055,14 +5073,14 @@
             const d = devicesData.find(x => x.student_id === id);
             if (d) d.filter_mode = mode;
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         revert: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
             if (d && Object.prototype.hasOwnProperty.call(prevModes, id)) d.filter_mode = prevModes[id];
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         afterSuccess: () => {
           if (saveAsPref && currentTeacher) {
@@ -5342,7 +5360,7 @@
             const d = devicesData.find(x => x.student_id === id);
             if (d) d.broadcast_url = url;
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         revert: () => {
           ids.forEach(id => {
@@ -5351,7 +5369,7 @@
               d.broadcast_url = prevUrlsQuick[id];
             }
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         successMessage: `「${title || url}」を配信しました`,
         errorPrefix: '配信エラー',
