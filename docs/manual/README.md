@@ -2,12 +2,14 @@
 
 **美作市教育委員会 ／ 14小中学校**
 
+**拡張機能 v1.6.4 対応 ／ 2026年11月改訂**
+
 はじめてこのシステムを使う先生向けの説明書です。
 「このボタンを押すと、児童の画面はこうなる」という**操作例**を中心にまとめました。
 
 > **この説明書の読み方**
-> - **前半（第1〜5章）** … 先生が毎日の授業で使う操作。まずはここだけ読めば使えます。
-> - **後半（第6〜9章）** … 管理者（情報担当の先生）が最初に1回だけ行う設定。
+> - **前半（第1〜9章）** … 先生が毎日の授業で使う操作。まずはここだけ読めば使えます。
+> - **後半（第10〜12章）** … 管理者（情報担当の先生）が最初に1回だけ行う設定。
 
 ---
 
@@ -22,13 +24,14 @@
 5. [操作例：URLを配信する・規制する](#5-操作例urlを配信する規制する)
 6. [操作例：児童の画面を見る](#6-操作例児童の画面を見る)
 7. [操作例：注意マーク（AI監視）](#7-操作例注意マークai監視)
-8. [困ったときは](#8-困ったときは)
+8. [予約スケジュール（時間制限タイマー）](#8-予約スケジュール時間制限タイマー)
+9. [困ったときは](#9-困ったときは)
 
 **後半：管理者の初期設定**
 
-9. [システムの全体像](#9-システムの全体像)
-10. [初期設定の手順](#10-初期設定の手順)
-11. [AI監視の設定](#11-ai監視の設定)
+10. [システムの全体像](#10-システムの全体像)
+11. [初期設定の手順](#11-初期設定の手順)
+12. [AI監視の設定](#12-ai監視の設定)
 
 ---
 
@@ -48,6 +51,7 @@
 | **URL規制** | 決めたサイトだけ見られる／見られないようにする | 調べ学習中、関係ないサイトを防ぐ |
 | **画面情報取得** | 児童の今の画面を写真で確認できる | きちんと作業できているか見たい |
 | **AI監視** | 学習に関係ないサイトを開くと名簿に「⚠ 注意」が出る | 見回りなしで気づきたい |
+| **予約スケジュール** | 指定した日時のあいだだけ、自動でロックや規制がON/OFFになる | 放課後・長期休業・テスト期間 |
 
 ### 仕組み（かんたんに）
 
@@ -327,7 +331,7 @@
 （ボタンの表示が「🔓 解除中」になっている児童は、押すとロックが解除されます）
 
 > ⏱ **反映は約2秒**です。押した直後に児童の画面が変わるのが見えます。
-> 変わるまで少し待っても変わらない場合は、[第8章](#8-困ったときは)を確認してください。
+> 変わるまで少し待っても変わらない場合は、[第9章](#9-困ったときは)を確認してください。
 
 ---
 
@@ -591,12 +595,229 @@
 </svg>
 ```
 
-> ⚠ **先生の管理画面からON/OFFできます。** 監視設定は**管理者のみ**が変更できます（[第11章](#11-ai監視の設定)）。
+> ⚠ **先生の管理画面からON/OFFできます。** 監視設定は**管理者のみ**が変更できます（[第12章](#12-ai監視の設定)）。
 > OFFにすると、マークは全端末で即座に消えます。
 
 ---
 
-## 8. 困ったときは
+## 8. 予約スケジュール（時間制限タイマー）
+
+### これは何か
+
+「**毎日 19:00〜21:00 は YouTube を規制する**」「**テスト期間中は朝から画面ロック**」のように、
+**日時を決めておけば自動で ON／OFF してくれる**機能です。
+
+| 項目 | 手動の操作（第4章・第5章） | 予約スケジュール（この章） |
+|---|---|---|
+| いつ効くか | 押した**その瞬間**から | 決めた**日時のあいだだけ** |
+| 解除 | 先生がもう一度押す | **終了時刻に自動で解除** |
+| 向いている用途 | その場の指示・緊急時 | 放課後・長期休業・テスト期間 |
+
+> 💡 **押し忘れ・解除し忘れがなくなります。**
+> 先生が管理画面を閉じていても、予約は児童端末側で発動します。
+
+### 画面の開き方
+
+上部のタブの**3つ目「スケジュール管理」**を押します。
+タブは「端末一覧」「画面一覧」「スケジュール管理」の3つです。
+
+```svg
+<svg viewBox="0 0 720 310" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+  <rect width="720" height="310" fill="#f8fafc" rx="12"/>
+  <text x="24" y="28" fill="#1e293b" font-size="13" font-weight="bold">スケジュール管理（時間制限タイマー）</text>
+
+  <rect x="24" y="44" width="126" height="27" rx="6" fill="#7c3aed"/>
+  <text x="87" y="62" fill="#fff" font-size="10" text-anchor="middle" font-weight="bold">新規予約作成</text>
+  <rect x="158" y="44" width="76" height="27" rx="6" fill="#e2e8f0"/>
+  <text x="196" y="62" fill="#334155" font-size="10" text-anchor="middle">再読込</text>
+  <text x="700" y="62" fill="#64748b" font-size="10" text-anchor="end">予約: 3 件</text>
+
+  <rect x="24" y="84" width="430" height="200" rx="8" fill="#fff" stroke="#cbd5e1"/>
+  <text x="40" y="106" fill="#334155" font-size="10" font-weight="bold">2026年 11月</text>
+  <text x="438" y="106" fill="#94a3b8" font-size="9" text-anchor="end">前月 ／ 今日 ／ 翌月</text>
+  <line x1="24" y1="116" x2="454" y2="116" stroke="#e2e8f0"/>
+
+  <text x="60" y="136" fill="#f43f5e" font-size="9" text-anchor="middle">日</text>
+  <text x="120" y="136" fill="#64748b" font-size="9" text-anchor="middle">月</text>
+  <text x="180" y="136" fill="#64748b" font-size="9" text-anchor="middle">火</text>
+  <text x="240" y="136" fill="#64748b" font-size="9" text-anchor="middle">水</text>
+  <text x="300" y="136" fill="#64748b" font-size="9" text-anchor="middle">木</text>
+  <text x="360" y="136" fill="#64748b" font-size="9" text-anchor="middle">金</text>
+  <text x="420" y="136" fill="#0ea5e9" font-size="9" text-anchor="middle">土</text>
+
+  <text x="60" y="160" fill="#94a3b8" font-size="9" text-anchor="middle">1</text>
+  <text x="120" y="160" fill="#94a3b8" font-size="9" text-anchor="middle">2</text>
+  <text x="180" y="160" fill="#94a3b8" font-size="9" text-anchor="middle">3</text>
+  <text x="240" y="160" fill="#94a3b8" font-size="9" text-anchor="middle">4</text>
+  <text x="300" y="160" fill="#94a3b8" font-size="9" text-anchor="middle">5</text>
+  <text x="360" y="160" fill="#94a3b8" font-size="9" text-anchor="middle">6</text>
+  <text x="420" y="160" fill="#94a3b8" font-size="9" text-anchor="middle">7</text>
+
+  <text x="60" y="186" fill="#334155" font-size="9" text-anchor="middle">8</text>
+  <text x="120" y="186" fill="#334155" font-size="9" text-anchor="middle">9</text>
+  <rect x="222" y="170" width="36" height="22" rx="5" fill="#ede9fe" stroke="#a78bfa"/>
+  <text x="240" y="186" fill="#5b21b6" font-size="9" text-anchor="middle" font-weight="bold">10</text>
+  <circle cx="240" cy="194" r="2.5" fill="#8b5cf6"/>
+  <text x="300" y="186" fill="#334155" font-size="9" text-anchor="middle">11</text>
+  <circle cx="300" cy="194" r="2.5" fill="#8b5cf6"/>
+  <text x="360" y="186" fill="#334155" font-size="9" text-anchor="middle">12</text>
+  <text x="420" y="186" fill="#334155" font-size="9" text-anchor="middle">13</text>
+
+  <text x="60" y="214" fill="#334155" font-size="9" text-anchor="middle">14</text>
+  <text x="120" y="214" fill="#334155" font-size="9" text-anchor="middle">15</text>
+  <text x="180" y="214" fill="#334155" font-size="9" text-anchor="middle">16</text>
+  <text x="240" y="214" fill="#334155" font-size="9" text-anchor="middle">17</text>
+  <text x="300" y="214" fill="#334155" font-size="9" text-anchor="middle">18</text>
+  <text x="360" y="214" fill="#334155" font-size="9" text-anchor="middle">19</text>
+  <text x="420" y="214" fill="#334155" font-size="9" text-anchor="middle">20</text>
+
+  <text x="60" y="242" fill="#334155" font-size="9" text-anchor="middle">21</text>
+  <text x="120" y="242" fill="#334155" font-size="9" text-anchor="middle">22</text>
+  <text x="180" y="242" fill="#334155" font-size="9" text-anchor="middle">23</text>
+  <text x="240" y="242" fill="#334155" font-size="9" text-anchor="middle">24</text>
+  <text x="300" y="242" fill="#334155" font-size="9" text-anchor="middle">25</text>
+  <text x="360" y="242" fill="#334155" font-size="9" text-anchor="middle">26</text>
+  <text x="420" y="242" fill="#334155" font-size="9" text-anchor="middle">27</text>
+
+  <circle cx="52" cy="262" r="3" fill="#8b5cf6"/>
+  <text x="62" y="265" fill="#64748b" font-size="9">予約あり</text>
+  <circle cx="140" cy="262" r="3" fill="#f59e0b"/>
+  <text x="150" y="265" fill="#64748b" font-size="9">今回解除済</text>
+
+  <rect x="468" y="84" width="228" height="200" rx="8" fill="#fff" stroke="#cbd5e1"/>
+  <text x="484" y="106" fill="#334155" font-size="10" font-weight="bold">選択日の予約</text>
+  <text x="484" y="122" fill="#94a3b8" font-size="8">11月10日（火）</text>
+  <line x1="468" y1="132" x2="696" y2="132" stroke="#e2e8f0"/>
+
+  <rect x="480" y="142" width="204" height="56" rx="6" fill="#faf5ff" stroke="#d8b4fe"/>
+  <text x="492" y="158" fill="#5b21b6" font-size="9" font-weight="bold">19:00 - 21:00　YouTube規制</text>
+  <text x="492" y="172" fill="#7c3aed" font-size="8">対象: 5年1組（30台）</text>
+  <text x="492" y="188" fill="#7c3aed" font-size="8">状態: 発動中</text>
+  <rect x="608" y="178" width="32" height="14" rx="4" fill="#fef3c7"/>
+  <text x="624" y="189" fill="#92400e" font-size="7" text-anchor="middle">解除</text>
+  <rect x="646" y="178" width="32" height="14" rx="4" fill="#fee2e2"/>
+  <text x="662" y="189" fill="#991b1b" font-size="7" text-anchor="middle">取消</text>
+
+  <rect x="480" y="208" width="204" height="46" rx="6" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="492" y="224" fill="#334155" font-size="9" font-weight="bold">08:00 - 09:00　画面ロック</text>
+  <text x="492" y="238" fill="#64748b" font-size="8">対象: 児童3名</text>
+  <text x="492" y="250" fill="#64748b" font-size="8">状態: 予定</text>
+
+  <text x="24" y="300" fill="#64748b" font-size="9">※ 自動取得はしません。タブを開いたときと「再読込」を押したときだけ読み込みます。</text>
+</svg>
+```
+
+### 予約を作る手順
+
+1. **「新規予約作成」** を押します。
+2. **対象**を選びます。
+   - **対象種別** … 「クラス全体」または「個別の児童」
+   - **学校** … 所属校以外は選べません（管理者は全校から選択可）
+   - **クラス** または **児童（複数選択可）**
+3. **制限内容**を選びます。
+   - **制限タイプ** … 「URL制限」または「画面ロック」
+   - URL制限のときは **URL規制モード**（BLACKLIST／WHITELIST）と **URLリスト**（1行1件）
+4. **期間・時間帯**を入れます。
+   - **開始日／終了日**（カレンダーから選べます）
+   - **開始時刻／終了時刻**
+5. **繰り返し**を選びます。
+
+   | 選択肢 | 意味 |
+   |---|---|
+   | **単発** | 開始日の1回だけ |
+   | **毎日** | 開始日〜終了日の毎日 |
+   | **毎週** | 開始日〜終了日のうち、選んだ曜日だけ |
+
+6. **備考**（任意）を書きます。例「家庭学習の時間帯」
+7. 内容を確認して **保存** を押します。
+
+> ⏰ **終了時刻が開始時刻より前**のときは「**翌日またぎ**」になります。
+> 例：`22:00` 〜 `06:00` と入れると、夜22時から翌朝6時までロックします。
+
+### 「手動解除」と「取消」の違い（ここがいちばん大事）
+
+予約一覧の各行に **「解除」** と **「取消」** の2つがあります。**意味がまったく違います。**
+
+| ボタン | 何が起きるか | 予約はどうなる | 使う場面 |
+|---|---|---|---|
+| **解除** | **今回の時間帯だけ**止める | **残ります**（次回以降はまた発動） | 今日は使いたい／一時的にやめたい |
+| **取消** | 予約そのものを止める | **止まります**（記録は残る） | もうこの予約は要らない |
+
+> ⚠ **「解除」を押しても予約は消えません。**
+> 「もう二度と発動させたくない」ときは **「取消」** を押してください。
+> 逆に「今日だけやめたい」ときに「取消」を押すと、**明日からも発動しなくなります**。
+
+### 予約が動く仕組み
+
+予約は**児童端末が自分で時計を見て判断**します。GAS に毎回問い合わせるわけではありません。
+
+```svg
+<svg viewBox="0 0 720 210" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+  <rect width="720" height="210" fill="#f8fafc" rx="12"/>
+  <text x="24" y="30" fill="#1e293b" font-size="13" font-weight="bold">予約が発動してから解除されるまで</text>
+
+  <line x1="60" y1="106" x2="660" y2="106" stroke="#cbd5e1" stroke-width="2"/>
+  <polygon points="660,106 652,102 652,110" fill="#cbd5e1"/>
+
+  <circle cx="120" cy="106" r="7" fill="#8b5cf6"/>
+  <text x="120" y="88" fill="#5b21b6" font-size="10" font-weight="bold" text-anchor="middle">19:00</text>
+  <text x="120" y="132" fill="#334155" font-size="9" text-anchor="middle">予約が発動</text>
+  <text x="120" y="146" fill="#64748b" font-size="8" text-anchor="middle">自動でロック／規制ON</text>
+
+  <rect x="150" y="98" width="440" height="16" rx="8" fill="#ede9fe"/>
+
+  <circle cx="320" cy="106" r="5" fill="#a78bfa"/>
+  <text x="320" y="132" fill="#64748b" font-size="8" text-anchor="middle">端末は自分で時計を見て判定</text>
+  <text x="320" y="146" fill="#64748b" font-size="8" text-anchor="middle">（管理画面を閉じていても動く）</text>
+
+  <circle cx="590" cy="106" r="7" fill="#059669"/>
+  <text x="590" y="88" fill="#065f46" font-size="10" font-weight="bold" text-anchor="middle">21:00</text>
+  <text x="590" y="132" fill="#334155" font-size="9" text-anchor="middle">自動で解除</text>
+  <text x="590" y="146" fill="#64748b" font-size="8" text-anchor="middle">元の画面に戻る</text>
+
+  <rect x="24" y="166" width="672" height="30" rx="7" fill="#fef3c7" stroke="#f59e0b"/>
+  <text x="40" y="186" fill="#78350f" font-size="9" font-weight="bold">予約は端末の中にも保存されます。通信が止まっていても、決めた時刻になれば発動します。</text>
+</svg>
+```
+
+| ポイント | 説明 |
+|---|---|
+| **端末が自分で判断** | 毎回サーバーに問い合わせないので、端末が増えても重くなりません |
+| **端末内に保存** | 予約は端末側にも保存され、通信が止まっていても発動します |
+| **時計のずれを自動補正** | 端末の時計が少しずれていても、サーバーの時刻に合わせて判定します |
+| **境界時刻ぴったり** | 19:00 ちょうどに発動し、21:00 ちょうどに解除されます |
+
+### 予約が入るシート（4枚目）
+
+予約は **「スケジュール管理」** シートに1行1件で保存されます。
+1校につき1つのスプレッドシートなので、**他校の予約とは完全に分かれています**。
+
+| 項目 | 例 |
+|---|---|
+| スケジュールID | `sch_1762500000000_a1b2` |
+| 対象種別／学校名／クラス名／児童ID | `class` ／ `第一小学校` ／ `5年1組` ／ 空欄 |
+| 制限タイプ／URL規制モード | `url_block` ／ `BLACKLIST` |
+| 許可URLリスト／規制URLリスト | 空欄 ／ `youtube.com` |
+| 開始日／終了日／開始時刻／終了時刻 | `2026/11/10` ／ `2026/11/14` ／ `19:00` ／ `21:00` |
+| 繰り返し／曜日 | `DAILY` ／ 空欄 |
+| 有効／手動解除／手動解除日時 | `TRUE` ／ `FALSE` ／ 空欄 |
+| 作成者／作成日時／更新日時／備考 | `teacher@...` ／ … ／ … ／ `放課後YouTube対策` |
+
+> 💡 **シートを直接編集してもかまいません**が、**日付は `2026/11/10`、時刻は `19:00` の形式**で入れてください。
+> 自動で日付型に変換されると正しく読めなくなるため、このシートの日付・時刻列は**書式なしテキスト**に固定してあります。
+
+### うまく動かないとき
+
+| 症状 | 確認すること |
+|---|---|
+| **時刻になっても発動しない** | 端末の電源とログイン状態。予約の「有効」が `TRUE` か。「手動解除」が `TRUE` のままになっていないか |
+| **解除されない** | 終了時刻を過ぎているか。深夜帯（翌日またぎ）の予約ではないか |
+| **予約が一覧に出ない** | 「再読込」を押す。学校・クラスの絞り込みがかかっていないか |
+| **思った日だけ動かない** | 「毎週」の曜日にチェックが入っているか。「単発」は開始日の1回だけ |
+
+---
+
+## 9. 困ったときは
 
 | 症状 | 原因と対処 |
 |---|---|
@@ -625,7 +846,7 @@
 
 ---
 
-## 9. システムの全体像
+## 10. システムの全体像
 
 このシステムは、**3つの部品**でできています。
 
@@ -684,6 +905,57 @@
 </svg>
 ```
 
+### 親GAS と 子GAS（Hub-Spoke 構成）
+
+このシステムの GAS は、役割の違う**2種類**があります。
+
+```svg
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+  <rect width="720" height="300" fill="#f8fafc" rx="12"/>
+  <text x="24" y="28" fill="#1e293b" font-size="13" font-weight="bold">親GAS（Hub）が全校をまとめ、子GAS（Spoke）が学校ごとに受ける</text>
+
+  <rect x="24" y="52" width="150" height="76" rx="9" fill="#4f46e5"/>
+  <text x="99" y="80" fill="#fff" font-size="11" font-weight="bold" text-anchor="middle">親GAS（Hub）</text>
+  <text x="99" y="98" fill="#c7d2fe" font-size="8" text-anchor="middle">教育委員会で1つ</text>
+  <text x="99" y="114" fill="#c7d2fe" font-size="8" text-anchor="middle">全校の名簿を集約</text>
+
+  <rect x="286" y="52" width="150" height="76" rx="9" fill="#059669"/>
+  <text x="361" y="80" fill="#fff" font-size="11" font-weight="bold" text-anchor="middle">子GAS（Spoke）</text>
+  <text x="361" y="98" fill="#a7f3d0" font-size="8" text-anchor="middle">学校ごとに1つ</text>
+  <text x="361" y="114" fill="#a7f3d0" font-size="8" text-anchor="middle">校内の端末を配信</text>
+
+  <rect x="548" y="52" width="148" height="76" rx="9" fill="#0284c7"/>
+  <text x="622" y="80" fill="#fff" font-size="11" font-weight="bold" text-anchor="middle">児童端末</text>
+  <text x="622" y="98" fill="#bae6fd" font-size="8" text-anchor="middle">Chromebook</text>
+  <text x="622" y="114" fill="#bae6fd" font-size="8" text-anchor="middle">拡張機能 v1.6.4</text>
+
+  <path d="M174 90 L282 90" stroke="#94a3b8" stroke-width="2" marker-end="url(#e1)"/>
+  <text x="228" y="82" fill="#64748b" font-size="8" text-anchor="middle">指示を振り分け</text>
+  <path d="M436 90 L544 90" stroke="#94a3b8" stroke-width="2" marker-end="url(#e1)"/>
+  <text x="490" y="82" fill="#64748b" font-size="8" text-anchor="middle">予約・制限を配信</text>
+
+  <rect x="24" y="152" width="672" height="60" rx="8" fill="#fff" stroke="#cbd5e1"/>
+  <text x="40" y="174" fill="#334155" font-size="10" font-weight="bold">なぜ分けるのか（負荷分散）</text>
+  <text x="40" y="192" fill="#64748b" font-size="8">全校の端末が1つのGASに集中すると、Google の実行回数上限に当たって応答が遅くなります。</text>
+  <text x="40" y="206" fill="#64748b" font-size="8">学校ごとに分ければ、1校あたりの負荷が小さく、他校の影響を受けません。</text>
+
+  <rect x="24" y="226" width="672" height="56" rx="8" fill="#fee2e2" stroke="#f87171"/>
+  <text x="40" y="248" fill="#991b1b" font-size="10" font-weight="bold">⚠ 大事な前提：1校 = 1つの独立したスプレッドシート</text>
+  <text x="40" y="266" fill="#b91c1c" font-size="8">学校ごとにスプレッドシートもGASも別物です。データは学校の外に出ません。</text>
+
+  <defs><marker id="e1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="#94a3b8"/></marker></defs>
+</svg>
+```
+
+| 種類 | 台数 | 役割 |
+|---|---|---|
+| **親GAS** | 教育委員会で1つ | 全校の端末名簿を集約して見る。各校へ指示を振り分ける |
+| **子GAS** | 学校ごとに1つ（14校分） | 自校の端末へ制限・予約を配信する。自校のシートだけを読み書きする |
+
+> 💡 **データは PropertiesService にだけ流れます。**
+> 子GAS が子スプレッドシートに行を書き込むことはありません。
+> 端末への配信内容は「プロパティ（設定値）」として受け渡します。
+
 ### 学校ごとに GAS を分ける仕組み
 
 美作市の14校は、**学校ごとに別のスプレッドシート**で管理します。
@@ -732,17 +1004,18 @@
 
 > ⚠ **東粟倉小学校は廃校のため、一覧に含めないでください。**
 
-### データの置き場所（スプレッドシートの3シート）
+### データの置き場所（スプレッドシートの4シート）
 
 | シート名 | 何が入るか |
 |---|---|
 | **端末一覧** | 児童ID・学校名・氏名・クラス・ロック状態・URL規制・現在のURL・注意マーク など |
 | **教員マスタ** | 先生のメールアドレス・パスワード・所属学校・権限・対象クラス |
 | **画面情報** | 「画面情報取得」で撮った写真（1児童=1行で上書き） |
+| **スケジュール管理** | 予約スケジュール（第8章）。1行=1件の予約 |
 
 ---
 
-## 10. 初期設定の手順
+## 11. 初期設定の手順
 
 **全体の流れ（5ステップ）**
 
@@ -801,7 +1074,7 @@
 3. **保存**します（💾 アイコン）。
 4. 関数を選ぶプルダウンで **`setupSpreadsheet`** を選び、**▶ 実行** を押します。
    - 初回は権限の確認が出ます。「詳細」→「（安全でないページ）に移動」→「許可」。
-   - これで3つのシート（端末一覧／教員マスタ／画面情報）が自動で作られます。
+   - これで4つのシート（端末一覧／教員マスタ／画面情報／スケジュール管理）が自動で作られます。
 5. 続けて **`initializeTeacherAccount`**（または同様の初期アカウント作成関数）を実行し、
    **管理者アカウント**を作ります（教員メールアドレス＋パスワード）。
 6. **「デプロイ」→「新しいデプロイ」** を押します。
@@ -950,21 +1223,22 @@
 
 ### 学校名が「未設定」のままになるとき
 
-バージョン **1.6.3** 以降で解決済みです。それでも「未設定」になる場合は次を確認してください。
+バージョン **1.6.3** 以降で解決済みです。**1.6.4** ではポリシー未配布の端末でも一度は通信するよう改善しました。
+それでも「未設定」になる場合は次を確認してください。
 
 | 確認すること | 対処 |
 |---|---|
-| 拡張機能が 1.6.3 未満 | ストアから 1.6.3 を配布し直す |
+| 拡張機能が 1.6.4 未満 | ストアから 1.6.4 を配布し直す |
 | GAS を再デプロイしていない | 鉛筆アイコンから新バージョンでデプロイ |
 | ポリシーのキー名が違う | `school_name` になっているか確認 |
 | 学校名の綴りが違う | `CONFIG.SCHOOL_LIST` と完全に一致させる（「英田小」などの略称は不可） |
 
-> 💡 1.6.3 は「**端末が学校名を送る**」＋「**GASが受け取る**」の**両方**が揃って初めて動きます。
+> 💡 1.6.3 以降は「**端末が学校名を送る**」＋「**GASが受け取る**」の**両方**が揃って初めて動きます。
 > 片方だけでは動きません。
 
 ---
 
-## 11. AI監視の設定
+## 12. AI監視の設定
 
 **管理者のみ**が変更できます。
 
@@ -1075,5 +1349,5 @@
 
 ---
 
-**困ったときは**：まず[第8章](#8-困ったときは)を確認してください。
+**困ったときは**：まず[第9章](#9-困ったときは)を確認してください。
 解決しない場合は、管理者（情報担当の先生）に連絡してください。
