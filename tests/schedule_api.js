@@ -1809,6 +1809,9 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
       'const IDLE_SYNC_MS = 0;\n' +
       'const IDLE_DRIFT_MS = 1000;\n' +
       'const SHARD_COOLDOWN_MS = 1800000;\n' +
+      'const SLOW_POLL_MS = 5 * 60 * 1000;\n' +
+      'const SLOW_POLL_ALARM = "schedulePoll";\n' +
+      'const SLOW_POLL_ALARM_MIN = 5;\n' +
       'const DEFAULT_GAS_URL = ' + JSON.stringify(o.defaultGasUrl || '') + ';\n' +
       'let keepaliveActive = ' + (o.keepaliveActive === true ? 'true' : 'false') + ';\n' +
       'let activeIntervalMs = 1500;\n' +
@@ -1816,12 +1819,17 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
       'let lastSyncMs = 0;\n' +
       'let hasSyncedOnce = false;\n' +
       'let shardAssignedCache = "";\n' +
-      'let shardFailCount = 0;\n';
+      'let shardFailCount = 0;\n' +
+      'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n' +
+      'let shardHandoffPending = false;\n';
     const body = ['normalizeSchoolKey', 'resolveGasUrl', 'maybeSync',
+      'scheduleInterestActive', 'ensureSlowPoll', 'clearSlowPoll',
       'shardAssignedUrl', 'applyShardAssignment'].map(bgExtract).join('\n');
     vmMod.runInContext(pre + body +
       '\n__bg = { maybeSync: maybeSync, resolveGasUrl: resolveGasUrl,' +
-      ' applyAssign: applyShardAssignment };', sandbox);
+      ' applyAssign: applyShardAssignment,' +
+      ' getHandoff: function () { return shardHandoffPending; },' +
+      ' setShardCache: function (v) { shardAssignedCache = v; } };', sandbox);
     return {
       sandbox: sandbox, store: store, sets: sets, syncs: syncs,
       at: function (v) { clock.now = v; }, __bg: sandbox.__bg
@@ -1922,15 +1930,23 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
       'const IDLE_SYNC_MS = 0;\n' +
       'const IDLE_DRIFT_MS = 1000;\n' +
       'const SHARD_COOLDOWN_MS = 1800000;\n' +
+      'const SLOW_POLL_MS = 5 * 60 * 1000;\n' +
+      'const SLOW_POLL_ALARM = "schedulePoll";\n' +
+      'const SLOW_POLL_ALARM_MIN = 5;\n' +
       'const DEFAULT_GAS_URL = ' + JSON.stringify(o.defaultGasUrl || '') + ';\n' +
       'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\n' +
       'let idleDriftUntil = 0;\nlet lastSyncMs = 0;\nlet hasSyncedOnce = false;\n' +
-      'let shardAssignedCache = "";\nlet shardFailCount = 0;\n';
+      'let shardAssignedCache = "";\nlet shardFailCount = 0;\n' +
+      'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n' +
+      'let shardHandoffPending = false;\n';
     const body = ['normalizeSchoolKey', 'resolveGasUrl', 'maybeSync',
+      'scheduleInterestActive', 'ensureSlowPoll', 'clearSlowPoll',
       'shardAssignedUrl', 'applyShardAssignment'].map(bgExtract).join('\n');
     vmMod.runInContext(pre + body +
       '\n__bg = { maybeSync: maybeSync, resolveGasUrl: resolveGasUrl,' +
-      ' applyAssign: applyShardAssignment };', sandbox);
+      ' applyAssign: applyShardAssignment,' +
+      ' getHandoff: function () { return shardHandoffPending; },' +
+      ' setShardCache: function (v) { shardAssignedCache = v; } };', sandbox);
     return { sandbox: sandbox, store: store, sets: sets, __bg: sandbox.__bg };
   }
 
@@ -2101,6 +2117,245 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
     doPostBody.indexOf('received(POST)') < doPostBody.indexOf("action === 'heartbeat'"));
   check('U29 student_id 未設定を無言で返さない（端末側の設定不良を記録する）',
     doPostBody.indexOf('student_id 未設定') >= 0);
+
+  // ================================================================
+  // V. 即時ハートビート（親GAS → 子GAS の自動バトンタッチ）
+  //   実害: 親GASから assigned_gas_url を受け取って保存しても、その瞬間は
+  //         syncWithGas() の syncInFlight ガードが立っている。よって
+  //         applyShardAssignment() の中から2通目を素直に呼んでも先頭のガードで
+  //         無言で捨てられ、子GASの実行数はゼロのまま＝予約が永久に届かなかった。
+  //   ここでは「ガード解放直後の finally でだけ、1回だけ発火する」ことを実挙動で固定する。
+  // ================================================================
+  console.log('===== V. 即時ハートビート（親→子GASのバトンタッチ） =====');
+
+  // --- V0: 静的検査（発火点がガード解放より後ろにあること） ---
+  {
+    const syncBody = bgExtract('syncWithGas');
+    const iRelease = syncBody.indexOf('syncInFlight = false');
+    const iHandoff = syncBody.indexOf('shardHandoffPending');
+    // 最後の「} finally {」で判定する（'finally' の語はコメント中にも現れるため使わない）
+    const iFinally = syncBody.lastIndexOf('} finally {');
+    check('V0 バトンタッチは finally 内で syncInFlight 解放より後ろにある',
+      iFinally >= 0 && iRelease > iFinally && iHandoff > iRelease,
+      { finally: iFinally, release: iRelease, handoff: iHandoff });
+  }
+
+  // --- 実 syncWithGas を fetch スタブ付きで走らせるハーネス ---
+  function buildHandoff(o) {
+    o = o || {};
+    const store = Object.assign({
+      school_name: '英田小学校',
+      student_id: '1607002@city-mimasaka.ed.jp',
+      gas_url: PARENT
+    }, o.store || {});
+    const fetches = [], applied = [], diag = [], timers = [];
+    const sandbox = {
+      console: { log: function () {}, warn: function () {}, error: function () {} },
+      JSON: JSON, String: String, Object: Object, Array: Array, Number: Number,
+      Boolean: Boolean, Math: Math, RegExp: RegExp, Error: Error, Promise: Promise,
+      Date: { now: function () { return o.now || 1000000; } },
+      AbortController: function () { this.signal = {}; this.abort = function () {}; },
+      // バトンタッチの setTimeout(0) を「テストが明示的に消化できる」形で捕捉する
+      // バトンタッチの setTimeout(0) だけを捕捉する。
+      //   ※ SYNC_TIMEOUT_MS の中断タイマー（第2引数あり）は捕捉しない。
+      //     捕捉すると「2通目が予約された」ことを誤検知する。
+      setTimeout: function (fn, ms) { if (!ms) { timers.push(fn); } return 1; },
+      clearTimeout: function () {},
+      fetch: function (url) {
+        const u = String(url);
+        fetches.push(u);
+        // 1通目（親）: 子GASの割り当てだけを返す（schedules は返さない）
+        // 2通目（子）: 割り当ては返さず、予約（schedules.active）を返す
+        const body = (u === CHILD)
+          ? { success: true, ka_active: false,
+              schedules: { active: [{ id: 'S-V1', restriction_type: 'url_block' }],
+                           upcoming: [], overridden_ids: [] } }
+          : { success: true, ka_active: false,
+              assigned_gas_url: (o.parentAssign === undefined ? CHILD : o.parentAssign),
+              assigned_class: '5年1組' };
+        return Promise.resolve({
+          ok: true, status: 200,
+          json: function () { return Promise.resolve(body); }
+        });
+      },
+      chrome: { storage: { local: {
+        get: function () { return Promise.resolve(Object.assign({}, store)); },
+        set: function (patch) { Object.assign(store, patch); return Promise.resolve(); }
+      } } },
+      getStudentIdentity: function () { return Promise.resolve(''); },
+      getActiveTabUrl: function () { return Promise.resolve('https://www.example.jp/'); },
+      getManagedPolicy: function () { return Promise.resolve({}); },
+      pickMeaningfulSchoolName: function (a, b) { return a || b || ''; },
+      applyPolicies: function (p) { applied.push(p || {}); return Promise.resolve(); },
+      applyRemoteKeepalive: function () {},
+      recordSyncDiag: function (ok, code) {
+        diag.push({ ok: !!ok, code: String(code || '') }); return Promise.resolve();
+      }
+    };
+    vmMod.createContext(sandbox);
+    const pre =
+      'const DEFAULT_GAS_URL = "";\n' +
+      'const SYNC_TIMEOUT_MS = 12000;\n' +
+      'const SHARD_RECHECK_MS = 6 * 60 * 60 * 1000;\n' +
+      'const SHARD_FAIL_LIMIT = 3;\n' +
+      'const SHARD_COOLDOWN_MS = 30 * 60 * 1000;\n' +
+      'let syncInFlight = false;\n' +
+      'let shardHandoffPending = false;\n' +
+      'let shardAssignedCache = "";\n' +
+      'let shardFailCount = 0;\n' +
+      'let lastHeartbeatSentMs = 0;\n';
+    const body = ['normalizeSchoolKey', 'resolveGasUrl', 'shardAssignedUrl',
+      'shardSyncMemory', 'applyShardAssignment', 'syncWithGas'].map(bgExtract).join('\n');
+    // finally の setTimeout コールバックは「戻り値を返さない」設計（呼び出し元を待たせない）。
+    // そのため Promise を戻り値から拾えない。syncWithGas を包んで、発火した同期の
+    // Promise をテスト側が明示的に await できるよう記録する。
+    vmMod.runInContext(pre + body +
+      '\nvar __pending = [];' +
+      '\nsyncWithGas = (function (orig) {' +
+      '\n  return function () {' +
+      '\n    var p = orig.apply(null, arguments);' +
+      '\n    __pending.push(p);' +
+      '\n    return p;' +
+      '\n  };' +
+      '\n})(syncWithGas);' +
+      '\n__v = {' +
+      '\n  syncWithGas: function () { return syncWithGas.apply(null, arguments); },' +
+      '\n  inFlight: function () { return syncInFlight; },' +
+      '\n  handoff: function () { return shardHandoffPending; },' +
+      '\n  pending: function () { return __pending; }' +
+      '\n};', sandbox);
+    return { store: store, fetches: fetches, applied: applied, diag: diag,
+      timers: timers, __v: sandbox.__v };
+  }
+
+  // 保留中の setTimeout(0) を消化し、そこから発火した同期の完了まで待つ。
+  //   finally の中では await しない設計なので、タイマー → Promise の順に追いかける。
+  //   無限再入していないことは呼び出し回数の上限で検出する。
+  async function drain(h) {
+    let guard = 0;
+    while (guard++ < 10) {
+      while (h.timers.length) { h.timers.shift()(); }
+      const pend = h.__v.pending();
+      if (!pend.length) break;
+      const batch = pend.splice(0, pend.length);
+      await Promise.all(batch);
+    }
+  }
+
+  // --- V1〜V6: 親→子のバトンタッチが「1回だけ」発火し、予約が適用される ---
+  const h1 = buildHandoff({});
+  await h1.__v.syncWithGas(); // 1通目（親GAS）
+  check('V1 1通目は親GASへ送る', h1.fetches.length === 1 && h1.fetches[0] === PARENT, h1.fetches);
+  check('V2 親が返した assigned_gas_url を保存し、以後の通信先を子にする',
+    h1.store.assigned_gas_url === CHILD, h1.store.assigned_gas_url);
+  check('V3 1通目の完了時点でバトンタッチが1件だけ予約されている（まだ送っていない）',
+    h1.timers.length === 1 && h1.fetches.length === 1,
+    { timers: h1.timers.length, fetches: h1.fetches.length });
+
+  await drain(h1); // finally の setTimeout(0) を消化＝ガード解放後の再入
+  check('V4 ガード解放後に子GAS宛ての2通目が自動発火する（合計2通・宛先は子）',
+    h1.fetches.length === 2 && h1.fetches[1] === CHILD, h1.fetches);
+  check('V5 2通目で子GASの schedules.active を取得して適用している',
+    h1.applied.length === 2 && !!h1.applied[1].schedules &&
+    h1.applied[1].schedules.active.length === 1 &&
+    h1.applied[1].schedules.active[0].id === 'S-V1',
+    h1.applied.map(function (a) {
+      return a.schedules && a.schedules.active ? a.schedules.active.length : -1;
+    }));
+  check('V6 バトンタッチは1回限り（再入せず3通目を出さない＝無限ループしない）',
+    h1.timers.length === 0 && h1.fetches.length === 2 && h1.__v.handoff() === false,
+    { timers: h1.timers.length, fetches: h1.fetches.length, handoff: h1.__v.handoff() });
+
+  // --- V7: 親が割り当てを返さない場合は2通目を出さない（無駄な通信をしない） ---
+  const h2 = buildHandoff({ parentAssign: '' });
+  await h2.__v.syncWithGas();
+  await drain(h2);
+  check('V7 親が assigned_gas_url を返さなければ2通目を発火しない（通信は1回だけ）',
+    h2.fetches.length === 1 && h2.__v.handoff() === false,
+    { fetches: h2.fetches.length, handoff: h2.__v.handoff() });
+
+  // ================================================================
+  // V8〜V12: 要件2（低速ポーリング）— 未割り当て・非稼働は通信ゼロを維持しつつ、
+  //          予約保持または子GAS割り当て済みなら 5 分周期で起床する。
+  // ================================================================
+  function buildRate(o) {
+    o = o || {};
+    const clock = { now: o.now || 5000000 };
+    const sets = [], syncs = [], made = [];
+    const sandbox = {
+      console: { log: function () {}, warn: function () {}, error: function () {} },
+      JSON: JSON, String: String, Object: Object, Array: Array, Number: Number,
+      Boolean: Boolean, Math: Math, RegExp: RegExp, Error: Error, Promise: Promise,
+      Date: { now: function () { return clock.now; } },
+      chrome: {
+        storage: { local: {
+          get: function () { return Promise.resolve({}); },
+          set: function (p) { sets.push(p); return Promise.resolve(); }
+        } },
+        alarms: {
+          create: function (n) { made.push(n); },
+          clear: function () { return Promise.resolve(true); }
+        }
+      },
+      syncWithGas: function () { syncs.push(clock.now); return Promise.resolve(); }
+    };
+    vmMod.createContext(sandbox);
+    const pre =
+      'const ACTIVE_SYNC_MS = 1500;\n' +
+      'const IDLE_DRIFT_MS = 1000;\n' +
+      'const SLOW_POLL_MS = 5 * 60 * 1000;\n' +
+      'const SLOW_POLL_ALARM = "schedulePoll";\n' +
+      'const SLOW_POLL_ALARM_MIN = 5;\n' +
+      'let keepaliveActive = false;\n' +
+      'let activeIntervalMs = 1500;\n' +
+      'let idleDriftUntil = 0;\n' +
+      'let lastSyncMs = 0;\n' +
+      'let hasSyncedOnce = true;\n' + // 初回ブートストラップ済み＝レート判定のみを測る
+      'let shardAssignedCache = ' + JSON.stringify(o.shard || '') + ';\n' +
+      'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n';
+    const body = ['maybeSync', 'scheduleInterestActive', 'ensureSlowPoll',
+      'clearSlowPoll', 'clearIdleDriftAlarm'].map(bgExtract).join('\n');
+    vmMod.runInContext(pre + body + '\n__r = { maybeSync: maybeSync };', sandbox);
+    return { syncs: syncs, made: made, clock: clock, __r: sandbox.__r };
+  }
+
+  const r0 = buildRate({ shard: '', scheduleCache: null });
+  r0.__r.maybeSync();
+  r0.clock.now += 60 * 60 * 1000; // 1時間経過しても
+  r0.__r.maybeSync();
+  check('V8 未割り当て・予約なし・非稼働は通信ゼロを維持する（doPost を出さない）',
+    r0.syncs.length === 0 && r0.made.indexOf('schedulePoll') < 0,
+    { syncs: r0.syncs.length, made: r0.made });
+
+  const r1 = buildRate({ shard: CHILD });
+  r1.__r.maybeSync(); // 初回（経過 5000000ms >= 5分）
+  const afterFirst = r1.syncs.length;
+  r1.clock.now += 60 * 1000; // 1分後（5分未満）
+  r1.__r.maybeSync();
+  const afterShort = r1.syncs.length;
+  r1.clock.now += 4 * 60 * 1000; // 合計5分
+  r1.__r.maybeSync();
+  check('V9 子GAS割り当て済みなら非稼働でも 5 分周期で起床して同期する',
+    afterFirst === 1 && afterShort === 1 && r1.syncs.length === 2,
+    { first: afterFirst, short: afterShort, total: r1.syncs.length });
+  check('V10 schedulePoll（5分）アラームを登録する',
+    r1.made.indexOf('schedulePoll') >= 0, r1.made);
+
+  const r2 = buildRate({
+    shard: '',
+    scheduleCache: { schedules: { active: [], upcoming: [{ id: 'S-V2' }], overridden_ids: [] } }
+  });
+  r2.__r.maybeSync();
+  check('V11 予約キャッシュを保持していれば（未割り当てでも）低速ポーリングする',
+    r2.syncs.length === 1, r2.syncs.length);
+
+  const r3 = buildRate({
+    shard: '',
+    scheduleCache: { schedules: { active: [], upcoming: [], overridden_ids: [] } }
+  });
+  r3.__r.maybeSync();
+  check('V12 予約が空になれば低速ポーリングも止める（不要な通信を残さない）',
+    r3.syncs.length === 0, r3.syncs.length);
 
   console.log('');
   console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');

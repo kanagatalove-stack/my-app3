@@ -32,8 +32,9 @@ let pass=0,fail=0;
 function check(n,c,e){ if(c){console.log('PASS',n,e!==undefined?'=> '+JSON.stringify(e):'');pass++;} else {console.log('FAIL',n,e!==undefined?'=> '+JSON.stringify(e):'');fail++;} }
 
 // ---- maybeSync（レート制御）の実挙動を vm 上で検証 ----
-// 稼働中=1.5秒／非稼働=停止（同期しない）／猶予期間=1秒上限。
-console.log('===== maybeSync: 稼働中=1.5秒／非稼働=停止／猶予=1秒 のレート制御 =====');
+// 稼働中=1.5秒／非稼働=停止（同期しない）／猶予期間=1秒上限／
+// 非稼働でも予約保持または子GAS割り当て済みなら 5 分周期の低速ポーリング。
+console.log('===== maybeSync: 稼働中=1.5秒／非稼働=停止（予約保持時のみ5分）／猶予=1秒 のレート制御 =====');
 let t = 1000000;
 const calls = [];
 const ctx = {
@@ -50,11 +51,16 @@ const syncCount = () => calls.filter(c=>c.sync).length;
 vm.createContext(ctx);
 vm.runInContext(
   'const ACTIVE_SYNC_MS = 1500;\nconst IDLE_SYNC_MS = 0;\nconst IDLE_DRIFT_MS = 1000;\nconst IDLE_DRIFT_ALARM_MIN = 5/60;\n' +
+  'const SLOW_POLL_MS = 5*60*1000;\nconst SLOW_POLL_ALARM = \'schedulePoll\';\nconst SLOW_POLL_ALARM_MIN = 5;\n' +
   'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\nlet idleDriftUntil = 0;\nlet lastSyncMs = 0;\nlet hasSyncedOnce = false;\n' +
-  extract('maybeSync') + '\n' + extract('ensureSyncLoop') + '\n' + extract('stopSyncLoop') +
+  'let shardAssignedCache = \'\';  // 子GASへ割り当て済みか（低速ポーリングの判定材料）\n' +
+  extract('maybeSync') + '\n' + extract('scheduleInterestActive') + '\n' +
+  extract('ensureSyncLoop') + '\n' + extract('stopSyncLoop') +
   '\n' + extract('scheduleIdleDrift') + '\n' + extract('clearIdleDriftAlarm') +
+  '\n' + extract('ensureSlowPoll') + '\n' + extract('clearSlowPoll') +
   '\n__sync=maybeSync; __ensure=ensureSyncLoop; __stop=stopSyncLoop;' +
-  '\n__setActive=(v)=>{keepaliveActive=v;}; __setDrift=(u)=>{idleDriftUntil=u;};', ctx);
+  '\n__setActive=(v)=>{keepaliveActive=v;}; __setDrift=(u)=>{idleDriftUntil=u;};' +
+  '\n__setShard=(v)=>{shardAssignedCache=v;};', ctx);
 
 ctx.__sync();
 check('稼働中: 初回の maybeSync で同期する', syncCount() === 1, syncCount());
