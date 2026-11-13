@@ -1967,6 +1967,52 @@ let broadcastGuardUntil = 0;
 let broadcastTabId = null;
 // 同一配信IDの二重オープン防止
 let lastBroadcastOpenedId = '';
+// 【要件2】同一URLの二重オープン防止（時間窓）。
+//   GAS側で broadcast_id を統一しても、経路（親/子直送/保留キューflush）の
+//   重複やID再発番が起きると同じページが2枚開く。ここは最後の安全網として
+//   「直近30秒以内に同じURLを自動オープン済みなら、IDが違っても開かない」を担う。
+const BROADCAST_DEDUP_WINDOW_MS = 30000;
+let lastBroadcastUrls = [];   // [{ url: string, at: number }]
+
+// URLの比較用正規化（末尾スラッシュ・大文字小文字・既定ポート差を吸収）
+function normalizeBroadcastUrl(u) {
+  let v = String(u || '').trim();
+  if (!v) return '';
+  if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+  try {
+    const parsed = new URL(v);
+    let host = parsed.hostname.toLowerCase();
+    let port = parsed.port;
+    if ((parsed.protocol === 'https:' && port === '443') ||
+        (parsed.protocol === 'http:' && port === '80')) port = '';
+    let path = parsed.pathname || '/';
+    if (path.length > 1 && path.charAt(path.length - 1) === '/') path = path.slice(0, -1);
+    return parsed.protocol.toLowerCase() + '//' + host + (port ? ':' + port : '') +
+      path + (parsed.search || '');
+  } catch (e) {
+    return v.replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+// 直近に同じURLを自動オープンしたか（時間窓内）。判定と記録を同時に行う。
+//   true  = 開いてよい（記録した）
+//   false = 窓内で同一URLを既に開いている（抑止）
+//   空URL（配信の解除）は対象外＝常に true。
+function claimBroadcastUrlOnce(url, nowMs) {
+  const now = (typeof nowMs === 'number') ? nowMs : Date.now();
+  const key = normalizeBroadcastUrl(url);
+  if (!key) return true;
+  const win = (typeof BROADCAST_DEDUP_WINDOW_MS === 'number' && BROADCAST_DEDUP_WINDOW_MS > 0)
+    ? BROADCAST_DEDUP_WINDOW_MS : 30000;
+  lastBroadcastUrls = (Array.isArray(lastBroadcastUrls) ? lastBroadcastUrls : []).filter(function (e) {
+    return e && typeof e.at === 'number' && (now - e.at) < win;
+  });
+  for (let i = 0; i < lastBroadcastUrls.length; i++) {
+    if (lastBroadcastUrls[i].url === key) return false;   // 窓内で同一URL → 抑止
+  }
+  lastBroadcastUrls.push({ url: key, at: now });
+  return true;
+}
 
 /**
  * 一斉配信直後に保護すべきタブかどうかを判定する。
@@ -1992,6 +2038,15 @@ async function openBroadcastUrl(url, broadcastId) {
     let validUrl = url;
     if (!validUrl.startsWith('http://') && !validUrl.startsWith('https://')) {
       validUrl = 'https://' + validUrl;
+    }
+    // 【要件2】IDが違っても、直近30秒以内に同じURLを開いていれば開かない。
+    //   これが無いと、経路の重複やID再発番で同じページが2枚開く（実機症状）。
+    //   空URL（配信の解除）は対象外。
+    //   抑止した場合も「処理済みID」だけは記録し、以降の再送も弾けるようにする。
+    if (!claimBroadcastUrlOnce(validUrl)) {
+      if (broadcastId) lastBroadcastOpenedId = broadcastId;
+      console.log('[EduAgent] 同一URLの二重オープンを抑止:', validUrl);
+      return;
     }
     if (broadcastId) lastBroadcastOpenedId = broadcastId;
 

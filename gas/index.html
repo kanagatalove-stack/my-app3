@@ -2050,6 +2050,15 @@
     }
 
     // GAS 側 parseBoolean と同じ意味（"false" を true にしない）。
+    // 【要件1】一斉URL配信の broadcast_id は「押下した瞬間」にクライアントで1つだけ採番する。
+    //   理由: R41 の高速配信は 親/exec と 子GAS直送 を同一tickで撃つため、
+    //         親の応答を待ってからIDを受け取る方式では直送にIDを載せられない。
+    //   ここで採番した1つのIDを 親・子直送・保留キューflush の全経路に載せることで、
+    //   端末側が「同じ配信」と判定でき、同じページが2枚開く事故を防ぐ。
+    function mintBroadcastId() {
+      return 'bc_' + new Date().getTime() + '_' + Math.random().toString(36).slice(2, 7);
+    }
+
     function parseBoolJs(v) {
       if (v === true || v === false) return v;
       if (typeof v === 'number') return v !== 0;
@@ -2116,6 +2125,12 @@
         patch.screen_lock = parseBoolJs(src.locked);
       } else if (act === 'bulk_broadcast') {
         patch.broadcast_url = String(src.url === undefined ? '' : src.url);
+        // 【要件1】子GAS直送にも押下時に採番したIDを載せる。
+        //   載せないと子が generateBroadcastId() で別IDを発番し、
+        //   親経由と子直送で2つのIDになり端末が2枚開く（実機症状の本丸）。
+        if (src.broadcast_id !== undefined && src.broadcast_id !== null) {
+          patch.broadcast_id = String(src.broadcast_id);
+        }
       } else if (act === 'bulk_filter') {
         if (src.filter_mode !== undefined) patch.filter_mode = src.filter_mode;
         if (src.whitelist_urls !== undefined) patch.whitelist_urls = src.whitelist_urls;
@@ -2127,6 +2142,9 @@
         if (d.whitelist_urls !== undefined) patch.whitelist_urls = d.whitelist_urls;
         if (d.blacklist_urls !== undefined) patch.blacklist_urls = d.blacklist_urls;
         if (d.broadcast_url !== undefined) patch.broadcast_url = d.broadcast_url;
+        if (d.broadcast_id !== undefined && d.broadcast_id !== null) {
+          patch.broadcast_id = String(d.broadcast_id);
+        }
       }
       return patch;
     }
@@ -2813,7 +2831,7 @@
           } else if (act === 'bulk_lock') {
             runner.api_bulkLock(authToken, payload.student_ids, payload.locked);
           } else if (act === 'bulk_broadcast') {
-            runner.api_bulkBroadcast(authToken, payload.student_ids, payload.url);
+            runner.api_bulkBroadcast(authToken, payload.student_ids, payload.url, payload.broadcast_id || '');
           } else if (act === 'bulk_filter') {
             runner.api_bulkFilter(authToken, payload.student_ids, payload.filter_mode, payload.whitelist_urls, payload.blacklist_urls);
           } else if (act === 'update_single') {
@@ -5087,12 +5105,18 @@
         if (d) prevUrls[id] = d.broadcast_url || '';
       });
       armOptimisticGuard(ids, { broadcast_url: url });
+      // 【要件1】この配信の broadcast_id はここで1つだけ採番し、全経路で共用する。
+      const bcId = mintBroadcastId();
       await runMutation({
-        payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
+        payload: { action: 'bulk_broadcast', student_ids: ids, url: url, broadcast_id: bcId },
         apply: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
-            if (d) d.broadcast_url = url;
+            if (d) {
+              d.broadcast_url = url;
+              // 端末一覧の表示も親と揃える（次の全件取得を待たない）
+              d.broadcast_id = bcId;
+            }
           });
           try { refreshDeviceViews(); } catch (e) {}
         },
@@ -5590,12 +5614,17 @@
         if (d) prevUrlsQuick[id] = d.broadcast_url || '';
       });
       armOptimisticGuard(ids, { broadcast_url: url });
+      // 【要件1】マイURL配信も同じ採番方式（押下時に1つ）に統一する。
+      const bcIdQuick = mintBroadcastId();
       await runMutation({
-        payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
+        payload: { action: 'bulk_broadcast', student_ids: ids, url: url, broadcast_id: bcIdQuick },
         apply: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
-            if (d) d.broadcast_url = url;
+            if (d) {
+              d.broadcast_url = url;
+              d.broadcast_id = bcIdQuick;
+            }
           });
           try { refreshDeviceViews(); } catch (e) {}
         },

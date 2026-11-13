@@ -1184,8 +1184,16 @@ function doPost(e) {
       if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
-      const broadcastId = bulkUpdateBroadcastUrl(scoped.ids, targetUrl, '');
-      const shardBc = shardPropagatePolicy(scoped.ids, { broadcast_url: targetUrl });
+      // 【要件1】配信IDは管理画面の押下時に1つだけ採番され、payload.broadcast_id で届く。
+      //   ここで採番し直すと子GAS直送（ブラウザ→子）と別IDになり、
+      //   端末が「新しい配信」と誤認して同じページを2枚開く（実機症状）。
+      //   届かなかった場合のみ bulkUpdateBroadcastUrl 側がフォールバック発番する。
+      const reqBcId = String((payload && payload.broadcast_id) || '').trim();
+      const broadcastId = bulkUpdateBroadcastUrl(scoped.ids, targetUrl, reqBcId);
+      const shardBc = shardPropagatePolicy(scoped.ids, {
+        broadcast_url: targetUrl,
+        broadcast_id: broadcastId
+      });
       return jsonResponse({ success: true, message: '一斉URLを配信しました', broadcast_id: broadcastId, shard: shardBc });
     }
 
@@ -5246,7 +5254,11 @@ function shardApplyFromParent(payload) {
     }
     // 【R38】真偽値判定だと空文字（配信の取り消し）が落ちる。undefined で判定する。
     if (patch.broadcast_url !== undefined && patch.broadcast_url !== null) {
-      bulkUpdateBroadcastUrl(idList, String(patch.broadcast_url), '');
+      // 【要件1】親が採番した broadcast_id をそのまま使う。
+      //   ここで '' を渡して子が generateBroadcastId() すると、同じ配信に別IDが付き、
+      //   端末が「新しい配信」と誤認して同じページを新しいタブで開く（実機症状）。
+      //   空のときだけ bulkUpdateBroadcastUrl 側がフォールバック発番する（後方互換）。
+      bulkUpdateBroadcastUrl(idList, String(patch.broadcast_url), String(patch.broadcast_id || ''));
     }
     if (patch.filter_mode !== undefined) {
       bulkUpdateFilterMode(idList, String(patch.filter_mode),
@@ -7155,7 +7167,7 @@ function api_bulkLock(token, studentIds, locked) {
   }
 }
 
-function api_bulkBroadcast(token, studentIds, url) {
+function api_bulkBroadcast(token, studentIds, url, broadcastId) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
@@ -7165,9 +7177,14 @@ function api_bulkBroadcast(token, studentIds, url) {
     if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
-    const bcId = bulkUpdateBroadcastUrl(scoped.ids, url, '');
+    // 【要件1】管理画面が押下時に採番したIDをそのまま使う（空なら従来どおり発番）。
+    //   親・子直送・保留キューflush の3経路で同一IDになることが二重タブ防止の要。
+    const bcId = bulkUpdateBroadcastUrl(scoped.ids, url, String(broadcastId || '').trim());
     // 子GAS分散: 一斉URL配信も子へ伝達する（届かないと端末側で配信されない）
-    const shardBc = shardPropagatePolicy(scoped.ids, { broadcast_url: url });
+    const shardBc = shardPropagatePolicy(scoped.ids, {
+      broadcast_url: url,
+      broadcast_id: bcId
+    });
     return { success: true, broadcast_id: bcId, shard: shardBc };
   } catch (err) {
     return { success: false, error: err.toString() };
