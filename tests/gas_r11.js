@@ -84,7 +84,7 @@ const ctx = {
   Logger: { log(){} }
 };
 
-const names = ['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isDeviceInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','sheetTsToMs','getAllDevices','parseBoolean','applyMonitorVisibility'];
+const names = ['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isDeviceInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','sheetTsToMs','getAllDevices','parseBoolean','applyMonitorVisibility','normalizeHostListToArray_','hostListToSheetString_'];
 let code = '';
 code += 'const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;\n';
 code += 'const SCHOOL_ALIASES = ' + JSON.stringify({

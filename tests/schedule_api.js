@@ -58,6 +58,28 @@ function check(n, c, e) {
   else { console.log('FAIL ' + n, e !== undefined ? '=> ' + JSON.stringify(e) : ''); fail++; }
 }
 
+// ---------------------------------------------------------------- pinned clock
+// 【時刻固定】expandScheduleWindows_ は「実時刻」で窓を切り詰める
+//   （lo = max(開始日, now-1日) / hi = min(終了日, now+horizon)）。
+//   予約のフィクスチャは 2026/11/10 前提で書かれているため、実時刻が
+//   11/11 以降に進むと hi < lo となり窓が 0 件になる（＝テストが期限切れで
+//   静かに壊れる）。ここでは「フィクスチャ執筆時点の now」を固定して、
+//   実行日に関係なく同じ結果になるようにする。
+//   Date を差し替えても sheetTsToMs の Date.UTC / Date.parse と
+//   new Date(s) はそのまま使えるよう、実 Date を継承した最小のサブクラスにする。
+const PINNED_NOW_MS = Date.UTC(2026, 10, 10, 10, 0, 0); // 2026/11/10 19:00 JST
+function makePinnedDate(pinnedMs) {
+  const PIN = pinnedMs;
+  class PinnedDate extends Date {
+    constructor(...args) {
+      if (args.length === 0) super(PIN);
+      else super(...args);
+    }
+    static now() { return PIN; }
+  }
+  return PinnedDate;
+}
+
 // ---------------------------------------------------------------- fake sheet
 function makeSheet(cols, rows) {
   return {
@@ -114,6 +136,17 @@ function makeSheet(cols, rows) {
 }
 
 const CONFIG_SRC = extractConst('CONFIG');
+// セクション R で使うシート名（製品コードの CONFIG から解決する）
+const CONFIG_SCHEDULE_NAME = (function () {
+  const m = CONFIG_SRC.match(/SCHEDULE_SHEET_NAME:\s*'([^']+)'/);
+  if (!m) throw new Error('SCHEDULE_SHEET_NAME not found');
+  return m[1];
+})();
+const CONFIG_DEVICE_NAME = (function () {
+  const m = CONFIG_SRC.match(/DEVICE_SHEET_NAME:\s*'([^']+)'/);
+  if (!m) throw new Error('DEVICE_SHEET_NAME not found');
+  return m[1];
+})();
 const sandboxStub = 'var __CFG = ' + CONFIG_SRC.replace('const CONFIG = ', '') + ';';
 
 const sheets = {};
@@ -148,6 +181,9 @@ sheets['スケジュール管理'] = makeSheet([], []); // 空 → ヘッダー�
 const ctx = vm.createContext({
   console: { log: function () {} },
   Logger: { log: function () {} },
+  // 【時刻固定】expandScheduleWindows_ が実時刻で窓を切り詰めるため、
+  //   フィクスチャ執筆時点（2026/11/10 19:00 JST）に固定する。
+  Date: makePinnedDate(PINNED_NOW_MS),
   LockService: {
     getScriptLock: function () {
       return { waitLock: function () {}, releaseLock: function () {} };
@@ -187,13 +223,21 @@ const FNS = [
   'isAllSchoolsName', 'normalizeClassName', 'isAdminTeacher',
   'getTeacherScopeInfo', 'getTeacherTargetClasses', 'isClassInTeacherScope',
   'scopeStudentIdsForTeacher', 'parseBoolean',
+  // --- URLリストの配列化（シートは文字列 / 端末契約は string[]） ---
+  'normalizeHostListToArray_', 'hostListToSheetString_',
+  // --- 児童IDの表記ゆれ吸収（メール全体 / @より前のローカル部） ---
+  'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
   // --- スケジュール中核 ---
   'deviceMatchesSchedule_', 'readScheduleRows_', 'isAnyScheduleActive_',
   // --- CRUD ---
   'schNowJstSec_', 'generateScheduleId_', 'validateScheduleInput_',
   'authorizeScheduleTarget_', 'appendScheduleRow_', 'updateScheduleCells_',
   'isScheduleRowInTeacherScope_', 'scheduleRowToJson_',
-  'handleSaveSchedule_', 'handleListSchedules_', 'handleCancelSchedule_', 'handleOverrideSchedule_'
+  // --- 端末へ配る経路（配列化の検証対象） ---
+  'buildSchedulePayloadForDevice_', 'shardBuildWindowsForStudent_',
+  'handleSaveSchedule_', 'handleListSchedules_', 'handleCancelSchedule_', 'handleOverrideSchedule_',
+  // --- フェーズ5: 子GAS伝播の入口（isShardParent が false なら即 skipped） ---
+  'propagateScheduleToChildren_'
 ];
 FNS.forEach(function (n) { pieces.push(extractFn(n)); });
 
@@ -218,6 +262,13 @@ pieces.push([
 pieces.push([
   'function withWriteLock(fn){ return fn(); }',
   'function invalidateDevicesCache(){}',
+  // フェーズ5: このスイートは「親でも子でもない」単体GASとして扱う。
+  //   propagateScheduleToChildren_ は isShardParent()===false で即 skipped を返す。
+  'function isShardParent(){ return false; }',
+  // 索引は「使えない環境」を再現する。null を返すこと（[] だと truthy のため
+  // scopeStudentIdsForTeacher がシート読みフォールバックへ落ちず、個別児童が
+  // 全滅する）。
+  'function shardDeviceEntries(){ return null; }',
 ].join('\n'));
 
 // __SHEETS / __SCHOOLS は context 側で渡す（ここで var 宣言すると上書きしてしまう）
@@ -438,6 +489,1880 @@ check('不変条件: 予約シートへの書き込みは CRUD 経由のみ',
   check('不変条件: スケジュール実装は行削除しない（監査ログ保全）', bad.length === 0, bad);
 })();
 
-console.log('');
-console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
-process.exit(fail > 0 ? 1 : 0);
+// ================================================================ M. Web API ラッパー
+//   背景（実害）: 過去のラッパーは存在しないヘルパー（getTeacherByToken_ /
+//     authenticateToken_ / getSessionUserEmail_）を呼んでいたため teacher が
+//     常に null になり、
+//        ・isScheduleRowInTeacherScope_ が全行 false → 一覧 0 件（カレンダーが空）
+//        ・createdBy（by=）が空文字 → 監査ログが壊れる
+//     という 2 つの不具合を同時に起こしていた。
+//   再発防止として「認証は verifyToken のみ」「架空ヘルパー禁止」
+//   「teacher.school_name 禁止（正は teacher.school）」を機械的に固定する。
+console.log('===== M. Web API ラッパー（認証チェーン） =====');
+{
+  const API_FNS = [
+    'extractTeacherFromToken_', 'api_listSchedules', 'api_saveSchedule',
+    'api_cancelSchedule', 'api_overrideSchedule'
+  ];
+  const bodies = {};
+  API_FNS.forEach(function (n) { bodies[n] = extractFn(n); });
+
+  // ① 認証の入口は verifyToken だけ
+  check('extractTeacherFromToken_ は verifyToken で検証する',
+    /verifyToken\s*\(/.test(bodies.extractTeacherFromToken_));
+  check('extractTeacherFromToken_ は res.valid と res.teacher を確認する',
+    /\.valid/.test(bodies.extractTeacherFromToken_) && /\.teacher/.test(bodies.extractTeacherFromToken_));
+
+  // ② 架空ヘルパーの呼び出しが無い（関数本体だけを見る＝説明コメントは対象外）
+  const PHANTOM = ['getTeacherByToken_', 'authenticateToken_', 'getSessionUserEmail_'];
+  const phantomHits = [];
+  API_FNS.forEach(function (n) {
+    PHANTOM.forEach(function (p) {
+      if (bodies[n].indexOf(p) >= 0) phantomHits.push(n + ' -> ' + p);
+    });
+  });
+  check('架空ヘルパーを一切呼ばない', phantomHits.length === 0, phantomHits);
+
+  // ③ teacher.school_name を使わない（verifyToken が返す正しいキーは school）
+  const wrongProp = [];
+  API_FNS.forEach(function (n) {
+    if (/teacher\s*\.\s*school_name/.test(bodies[n])) wrongProp.push(n);
+  });
+  check('teacher.school_name を使わない', wrongProp.length === 0, wrongProp);
+  check('Code.gs 全体でも teacher.school_name を参照しない',
+    !/teacher\s*\.\s*school_name/.test(src));
+
+  // ④ 4 本すべてが既存ハンドラへ委譲する（ロジックを二重実装しない）
+  check('api_listSchedules は handleListSchedules_ に委譲',
+    /handleListSchedules_\s*\(/.test(bodies.api_listSchedules));
+  check('api_saveSchedule は handleSaveSchedule_ に委譲',
+    /handleSaveSchedule_\s*\(/.test(bodies.api_saveSchedule));
+  check('api_cancelSchedule は handleCancelSchedule_ に委譲',
+    /handleCancelSchedule_\s*\(/.test(bodies.api_cancelSchedule));
+  check('api_overrideSchedule は handleOverrideSchedule_ に委譲',
+    /handleOverrideSchedule_\s*\(/.test(bodies.api_overrideSchedule));
+}
+
+// ================================================================ N. 実行: 認証チェーン
+//   ソース検査だけでは「teacher が実際に解決されるか」は分からないため、
+//   verifyToken / resolveCurrentTeacher / handle*_ を差し替えた小さな VM で
+//   ラッパーを実際に走らせ、引数の中身まで確認する。
+console.log('===== N. Web API ラッパーの実行 =====');
+{
+  const vmMod = require('vm');
+  const API_SRC_FNS = [
+    'extractTeacherFromToken_', 'apiNeedAuth_', 'api_listSchedules',
+    'api_saveSchedule', 'api_cancelSchedule', 'api_overrideSchedule'
+  ];
+  const apiSrc = API_SRC_FNS.map(function (n) { return extractFn(n); }).join('\n');
+
+  function buildApi(o) {
+    o = o || {};
+    const stash = { tokens: [], calls: [], list: null, save: null, cancel: null, override: null };
+    const sandbox = {
+      __stash: stash,
+      __verifyRes: o.verifyRes === undefined ? null : o.verifyRes,
+      __verifyThrows: !!o.verifyThrows,
+      __resolved: o.resolved || null,
+      __resolveThrows: !!o.resolveThrows,
+      Logger: { log: function () {} }
+    };
+    const pre = [
+      'function verifyToken(t){ __stash.tokens.push(t); if (__verifyThrows) throw new Error("boom"); return __verifyRes; }',
+      'function resolveCurrentTeacher(t){ if (__resolveThrows) throw new Error("boom"); return __resolved || t; }',
+      'function handleListSchedules_(p, t){ __stash.list = p; __stash.calls.push({fn:"list", teacher:t}); return {success:true, data:[], src:"list"}; }',
+      'function handleSaveSchedule_(p, t){ __stash.save = p; __stash.calls.push({fn:"save", teacher:t}); return {success:true, src:"save"}; }',
+      'function handleCancelSchedule_(p, t){ __stash.cancel = p; __stash.calls.push({fn:"cancel", teacher:t}); return {success:true, src:"cancel"}; }',
+      'function handleOverrideSchedule_(p, t){ __stash.override = p; __stash.calls.push({fn:"override", teacher:t}); return {success:true, src:"override"}; }'
+    ].join('\n');
+    const tail = '\n__API = { extract: extractTeacherFromToken_, list: api_listSchedules,' +
+      ' save: api_saveSchedule, cancel: api_cancelSchedule, override: api_overrideSchedule };';
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(pre + '\n' + apiSrc + '\n' + tail, sandbox);
+    return sandbox;
+  }
+
+  const TCH = { email: 't@example.com', name: '担任', school: '第一小学校', role: 'TEACHER', target_class: '5年1組' };
+
+  // ① トークン無し → null
+  check('トークン無しは teacher を返さない', buildApi({ verifyRes: { valid: true, teacher: TCH } }).__API.extract('') === null);
+
+  // ② 無効トークン → null
+  check('valid=false は teacher を返さない', buildApi({ verifyRes: { valid: false } }).__API.extract('bad.token') === null);
+
+  // ③ 有効トークン → teacher
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    const t = ctx.__API.extract('a.b');
+    check('有効トークンは teacher を返す', !!t && t.email === 't@example.com', t);
+    check('有効トークンは school を保持する', !!t && t.school === '第一小学校', t && t.school);
+    check('トークンが verifyToken へ渡る', ctx.__stash.tokens[0] === 'a.b', ctx.__stash.tokens);
+  })();
+
+  // ④ verifyToken が例外を投げても落ちない
+  (function () {
+    const ctx = buildApi({ verifyThrows: true });
+    let threw = false, out = 'unset';
+    try { out = ctx.__API.extract('a.b'); } catch (e) { threw = true; }
+    check('verifyToken の例外で落ちない', threw === false && out === null, out);
+  })();
+
+  // ⑤ resolveCurrentTeacher が最新レコードで上書きする
+  (function () {
+    const ctx = buildApi({
+      verifyRes: { valid: true, teacher: TCH },
+      resolved: { email: 't@example.com', name: '担任', school: '英田小学校', role: 'ADMIN' }
+    });
+    const t = ctx.__API.extract('a.b');
+    check('最新の所属校で解決し直す', t.school === '英田小学校', t.school);
+    check('最新の権限で解決し直す', t.role === 'ADMIN', t.role);
+  })();
+
+  // ⑥ resolveCurrentTeacher が例外 → トークン内容で続行
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH }, resolveThrows: true });
+    const t = ctx.__API.extract('a.b');
+    check('最新化に失敗してもトークン内容で続行', !!t && t.school === '第一小学校', t && t.school);
+  })();
+
+  // ⑦ 認証できないときは need_auth を返す（黙って空配列を返さない）
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: false } });
+    ['list', 'save', 'cancel', 'override'].forEach(function (k) {
+      const r = ctx.__API[k]('bad.token', 'x', 'y');
+      check('api_' + k + ' は未認証なら need_auth', !!r && r.success === false && r.need_auth === true, r);
+    });
+    check('未認証ではハンドラへ到達しない', ctx.__stash.calls.length === 0, ctx.__stash.calls.length);
+  })();
+
+  // ⑧ list: teacher.school が school_name に載り、teacher がそのまま渡る
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    const r = ctx.__API.list('a.b', '');
+    check('api_listSchedules はハンドラへ委譲する', r && r.src === 'list', r);
+    check('api_listSchedules は school_name を所属校で補う',
+      ctx.__stash.list && ctx.__stash.list.school_name === '第一小学校', ctx.__stash.list);
+    check('api_listSchedules は解決済み teacher を渡す',
+      ctx.__stash.calls[0] && ctx.__stash.calls[0].teacher && ctx.__stash.calls[0].teacher.email === 't@example.com');
+  })();
+
+  // ⑨ save: schoolName が補われ、token が載る
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    const r = ctx.__API.save('a.b', { target_type: 'class', class_name: '5年1組' });
+    check('api_saveSchedule はハンドラへ委譲する', r && r.src === 'save', r);
+    check('api_saveSchedule は schoolName を所属校で補う',
+      ctx.__stash.save && ctx.__stash.save.schoolName === '第一小学校', ctx.__stash.save);
+    check('api_saveSchedule は token を載せる',
+      ctx.__stash.save && ctx.__stash.save.token === 'a.b', ctx.__stash.save && ctx.__stash.save.token);
+    check('api_saveSchedule は解決済み teacher を渡す',
+      ctx.__stash.calls[0] && ctx.__stash.calls[0].teacher && ctx.__stash.calls[0].teacher.school === '第一小学校');
+  })();
+
+  // ⑩ save: 既に学校名が入っていれば上書きしない
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    ctx.__API.save('a.b', { schoolName: '英田小学校' });
+    check('api_saveSchedule は明示された学校名を尊重する',
+      ctx.__stash.save && ctx.__stash.save.schoolName === '英田小学校', ctx.__stash.save);
+  })();
+
+  // ⑪ cancel / override: schedule_id を載せて委譲する
+  (function () {
+    const ctx = buildApi({ verifyRes: { valid: true, teacher: TCH } });
+    const rc = ctx.__API.cancel('a.b', 'sch_1');
+    const ro = ctx.__API.override('a.b', 'sch_2', 'manual');
+    check('api_cancelSchedule はハンドラへ委譲する', rc && rc.src === 'cancel', rc);
+    check('api_cancelSchedule は schedule_id を載せる',
+      ctx.__stash.cancel && (ctx.__stash.cancel.schedule_id === 'sch_1' || ctx.__stash.cancel.id === 'sch_1'), ctx.__stash.cancel);
+    check('api_overrideSchedule はハンドラへ委譲する', ro && ro.src === 'override', ro);
+    check('api_overrideSchedule は schedule_id を載せる',
+      ctx.__stash.override && (ctx.__stash.override.schedule_id === 'sch_2' || ctx.__stash.override.id === 'sch_2'), ctx.__stash.override);
+  })();
+}
+
+// ================================================================ O. 保存の性能
+//   実害: 「予約を登録」→「完了表示」までが数秒かかっていた。原因の 1 つが
+//     書き込み直後の readScheduleRows_()（予約シート全読み）だった。
+//     追加した行は obj にそのまま在るので読み直す必要が無い。
+console.log('===== O. 保存の性能（全読み回帰） =====');
+{
+  const saveBody = extractFn('handleSaveSchedule_');
+  // コメントは「説明」であって「呼び出し」ではない。
+  //   （実装の意図を残すためコメントには関数名を書いているので、
+  //     判定の前にコメントを落として“実際の呼び出し”だけを見る）
+  const codeOnly = saveBody
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+  check('保存時に予約シートを全読みしない', codeOnly.indexOf('readScheduleRows_') < 0,
+    codeOnly.indexOf('readScheduleRows_'));
+  check('保存時に appendScheduleRow_ で追記する', /appendScheduleRow_\s*\(/.test(codeOnly));
+  check('保存時に保存行を自前で組み立てる（saved）', /var\s+saved\s*=|const\s+saved\s*=/.test(codeOnly));
+  check('保存時に子GAS伝播を呼ぶ', codeOnly.indexOf('propagateScheduleToChildren_') >= 0);
+  check('保存行は新規＝有効で作られる', /enabled\s*:\s*true/.test(codeOnly));
+  check('保存行は新規＝未解除で作られる', /overridden\s*:\s*false/.test(codeOnly));
+  // appendScheduleRow_ が書く条件付き列を、saved 側でも同じ条件で落としていること
+  check('URL規制モードは url_block のときだけ載せる',
+    /filterMode\s*:\s*isUrlBlock/.test(codeOnly) && /isUrlBlock\s*=\s*obj\.type\s*===\s*'url_block'/.test(codeOnly));
+}
+
+
+// ================================================================ P. URLリストの配列化
+//   実害: シートの「許可URLリスト」「規制URLリスト」は 1 セルに
+//     "youtube.com, game.example" の「文字列」で入っている。
+//   一方、拡張機能側の normalizeHostList(list) は
+//     if (!Array.isArray(list)) return [];
+//   なので、GAS が文字列のまま配ると URL規制が端末で一切効かない。
+//   ここでは 6 つの経路すべてが string[] を返すことを実測で確かめる。
+console.log('===== P. URLリストの配列化（文字列 → string[]） =====');
+{
+  // 子GASが予約キャッシュを持つプロパティキー（製品コードと同じ値）
+  const SHARD_PROP = 'SHARD_SCHEDULES_CACHE';
+  const WL = 'allow.example, ok.example';
+  const BL = 'youtube.com,game.example';
+  const WL_ARR = ['allow.example', 'ok.example'];
+  const BL_ARR = ['youtube.com', 'game.example'];
+
+  // ---------------------------------------------------------- ① ヘルパー単体
+  check('P1 normalizeHostListToArray_: カンマ区切り文字列を配列化',
+    JSON.stringify(T.normalizeHostListToArray_(BL)) === JSON.stringify(BL_ARR),
+    T.normalizeHostListToArray_(BL));
+  check('P2 normalizeHostListToArray_: 改行区切りも配列化',
+    JSON.stringify(T.normalizeHostListToArray_('a.example\nb.example')) === JSON.stringify(['a.example', 'b.example']));
+  check('P3 normalizeHostListToArray_: 配列はそのまま（trim のみ）',
+    JSON.stringify(T.normalizeHostListToArray_([' a.example ', 'b.example'])) === JSON.stringify(['a.example', 'b.example']));
+  check('P4 normalizeHostListToArray_: null/undefined は空配列',
+    T.normalizeHostListToArray_(null).length === 0 && T.normalizeHostListToArray_(undefined).length === 0);
+  check('P5 normalizeHostListToArray_: 空文字は空配列', T.normalizeHostListToArray_('').length === 0);
+  check('P6 normalizeHostListToArray_: 数値など非文字列は空配列', T.normalizeHostListToArray_(123).length === 0);
+  check('P7 normalizeHostListToArray_: 空要素は落とす',
+    JSON.stringify(T.normalizeHostListToArray_('a,,b,')) === JSON.stringify(['a', 'b']));
+  check('P8 normalizeHostListToArray_: 大文字小文字は保持（表示用）',
+    T.normalizeHostListToArray_('YouTube.com')[0] === 'YouTube.com', T.normalizeHostListToArray_('YouTube.com')[0]);
+  check('P9 hostListToSheetString_: 配列を 1 セル文字列へ戻す',
+    T.hostListToSheetString_(['a.example', 'b.example']) === 'a.example, b.example',
+    T.hostListToSheetString_(['a.example', 'b.example']));
+  check('P10 hostListToSheetString_: 空配列は空文字', T.hostListToSheetString_([]) === '');
+
+  // シート保存 → 読み取りの往復で壊れないこと（1 セルに配列を入れない）
+  (function () {
+    const cell = T.hostListToSheetString_(BL_ARR);
+    check('P11 往復: セル文字列 → 読み取りで元の配列に戻る',
+      JSON.stringify(T.normalizeHostListToArray_(cell)) === JSON.stringify(BL_ARR), cell);
+  })();
+
+  // ---------------------------------------------------------- ② readScheduleRows_
+  const SID = 'sch_arr01';
+  const schSheet = sheets['スケジュール管理'];
+  (function () {
+    const map = T.getHeaderMap(schSheet, SCHEDULE_COLUMNS);
+    const row = new Array(SCHEDULE_COLUMNS.length).fill('');
+    const put = function (k, v) { const c = map[k]; if (c) row[c - 1] = v; };
+    put('スケジュールID', SID);
+    put('対象種別', 'class');
+    put('学校名', '第一小学校');
+    put('クラス名', '5年1組');
+    put('制限タイプ', 'url_block');
+    put('URL規制モード', 'BLACKLIST');
+    put('許可URLリスト', WL);
+    put('規制URLリスト', BL);
+    put('開始日', '2026/11/10');
+    put('終了日', '2026/11/14');
+    put('繰り返し', 'NONE');
+    put('開始時刻', '19:00');
+    put('終了時刻', '21:00');
+    put('有効', 'TRUE');
+    put('手動解除', 'FALSE');
+    schSheet._rows.push(row);
+  })();
+
+  const rowsP = T.readScheduleRows_();
+  const rowP = rowsP.filter(function (r) { return r.id === SID; })[0];
+  check('P12 readScheduleRows_: 行が読める', !!rowP, SID);
+  check('P13 readScheduleRows_: whitelist が string[]',
+    !!rowP && Array.isArray(rowP.whitelist) && JSON.stringify(rowP.whitelist) === JSON.stringify(WL_ARR),
+    rowP && rowP.whitelist);
+  check('P14 readScheduleRows_: blacklist が string[]',
+    !!rowP && Array.isArray(rowP.blacklist) && JSON.stringify(rowP.blacklist) === JSON.stringify(BL_ARR),
+    rowP && rowP.blacklist);
+
+  // ---------------------------------------------------------- ③ scheduleRowToJson_
+  if (rowP) {
+    const j = T.scheduleRowToJson_(rowP, Date.UTC(2026, 10, 10, 10, 30));
+    check('P15 scheduleRowToJson_: whitelist_urls が string[]',
+      Array.isArray(j.whitelist_urls) && JSON.stringify(j.whitelist_urls) === JSON.stringify(WL_ARR), j.whitelist_urls);
+    check('P16 scheduleRowToJson_: blacklist_urls が string[]',
+      Array.isArray(j.blacklist_urls) && JSON.stringify(j.blacklist_urls) === JSON.stringify(BL_ARR), j.blacklist_urls);
+  } else {
+    check('P15 scheduleRowToJson_: whitelist_urls が string[]', false, 'row missing');
+    check('P16 scheduleRowToJson_: blacklist_urls が string[]', false, 'row missing');
+  }
+
+  // ---------------------------------------------------------- ④⑤ 端末へ配る経路
+  //   「文字列のまま」の行を渡しても、出口で必ず配列になること。
+  const legacyRow = {
+    rowIndex: 999, id: 'sch_legacy', targetType: 'class', schoolName: '第一小学校',
+    className: '5年1組', studentIds: [], type: 'url_block', filterMode: 'BLACKLIST',
+    whitelist: WL, blacklist: BL,               // ← 旧データを再現（文字列）
+    dateFrom: '2026/11/10', dateTo: '2026/11/14', repeat: 'NONE',
+    startTime: '19:00', endTime: '21:00', weekdaysRaw: '', enabled: true,
+    overridden: false, overrideAt: '', createdBy: '', createdAt: '', updatedAt: '', note: ''
+  };
+  const NOW_IN = Date.UTC(2026, 10, 10, 10, 30); // 11/10 19:30 JST（窓の内側）
+
+  const p4 = T.buildSchedulePayloadForDevice_('s1', '5年1組', '第一小学校', NOW_IN, [legacyRow]);
+  check('P17 buildSchedulePayloadForDevice_: active に載る', p4.active.length === 1, p4.active.length);
+  check('P18 buildSchedulePayloadForDevice_: whitelist が string[]',
+    p4.active.length === 1 && Array.isArray(p4.active[0].whitelist) &&
+    JSON.stringify(p4.active[0].whitelist) === JSON.stringify(WL_ARR),
+    p4.active[0] && p4.active[0].whitelist);
+  check('P19 buildSchedulePayloadForDevice_: blacklist が string[]',
+    p4.active.length === 1 && Array.isArray(p4.active[0].blacklist) &&
+    JSON.stringify(p4.active[0].blacklist) === JSON.stringify(BL_ARR),
+    p4.active[0] && p4.active[0].blacklist);
+
+  const p5 = T.shardBuildWindowsForStudent_([legacyRow], 's1', '5年1組', '第一小学校', NOW_IN);
+  check('P20 shardBuildWindowsForStudent_: 窓を返す', p5.windows.length > 0, p5.windows.length);
+  check('P21 shardBuildWindowsForStudent_: whitelist が string[]',
+    p5.windows.length > 0 && Array.isArray(p5.windows[0].whitelist) &&
+    JSON.stringify(p5.windows[0].whitelist) === JSON.stringify(WL_ARR),
+    p5.windows[0] && p5.windows[0].whitelist);
+  check('P22 shardBuildWindowsForStudent_: blacklist が string[]',
+    p5.windows.length > 0 && Array.isArray(p5.windows[0].blacklist) &&
+    JSON.stringify(p5.windows[0].blacklist) === JSON.stringify(BL_ARR),
+    p5.windows[0] && p5.windows[0].blacklist);
+
+  // 拡張機能の契約そのもの（Array.isArray でなければ捨てられる）を再現して確認
+  function extNormalizeHostList(list) {
+    if (!Array.isArray(list)) return [];
+    return list.map(function (s) { return String(s).trim().toLowerCase(); })
+      .filter(function (s) { return s.length > 0 && s.indexOf('*') < 0; });
+  }
+  check('P23 端末側 normalizeHostList が GAS の出力を受け付ける',
+    extNormalizeHostList(p4.active[0] && p4.active[0].blacklist).length === 2,
+    extNormalizeHostList(p4.active[0] && p4.active[0].blacklist));
+
+  // ---------------------------------------------------------- ⑥ 子GASのキャッシュ経路
+  //   旧バージョンのキャッシュ（文字列で保存された回）が残っていても救うこと。
+  (function () {
+    const vmMod = require('vm');
+    const srcP = [
+      'const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;',
+      extractFn('normalizeHostListToArray_'),
+      extractFn('hostListToSheetString_'),
+      // 児童IDの表記ゆれ吸収（メール全体 / ローカル部）— shardSchedulePayloadFromCache_ が使う
+      extractFn('normalizeIdKey'),
+      extractFn('normalizeUserLocalPart_'),
+      extractFn('idKeysMatch_'),
+      extractFn('emptySchedulePayload_'),
+      extractFn('shardLoadScheduleCache_'),
+      extractFn('shardSchedulePayloadFromCache_'),
+      extractFn('schPad2_'), extractFn('schMsToJstStr_')
+    ].join('\n');
+    const legacyCache = {
+      updated_ms: NOW_IN,
+      by_student: {
+        s1: {
+          windows: [{
+            id: 'sch_legacy', type: 'url_block', filter_mode: 'BLACKLIST',
+            whitelist: WL, blacklist: BL,                 // ← 文字列で保存された旧キャッシュ
+            start_ms: NOW_IN - 600000, end_ms: NOW_IN + 600000
+          }],
+          overridden_ids: []
+        }
+      }
+    };
+    const store = {};
+    store[SHARD_PROP] = JSON.stringify(legacyCache);
+    const sandbox = {
+      CONFIG: JSON.parse(JSON.stringify(ctx.CONFIG || {})),
+      SHARD_SCHEDULES_PROP: SHARD_PROP,
+      SHARD_SCHEDULES_MEMO_SEC: 30,
+      SHARD_SCHEDULES_MEMO_KEY: 'shard_sched_memo1',
+      CacheService: {
+        getScriptCache: function () {
+          return { get: function () { return null; }, put: function () {}, remove: function () {} };
+        }
+      },
+      PropertiesService: {
+        getScriptProperties: function () {
+          return { getProperty: function (k) { return store[k] || null; }, setProperty: function (k, v) { store[k] = v; } };
+        }
+      }
+    };
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(srcP + '\n__P = { fromCache: shardSchedulePayloadFromCache_ };', sandbox);
+    const out = sandbox.__P.fromCache('s1', NOW_IN);
+    check('P24 shardSchedulePayloadFromCache_: 旧キャッシュでも active に載る', out.active.length === 1, out.active.length);
+    check('P25 shardSchedulePayloadFromCache_: whitelist が string[]',
+      out.active.length === 1 && Array.isArray(out.active[0].whitelist) &&
+      JSON.stringify(out.active[0].whitelist) === JSON.stringify(WL_ARR),
+      out.active[0] && out.active[0].whitelist);
+    check('P26 shardSchedulePayloadFromCache_: blacklist が string[]',
+      out.active.length === 1 && Array.isArray(out.active[0].blacklist) &&
+      JSON.stringify(out.active[0].blacklist) === JSON.stringify(BL_ARR),
+      out.active[0] && out.active[0].blacklist);
+  })();
+
+  // ---------------------------------------------------------- ⑦ 端末一覧の出力部
+  (function () {
+    const vmMod = require('vm');
+    const devCols = ['児童ID', '学校名', '氏名', 'クラス', '画面ロック', 'URL規制モード',
+      '許可URLリスト', '規制URLリスト', '一斉表示URL', '一斉表示実行ID', '現在開いているURL',
+      '最終同期日時', '備考', '画面情報要求日時', '画面情報更新日時'];
+    const devSheet = makeSheet(devCols, [
+      devCols.slice(),
+      ['s1', '第一小学校', '第一 一郎', '5年1組', false, 'BLACKLIST', WL, BL, '', '', '', '', '', '', '']
+    ]);
+    const cfg = extractConst('CONFIG');
+    const srcD = [
+      cfg,
+      extractFn('normalizeHostListToArray_'),
+      extractFn('getHeaderMap'),
+      extractFn('parseBoolean'),
+      extractFn('sheetTsToMs'),
+      extractFn('getAllDevices')
+    ].join('\n');
+    const sandbox = {
+      CacheService: undefined,
+      PropertiesService: undefined,
+      LockService: { getScriptLock: function () { return { waitLock: function () {}, releaseLock: function () {} }; } },
+      console: { log: function () {} },
+      getTargetSheet: function () { return devSheet; },
+      applyMonitorVisibility: function (r) { return r; },
+      getTeacherScopeInfo: function () { return { type: 'admin', school: '' }; },
+      getTeacherTargetClasses: function () { return []; },
+      isClassInTeacherScope: function () { return true; },
+      isAdminTeacher: function () { return true; },
+      normalizeSchoolName: function (s) { return String(s || '').trim(); },
+      schoolNamesMatch: function (a, b) { return String(a).trim() === String(b).trim(); },
+      resolveCanonicalSchool: function (s) { return String(s || '').trim(); },
+      isAllSchoolsName: function () { return false; },
+      normalizeClassName: function (s) { return String(s || '').trim(); },
+      invalidateDevicesCache: function () {},
+      readScheduleRows_: function () { return []; },
+      isAnyScheduleActive_: function () { return false; }
+    };
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(srcD + '\n__D = { all: getAllDevices };', sandbox);
+    const list = sandbox.__D.all('ALL', { email: 'a@b.c', role: 'ADMIN', school: '全校管理' }, false);
+    check('P27 getAllDevices: 1 件返る', list.length === 1, list.length);
+    check('P28 getAllDevices: whitelist_urls が string[]',
+      list.length === 1 && Array.isArray(list[0].whitelist_urls) &&
+      JSON.stringify(list[0].whitelist_urls) === JSON.stringify(WL_ARR),
+      list[0] && list[0].whitelist_urls);
+    check('P29 getAllDevices: blacklist_urls が string[]',
+      list.length === 1 && Array.isArray(list[0].blacklist_urls) &&
+      JSON.stringify(list[0].blacklist_urls) === JSON.stringify(BL_ARR),
+      list[0] && list[0].blacklist_urls);
+  })();
+
+  // ---------------------------------------------------------- ⑧ 書き込み側は文字列に戻す
+  //   配列をそのままセルへ書くと、次回の読み取りが壊れる。
+  check('P30 appendScheduleRow_: 配列をセル文字列へ戻す',
+    /hostListToSheetString_\(obj\.whitelist\)/.test(extractFn('appendScheduleRow_')) &&
+    /hostListToSheetString_\(obj\.blacklist\)/.test(extractFn('appendScheduleRow_')));
+
+  // ---------------------------------------------------------- ⑨ 検証は .length で見る
+  const vArr = T.validateScheduleInput_({
+    target_type: 'class', school_name: '第一小学校', class_name: '5年1組',
+    type: 'url_block', filter_mode: 'BLACKLIST', blacklist_urls: ['youtube.com'],
+    date_from: '2026/11/10', date_to: '2026/11/14', repeat: 'WEEKLY', weekdays: '1,2,3,4,5',
+    start_time: '19:00', end_time: '21:00'
+  });
+  check('P31 validateScheduleInput_: 配列入力を受け付ける', vArr.ok === true, vArr.errors);
+  check('P32 validateScheduleInput_: norm は string[]',
+    vArr.ok === true && Array.isArray(vArr.norm.blacklist) &&
+    JSON.stringify(vArr.norm.blacklist) === JSON.stringify(['youtube.com']),
+    vArr.ok && vArr.norm && vArr.norm.blacklist);
+  // 空配列は truthy なので !norm.blacklist では弾けない（.length で判定する回帰）
+  const vEmpty = T.validateScheduleInput_({
+    target_type: 'class', school_name: '第一小学校', class_name: '5年1組',
+    type: 'url_block', filter_mode: 'BLACKLIST', blacklist_urls: [],
+    date_from: '2026/11/10', date_to: '2026/11/14', repeat: 'WEEKLY', weekdays: '1,2,3,4,5',
+    start_time: '19:00', end_time: '21:00'
+  });
+  check('P33 validateScheduleInput_: 空配列の blacklist は弾く', vEmpty.ok === false, vEmpty.errors);
+}
+
+
+// ================================================================ Q. 伝播経路の静かな脱落
+//   実害: 親の「選択日の予約」は有効に見え、子GASの実行ログも HTTP 200。
+//         しかし子GASへは 1 件も送られておらず（sent: []）、端末で規制が効かない。
+//   原因: shardPropagatePolicy の宛先解決で、端末のクラス表記が SHARD_MAP_V1 の
+//         キーと一致せず、既定URLも未設定だと、その児童を「黙って」捨てていた。
+//         1校=1子GAS（R41）でも同じ脱落が起きていた。
+console.log('===== Q. 伝播経路（宛先解決とフォールバック） =====');
+{
+  const vmMod = require('vm');
+  const CHAIN_FNS = [
+    'normalizeClassName', 'normalizeShardClass', 'normalizeSchoolName', 'schoolNamesMatch',
+    'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
+    'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
+    'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_', 'parseBoolean',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'deviceMatchesSchedule_', 'shardBuildWindowsForStudent_', 'shardBuildScheduleByStudent_',
+    'shardMapIndexFromMap', 'shardMapDefaultFromEmptyKey',
+    'shardPropagatePolicy', 'propagateScheduleToChildren_'
+  ];
+  const chainSrc = ['const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;', 'const SHARD_ASYNC_ENABLED = false;']
+    .concat([extractConst('CONFIG')])
+    .concat(CHAIN_FNS.map(function (n) { return extractFn(n); }))
+    .join('\n');
+
+  const STUDENT_ROW = {
+    rowIndex: 2, id: 'sch_q1', targetType: 'student', schoolName: '第一小学校', className: '',
+    studentIds: ['s1'], type: 'screen_lock', filterMode: '', whitelist: [], blacklist: [],
+    dateFrom: '2026/11/10', dateTo: '2026/11/10', repeat: 'NONE', startTime: '12:02', endTime: '12:03',
+    weekdaysRaw: '', enabled: true, overridden: false, overrideAt: '',
+    createdBy: 't@school.ed.jp', createdAt: '', updatedAt: '', note: ''
+  };
+  const CLASS_ROW = Object.assign({}, STUDENT_ROW, {
+    id: 'sch_q2', targetType: 'class', className: '5年1組', studentIds: [],
+    type: 'url_block', filterMode: 'BLACKLIST',
+    whitelist: [], blacklist: ['youtube.com']
+  });
+
+  // 送信された payload を捕捉して、子GASへ何が渡ったかを実測する
+  function runChain(o) {
+    const sent = [];
+    const warns = [];
+    const sandbox = {
+      __sent: sent, __warns: warns,
+      console: { log: function () {} },
+      Logger: { log: function (m) { warns.push(String(m)); } },
+      // 【時刻固定】expandScheduleWindows_ が実時刻で窓を切り詰めるため
+      //   （予約は 2026/11/10 前提）、フィクスチャ時点に固定する。
+      Date: makePinnedDate(PINNED_NOW_MS),
+      isShardParent: function () { return true; },
+      shardConfigCached: function () { return { map: o.map, sec: 'sk_test', def: o.def || '' }; },
+      shardDeviceEntries: function () { return o.entries; },
+      // 予約行は呼び出し側が明示しない限り「今回の 1 行」を返す
+      //   （空配列を返すと schedules が同封されず、テストが無意味になる）
+      readScheduleRows_: function () { return o.rows !== undefined ? o.rows : [o.row]; },
+      shardFetchMany: function (reqs) {
+        for (let i = 0; i < reqs.length; i++) sent.push(JSON.parse(reqs[i].payload));
+        return reqs.map(function () {
+          return { getResponseCode: function () { return 200; }, getContentText: function () { return '{"success":true}'; } };
+        });
+      },
+      shardQueuePending: function () { return false; },
+      shardWarnOnce: function (k, m) { warns.push(String(m)); },
+      bulkTraceMark: function () {}
+    };
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(chainSrc + '\n__Q = { prop: propagateScheduleToChildren_ };', sandbox);
+    return { res: sandbox.__Q.prop(o.row), sent: sent, warns: warns };
+  }
+
+  // 端末一覧のクラスは「5年1組」、SHARD_MAP_V1 のキーは「5-1」（実環境の表記）
+  const ENTRIES = [['s1', '第一小学校', '5年1組']];
+
+  // ① 個別指定（student）: 正規化が効いて宛先が解決する
+  (function () {
+    const r = runChain({ row: STUDENT_ROW, entries: ENTRIES, map: { '5-1': 'https://child1.example/exec' } });
+    check('Q1 student: 子GASへ送信される（脱落しない）', r.sent.length === 1, r.sent.length);
+    check('Q2 student: student_ids に対象児童が入る',
+      r.sent.length === 1 && r.sent[0].student_ids[0] === 's1',
+      r.sent[0] && r.sent[0].student_ids);
+    check('Q3 student: schedules.by_student に児童が載る',
+      r.sent.length === 1 && !!r.sent[0].schedules && !!r.sent[0].schedules.by_student.s1,
+      r.sent[0] && r.sent[0].schedules && Object.keys(r.sent[0].schedules.by_student));
+    check('Q4 student: 窓が数値の start_ms/end_ms を持つ（v1.6.4 の判定契約）',
+      r.sent.length === 1 &&
+      !!r.sent[0].schedules && !!r.sent[0].schedules.by_student.s1 &&
+      Array.isArray(r.sent[0].schedules.by_student.s1.windows) &&
+      r.sent[0].schedules.by_student.s1.windows.length > 0 && (function () {
+        const w = r.sent[0].schedules.by_student.s1.windows[0];
+        return !!w && typeof w.start_ms === 'number' && typeof w.end_ms === 'number' && w.end_ms > w.start_ms;
+      })(), r.sent[0] && r.sent[0].schedules && r.sent[0].schedules.by_student);
+  })();
+
+  // ② クラス指定（class）: 同じく解決する
+  (function () {
+    const r = runChain({ row: CLASS_ROW, entries: ENTRIES, map: { '5-1': 'https://child1.example/exec' } });
+    check('Q5 class: 子GASへ送信される', r.sent.length === 1, r.sent.length);
+    check('Q6 class: blacklist が string[] で届く',
+      r.sent.length === 1 && Array.isArray(r.sent[0].schedules.by_student.s1.windows[0].blacklist) &&
+      r.sent[0].schedules.by_student.s1.windows[0].blacklist[0] === 'youtube.com',
+      r.sent.length === 1 && r.sent[0].schedules.by_student.s1.windows[0].blacklist);
+  })();
+
+  // ③ 表記不一致＋子GASが1つだけ（R41: 1校=1子GAS）→ 唯一の子へフォールバック
+  (function () {
+    const r = runChain({ row: STUDENT_ROW, entries: ENTRIES, map: { '1-1': 'https://child1.example/exec' } });
+    check('Q7 表記不一致でも唯一の子GASへフォールバックする', r.sent.length === 1, r.sent.length);
+    check('Q8 フォールバック時も schedules が同封される',
+      r.sent.length === 1 && !!r.sent[0].schedules && !!r.sent[0].schedules.by_student.s1,
+      r.sent.length === 1 && r.sent[0].schedules && Object.keys(r.sent[0].schedules.by_student));
+    check('Q9 フォールバックした事実をログに残す（静かに落とさない）',
+      r.warns.some(function (m) { return m.indexOf('SHARD_MAP_V1') >= 0 && m.indexOf('フォールバック') >= 0; }),
+      r.warns);
+  })();
+
+  // ④ 宛先が本当に無い（子GAS 2つ・どれも不一致・既定URLなし）→ 明示的に失敗を返す
+  (function () {
+    const r = runChain({
+      row: STUDENT_ROW, entries: ENTRIES,
+      map: { '1-1': 'https://childA.example/exec', '2-1': 'https://childB.example/exec' }
+    });
+    check('Q10 宛先不明は sent:[] のまま', r.sent.length === 0, r.sent.length);
+    check('Q11 宛先不明は黙って成功にせず no_route を返す',
+      !!r.res && r.res.reason === 'no_route' && r.res.dropped === 1, r.res);
+    check('Q12 宛先不明はログにも残す', r.warns.length > 0, r.warns.length);
+  })();
+
+  // ⑤ 既定URLがあればそちらへ送る（従来動作の維持）
+  (function () {
+    const r = runChain({
+      row: STUDENT_ROW, entries: ENTRIES,
+      map: { '1-1': 'https://childA.example/exec' }, def: 'https://def.example/exec'
+    });
+    check('Q13 既定URLがあるときは既定URLへ送る',
+      r.sent.length === 1 && r.res.sent[0].url === 'https://def.example/exec', r.res);
+  })();
+
+  // ⑥ 索引が「空配列」で固まってもシート読みへ落ちる（[] は truthy の罠）
+  const propBody = extractFn('shardPropagatePolicy');
+  check('Q14 空の索引([])でもシート読みへフォールバックする',
+    /if\s*\(\s*!entries\s*\|\|\s*!entries\.length\s*\)/.test(propBody));
+  check('Q15 宛先解決に unique子GAS フォールバックが入っている',
+    /singleChildUrl/.test(propBody) && /idxKeys\.length === 1/.test(propBody));
+}
+
+
+// ================================================================ R. 保存→伝播の発火保証
+//   実害: 親の保存ログ [SCHEDULE] saved ... だけが出て、[SHARD] ログが 1 行も無い。
+//         しかし shardPropagatePolicy の成功経路には元々ログが無かったため、
+//         「無言の成功」と「無言のスキップ」が区別できなかった。
+//   ここでは handleSaveSchedule_ を実際に走らせ、保存と同時に伝播が
+//   必ず発火すること、およびスキップ時は理由がログと戻り値に残ることを検証する。
+console.log('===== R. 保存→伝播の発火保証 =====');
+{
+  const vmMod = require('vm');
+
+  const SAVE_FNS = [
+    'getHeaderMap',
+    'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
+    'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
+    'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_',
+    'normalizeSchoolName', 'schoolNamesMatch', 'resolveCanonicalSchool',
+    'isAllSchoolsName', 'normalizeClassName', 'isAdminTeacher',
+    'getTeacherScopeInfo', 'getTeacherTargetClasses', 'isClassInTeacherScope',
+    'scopeStudentIdsForTeacher', 'parseBoolean',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'deviceMatchesSchedule_', 'readScheduleRows_', 'isAnyScheduleActive_',
+    'schNowJstSec_', 'generateScheduleId_', 'validateScheduleInput_',
+    'authorizeScheduleTarget_', 'appendScheduleRow_', 'updateScheduleCells_',
+    'isScheduleRowInTeacherScope_', 'scheduleRowToJson_',
+    'handleSaveSchedule_', 'propagateScheduleToChildren_'
+  ];
+
+  function buildSave(o) {
+    o = o || {};
+    const logs = [];
+    const propCalls = [];
+    const schedSheet = makeSheet([], []);
+    const devSheet = makeSheet(DEVICE_COLUMNS, [
+      DEVICE_COLUMNS.slice(),
+      ['s1', '第一小学校', '第一 一郎', '5年1組', false, 'OFF', '', '', '', '', '', '', '', '', '']
+    ]);
+    const targetSheets = {};
+    targetSheets[CONFIG_SCHEDULE_NAME] = schedSheet;
+    targetSheets[CONFIG_DEVICE_NAME] = devSheet;
+
+    const sandbox = {
+      // CONFIG は src 側で `var CONFIG = {...}` として評価する。
+      //   （CONFIG_SRC は JS オブジェクトリテラルなので JSON.parse では落ちる）
+      SCHEDULE_COLUMNS: SCHEDULE_COLUMNS,
+      SHEET_TZ_OFFSET_MS: 9 * 60 * 60 * 1000,
+      __logs: logs,
+      __propCalls: propCalls,
+      console: { log: function () {} },
+      Logger: { log: function (m) { logs.push(String(m)); } },
+      Utilities: { formatDate: function (d, tz, fmt) { return '2026/11/10 12:36:15'; } },
+      LockService: {
+        getScriptLock: function () {
+          return { waitLock: function () {}, releaseLock: function () {} };
+        }
+      },
+      getTargetSheet: function (name) { return targetSheets[name]; },
+      ensureScheduleHeaders: function (sheet) {
+        if (sheet.getLastColumn() === 0) {
+          sheet._cols = SCHEDULE_COLUMNS.slice();
+          sheet._rows[0] = SCHEDULE_COLUMNS.slice();
+          return;
+        }
+        const hdr = sheet._rows[0].map(function (h) { return String(h).trim(); });
+        SCHEDULE_COLUMNS.forEach(function (col) {
+          if (hdr.indexOf(col) < 0) { sheet._cols.push(col); sheet._rows[0].push(col); }
+        });
+      },
+      withWriteLock: function (fn) { return fn(); },
+      invalidateDevicesCache: function () {},
+      shardDeviceEntries: function () { return [['s1', '第一小学校', '5年1組']]; },
+      shardWarnOnce: function () {},
+      // 親か子かはテスト側で切り替える（既定は親）
+      isShardParent: function () { return o.isParent !== false; },
+      // shardPropagatePolicy を差し替えて「呼ばれたか」と「引数」を捕捉する
+      shardPropagatePolicy: function (ids, patch, forceSync) {
+        propCalls.push({ ids: (ids || []).slice(), patch: patch, forceSync: forceSync });
+        if (o.propResult) return o.propResult;
+        return { sent: [{ url: 'https://child1.example/exec', count: (ids || []).length, status: 200 }] };
+      }
+    };
+
+    const src = [CONFIG_SRC.replace('const CONFIG = ', 'var CONFIG = ')]
+      .concat(SAVE_FNS.map(function (n) { return extractFn(n); }))
+      .join('\n');
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(src + '\n__R = { save: handleSaveSchedule_ };', sandbox);
+    return { sandbox: sandbox, logs: logs, propCalls: propCalls, schedSheet: schedSheet };
+  }
+
+  const TEACHER = {
+    email: 'teacher.daiichi@school.ed.jp', name: '第一小', school: '第一小学校',
+    role: 'TEACHER', target_class: '5年1組'
+  };
+  const STUDENT_PAYLOAD = {
+    target_type: 'student', student_ids: ['s1'],
+    type: 'screen_lock',
+    date_from: '2026/11/10', date_to: '2026/11/10', repeat: 'NONE',
+    start_time: '12:02', end_time: '12:03',
+    note: '実機再現'
+  };
+
+  // ① 親GAS: 保存と同時に伝播が必ず発火する
+  (function () {
+    const b = buildSave({ isParent: true });
+    const res = b.sandbox.__R.save(STUDENT_PAYLOAD, TEACHER);
+
+    check('R1 保存が成功する', res.success === true, res.error);
+    check('R2 親シートへ 1 行追記される', b.schedSheet.getLastRow() === 2, b.schedSheet.getLastRow());
+    check('R3 保存ログが出る', b.logs.some(function (m) { return m.indexOf('[SCHEDULE] saved') >= 0; }), b.logs);
+    check('R4 伝播が 1 回だけ発火する', b.propCalls.length === 1, b.propCalls.length);
+    check('R5 伝播に児童IDが渡る',
+      b.propCalls.length === 1 && JSON.stringify(b.propCalls[0].ids) === JSON.stringify(['s1']),
+      b.propCalls[0] && b.propCalls[0].ids);
+    check('R6 伝播は即時同期（forceSync=true）',
+      b.propCalls.length === 1 && b.propCalls[0].forceSync === true,
+      b.propCalls[0] && b.propCalls[0].forceSync);
+    check('R7 戻り値 shard に sent が入る（画面から確認できる）',
+      !!res.shard && Array.isArray(res.shard.sent) && res.shard.sent.length === 1, res.shard);
+    check('R8 伝播ログ [SHARD] が出る', b.logs.some(function (m) { return m.indexOf('[SHARD]') >= 0; }), b.logs);
+  })();
+
+  // ② クラス指定でも同じく発火する
+  (function () {
+    const b = buildSave({ isParent: true });
+    const res = b.sandbox.__R.save({
+      target_type: 'class', school_name: '第一小学校', class_name: '5年1組',
+      type: 'url_block', filter_mode: 'BLACKLIST', blacklist_urls: 'youtube.com',
+      date_from: '2026/11/10', date_to: '2026/11/10', repeat: 'NONE',
+      start_time: '12:06', end_time: '12:07'
+    }, TEACHER);
+    check('R9 class: 保存が成功する', res.success === true, res.error);
+    check('R10 class: 伝播が発火する', b.propCalls.length === 1, b.propCalls.length);
+    check('R11 class: クラスの児童が対象になる',
+      b.propCalls.length === 1 && b.propCalls[0].ids.indexOf('s1') >= 0,
+      b.propCalls[0] && b.propCalls[0].ids);
+  })();
+
+  // ③ 親でない場合は「無言でスキップ」せず理由が残る
+  (function () {
+    const b = buildSave({ isParent: false });
+    const res = b.sandbox.__R.save(STUDENT_PAYLOAD, TEACHER);
+    check('R12 親でなくても保存自体は成功する', res.success === true, res.error);
+    check('R13 親でない場合は理由付きでスキップされる',
+      !!res.shard && res.shard.skipped === true && res.shard.reason === 'not_parent', res.shard);
+    check('R14 スキップ理由がログに残る（無言にしない）',
+      b.logs.some(function (m) { return m.indexOf('親GASではありません') >= 0; }), b.logs);
+    check('R15 親でない場合は伝播ポリシーを呼ばない', b.propCalls.length === 0, b.propCalls.length);
+  })();
+
+  // ④ 伝播が例外を投げても保存は成立する（予約を失わない）
+  (function () {
+    const b = buildSave({
+      isParent: true,
+      propResult: null
+    });
+    // shardPropagatePolicy が例外を投げる版で上書き
+    let threw = false;
+    b.sandbox.shardPropagatePolicy = function () { threw = true; throw new Error('child unreachable'); };
+    const res = b.sandbox.__R.save(STUDENT_PAYLOAD, TEACHER);
+    check('R16 伝播が例外でも保存は成功する', res.success === true, res.error);
+    check('R17 伝播が例外でも呼ばれている', threw === true);
+    // 表示は "Error:" を含めない（run_all.sh は Error: を失敗シグナルとして拾う）
+    check('R18 例外は戻り値に載る',
+      !!res.shard && typeof res.shard.error === 'string' && res.shard.error.indexOf('child unreachable') >= 0,
+      res.shard && String(res.shard.error).replace(/Error:\s*/g, ''));
+    check('R19 例外がログに残る',
+      b.logs.some(function (m) { return m.indexOf('propagate: 例外') >= 0; }), b.logs);
+  })();
+
+  // ⑤ ソース検査: 保存直後に無条件で伝播を呼んでいる
+  (function () {
+    const body = extractFn('handleSaveSchedule_');
+    const code = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+    check('R20 保存直後に propagateScheduleToChildren_ を呼ぶ',
+      /const\s+shardProp\s*=\s*propagateScheduleToChildren_\s*\(/.test(code));
+    check('R21 伝播呼び出しに if ガードが無い（無条件で発火）',
+      !/if\s*\([^)]*\)\s*\{?\s*const\s+shardProp\s*=/.test(code));
+    check('R22 shard を戻り値に載せている', /shard\s*:\s*shardProp/.test(code));
+  })();
+}
+
+
+// ================================================================ S. 子GASの自動判別
+//   実害: 子GASのスクリプトプロパティ SHARD_CHILD_MODE=true を入れ忘れると
+//         isShardChild() が false になり、resolveSchedulePayloadForDevice_ が
+//         親用ロジック（buildSchedulePayloadForDevice_ → 子シート直読み）へ落ちる。
+//         子シートにスケジュール行は書かない確定仕様のため、端末には常に
+//         空の schedules が返り、予約が一切効かなかった。
+//   ここでは shard_apply 受信 → PropertiesService 保存 → ハートビート配信までを
+//   実際に走らせ、SHARD_CHILD_MODE 未設定でも配給されることを検証する。
+console.log('===== S. 子GASの自動判別（設定漏れの救済） =====');
+{
+  const vmMod = require('vm');
+
+  const CHILD_FNS = [
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
+    'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
+    'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_', 'parseBoolean',
+    'normalizeClassName', 'schoolNamesMatch', 'normalizeSchoolName',
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'deviceMatchesSchedule_', 'shardBuildWindowsForStudent_', 'shardBuildScheduleByStudent_',
+    'emptySchedulePayload_',
+    'shardLoadScheduleCache_', 'shardSaveScheduleCache_',
+    'shardSchedulePayloadFromCache_',
+    'propRaw', 'propBool',
+    'shardDetectChildByInbox_',
+    'isShardChild', 'resolveSchedulePayloadForDevice_'
+  ];
+
+  // 実際の PropertiesService 相当（スクリプトプロパティの保管庫）
+  function buildChild(o) {
+    o = o || {};
+    const store = {};
+    const keys = o.props || {};
+    Object.keys(keys).forEach(function (k) { store[k] = String(keys[k]); });
+    const memo = {};
+    const logs = [];
+
+    const sandbox = {
+      __store: store,
+      __logs: logs,
+      console: { log: function () {} },
+      Logger: { log: function (m) { logs.push(String(m)); } },
+      CONFIG: { SCHEDULE_HORIZON_DAYS: 14, SCHEDULE_MAX_ACTIVE: 5, SCHEDULE_MAX_WINDOWS: 20 },
+      SHEET_TZ_OFFSET_MS: 9 * 60 * 60 * 1000,
+      SHARD_SCHEDULES_PROP: 'SHARD_SCHEDULES_CACHE',
+      SHARD_SCHEDULES_MEMO_SEC: 30,
+      SHARD_SCHEDULES_MEMO_KEY: 'shard_sched_memo1',
+      PROP_SHARD_MODE: 'SHARD_MODE',
+      PROP_SHARD_CHILD_MODE: 'SHARD_CHILD_MODE',
+      SHARD_MODE_CACHE: 'shard_mode1',
+      PropertiesService: {
+        getScriptProperties: function () {
+          return {
+            getProperty: function (k) {
+              return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null;
+            },
+            setProperty: function (k, v) { store[k] = String(v); }
+          };
+        }
+      },
+      CacheService: {
+        getScriptCache: function () {
+          return {
+            get: function (k) { return Object.prototype.hasOwnProperty.call(memo, k) ? memo[k] : null; },
+            put: function (k, v) { memo[k] = String(v); },
+            remove: function (k) { delete memo[k]; }
+          };
+        }
+      },
+      // shardModeFlags は本物を抽出せず、明示設定だけを反映する最小実装
+      shardModeFlags: function () {
+        var cb = (store['SHARD_CHILD_MODE'] || '').toLowerCase();
+        var pb = (store['SHARD_MODE'] || '').toLowerCase();
+        return { child: (cb === 'true' || cb === '1'), parent: (pb === 'true' || pb === '1') };
+      },
+      // 親用ロジックが呼ばれたら「呼ばれた」ことを記録（＝誤判定の検出）
+      buildSchedulePayloadForDevice_: function () {
+        logs.push('__PARENT_PATH_CALLED__');
+        return { active: [], upcoming: [], overridden_ids: [] };
+      }
+    };
+
+    const src = CHILD_FNS.map(function (n) { return extractFn(n); }).join('\n');
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(src +
+      '\n__S = { save: shardSaveScheduleCache_, detect: shardDetectChildByInbox_,' +
+      ' isChild: isShardChild, resolve: resolveSchedulePayloadForDevice_,' +
+      ' applySave: function(b, u) { return shardSaveScheduleCache_(b, u, true); } };', sandbox);
+    return { sandbox: sandbox, store: store, logs: logs };
+  }
+
+  const NOW = Date.UTC(2026, 10, 10, 3, 2, 30); // 11/10 12:02:30 JST
+
+  // 親が同封してくる by_student（student 予約 1 件ぶん）
+  const BY_STUDENT = {
+    s1: {
+      windows: [{
+        id: 'sch_s1', type: 'screen_lock', filter_mode: '',
+        whitelist: [], blacklist: [],
+        start_ms: NOW - 30000, end_ms: NOW + 30000
+      }],
+      overridden_ids: []
+    }
+  };
+
+  // ① SHARD_CHILD_MODE 未設定でも、保存されたら子として自動判別される
+  (function () {
+    const c = buildChild({ props: {} }); // ← 何も設定されていない子GAS
+    check('S1 設定なしの初期状態では子と判定されない', c.sandbox.__S.isChild() === false);
+    check('S2 痕跡なしでは自動判別も false', c.sandbox.__S.detect() === false);
+
+    // shard_apply の保存処理を実行（= 親から受け取った）
+    const saved = c.sandbox.__S.applySave(BY_STUDENT, NOW);
+    check('S3 保存件数が返る（親が確認できる）', saved && saved.saved === 1, saved);
+    check('S4 PropertiesService に実体が入る',
+      typeof c.store['SHARD_SCHEDULES_CACHE'] === 'string' &&
+      c.store['SHARD_SCHEDULES_CACHE'].indexOf('sch_s1') >= 0,
+      (c.store['SHARD_SCHEDULES_CACHE'] || '').slice(0, 60));
+
+    check('S5 保存後は痕跡により子と自動判定される', c.sandbox.__S.isChild() === true);
+    check('S6 自動判別の理由が PropertiesService の実体である',
+      c.sandbox.__S.detect() === true);
+  })();
+
+  // ② SHARD_CHILD_MODE 未設定でも、ハートビートが空にならない
+  (function () {
+    const c = buildChild({ props: {} });
+    c.sandbox.__S.applySave(BY_STUDENT, NOW);
+    const pl = c.sandbox.__S.resolve('s1', '5年1組', '第一小学校', NOW);
+
+    check('S7 ハートビートで active が 1 件返る（空にならない）',
+      !!pl && Array.isArray(pl.active) && pl.active.length === 1,
+      pl && pl.active.length);
+    check('S8 窓が予約IDを持つ', !!pl && pl.active.length === 1 && pl.active[0].id === 'sch_s1',
+      pl && pl.active[0] && pl.active[0].id);
+    check('S9 窓が数値の start_ms/end_ms を持つ（v1.6.4 の判定契約）',
+      !!pl && pl.active.length === 1 &&
+      typeof pl.active[0].start_ms === 'number' && typeof pl.active[0].end_ms === 'number' &&
+      pl.active[0].end_ms > pl.active[0].start_ms,
+      pl && pl.active[0]);
+    check('S10 窓の type が screen_lock', !!pl && pl.active.length === 1 && pl.active[0].type === 'screen_lock');
+    check('S11 whitelist/blacklist が配列（端末の normalizeHostList 契約）',
+      !!pl && pl.active.length === 1 &&
+      Array.isArray(pl.active[0].whitelist) && Array.isArray(pl.active[0].blacklist),
+      pl && pl.active[0]);
+    check('S12 親用ロジックへ落ちていない（子シートを読んでいない）',
+      c.logs.indexOf('__PARENT_PATH_CALLED__') < 0, c.logs);
+    check('S13 配信ログが残る（実機で切り分け可能）',
+      c.logs.some(function (m) { return m.indexOf('子GASとして配信') >= 0; }), c.logs);
+  })();
+
+  // ③ SHARD_CHILD_MODE=true が明示されていれば従来どおり
+  (function () {
+    const c = buildChild({ props: { SHARD_CHILD_MODE: 'true' } });
+    check('S14 明示設定があれば子と判定される', c.sandbox.__S.isChild() === true);
+    c.sandbox.__S.applySave(BY_STUDENT, NOW);
+    const pl = c.sandbox.__S.resolve('s1', '5年1組', '第一小学校', NOW);
+    check('S15 明示設定でも配給される', !!pl && pl.active.length === 1, pl && pl.active.length);
+  })();
+
+  // ④ 親GASは絶対に子と誤判定されない（最重要の退行防止）
+  (function () {
+    // 親は SHARD_SECRET を持つが、SHARD_SCHEDULES_CACHE は持たない
+    const c = buildChild({ props: { SHARD_MODE: 'true', SHARD_SECRET: 'sk_parent_secret' } });
+    check('S16 明示的な親は子と判定されない', c.sandbox.__S.isChild() === false);
+    check('S17 SHARD_SECRET だけでは子と判定しない（親の誤判定防止）',
+      c.sandbox.__S.detect() === false);
+
+    // 親がシートベースで配給すること（buildSchedulePayloadForDevice_ 側へ行く）
+    const pl = c.sandbox.__S.resolve('s1', '5年1組', '第一小学校', NOW);
+    check('S18 親は親用ロジックを通る', c.logs.indexOf('__PARENT_PATH_CALLED__') >= 0, c.logs);
+  })();
+
+  // ⑤ 予約 0 件でも痕跡を残す（次回の自動判別のため）
+  (function () {
+    const c = buildChild({ props: {} });
+    const r = c.sandbox.__S.applySave({}, NOW); // 空の地図＝全予約取消
+    check('S19 空の保存でも saved=0 で成功する', r && r.saved === 0, r);
+    check('S20 空でも Serializable な実体が残る',
+      typeof c.store['SHARD_SCHEDULES_CACHE'] === 'string',
+      c.store['SHARD_SCHEDULES_CACHE']);
+  })();
+
+  // ⑥ ソース検査: 自動判別が親判定より後ろに置かれている（親を壊さない）
+  (function () {
+    const body = extractFn('shardDetectChildByInbox_');
+    check('S21 自動判別は明示的な親を最優先で除外する',
+      /if\s*\(\s*explicitParent\s*\)\s*return\s+false/.test(body));
+    check('S22 自動判別は SHARD_SECRET を材料にしていない',
+      body.indexOf('SHARD_SECRET') < 0);
+    check('S23 受信痕跡 SHARD_INBOX_SEEN を材料にしている',
+      body.indexOf('SHARD_INBOX_SEEN') >= 0);
+  })();
+}
+
+// ================================================================ T. 児童IDの表記ゆれ
+//   実害: シートの児童IDは「1607002@city-mimasaka.ed.jp」形式だが、端末が送る
+//         student_id は環境によって「1607002（@より前）」のこともある。
+//         shardSchedulePayloadFromCache_ が cache.by_student[sid] の生完全一致だけ
+//         だったため、@ の有無の差だけで無言の空配列になり、端末で規制が動かなかった。
+//   ここでは「メール全体 ⇄ ローカル部」の双方向の吸収と、誤配信しない安全側の
+//   挙動（別ドメインの同名ローカル部）まで固定する。
+console.log('===== T. 児童IDの表記ゆれ吸収（メール全体 ⇄ ローカル部） =====');
+{
+  const vmMod = require('vm');
+
+  const T_FNS = [
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'normalizeClassName', 'normalizeSchoolName', 'schoolNamesMatch',
+    'deviceMatchesSchedule_',
+    'emptySchedulePayload_', 'shardLoadScheduleCache_', 'shardSchedulePayloadFromCache_',
+    'schPad2_', 'schMsToJstStr_'
+  ];
+
+  const T_NOW = Date.UTC(2026, 10, 10, 10, 30); // 11/10 19:30 JST
+
+  function buildT(o) {
+    o = o || {};
+    const store = {};
+    const memo = {};
+    const logs = [];
+    const cache = { updated_ms: T_NOW, by_student: o.byStudent || {} };
+    store['SHARD_SCHEDULES_CACHE'] = JSON.stringify(cache);
+
+    const sandbox = {
+      console: { log: function () {} },
+      Logger: { log: function (m) { logs.push(String(m)); } },
+      CONFIG: { SCHEDULE_HORIZON_DAYS: 14, SCHEDULE_MAX_ACTIVE: 5, SCHEDULE_MAX_WINDOWS: 20 },
+      SHEET_TZ_OFFSET_MS: 9 * 60 * 60 * 1000,
+      SHARD_SCHEDULES_PROP: 'SHARD_SCHEDULES_CACHE',
+      SHARD_SCHEDULES_MEMO_SEC: 30,
+      SHARD_SCHEDULES_MEMO_KEY: 'shard_sched_memo1',
+      PropertiesService: {
+        getScriptProperties: function () {
+          return {
+            getProperty: function (k) {
+              return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null;
+            },
+            setProperty: function (k, v) { store[k] = String(v); }
+          };
+        }
+      },
+      CacheService: {
+        getScriptCache: function () {
+          return {
+            get: function (k) { return Object.prototype.hasOwnProperty.call(memo, k) ? memo[k] : null; },
+            put: function (k, v) { memo[k] = String(v); },
+            remove: function (k) { delete memo[k]; }
+          };
+        }
+      }
+    };
+
+    const src = T_FNS.map(function (n) { return extractFn(n); }).join('\n');
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(src +
+      '\n__T = { fromCache: shardSchedulePayloadFromCache_,' +
+      ' localOf: normalizeUserLocalPart_, match: idKeysMatch_,' +
+      ' matchesAny: idMatchesAny_, device: deviceMatchesSchedule_,' +
+      ' normalizeIdKey: normalizeIdKey };', sandbox);
+    return { sandbox: sandbox, logs: logs, __T: sandbox.__T };
+  }
+
+  // 窓 1 件（19:30 JST の内側）を持つ by_student を作る
+  function rec(id) {
+    return {
+      windows: [{
+        id: 'sch_' + id, type: 'screen_lock', filter_mode: '',
+        whitelist: ['allow.example'], blacklist: ['game.example'],
+        start_ms: T_NOW - 600000, end_ms: T_NOW + 600000
+      }],
+      overridden_ids: []
+    };
+  }
+
+  const EMAIL = '1607002@city-mimasaka.ed.jp';
+  const LOCAL = '1607002';
+
+  // ----------------------------------------------------------- ① 正規化ヘルパー単体
+  (function () {
+    const t = buildT({ byStudent: {} });
+    check('T1 normalizeUserLocalPart_: メール → @より前', t.__T.localOf(EMAIL) === LOCAL,
+      t.__T.localOf(EMAIL));
+    check('T2 normalizeUserLocalPart_: @無しはそのまま', t.__T.localOf(LOCAL) === LOCAL,
+      t.__T.localOf(LOCAL));
+    check('T3 normalizeUserLocalPart_: 空は空', t.__T.localOf('') === '');
+    check('T4 normalizeUserLocalPart_: 全角の@も半角化して分解',
+      t.__T.localOf('１６０７００２＠city-mimasaka.ed.jp') === LOCAL,
+      t.__T.localOf('１６０７００２＠city-mimasaka.ed.jp'));
+
+    check('T5 idKeysMatch_: メールと一致', t.__T.match(EMAIL, EMAIL) === true);
+    check('T6 idKeysMatch_: メール vs ローカル部は同一とみなす',
+      t.__T.match(EMAIL, LOCAL) === true);
+    check('T7 idKeysMatch_: ローカル部 vs メールも同一とみなす',
+      t.__T.match(LOCAL, EMAIL) === true);
+    check('T8 idKeysMatch_: 別ドメインの同名ローカル部は別人',
+      t.__T.match('1607002@a.ed.jp', '1607002@b.ed.jp') === false);
+    check('T9 idKeysMatch_: 別IDは不一致', t.__T.match('1607003', '1607002') === false);
+    check('T10 idKeysMatch_: 空は不一致', t.__T.match('', '') === false);
+    check('T11 idKeysMatch_: 大文字・前後空白を吸収',
+      t.__T.match('  1607002@CITY-MIMASAKA.ed.jp  ', LOCAL) === true);
+  })();
+
+  // ----------------------------------------------------------- ② ストア=メール / 端末=ローカル部
+  (function () {
+    const t = buildT({ byStudent: (function () {
+      const o = {}; o[EMAIL] = rec('email'); return o;
+    })() });
+
+    const pl = t.__T.fromCache(LOCAL, T_NOW);
+    check('T12 ストア=メール / 端末=ローカル部 でも active が 1 件返る',
+      !!pl && Array.isArray(pl.active) && pl.active.length === 1,
+      pl && pl.active.length);
+    check('T13 その窓はストア側の予約IDを持つ',
+      !!pl && pl.active.length === 1 && pl.active[0].id === 'sch_email',
+      pl && pl.active[0] && pl.active[0].id);
+    check('T14 窓は数値の start_ms/end_ms を持つ（v1.6.4 の判定契約）',
+      !!pl && pl.active.length === 1 &&
+      typeof pl.active[0].start_ms === 'number' && typeof pl.active[0].end_ms === 'number' &&
+      pl.active[0].end_ms > pl.active[0].start_ms, pl && pl.active[0]);
+    check('T15 whitelist/blacklist が配列のまま（端末の normalizeHostList 契約）',
+      !!pl && pl.active.length === 1 &&
+      Array.isArray(pl.active[0].whitelist) && Array.isArray(pl.active[0].blacklist) &&
+      pl.active[0].whitelist[0] === 'allow.example', pl && pl.active[0]);
+  })();
+
+  // ----------------------------------------------------------- ③ ストア=ローカル部 / 端末=メール
+  (function () {
+    const t = buildT({ byStudent: (function () {
+      const o = {}; o[LOCAL] = rec('local'); return o;
+    })() });
+
+    const pl = t.__T.fromCache(EMAIL, T_NOW);
+    check('T16 ストア=ローカル部 / 端末=メール でも active が 1 件返る',
+      !!pl && Array.isArray(pl.active) && pl.active.length === 1,
+      pl && pl.active.length);
+    check('T17 その窓はストア側の予約IDを持つ',
+      !!pl && pl.active.length === 1 && pl.active[0].id === 'sch_local',
+      pl && pl.active[0] && pl.active[0].id);
+    check('T18 大文字・前後空白付きのメールでも届く',
+      (function () {
+        const p2 = t.__T.fromCache('  1607002@CITY-MIMASAKA.ED.JP ', T_NOW);
+        return !!p2 && p2.active.length === 1;
+      })());
+  })();
+
+  // ----------------------------------------------------------- ④ 完全一致が最優先
+  (function () {
+    // 同じローカル部の別ドメインが併存するケース。
+    //   端末がメール全体で来たときは、その完全一致だけを選ぶ（他へ漏らさない）。
+    const o = {};
+    o['1607002@a.ed.jp'] = rec('a');
+    o['1607002@b.ed.jp'] = rec('b');
+    const t = buildT({ byStudent: o });
+
+    const pa = t.__T.fromCache('1607002@a.ed.jp', T_NOW);
+    check('T19 完全一致が優先される（別ドメインへ漏れない）',
+      !!pa && pa.active.length === 1 && pa.active[0].id === 'sch_a',
+      pa && pa.active[0] && pa.active[0].id);
+
+    const pb = t.__T.fromCache('1607002@b.ed.jp', T_NOW);
+    check('T20 もう一方のドメインも自分の窓だけを受け取る',
+      !!pb && pb.active.length === 1 && pb.active[0].id === 'sch_b',
+      pb && pb.active[0] && pb.active[0].id);
+  })();
+
+  // ----------------------------------------------------------- ⑤ 曖昧なときは配信しない（安全側）
+  (function () {
+    const o = {};
+    o['1607002@a.ed.jp'] = rec('a');
+    o['1607002@b.ed.jp'] = rec('b');
+    const t = buildT({ byStudent: o });
+
+    // 端末がローカル部だけを送ってきた → どちらの児童か決められない
+    const pl = t.__T.fromCache(LOCAL, T_NOW);
+    check('T21 候補が複数のときは配信しない（誤配信より無配信を選ぶ）',
+      !!pl && Array.isArray(pl.active) && pl.active.length === 0,
+      pl && pl.active.length);
+    check('T22 曖昧だった事実をログに残す（実機で切り分け可能）',
+      t.logs.some(function (m) { return m.indexOf('曖昧') >= 0; }), t.logs);
+  })();
+
+  // ----------------------------------------------------------- ⑥ 未知のIDは空（従来どおり）
+  (function () {
+    const t = buildT({ byStudent: (function () {
+      const o = {}; o[EMAIL] = rec('email'); return o;
+    })() });
+    const pl = t.__T.fromCache('9999999', T_NOW);
+    check('T23 無関係なIDは空配列（誤配信しない）',
+      !!pl && pl.active.length === 0, pl && pl.active.length);
+    check('T24 照合できなかった事実をログに残す',
+      t.logs.some(function (m) { return m.indexOf('照合なし') >= 0; }), t.logs);
+  })();
+
+  // ----------------------------------------------------------- ⑦ 予約の対象判定も同じ吸収を通る
+  (function () {
+    const t = buildT({ byStudent: {} });
+    const cn = '';
+    const rowEmail = {
+      targetType: 'student', className: '', schoolName: '第一小学校',
+      studentIds: [EMAIL]
+    };
+    const rowLocal = {
+      targetType: 'student', className: '', schoolName: '第一小学校',
+      studentIds: [LOCAL]
+    };
+    check('T25 対象判定: 予約=メール / 端末=ローカル部 で一致',
+      t.__T.device(rowEmail, LOCAL, cn, '第一小学校') === true);
+    check('T26 対象判定: 予約=ローカル部 / 端末=メール で一致',
+      t.__T.device(rowLocal, EMAIL, cn, '第一小学校') === true);
+    check('T27 対象判定: 別ドメインの同名ローカル部は不一致',
+      t.__T.device(rowEmail, '1607002@other.ed.jp', cn, '第一小学校') === false);
+    check('T28 対象判定: 無関係な児童は不一致',
+      t.__T.device(rowEmail, '9999999', cn, '第一小学校') === false);
+  })();
+
+  // ----------------------------------------------------------- ⑧ ソース検査（生の添字引きに戻っていない）
+  (function () {
+    const body = extractFn('shardSchedulePayloadFromCache_');
+    check('T29 キャッシュ引照が idKeysMatch_ を用いている（生の完全一致へ戻っていない）',
+      body.indexOf('idKeysMatch_') >= 0);
+    check('T30 ローカル部比較のヘルパーを経由している',
+      body.indexOf('normalizeIdKey') >= 0);
+    const devBody = extractFn('deviceMatchesSchedule_');
+    check('T31 対象判定が idMatchesAny_ を用いている（indexOf の生比較へ戻っていない）',
+      devBody.indexOf('idMatchesAny_') >= 0 &&
+      devBody.indexOf('studentIds.indexOf') < 0);
+  })();
+}
+
+// ================================================================ U. 端末の初回送信トリガー
+//   実害: Managed Storage ポリシー（gas_url / gas_url_map）が未配布の端末では
+//         resolveGasUrl() が '' を返し、initializeClient() が無言で同期を諦め、
+//         maybeSync() も keepaliveActive=false / idleDriftUntil=0 で早期 return していた。
+//         その結果、端末は一度も送信せず assigned_gas_url も永久に未確定のままとなり、
+//         子GASの実行数がゼロ（＝予約も規制も一切届かない）状態になった。
+//   ここでは
+//     ① 初回はガード（keepalive/猶予）に関係なく必ず 1 回送る
+//     ② 送信先が既定の親URLへフォールバックする（無言で空にしない）
+//     ③ 親が返した assigned_gas_url が保存され、以後の送信先になる
+//     ④ 初回ハートビート応答に schedules と assigned_gas_url が同居する
+//   を実挙動で固定する。
+console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
+{
+  const vmMod = require('vm');
+  const bgSrc = fs.readFileSync('/home/user/webapp/extension/background.js', 'utf8');
+
+  function bgExtract(name) {
+    const re = new RegExp('^(?:async\\s+)?function ' + name + '\\s*\\(', 'm');
+    const start = bgSrc.search(re);
+    if (start < 0) throw new Error('bg fn not found: ' + name);
+    let i = bgSrc.indexOf('{', start), depth = 0, end = -1;
+    for (; i < bgSrc.length; i++) {
+      if (bgSrc[i] === '{') depth++;
+      else if (bgSrc[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    return bgSrc.slice(start, end + 1);
+  }
+
+  const PARENT = 'https://script.google.com/macros/s/PARENT_EXEC/exec';
+  const CHILD = 'https://script.google.com/macros/s/CHILD_51_EXEC/exec';
+
+  function buildBg(o) {
+    o = o || {};
+    const clock = { now: o.now || 1000000 };
+    const store = Object.assign({}, o.store || {});
+    const sets = [], syncs = [];
+    const sandbox = {
+      console: { log: function () {}, warn: function () {} },
+      JSON: JSON, String: String, Object: Object, Array: Array, Number: Number,
+      Boolean: Boolean, Math: Math, RegExp: RegExp, Error: Error, Promise: Promise,
+      Date: { now: function () { return clock.now; } },
+      chrome: {
+        storage: {
+          local: {
+            get: function () { return Promise.resolve(Object.assign({}, store)); },
+            set: function (patch) {
+              sets.push(Object.assign({}, patch));
+              Object.assign(store, patch);
+              return Promise.resolve();
+            }
+          }
+        }
+      },
+      syncWithGas: function () { syncs.push(clock.now); return Promise.resolve(); },
+      clearIdleDriftAlarm: function () {}
+    };
+    vmMod.createContext(sandbox);
+    const pre =
+      'const ACTIVE_SYNC_MS = 1500;\n' +
+      'const IDLE_SYNC_MS = 0;\n' +
+      'const IDLE_DRIFT_MS = 1000;\n' +
+      'const SHARD_COOLDOWN_MS = 1800000;\n' +
+      'const SLOW_POLL_MS = 5 * 60 * 1000;\n' +
+      'const SLOW_POLL_ALARM = "schedulePoll";\n' +
+      'const SLOW_POLL_ALARM_MIN = 5;\n' +
+      'const DEFAULT_GAS_URL = ' + JSON.stringify(o.defaultGasUrl || '') + ';\n' +
+      'let keepaliveActive = ' + (o.keepaliveActive === true ? 'true' : 'false') + ';\n' +
+      'let activeIntervalMs = 1500;\n' +
+      'let idleDriftUntil = 0;\n' +
+      'let lastSyncMs = 0;\n' +
+      'let hasSyncedOnce = false;\n' +
+      'let shardAssignedCache = "";\n' +
+      'let shardFailCount = 0;\n' +
+      'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n' +
+      'let shardHandoffPending = false;\n';
+    const body = ['normalizeSchoolKey', 'resolveGasUrl', 'maybeSync',
+      'scheduleInterestActive', 'ensureSlowPoll', 'clearSlowPoll',
+      'shardAssignedUrl', 'applyShardAssignment'].map(bgExtract).join('\n');
+    vmMod.runInContext(pre + body +
+      '\n__bg = { maybeSync: maybeSync, resolveGasUrl: resolveGasUrl,' +
+      ' applyAssign: applyShardAssignment,' +
+      ' getHandoff: function () { return shardHandoffPending; },' +
+      ' setShardCache: function (v) { shardAssignedCache = v; } };', sandbox);
+    return {
+      sandbox: sandbox, store: store, sets: sets, syncs: syncs,
+      at: function (v) { clock.now = v; }, __bg: sandbox.__bg
+    };
+  }
+
+  // ----------------------------------------------------------- ① 初回は必ず送る
+  const b1 = buildBg({ defaultGasUrl: PARENT, keepaliveActive: false });
+  b1.__bg.maybeSync(); // ← 初回ブートストラップの実挙動を測る
+  check('U1 管理ポリシー未配布・非稼働（教員コンソール未起動）でも初回の maybeSync で必ず 1 回送信する',
+    b1.syncs.length === 1, b1.syncs.length);
+  check('U2 送信先が既定の親GAS URLへフォールバックして確定する（無言の空文字にしない）',
+    b1.__bg.resolveGasUrl({}) === PARENT, b1.__bg.resolveGasUrl({}));
+
+  b1.at(1000000 + 60000);
+  b1.__bg.maybeSync();
+  check('U3 初回を終えた後は「非稼働＋猶予なし」で送らない（通信量は増やさない）',
+    b1.syncs.length === 1, b1.syncs.length);
+
+  // ----------------------------------------------------------- ② 既定URLが空のときの扱い
+  const b4 = buildBg({ defaultGasUrl: '' });
+  check('U4 既定URLが空なら空文字を返す（勝手に別のURLへ飛ばさない）',
+    b4.__bg.resolveGasUrl({}) === '');
+  check('U5 明示された gas_url は既定URLより優先する',
+    b4.__bg.resolveGasUrl({ gas_url: 'https://direct/exec' }) === 'https://direct/exec');
+
+  // ----------------------------------------------------------- ③ 無言停止しない（診断が必ず出る）
+  check('U6 URL未設定で終わる経路に no_gas_url の診断コードがある（無言停止の根絶）',
+    bgSrc.indexOf("'no_gas_url'") >= 0);
+  check('U7 initializeClient が URL 未設定時に警告と記録を行う',
+    /if \(initialGasUrl\)[\s\S]{0,600}?recordSyncDiag\(false, 'no_gas_url'/.test(bgSrc));
+  check('U8 resolveGasUrl の既定URL参照が単体検証でも落ちない（typeof ガード）',
+    /typeof DEFAULT_GAS_URL === 'string'/.test(bgSrc));
+
+  const maybeBody = bgExtract('maybeSync');
+  // コメント内の語ではなく「実際のガード文」の位置で判定する
+  check('U9 初回ブートストラップ判定が keepalive/猶予の判定より前にある',
+    (function () {
+      const boot = maybeBody.indexOf('if (!hasSyncedOnce)');
+      const gate = maybeBody.indexOf('if (keepaliveActive)');
+      return boot >= 0 && gate >= 0 && boot < gate;
+    })(), {
+      boot: maybeBody.indexOf('if (!hasSyncedOnce)'),
+      gate: maybeBody.indexOf('if (keepaliveActive)')
+    });
+
+  // ④ 保存 → 以後の送信先が子になる検証は、applyShardAssignment が async のため
+  //    直後の非同期ブロック（U22〜U24）で await して行う。
+}
+
+// --- 要件3-1 の後半（保存の確認）と 要件3-2（初回ハートビート）は非同期のため別ブロックで実行 ---
+(async function () {
+  const vmMod = require('vm');
+  const bgSrc = fs.readFileSync('/home/user/webapp/extension/background.js', 'utf8');
+
+  function bgExtract(name) {
+    const re = new RegExp('^(?:async\\s+)?function ' + name + '\\s*\\(', 'm');
+    const start = bgSrc.search(re);
+    if (start < 0) throw new Error('bg fn not found: ' + name);
+    let i = bgSrc.indexOf('{', start), depth = 0, end = -1;
+    for (; i < bgSrc.length; i++) {
+      if (bgSrc[i] === '{') depth++;
+      else if (bgSrc[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    return bgSrc.slice(start, end + 1);
+  }
+
+  const PARENT = 'https://script.google.com/macros/s/PARENT_EXEC/exec';
+  const CHILD = 'https://script.google.com/macros/s/CHILD_51_EXEC/exec';
+
+  function buildBg(o) {
+    o = o || {};
+    const store = Object.assign({}, o.store || {});
+    const sets = [];
+    const sandbox = {
+      console: { log: function () {}, warn: function () {} },
+      JSON: JSON, String: String, Object: Object, Array: Array, Number: Number,
+      Boolean: Boolean, Math: Math, RegExp: RegExp, Error: Error, Promise: Promise,
+      Date: { now: function () { return o.now || 1000000; } },
+      chrome: {
+        storage: {
+          local: {
+            get: function () { return Promise.resolve(Object.assign({}, store)); },
+            set: function (patch) {
+              sets.push(Object.assign({}, patch));
+              Object.assign(store, patch);
+              return Promise.resolve();
+            }
+          }
+        }
+      },
+      syncWithGas: function () { return Promise.resolve(); },
+      clearIdleDriftAlarm: function () {}
+    };
+    vmMod.createContext(sandbox);
+    const pre =
+      'const ACTIVE_SYNC_MS = 1500;\n' +
+      'const IDLE_SYNC_MS = 0;\n' +
+      'const IDLE_DRIFT_MS = 1000;\n' +
+      'const SHARD_COOLDOWN_MS = 1800000;\n' +
+      'const SLOW_POLL_MS = 5 * 60 * 1000;\n' +
+      'const SLOW_POLL_ALARM = "schedulePoll";\n' +
+      'const SLOW_POLL_ALARM_MIN = 5;\n' +
+      'const DEFAULT_GAS_URL = ' + JSON.stringify(o.defaultGasUrl || '') + ';\n' +
+      'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\n' +
+      'let idleDriftUntil = 0;\nlet lastSyncMs = 0;\nlet hasSyncedOnce = false;\n' +
+      'let shardAssignedCache = "";\nlet shardFailCount = 0;\n' +
+      'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n' +
+      'let shardHandoffPending = false;\n';
+    const body = ['normalizeSchoolKey', 'resolveGasUrl', 'maybeSync',
+      'scheduleInterestActive', 'ensureSlowPoll', 'clearSlowPoll',
+      'shardAssignedUrl', 'applyShardAssignment'].map(bgExtract).join('\n');
+    vmMod.runInContext(pre + body +
+      '\n__bg = { maybeSync: maybeSync, resolveGasUrl: resolveGasUrl,' +
+      ' applyAssign: applyShardAssignment,' +
+      ' getHandoff: function () { return shardHandoffPending; },' +
+      ' setShardCache: function (v) { shardAssignedCache = v; } };', sandbox);
+    return { sandbox: sandbox, store: store, sets: sets, __bg: sandbox.__bg };
+  }
+
+  // ================================================================
+  // GAS 側: 初回ハートビートの応答（schedules ＋ assigned_gas_url）
+  // ================================================================
+  const U_FNS = [
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
+    'normalizeClassName', 'normalizeSchoolName', 'schoolNamesMatch',
+    'deviceMatchesSchedule_', 'emptySchedulePayload_',
+    'shardLoadScheduleCache_', 'shardSchedulePayloadFromCache_',
+    'schPad2_', 'schMsToJstStr_',
+    'propRaw', 'propBool', 'cfgWarn',
+    'shardHash', 'shardWarnOnce',
+    'shardDetectChildByInbox_', 'isShardChild', 'resolveSchedulePayloadForDevice_',
+    'normalizeShardClass', 'shardMapIndexFromMap', 'shardMapDefaultFromEmptyKey',
+    'resolveShardForHeartbeat'
+  ];
+  const U_NOW = Date.UTC(2026, 10, 10, 3, 2, 30); // 11/10 12:02:30 JST
+  const U_EMAIL = '1607002@city-mimasaka.ed.jp';
+  const U_LOCAL = '1607002';
+
+  function buildU(o) {
+    o = o || {};
+    const store = {};
+    const props = o.props || {};
+    Object.keys(props).forEach(function (k) { store[k] = String(props[k]); });
+    if (o.byStudent) {
+      store['SHARD_SCHEDULES_CACHE'] = JSON.stringify({ updated_ms: U_NOW, by_student: o.byStudent });
+    }
+    const memo = {};
+    const logs = [];
+    const sandbox = {
+      console: { log: function () {} },
+      Logger: { log: function (m) { logs.push(String(m)); } },
+      CONFIG: { SCHEDULE_HORIZON_DAYS: 14, SCHEDULE_MAX_ACTIVE: 5, SCHEDULE_MAX_WINDOWS: 20 },
+      SHEET_TZ_OFFSET_MS: 9 * 60 * 60 * 1000,
+      SHARD_SCHEDULES_PROP: 'SHARD_SCHEDULES_CACHE',
+      SHARD_SCHEDULES_MEMO_SEC: 30,
+      SHARD_SCHEDULES_MEMO_KEY: 'shard_sched_memo1',
+      PROP_SHARD_MODE: 'SHARD_MODE',
+      PROP_SHARD_CHILD_MODE: 'SHARD_CHILD_MODE',
+      PropertiesService: {
+        getScriptProperties: function () {
+          return {
+            getProperty: function (k) {
+              return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null;
+            },
+            setProperty: function (k, v) { store[k] = String(v); }
+          };
+        }
+      },
+      CacheService: {
+        getScriptCache: function () {
+          return {
+            get: function (k) { return Object.prototype.hasOwnProperty.call(memo, k) ? memo[k] : null; },
+            put: function (k, v) { memo[k] = String(v); },
+            remove: function (k) { delete memo[k]; }
+          };
+        }
+      },
+      // 明示設定なし（本物の shardModeFlags と同じ既定 false）
+      shardModeFlags: function () { return { parent: false, child: false }; },
+      isShardParent: function () { return o.isParent === true; },
+      shardConfigCached: function () {
+        return { map: o.map || {}, def: o.def || '', sec: 'sk_test' };
+      },
+      buildSchedulePayloadForDevice_: function () {
+        logs.push('__PARENT_PATH_CALLED__');
+        return { active: [], upcoming: [], overridden_ids: [] };
+      }
+    };
+    const srcU = U_FNS.map(function (n) { return extractFn(n); }).join('\n');
+    vmMod.createContext(sandbox);
+    vmMod.runInContext(srcU +
+      '\n__U = { resolve: resolveSchedulePayloadForDevice_, assign: resolveShardForHeartbeat };', sandbox);
+    return { sandbox: sandbox, logs: logs, store: store, __U: sandbox.__U };
+  }
+
+  function recU(id) {
+    return {
+      windows: [{
+        id: 'sch_' + id, type: 'screen_lock', filter_mode: '',
+        whitelist: ['allow.example'], blacklist: ['game.example'],
+        start_ms: U_NOW - 600000, end_ms: U_NOW + 600000
+      }],
+      overridden_ids: []
+    };
+  }
+
+  // ----------------------------------------------------------- ⑤ 子GAS: 初回で schedules が返る
+  const c1 = buildU({ byStudent: (function () { const m = {}; m[U_EMAIL] = recU('a'); return m; })() });
+  const pl1 = c1.__U.resolve(U_EMAIL, '5-1', '第一小学校', U_NOW);
+  check('U10 子GASの初回ハートビートで schedules.active が 1 件返る（空配列を返さない）',
+    !!pl1 && Array.isArray(pl1.active) && pl1.active.length === 1, pl1 && pl1.active.length);
+  check('U11 その窓は配信元の予約IDを保持している（取り違えていない）',
+    !!pl1 && pl1.active[0] && pl1.active[0].id === 'sch_a', pl1 && pl1.active[0] && pl1.active[0].id);
+  check('U12 初回で親用ロジックへ落ちていない（子シート直読みをしていない）',
+    c1.logs.indexOf('__PARENT_PATH_CALLED__') < 0, c1.logs);
+
+  const c2 = buildU({ byStudent: (function () { const m = {}; m[U_EMAIL] = recU('b'); return m; })() });
+  const pl2 = c2.__U.resolve(U_LOCAL, '5-1', '第一小学校', U_NOW);
+  check('U13 端末がローカル部だけを送っても初回から配信される（表記ゆれで空にしない）',
+    !!pl2 && pl2.active.length === 1 && pl2.active[0].id === 'sch_b', pl2 && pl2.active.length);
+
+  check('U14 子GASは自分に割り当てを返さない（resolveShardForHeartbeat は {}）',
+    (function () {
+      const r = c1.__U.assign(U_EMAIL, '5-1');
+      return r && typeof r === 'object' && !r.assigned_gas_url;
+    })());
+
+  // ----------------------------------------------------------- ⑥ 親GAS: assigned_gas_url の確定
+  const p1 = buildU({
+    isParent: true,
+    map: { '5年1組': CHILD, '6年1組': 'https://script.google.com/macros/s/CHILD_61_EXEC/exec' }
+  });
+  const as1 = p1.__U.assign(U_EMAIL, '５年１組'); // 全角で届いても一致させる
+  check('U15 親GASが初回ハートビートで assigned_gas_url を返す（端末が子へ移れる）',
+    !!as1 && as1.assigned_gas_url === CHILD, as1);
+  check('U16 併せて正規化済みの assigned_class を返す',
+    !!as1 && as1.assigned_class === '5-1', as1 && as1.assigned_class);
+  check('U17 SHARD_MODE 有効を明示して返す', !!as1 && as1.shard_mode === true);
+
+  const p2 = buildU({ isParent: true, map: { '': 'https://script.google.com/macros/s/DEFAULT_EXEC/exec' } });
+  const as2 = p2.__U.assign(U_EMAIL, '3年2組');
+  check('U18 未知クラスは空キーの既定URLへ割り当てる（端末を止めない）',
+    !!as2 && as2.assigned_gas_url === 'https://script.google.com/macros/s/DEFAULT_EXEC/exec', as2);
+
+  const p3 = buildU({ isParent: true, map: {}, def: 'https://script.google.com/macros/s/DEF_EXEC/exec' });
+  const as3 = p3.__U.assign(U_EMAIL, '3年2組');
+  check('U19 既定URL（SHARD_DEFAULT_URL）にも割り当てる',
+    !!as3 && as3.assigned_gas_url === 'https://script.google.com/macros/s/DEF_EXEC/exec', as3);
+
+  const p4 = buildU({ isParent: true, map: {}, def: '' });
+  const as4 = p4.__U.assign(U_EMAIL, '3年2組');
+  check('U20 どこにも繋げないときは空応答（親のまま動かし、端末を止めない）',
+    !!as4 && typeof as4 === 'object' && !as4.assigned_gas_url, as4);
+
+  // ----------------------------------------------------------- ⑦ 応答合成 → 保存 → 以後の送信先
+  const combined = Object.assign({ success: true }, { schedules: pl1 }, as1);
+  check('U21 ハートビート応答に schedules と assigned_gas_url が同居する（1往復で完結）',
+    !!combined.schedules && combined.schedules.active.length === 1 &&
+    combined.assigned_gas_url === CHILD, { a: combined.schedules.active.length, u: combined.assigned_gas_url });
+
+  const b21 = buildBg({ defaultGasUrl: PARENT, store: {} });
+  await b21.__bg.applyAssign(combined, {}, PARENT, true);
+  check('U22 端末が受けた assigned_gas_url を保存する（assigned_gas_url 未確定の解消）',
+    b21.store.assigned_gas_url === CHILD, b21.store.assigned_gas_url);
+  check('U23 保存と同時に assigned_from（どの親から教わったか）も残す',
+    b21.store.assigned_from === PARENT, b21.store.assigned_from);
+  check('U24 同期後の resolveGasUrl は子GASを最優先で返す（以後は子へ直行）',
+    b21.__bg.resolveGasUrl(Object.assign({}, b21.store)) === CHILD,
+    b21.__bg.resolveGasUrl(Object.assign({}, b21.store)));
+
+  // ----------------------------------------------------------- ⑧ 到達の可観測化（doGet/doPost 冒頭ログ）
+  const doGetBody = extractFn('doGet');
+  check('U25 doGet は受け取った時点で received(GET) を必ず記録する',
+    doGetBody.indexOf('received(GET)') >= 0);
+  check('U26 received(GET) のログが heartbeat 分岐より前にある（分岐に入らなくても到達が分かる）',
+    doGetBody.indexOf('received(GET)') >= 0 &&
+    doGetBody.indexOf('received(GET)') < doGetBody.indexOf("api === 'heartbeat'"));
+  const doPostBody = extractFn('doPost');
+  check('U27 doPost は本文形式・パラメータ形式を問わず received(POST) を必ず記録する',
+    doPostBody.indexOf('received(POST)') >= 0);
+  check('U28 received(POST) のログが action 分岐より前にある',
+    doPostBody.indexOf('received(POST)') >= 0 &&
+    doPostBody.indexOf('received(POST)') < doPostBody.indexOf("action === 'heartbeat'"));
+  check('U29 student_id 未設定を無言で返さない（端末側の設定不良を記録する）',
+    doPostBody.indexOf('student_id 未設定') >= 0);
+
+  // ================================================================
+  // V. 即時ハートビート（親GAS → 子GAS の自動バトンタッチ）
+  //   実害: 親GASから assigned_gas_url を受け取って保存しても、その瞬間は
+  //         syncWithGas() の syncInFlight ガードが立っている。よって
+  //         applyShardAssignment() の中から2通目を素直に呼んでも先頭のガードで
+  //         無言で捨てられ、子GASの実行数はゼロのまま＝予約が永久に届かなかった。
+  //   ここでは「ガード解放直後の finally でだけ、1回だけ発火する」ことを実挙動で固定する。
+  // ================================================================
+  console.log('===== V. 即時ハートビート（親→子GASのバトンタッチ） =====');
+
+  // --- V0: 静的検査（発火点がガード解放より後ろにあること） ---
+  {
+    const syncBody = bgExtract('syncWithGas');
+    const iRelease = syncBody.indexOf('syncInFlight = false');
+    const iHandoff = syncBody.indexOf('shardHandoffPending');
+    // 最後の「} finally {」で判定する（'finally' の語はコメント中にも現れるため使わない）
+    const iFinally = syncBody.lastIndexOf('} finally {');
+    check('V0 バトンタッチは finally 内で syncInFlight 解放より後ろにある',
+      iFinally >= 0 && iRelease > iFinally && iHandoff > iRelease,
+      { finally: iFinally, release: iRelease, handoff: iHandoff });
+  }
+
+  // --- 実 syncWithGas を fetch スタブ付きで走らせるハーネス ---
+  function buildHandoff(o) {
+    o = o || {};
+    const store = Object.assign({
+      school_name: '英田小学校',
+      student_id: '1607002@city-mimasaka.ed.jp',
+      gas_url: PARENT
+    }, o.store || {});
+    const fetches = [], applied = [], diag = [], timers = [];
+    const sandbox = {
+      console: { log: function () {}, warn: function () {}, error: function () {} },
+      JSON: JSON, String: String, Object: Object, Array: Array, Number: Number,
+      Boolean: Boolean, Math: Math, RegExp: RegExp, Error: Error, Promise: Promise,
+      Date: { now: function () { return o.now || 1000000; } },
+      AbortController: function () { this.signal = {}; this.abort = function () {}; },
+      // バトンタッチの setTimeout(0) を「テストが明示的に消化できる」形で捕捉する
+      // バトンタッチの setTimeout(0) だけを捕捉する。
+      //   ※ SYNC_TIMEOUT_MS の中断タイマー（第2引数あり）は捕捉しない。
+      //     捕捉すると「2通目が予約された」ことを誤検知する。
+      setTimeout: function (fn, ms) { if (!ms) { timers.push(fn); } return 1; },
+      clearTimeout: function () {},
+      fetch: function (url) {
+        const u = String(url);
+        fetches.push(u);
+        // 1通目（親）: 子GASの割り当てだけを返す（schedules は返さない）
+        // 2通目（子）: 割り当ては返さず、予約（schedules.active）を返す
+        const body = (u === CHILD)
+          ? { success: true, ka_active: false,
+              schedules: { active: [{ id: 'S-V1', restriction_type: 'url_block' }],
+                           upcoming: [], overridden_ids: [] } }
+          : { success: true, ka_active: false,
+              assigned_gas_url: (o.parentAssign === undefined ? CHILD : o.parentAssign),
+              assigned_class: '5年1組' };
+        return Promise.resolve({
+          ok: true, status: 200,
+          json: function () { return Promise.resolve(body); }
+        });
+      },
+      chrome: { storage: { local: {
+        get: function () { return Promise.resolve(Object.assign({}, store)); },
+        set: function (patch) { Object.assign(store, patch); return Promise.resolve(); }
+      } } },
+      getStudentIdentity: function () { return Promise.resolve(''); },
+      getActiveTabUrl: function () { return Promise.resolve('https://www.example.jp/'); },
+      getManagedPolicy: function () { return Promise.resolve({}); },
+      pickMeaningfulSchoolName: function (a, b) { return a || b || ''; },
+      applyPolicies: function (p) { applied.push(p || {}); return Promise.resolve(); },
+      applyRemoteKeepalive: function () {},
+      recordSyncDiag: function (ok, code) {
+        diag.push({ ok: !!ok, code: String(code || '') }); return Promise.resolve();
+      }
+    };
+    vmMod.createContext(sandbox);
+    const pre =
+      'const DEFAULT_GAS_URL = "";\n' +
+      'const SYNC_TIMEOUT_MS = 12000;\n' +
+      'const SHARD_RECHECK_MS = 6 * 60 * 60 * 1000;\n' +
+      'const SHARD_FAIL_LIMIT = 3;\n' +
+      'const SHARD_COOLDOWN_MS = 30 * 60 * 1000;\n' +
+      'let syncInFlight = false;\n' +
+      'let shardHandoffPending = false;\n' +
+      'let shardAssignedCache = "";\n' +
+      'let shardFailCount = 0;\n' +
+      'let lastHeartbeatSentMs = 0;\n';
+    const body = ['normalizeSchoolKey', 'resolveGasUrl', 'shardAssignedUrl',
+      'shardSyncMemory', 'applyShardAssignment', 'syncWithGas'].map(bgExtract).join('\n');
+    // finally の setTimeout コールバックは「戻り値を返さない」設計（呼び出し元を待たせない）。
+    // そのため Promise を戻り値から拾えない。syncWithGas を包んで、発火した同期の
+    // Promise をテスト側が明示的に await できるよう記録する。
+    vmMod.runInContext(pre + body +
+      '\nvar __pending = [];' +
+      '\nsyncWithGas = (function (orig) {' +
+      '\n  return function () {' +
+      '\n    var p = orig.apply(null, arguments);' +
+      '\n    __pending.push(p);' +
+      '\n    return p;' +
+      '\n  };' +
+      '\n})(syncWithGas);' +
+      '\n__v = {' +
+      '\n  syncWithGas: function () { return syncWithGas.apply(null, arguments); },' +
+      '\n  inFlight: function () { return syncInFlight; },' +
+      '\n  handoff: function () { return shardHandoffPending; },' +
+      '\n  pending: function () { return __pending; }' +
+      '\n};', sandbox);
+    return { store: store, fetches: fetches, applied: applied, diag: diag,
+      timers: timers, __v: sandbox.__v };
+  }
+
+  // 保留中の setTimeout(0) を消化し、そこから発火した同期の完了まで待つ。
+  //   finally の中では await しない設計なので、タイマー → Promise の順に追いかける。
+  //   無限再入していないことは呼び出し回数の上限で検出する。
+  async function drain(h) {
+    let guard = 0;
+    while (guard++ < 10) {
+      while (h.timers.length) { h.timers.shift()(); }
+      const pend = h.__v.pending();
+      if (!pend.length) break;
+      const batch = pend.splice(0, pend.length);
+      await Promise.all(batch);
+    }
+  }
+
+  // --- V1〜V6: 親→子のバトンタッチが「1回だけ」発火し、予約が適用される ---
+  const h1 = buildHandoff({});
+  await h1.__v.syncWithGas(); // 1通目（親GAS）
+  check('V1 1通目は親GASへ送る', h1.fetches.length === 1 && h1.fetches[0] === PARENT, h1.fetches);
+  check('V2 親が返した assigned_gas_url を保存し、以後の通信先を子にする',
+    h1.store.assigned_gas_url === CHILD, h1.store.assigned_gas_url);
+  check('V3 1通目の完了時点でバトンタッチが1件だけ予約されている（まだ送っていない）',
+    h1.timers.length === 1 && h1.fetches.length === 1,
+    { timers: h1.timers.length, fetches: h1.fetches.length });
+
+  await drain(h1); // finally の setTimeout(0) を消化＝ガード解放後の再入
+  check('V4 ガード解放後に子GAS宛ての2通目が自動発火する（合計2通・宛先は子）',
+    h1.fetches.length === 2 && h1.fetches[1] === CHILD, h1.fetches);
+  check('V5 2通目で子GASの schedules.active を取得して適用している',
+    h1.applied.length === 2 && !!h1.applied[1].schedules &&
+    h1.applied[1].schedules.active.length === 1 &&
+    h1.applied[1].schedules.active[0].id === 'S-V1',
+    h1.applied.map(function (a) {
+      return a.schedules && a.schedules.active ? a.schedules.active.length : -1;
+    }));
+  check('V6 バトンタッチは1回限り（再入せず3通目を出さない＝無限ループしない）',
+    h1.timers.length === 0 && h1.fetches.length === 2 && h1.__v.handoff() === false,
+    { timers: h1.timers.length, fetches: h1.fetches.length, handoff: h1.__v.handoff() });
+
+  // --- V7: 親が割り当てを返さない場合は2通目を出さない（無駄な通信をしない） ---
+  const h2 = buildHandoff({ parentAssign: '' });
+  await h2.__v.syncWithGas();
+  await drain(h2);
+  check('V7 親が assigned_gas_url を返さなければ2通目を発火しない（通信は1回だけ）',
+    h2.fetches.length === 1 && h2.__v.handoff() === false,
+    { fetches: h2.fetches.length, handoff: h2.__v.handoff() });
+
+  // ================================================================
+  // V8〜V12: 要件2（低速ポーリング）— 未割り当て・非稼働は通信ゼロを維持しつつ、
+  //          予約保持または子GAS割り当て済みなら 5 分周期で起床する。
+  // ================================================================
+  function buildRate(o) {
+    o = o || {};
+    const clock = { now: o.now || 5000000 };
+    const sets = [], syncs = [], made = [];
+    const sandbox = {
+      console: { log: function () {}, warn: function () {}, error: function () {} },
+      JSON: JSON, String: String, Object: Object, Array: Array, Number: Number,
+      Boolean: Boolean, Math: Math, RegExp: RegExp, Error: Error, Promise: Promise,
+      Date: { now: function () { return clock.now; } },
+      chrome: {
+        storage: { local: {
+          get: function () { return Promise.resolve({}); },
+          set: function (p) { sets.push(p); return Promise.resolve(); }
+        } },
+        alarms: {
+          create: function (n) { made.push(n); },
+          clear: function () { return Promise.resolve(true); }
+        }
+      },
+      syncWithGas: function () { syncs.push(clock.now); return Promise.resolve(); }
+    };
+    vmMod.createContext(sandbox);
+    const pre =
+      'const ACTIVE_SYNC_MS = 1500;\n' +
+      'const IDLE_DRIFT_MS = 1000;\n' +
+      'const SLOW_POLL_MS = 5 * 60 * 1000;\n' +
+      'const SLOW_POLL_ALARM = "schedulePoll";\n' +
+      'const SLOW_POLL_ALARM_MIN = 5;\n' +
+      'let keepaliveActive = false;\n' +
+      'let activeIntervalMs = 1500;\n' +
+      'let idleDriftUntil = 0;\n' +
+      'let lastSyncMs = 0;\n' +
+      'let hasSyncedOnce = true;\n' + // 初回ブートストラップ済み＝レート判定のみを測る
+      'let shardAssignedCache = ' + JSON.stringify(o.shard || '') + ';\n' +
+      'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n';
+    const body = ['maybeSync', 'scheduleInterestActive', 'ensureSlowPoll',
+      'clearSlowPoll', 'clearIdleDriftAlarm'].map(bgExtract).join('\n');
+    vmMod.runInContext(pre + body + '\n__r = { maybeSync: maybeSync };', sandbox);
+    return { syncs: syncs, made: made, clock: clock, __r: sandbox.__r };
+  }
+
+  const r0 = buildRate({ shard: '', scheduleCache: null });
+  r0.__r.maybeSync();
+  r0.clock.now += 60 * 60 * 1000; // 1時間経過しても
+  r0.__r.maybeSync();
+  check('V8 未割り当て・予約なし・非稼働は通信ゼロを維持する（doPost を出さない）',
+    r0.syncs.length === 0 && r0.made.indexOf('schedulePoll') < 0,
+    { syncs: r0.syncs.length, made: r0.made });
+
+  const r1 = buildRate({ shard: CHILD });
+  r1.__r.maybeSync(); // 初回（経過 5000000ms >= 5分）
+  const afterFirst = r1.syncs.length;
+  r1.clock.now += 60 * 1000; // 1分後（5分未満）
+  r1.__r.maybeSync();
+  const afterShort = r1.syncs.length;
+  r1.clock.now += 4 * 60 * 1000; // 合計5分
+  r1.__r.maybeSync();
+  check('V9 子GAS割り当て済みなら非稼働でも 5 分周期で起床して同期する',
+    afterFirst === 1 && afterShort === 1 && r1.syncs.length === 2,
+    { first: afterFirst, short: afterShort, total: r1.syncs.length });
+  check('V10 schedulePoll（5分）アラームを登録する',
+    r1.made.indexOf('schedulePoll') >= 0, r1.made);
+
+  const r2 = buildRate({
+    shard: '',
+    scheduleCache: { schedules: { active: [], upcoming: [{ id: 'S-V2' }], overridden_ids: [] } }
+  });
+  r2.__r.maybeSync();
+  check('V11 予約キャッシュを保持していれば（未割り当てでも）低速ポーリングする',
+    r2.syncs.length === 1, r2.syncs.length);
+
+  const r3 = buildRate({
+    shard: '',
+    scheduleCache: { schedules: { active: [], upcoming: [], overridden_ids: [] } }
+  });
+  r3.__r.maybeSync();
+  check('V12 予約が空になれば低速ポーリングも止める（不要な通信を残さない）',
+    r3.syncs.length === 0, r3.syncs.length);
+
+  console.log('');
+  console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
+  process.exit(fail > 0 ? 1 : 0);
+})().catch(function (e) {
+  console.log('FAIL U セクションの実行に失敗しました => ' + String((e && e.message) || e));
+  console.log('');
+  console.log('===== 結果: PASS=' + pass + ' FAIL=' + (fail + 1) + ' =====');
+  process.exit(1);
+});

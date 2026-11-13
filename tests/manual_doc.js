@@ -122,13 +122,19 @@ const h2 = (src.match(/^##\s+.+$/gm) || []).map(s => s.replace(/^##\s+/, ''));
 ok(h2.length >= 13, '章・付録がそろっている', 'count=' + h2.length);
 
 const idxTeacher = src.indexOf('## 1. このシステムでできること');
-const idxAdmin = src.indexOf('## 10. 初期設定の手順');
+// 章番号は機能追加のたびに繰り下がるため、番号ではなく見出し本文で探す。
+// （「先生向けの章が管理者向けの章より前にある」という意図だけを固定する。）
+const idxAdmin = (() => {
+  const m = /^## \d+\. 初期設定の手順$/m.exec(src);
+  return m ? m.index : -1;
+})();
 ok(idxTeacher > 0 && idxAdmin > idxTeacher,
-  '先生向けの章(1〜)が管理者向けの章(10〜)より前にある');
+  '先生向けの章(1〜)が管理者向けの章より前にある');
 
 ['このシステムでできること', 'ログインする', '画面の見方',
  '児童の画面をロックする', 'URLを配信する', '児童の画面を見る',
- '注意マーク', '困ったときは', 'システムの全体像', '初期設定の手順',
+ '注意マーク', '予約スケジュール（時間制限タイマー）', '困ったときは',
+ 'システムの全体像', '初期設定の手順',
  'AI監視の設定'].forEach(kw => {
   ok(src.indexOf(kw) >= 0, '「' + kw + '」の章がある');
 });
@@ -199,6 +205,45 @@ ok(exampleCount >= 2, '「押すと児童の画面はこうなります」の操
   'count=' + exampleCount);
 ok(src.indexOf('画面ロック中') >= 0, 'ロック画面の実表示文言を再現している');
 ok(src.indexOf('アクセスが制限されています') >= 0, 'ブロック画面の実表示文言を再現している');
+
+// ---------- 8. 予約スケジュール（時間制限タイマー）の記載 ----------
+// 実装（gas/index.html の #scheduleView / #scheduleModal）と用語を一致させる。
+ok(src.indexOf('スケジュール管理') >= 0, '「スケジュール管理」タブの説明がある');
+ok(src.indexOf('新規予約作成') >= 0, '「新規予約作成」ボタンの記載がある');
+ok(src.indexOf('時間制限タイマー') >= 0, '機能の正式名称（時間制限タイマー）がある');
+
+// 繰り返し3種（NONE/DAILY/WEEKLY の日本語表示）
+['単発', '毎日', '毎週'].forEach(kw => {
+  ok(src.indexOf(kw) >= 0, '繰り返し「' + kw + '」の説明がある');
+});
+
+// 翌日またぎ（終了時刻 < 開始時刻）
+ok(/翌日またぎ/.test(src), '深夜帯（翌日またぎ）の扱いが書かれている');
+
+// 「解除」と「取消」の区別（取り違えると運用事故になるため必須）
+ok(/手動解除/.test(src), '「手動解除」の説明がある');
+ok(/取消/.test(src), '「取消」の説明がある');
+ok(/今回の時間帯だけ/.test(src),
+  '「解除＝今回だけ／取消＝予約ごと停止」の違いが明記されている');
+
+// 4枚目のシート
+ok(src.indexOf('スケジュール管理') >= 0 && /4シート|4つのシート/.test(src),
+  'シートが4枚になったことが書かれている');
+ok(src.indexOf('3シート') < 0 && src.indexOf('3つのシート') < 0,
+  '古い「3シート」表記が残っていない');
+
+// ---------- 9. Hub-Spoke（親GAS／子GAS）と v1.6.4 ----------
+ok(/親GAS/.test(src) && /子GAS/.test(src), '親GAS・子GASの役割が書かれている');
+ok(/Hub/.test(src) && /Spoke/.test(src), 'Hub-Spoke 構成であることが書かれている');
+ok(/PropertiesService/.test(src),
+  'データ伝播が PropertiesService 経由であることが書かれている');
+ok(/1校 = 1つの独立したスプレッドシート/.test(src),
+  'R41前提（1校=1独立環境）が明記されている');
+
+const mf = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension', 'manifest.json'), 'utf8'));
+ok(src.indexOf(mf.version) >= 0,
+  '説明書が manifest.json の版数(' + mf.version + ')に追随している');
+ok(!/1\.6\.3 を配布/.test(src), '古い「1.6.3 を配布」の指示が残っていない');
 
 // ---------- 結果 ----------
 console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');

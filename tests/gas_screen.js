@@ -69,7 +69,7 @@ const ctx = { console, JSON, Date, Math, String, Number, Array, Object, Boolean,
 let code = 'const SCHOOL_ALIASES = ' + JSON.stringify({ '英田小':'英田小学校','大原小':'大原小学校' }) + ';\n';
 code += 'const SCREENSHOT_MAX_BYTES = 400000;\n';
 code += 'const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;\n';
-['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','withWriteLock','parseBoolean','sheetTsToMs','getAllDevices','applyMonitorVisibility','invalidateDevicesCache','requestScreenCapture','processScreenshotUpload','getScreenshots','getScreenStatus'].forEach(n=>{ code += extract(n)+'\n'; });
+['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','withWriteLock','parseBoolean','sheetTsToMs','getAllDevices','applyMonitorVisibility','invalidateDevicesCache','requestScreenCapture','processScreenshotUpload','getScreenshots','getScreenStatus','normalizeHostListToArray_','hostListToSheetString_'].forEach(n=>{ code += extract(n)+'\n'; });
 vm.createContext(ctx); vm.runInContext(code, ctx);
 
 const admin = { email:'admin@x.jp', role:'ADMIN', school:'全校管理', target_class:'' };

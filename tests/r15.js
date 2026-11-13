@@ -91,8 +91,12 @@ check('showLoginView（ログアウト）で稼働停止', /function showLoginVi
 
 console.log('===== 課題A: 拡張側のレート制御（稼働中=1.5秒） =====');
 check('ACTIVE_SYNC_MS=1500（3秒以内反映の要）', /const ACTIVE_SYNC_MS = 1500;/.test(bgJs));
-check('IDLE_SYNC_MS=0（非稼働時は定期ポーリングしない＝通信ゼロ）', /const IDLE_SYNC_MS = 0;/.test(bgJs));
-check('maybeSync が非稼働時（猶予終了）に同期しない', /function maybeSync\(\)[\s\S]*?clearIdleDriftAlarm\(\);[\s\S]*?return;/.test(bgJs));
+check('IDLE_SYNC_MS=0（非稼働時は 1.5 秒の速いポーリングをしない）', /const IDLE_SYNC_MS = 0;/.test(bgJs));
+check('maybeSync が未割り当て・非稼働（猶予終了）に同期しない＝通信ゼロを維持',
+  /function maybeSync\(\)[\s\S]*?clearIdleDriftAlarm\(\);[\s\S]*?clearSlowPoll\(\);[\s\S]*?return;/.test(bgJs));
+check('予約保持または子GAS割り当て済みなら低速ポーリング（5分）を継続する',
+  /else if \(scheduleInterestActive\(\)\)[\s\S]{0,240}?interval = SLOW_POLL_MS;/.test(bgJs) &&
+  /SLOW_POLL_MS = 5 \* 60 \* 1000/.test(bgJs));
 check('稼働へ切替時に即同期（lastSyncMs=0）', /if \(activeChanged\) \{[\s\S]{0,80}?lastSyncMs = 0;/.test(bgJs));
 check('状態不変時は storage 書込み・アラーム再登録をしない（チャーン防止）', /if \(!activeChanged && !intervalChanged && !driftChanged\) return;/.test(bgJs));
 check('KEEPALIVE_PING が maybeSync を呼ぶ（非稼働時は doPost しない）', /message\.type === 'KEEPALIVE_PING'[\s\S]{0,200}?maybeSync\(\)/.test(bgJs));

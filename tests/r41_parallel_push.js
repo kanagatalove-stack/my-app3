@@ -30,9 +30,13 @@ check('shardInlineKick 関数は無い', src.indexOf('shardInlineKick') < 0);
 check('inlineKick の指定は1箇所も残っていない', src.indexOf('inlineKick') < 0);
 check('kickNow の分岐も残っていない', src.indexOf('kickNow') < 0);
 
-// shardPropagatePolicy は 2 引数に戻っていること
-check('shardPropagatePolicy は2引数（studentIds, patch）',
-  /function\s+shardPropagatePolicy\s*\(\s*studentIds\s*,\s*patch\s*\)/.test(src));
+// shardPropagatePolicy は R41 で「opts オブジェクト」を廃止して位置引数に戻した。
+//   フェーズ5 で第3引数 forceSync（スケジュール同封時は保留キューを使わず即時送信）を
+//   足したが、R41 が禁じた「opts オブジェクト渡し」ではないことは維持する。
+check('shardPropagatePolicy は位置引数（studentIds, patch[, forceSync]）',
+  /function\s+shardPropagatePolicy\s*\(\s*studentIds\s*,\s*patch\s*(?:,\s*forceSync\s*)?\)/.test(src));
+check('shardPropagatePolicy に opts オブジェクトを渡していない',
+  !/shardPropagatePolicy\([^)]*\{\s*opts\s*:/.test(src));
 
 // doPost の 4 経路は opts を渡さない
 const dopostStart = src.indexOf('function doPost(');
