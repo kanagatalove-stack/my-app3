@@ -122,6 +122,39 @@
         </button>
       </form>
 
+      <!-- ==================== Googleアカウント シングルサインオン（SSO） ==================== -->
+      <!-- 既存の手動ログイン（上の欄）はそのまま。その下に区切り線とSSOボタンを置く。 -->
+      <div class="space-y-4">
+        <div class="flex items-center space-x-3">
+          <div class="flex-1 h-px bg-slate-200"></div>
+          <span class="text-[11px] font-bold text-slate-400 tracking-wider">または</span>
+          <div class="flex-1 h-px bg-slate-200"></div>
+        </div>
+
+        <button type="button" id="ssoLoginBtn" onclick="handleSsoLogin()"
+          class="w-full bg-white hover:bg-slate-50 active:bg-slate-100 text-slate-700 font-bold py-3 rounded-xl border border-slate-300 shadow-sm transition text-sm flex items-center justify-center space-x-2.5 disabled:opacity-60 disabled:cursor-not-allowed">
+          <!-- Google ロゴ（インラインSVGのみ・外部画像URLは使用しない） -->
+          <svg class="w-5 h-5 shrink-0" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+            <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+            <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+            <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+            <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+          </svg>
+          <span id="ssoLoginBtnText">Googleアカウントでログイン（シングルサインオン）</span>
+          <svg id="ssoLoginBtnSpinner" class="w-4 h-4 animate-spin hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+          </svg>
+        </button>
+
+        <!-- SSO 拒否理由（児童アカウント・未許可・メール取得不可など） -->
+        <div id="ssoError" class="hidden p-3 bg-rose-50 border border-rose-200 text-rose-600 text-xs rounded-xl font-medium leading-relaxed"></div>
+
+        <p class="text-[10px] text-slate-400 leading-relaxed text-center">
+          学校のGoogleアカウントにログインした状態で押すと、パスワード入力なしでログインできます。<br>
+          許可された教員アカウントのみ利用できます（児童アカウントは利用できません）。
+        </p>
+      </div>
+
       <!-- 接続先ステータス & 設定アコーディオン -->
       <div class="border-t pt-3">
         <div class="flex items-center justify-between text-[11px] text-slate-500">
@@ -225,6 +258,14 @@
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
             </svg>
             <span>監視設定</span>
+          </button>
+
+          <!-- GoogleアカウントSSO設定ボタン（管理者のみ） -->
+          <button id="ssoSettingsBtn" onclick="openSsoSettingsModal()" title="GoogleアカウントSSOで管理画面へ入れる教員の許可設定（管理者のみ）" class="hidden flex items-center space-x-1.5 bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-slate-500">
+            <svg class="w-4 h-4 text-slate-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path>
+            </svg>
+            <span>SSO設定</span>
           </button>
 
           <!-- ログアウトボタン -->
@@ -1367,6 +1408,84 @@
       <div class="flex justify-end space-x-2 p-4 border-t bg-slate-50 shrink-0">
         <button onclick="closeModal('monitorModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition">閉じる</button>
         <button onclick="saveMonitoringSettingsFromModal()" class="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white rounded-lg shadow-sm transition">保存する</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== モーダル: GoogleアカウントSSO設定（管理者のみ） ==================== -->
+  <div id="ssoSettingsModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[65] hidden flex items-center justify-center p-3 sm:p-4">
+    <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden">
+      <div class="p-5 border-b flex items-center justify-between bg-slate-50 shrink-0">
+        <h3 class="text-lg font-bold text-slate-800 flex items-center space-x-2">
+          <span class="p-1.5 bg-slate-200 text-slate-700 rounded-lg">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path>
+            </svg>
+          </span>
+          <span>GoogleアカウントSSO設定（システム全体）</span>
+        </h3>
+        <button onclick="closeModal('ssoSettingsModal')" class="text-slate-400 hover:text-slate-600">✕</button>
+      </div>
+
+      <div class="p-5 space-y-4 text-xs overflow-y-auto flex-1">
+        <!-- SSO のON/OFF -->
+        <div class="bg-slate-50 border border-slate-300 rounded-xl p-4 flex items-start space-x-3">
+          <input type="checkbox" id="ssoEnabledToggle" class="w-5 h-5 mt-0.5 text-slate-700 rounded shrink-0">
+          <label for="ssoEnabledToggle" class="cursor-pointer select-none">
+            <span class="block text-sm font-bold text-slate-900">GoogleアカウントSSOを有効にする（システム全体）</span>
+            <span class="block text-[11px] text-slate-600 mt-1 leading-relaxed">
+              有効にすると、ログイン画面の「Googleアカウントでログイン」から
+              下の許可リストに載っている教員だけがパスワードなしでログインできます。<br>
+              無効にすると、SSOボタンは常に拒否されます（従来のパスワードログインは常に使えます）。
+            </span>
+          </label>
+        </div>
+
+        <!-- 許可メールアドレス -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <label class="font-semibold text-slate-700">許可する教員メールアドレス</label>
+            <span class="text-[11px] text-slate-400">1行に1アドレス</span>
+          </div>
+          <div class="text-[11px] text-slate-500 mb-1 leading-relaxed">
+            個別に許可する教員のGoogleアカウントです。
+            <code class="bg-slate-100 px-1 rounded">teacher@mimasaka.ed.jp</code> のように入力します。
+          </div>
+          <textarea id="ssoAllowedEmails" rows="6" spellcheck="false"
+            class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs font-mono focus:ring-slate-500 focus:border-slate-500"
+            placeholder="teacher@mimasaka.ed.jp&#10;admin@mimasaka.ed.jp"></textarea>
+        </div>
+
+        <!-- 許可ドメイン -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <label class="font-semibold text-slate-700">許可するドメイン（その組織の全教員を許可）</label>
+            <span class="text-[11px] text-slate-400">1行に1ドメイン</span>
+          </div>
+          <div class="text-[11px] text-slate-500 mb-1 leading-relaxed">
+            学校のドメインを登録すると、そのドメインのアカウントをまとめて許可します。
+            サブドメイン（<code class="bg-slate-100 px-1 rounded">sub.mimasaka.ed.jp</code>）も対象になります。<br>
+            <span class="font-bold text-rose-600">※ 児童アカウントが同じドメインの場合は「許可メールアドレス」で教員だけを個別指定してください。</span>
+          </div>
+          <textarea id="ssoAllowedDomains" rows="4" spellcheck="false"
+            class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs font-mono focus:ring-slate-500 focus:border-slate-500"
+            placeholder="mimasaka.ed.jp"></textarea>
+        </div>
+
+        <div id="ssoUpdatedInfo" class="text-[11px] text-slate-400"></div>
+
+        <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 text-[11px] text-amber-800 leading-relaxed">
+          <span class="font-bold">安全のための二重チェック</span><br>
+          SSOでログインできるのは ①上の許可リストに一致 かつ ②教員マスタに登録済み の両方を満たす場合だけです。
+          児童アカウントや未登録のアカウントは、たとえ許可リストに載っていてもログインできません。<br>
+          Webアプリのデプロイ設定が「全員（匿名を含む）」の場合、Googleアカウントのメールアドレスが取得できずSSOは必ず失敗します
+          （その場合は「自分として実行／組織内の全員」に変更してください）。
+        </div>
+      </div>
+
+      <div class="flex justify-end space-x-2 p-4 border-t bg-slate-50 shrink-0">
+        <button onclick="closeModal('ssoSettingsModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition">閉じる</button>
+        <button onclick="saveSsoSettingsFromModal()" class="px-4 py-2 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-lg shadow-sm transition">保存する</button>
       </div>
     </div>
   </div>
@@ -2703,6 +2822,10 @@
       const monitorBtn = document.getElementById('monitorSettingsBtn');
       if (monitorBtn) monitorBtn.classList.toggle('hidden', !isAdminUser());
 
+      // GoogleアカウントSSO設定も「システム全体」に効くため、管理者(ADMIN)のみに表示する。
+      const ssoBtn = document.getElementById('ssoSettingsBtn');
+      if (ssoBtn) ssoBtn.classList.toggle('hidden', !isAdminUser());
+
       const classBadge = document.getElementById('currentTeacherClassBadge');
       if (currentTeacher.target_class && currentTeacher.target_class.trim()) {
         classBadge.textContent = '対象クラス: ' + currentTeacher.target_class.trim();
@@ -2755,6 +2878,73 @@
       } finally {
         btnText.textContent = 'ログイン';
         spinner.classList.add('hidden');
+      }
+    }
+
+    // ==================== Googleアカウント シングルサインオン（SSO） ====================
+    // 教員が「Googleアカウントでログイン」を押したときの処理。
+    //   サーバー側 api_ssoLogin() が Session.getActiveUser().getEmail() で
+    //   アクセス中のGoogleアカウントを取得し、許可リスト（SSO_SETTINGS_V1）と
+    //   教員マスタの両方に一致したときだけ、手動ログインと同一の正規トークンを返す。
+    //   児童アカウント・未許可アカウント・メール取得不可は、すべてサーバー側で拒否される。
+    async function handleSsoLogin() {
+      const errBox = document.getElementById('ssoError');
+      const btn = document.getElementById('ssoLoginBtn');
+      const btnText = document.getElementById('ssoLoginBtnText');
+      const spinner = document.getElementById('ssoLoginBtnSpinner');
+
+      if (errBox) errBox.classList.add('hidden');
+
+      // google.script.run が無い環境（拡張機能・通常Webページ）ではSSOできない旨を案内する。
+      if (typeof google === 'undefined' || !google.script || !google.script.run) {
+        if (errBox) {
+          errBox.textContent = 'この環境ではGoogleアカウントSSOを利用できません。上の欄から管理者パスワードを入力してログインしてください。';
+          errBox.classList.remove('hidden');
+        }
+        return;
+      }
+
+      if (btn) btn.disabled = true;
+      if (btnText) btnText.textContent = 'ログイン中...';
+      if (spinner) spinner.classList.remove('hidden');
+
+      try {
+        const res = await new Promise((resolve, reject) => {
+          google.script.run
+            .withSuccessHandler(function (r) {
+              if (typeof r === 'string') { try { r = JSON.parse(r); } catch (e) {} }
+              resolve(r);
+            })
+            .withFailureHandler(function (err) {
+              reject(new Error(err && err.message ? err.message : String(err)));
+            })
+            .api_ssoLogin();
+        });
+
+        if (res && res.success && res.token) {
+          authToken = res.token;
+          currentTeacher = res.teacher;
+          localStorage.setItem('edu_teacher_token', authToken);
+          localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
+          showToast(`ようこそ、${currentTeacher.name} 先生（Googleアカウント）`, 'success');
+          showDashboard();
+          // 【R41】子GASのURLと共有シークレットを取得しておく（並列直送の準備）
+          try { syncShardClientConfig(true); } catch (eSC) {}
+        } else {
+          const msg = (res && res.error)
+            ? res.error
+            : 'このGoogleアカウントには管理権限がありません。許可された教員アカウントでログインするか、上の欄から管理者パスワードを入力してください。';
+          if (errBox) { errBox.textContent = msg; errBox.classList.remove('hidden'); }
+        }
+      } catch (err) {
+        if (errBox) {
+          errBox.textContent = 'GoogleアカウントSSOに失敗しました: ' + (err && err.message ? err.message : String(err));
+          errBox.classList.remove('hidden');
+        }
+      } finally {
+        if (btn) btn.disabled = false;
+        if (btnText) btnText.textContent = 'Googleアカウントでログイン（シングルサインオン）';
+        if (spinner) spinner.classList.add('hidden');
       }
     }
 
@@ -2860,6 +3050,10 @@
             runner.api_getMonitorSettings(authToken);
           } else if (act === 'save_monitor_settings') {
             runner.api_saveMonitorSettings(authToken, payload.settings || {});
+          } else if (act === 'get_sso_settings') {
+            runner.api_getSsoSettings(authToken);
+          } else if (act === 'save_sso_settings') {
+            runner.api_saveSsoSettings(authToken, payload.settings || {});
           } else if (act === 'list_schedules') {
             runner.api_listSchedules(authToken, payload.school_name);
           } else if (act === 'save_schedule') {
@@ -5724,6 +5918,77 @@
         await loadDevices();
       } catch (err) {
         showToast('監視設定の保存に失敗しました: ' + err.message, 'error');
+      }
+    }
+
+    // ==================== GoogleアカウントSSO設定（管理者のみ） ====================
+    async function openSsoSettingsModal() {
+      if (!isAdminUser()) {
+        showAlertModal('権限がありません', 'SSO設定を変更できるのは管理者のみです。', 'error');
+        return;
+      }
+      openModal('ssoSettingsModal');
+
+      const infoEl = document.getElementById('ssoUpdatedInfo');
+      if (infoEl) infoEl.textContent = '読み込み中...';
+
+      try {
+        const res = await apiRequest({ action: 'get_sso_settings' });
+        const st = (res && res.settings) || {};
+
+        const toggle = document.getElementById('ssoEnabledToggle');
+        const emailsEl = document.getElementById('ssoAllowedEmails');
+        const domainsEl = document.getElementById('ssoAllowedDomains');
+
+        if (toggle) toggle.checked = (st.enabled === true);
+        if (emailsEl) emailsEl.value = (Array.isArray(st.allowed_emails) ? st.allowed_emails : []).join('\n');
+        if (domainsEl) domainsEl.value = (Array.isArray(st.allowed_domains) ? st.allowed_domains : []).join('\n');
+
+        if (infoEl) {
+          infoEl.textContent = st.updated_at
+            ? `最終更新: ${st.updated_at}${st.updated_by ? '（' + st.updated_by + '）' : ''}`
+            : '初期設定のままです（未保存・SSOは無効）';
+        }
+      } catch (err) {
+        if (infoEl) infoEl.textContent = 'SSO設定の取得に失敗しました: ' + err.message;
+        showToast('SSO設定の取得に失敗しました: ' + err.message, 'error');
+      }
+    }
+
+    async function saveSsoSettingsFromModal() {
+      if (!isAdminUser()) {
+        showAlertModal('権限がありません', 'SSO設定を変更できるのは管理者のみです。', 'error');
+        return;
+      }
+
+      const toggle = document.getElementById('ssoEnabledToggle');
+      const emailsEl = document.getElementById('ssoAllowedEmails');
+      const domainsEl = document.getElementById('ssoAllowedDomains');
+
+      // 改行／カンマ区切りを配列へ（既存 parseAddressList を再利用）
+      const emails = parseAddressList(emailsEl ? emailsEl.value : '');
+      const domains = parseAddressList(domainsEl ? domainsEl.value : '');
+      const enabled = !!(toggle && toggle.checked);
+
+      if (enabled && emails.length === 0 && domains.length === 0) {
+        showAlertModal('設定を確認してください', 'SSOを有効にするには、許可メールアドレスまたは許可ドメインを1件以上登録してください。', 'warning');
+        return;
+      }
+
+      try {
+        showToast('SSO設定を保存中...', 'info');
+        await apiRequest({
+          action: 'save_sso_settings',
+          settings: {
+            enabled: enabled,
+            allowed_emails: emails,
+            allowed_domains: domains
+          }
+        });
+        showToast(enabled ? 'GoogleアカウントSSOを有効にしました' : 'GoogleアカウントSSOを無効にしました', 'success');
+        closeModal('ssoSettingsModal');
+      } catch (err) {
+        showToast('SSO設定の保存に失敗しました: ' + err.message, 'error');
       }
     }
 
