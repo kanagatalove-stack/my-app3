@@ -120,7 +120,10 @@ const CONFIG = {
     '登録URL情報',
     '個別ホワイトリスト',
     '個別ブラックリスト',
-    '最終ログイン日時'
+    '最終ログイン日時',
+    // 【Request K】教員ごとのGoogleアカウントSSO可否（末尾に追加。既存1〜10列の
+    //   インデックスは不変。ensureTeacherHeaders が既存シートへも自動補完する）
+    'Google SSO許可'
   ],
 
   // ==========================================================
@@ -1402,7 +1405,10 @@ function handleTeacherLogin(email, password) {
         target_class: String(data[i][headerMap['対象クラス'] - 1] || ''),
         urls: parseTeacherUrls(data[i][headerMap['登録URL情報'] - 1]),
         filter_whitelist: String(data[i][headerMap['個別ホワイトリスト'] - 1] || defaultWhitelist),
-        filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist)
+        filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist),
+        // 【Request K】SSO可否（列が無い環境でも安全に評価できるようガード）
+        sso_allowed: parseSsoAllowedFlag(
+          headerMap['Google SSO許可'] ? data[i][headerMap['Google SSO許可'] - 1] : undefined)
       };
 
       const token = generateToken(teacher);
@@ -1577,7 +1583,10 @@ function getTeacherSettings(email) {
         target_class: String(data[i][headerMap['対象クラス'] - 1] || ''),
         urls: parseTeacherUrls(data[i][headerMap['登録URL情報'] - 1]),
         filter_whitelist: String(data[i][headerMap['個別ホワイトリスト'] - 1] || defaultWhitelist),
-        filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist)
+        filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist),
+        // 【Request K】SSO可否（空欄＝既定ON。明示的な FALSE のみ拒否）
+        sso_allowed: parseSsoAllowedFlag(
+          headerMap['Google SSO許可'] ? data[i][headerMap['Google SSO許可'] - 1] : undefined)
       };
       if (__tCache && __tKey) {
         try { __tCache.put(__tKey, JSON.stringify(__found), 300); } catch (e) { /* 容量超過等は無視 */ }
@@ -1707,7 +1716,13 @@ function getAllTeachers(teacher) {
       school: String(data[i][headerMap['所属学校'] - 1] || ''),
       role: String(data[i][headerMap['権限'] - 1] || 'TEACHER'),
       target_class: String(data[i][headerMap['対象クラス'] - 1] || ''),
-      last_login: headerMap['最終ログイン日時'] ? String(data[i][headerMap['最終ログイン日時'] - 1] || '') : ''
+      last_login: headerMap['最終ログイン日時'] ? String(data[i][headerMap['最終ログイン日時'] - 1] || '') : '',
+      // 【Request K】編集モーダルで全項目を復元できるようにする
+      sso_allowed: parseSsoAllowedFlag(
+        headerMap['Google SSO許可'] ? data[i][headerMap['Google SSO許可'] - 1] : undefined),
+      urls: parseTeacherUrls(data[i][headerMap['登録URL情報'] - 1]),
+      filter_whitelist: String(data[i][headerMap['個別ホワイトリスト'] - 1] || ''),
+      filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || '')
     });
   }
   return results;
@@ -1724,8 +1739,17 @@ function addTeacher(teacher, payload) {
   const school = String((payload && payload.school) || '').trim();
   const role = String((payload && payload.role) || 'TEACHER').trim().toUpperCase();
   const targetClass = String((payload && payload.target_class) || '').trim();
+  // 【Request K】SSO許可・登録URL情報・個別ホワイト/ブラックリストも登録可能にする
+  const ssoAllowed = parseSsoAllowedFlag(
+    (payload && payload.sso_allowed !== undefined) ? payload.sso_allowed : true);
+  const urls = (payload && payload.urls) || [];
+  const whitelist = String((payload && payload.filter_whitelist) || '').trim();
+  const blacklist = String((payload && payload.filter_blacklist) || '').trim();
   if (!email) throw new Error('メールアドレスを入力してください');
-  if (!password) throw new Error('パスワードを入力してください');
+  // SSOが有効ならパスワード未設定でも登録できる（手動ログインを併用したい場合のみ設定）
+  if (!password && !ssoAllowed) {
+    throw new Error('パスワードを入力するか、Google SSO許可を有効にしてください');
+  }
   return withWriteLock(function () {
 
   const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
@@ -1745,6 +1769,13 @@ function addTeacher(teacher, payload) {
   newRow[headerMap['所属学校'] - 1] = school || '全校管理';
   newRow[headerMap['権限'] - 1] = role || 'TEACHER';
   newRow[headerMap['対象クラス'] - 1] = targetClass;
+  // 【Request K】URL情報・個別リスト・SSO可否（列が無い環境でも落ちないようガード）
+  if (headerMap['登録URL情報'] && Array.isArray(urls) && urls.length) {
+    newRow[headerMap['登録URL情報'] - 1] = serializeTeacherUrls(urls);
+  }
+  if (headerMap['個別ホワイトリスト'] && whitelist) newRow[headerMap['個別ホワイトリスト'] - 1] = whitelist;
+  if (headerMap['個別ブラックリスト'] && blacklist) newRow[headerMap['個別ブラックリスト'] - 1] = blacklist;
+  if (headerMap['Google SSO許可']) newRow[headerMap['Google SSO許可'] - 1] = ssoAllowed;
   sheet.appendRow(newRow);
   // 【R33】教員を追加したのでキャッシュを失効させる
   try { if (typeof invalidateTeacherCache === 'function') invalidateTeacherCache(); } catch (e) {}
@@ -1777,6 +1808,19 @@ function updateTeacherRecord(teacher, payload) {
   if (payload.school !== undefined && headerMap['所属学校']) sheet.getRange(targetRow, headerMap['所属学校']).setValue(String(payload.school).trim());
   if (payload.role !== undefined && headerMap['権限']) sheet.getRange(targetRow, headerMap['権限']).setValue(String(payload.role).trim().toUpperCase());
   if (payload.target_class !== undefined && headerMap['対象クラス']) sheet.getRange(targetRow, headerMap['対象クラス']).setValue(String(payload.target_class).trim());
+  // 【Request K】登録URL情報・個別ホワイト/ブラックリスト・SSO可否も更新できるようにする
+  if (payload.urls !== undefined && headerMap['登録URL情報']) {
+    sheet.getRange(targetRow, headerMap['登録URL情報']).setValue(serializeTeacherUrls(payload.urls || []));
+  }
+  if (payload.filter_whitelist !== undefined && headerMap['個別ホワイトリスト']) {
+    sheet.getRange(targetRow, headerMap['個別ホワイトリスト']).setValue(String(payload.filter_whitelist || '').trim());
+  }
+  if (payload.filter_blacklist !== undefined && headerMap['個別ブラックリスト']) {
+    sheet.getRange(targetRow, headerMap['個別ブラックリスト']).setValue(String(payload.filter_blacklist || '').trim());
+  }
+  if (payload.sso_allowed !== undefined && headerMap['Google SSO許可']) {
+    sheet.getRange(targetRow, headerMap['Google SSO許可']).setValue(parseSsoAllowedFlag(payload.sso_allowed));
+  }
   // 【R33】教員情報を更新したのでキャッシュを失効させる（所属校・権限の変更を即反映）
   try { if (typeof invalidateTeacherCache === 'function') invalidateTeacherCache(); } catch (e) {}
   return getTeacherSettings(email);
@@ -7495,208 +7539,80 @@ function api_saveMonitorSettings(token, settings) {
 }
 
 // ==================== Googleアカウント シングルサインオン（SSO） ====================
-// 教員が「Googleアカウントでログイン」を押したとき、Webアプリへアクセス中の
-// Googleアカウント（Session.getActiveUser().getEmail()）を取得し、
-// 許可メール／許可ドメインと一致した場合のみ、従来のパスワードログインと
-// まったく同じトークン（generateToken）・同じ教員情報を発行する。
+// 【設計（Request K）】SSOの可否は「教員マスタ（アカウント管理）」だけで完結する。
+//   二重管理をしない。判定は次の3点のみ。
+//     ① Session.getActiveUser().getEmail() でメールアドレスを取得できる
+//     ② 教員マスタ（アカウント管理）に登録済み
+//     ③ その行の「Google SSO許可」列が有効
+//   満たした場合のみ、手動ログインと同一の正規トークン（generateToken）を発行する。
 //
-// ■ 前提（デプロイ設定・確定仕様）
-//   実行ユーザー: 自分（管理者） ／ アクセス: 組織（ドメイン）内の全員
-//   → 同一ドメインのログインユーザーのメールアドレスが取得できる。
-//   デプロイ設定が「全員（匿名を含む）」だと getEmail() が空文字を返すため、
-//   その場合は reason:'no_email' で確実に拒否し、パスワード入力へ誘導する。
+//   ※ 旧仕様の独立SSO設定（PropertiesService の SSO_SETTINGS_V1 /
+//     SSO_ALLOWED_EMAILS / SSO_ALLOWED_DOMAINS による許可リスト・ドメイン一括許可）は
+//     全廃した。既存環境にこれらのキーが残っていても一切参照しない。
 //
-// ■ 児童アカウント対策（フェイルセーフ）
-//   許可リストに載っていない限りトークンは発行されない。既定は enabled:false
-//   ＝全拒否。さらに教員マスタに存在しないメールは拒否する（二重の防御）。
-//   したがって児童がSSOで管理画面へ入る経路は存在しない。
-//
-// ■ 保存先
-//   PropertiesService のみ（スプレッドシートへの書き戻しは一切行わない）。
-//   主キー SSO_SETTINGS_V1 に JSON で保存し、管理・手動編集用に
-//   SSO_ALLOWED_EMAILS / SSO_ALLOWED_DOMAINS へも同じ内容を複製する。
-const SSO_SETTINGS_PROP = 'SSO_SETTINGS_V1';
-const SSO_ALLOWED_EMAILS_PROP = 'SSO_ALLOWED_EMAILS';
-const SSO_ALLOWED_DOMAINS_PROP = 'SSO_ALLOWED_DOMAINS';
-const SSO_MAX_ENTRIES = 500;
-const SSO_EMAIL_RE = /^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$/;
-const SSO_DOMAIN_RE = /^[a-z0-9.\-]+$/;
+// ■ 前提（デプロイ設定）
+//   次のユーザーとして実行: 自分（管理者） ／ アクセス: 組織（ドメイン）内の全員
+//   「全員（匿名を含む）」だと getEmail() が空文字になり no_email で拒否する。
 const SSO_DENY_MESSAGE = 'このGoogleアカウントには管理権限がありません。許可された教員アカウントでログインするか、上の欄から管理者パスワードを入力してください。';
+const SSO_NO_EMAIL_MESSAGE = 'このGoogleアカウントからメールアドレスを取得できませんでした（Webアプリのデプロイ設定が「全員（匿名を含む）」になっている可能性があります）。上の欄から管理者パスワードを入力してログインしてください。';
 
 /**
- * 許可ドメインの表記ゆれ（URLスキーム・先頭@・大文字・末尾ドット・パス）を吸収する。
- * 例: '@Mimasaka.Ed.jp.' → 'mimasaka.ed.jp'
+ * 「Google SSO許可」セルの値を真偽値へ変換する。
+ *   空欄（未設定）は既定で【許可】とする。
+ *   教員マスタに行が存在する時点で管理者が承認した教員であるため、
+ *   列追加前から存在する既存教員がSSOを使えなくなる事故を避ける（移行措置）。
+ *   明示的に FALSE / 0 / no / off / 無効 等が入っている行だけ拒否する。
  */
-function normalizeSsoDomain(value) {
-  return String(value == null ? '' : value)
-    .trim().toLowerCase()
-    .replace(/^https?:\/\//, '')
-    .replace(/^@+/, '')
-    .replace(/\/.*$/, '')
-    .replace(/\.+$/, '');
+function parseSsoAllowedFlag(value) {
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  const s = String(value == null ? '' : value).trim().toLowerCase();
+  if (!s) return true;              // 未設定＝既定ON（既存教員の移行措置）
+  if (['false', '0', 'no', 'off', 'ng', 'x', '不可', '無効', '拒否'].indexOf(s) >= 0) return false;
+  return true;
 }
 
 /**
- * 許可メールアドレス一覧の正規化（小文字化・形式検証・重複除去・上限）。
- * 配列でもカンマ/改行/セミコロン区切りの文字列でも受け付ける。
+ * 【google.script.run】GoogleアカウントSSOログイン。
+ * アクセス中のGoogleアカウントを取得し、教員マスタ＋SSO許可で判定する。
  */
-function sanitizeSsoEmailList(list) {
-  const out = [];
-  const seen = {};
-  const arr = Array.isArray(list) ? list : String(list == null ? '' : list).split(/[\s,;]+/);
-  for (let i = 0; i < arr.length && out.length < SSO_MAX_ENTRIES; i++) {
-    const v = String(arr[i] == null ? '' : arr[i]).trim().toLowerCase();
-    if (!v || v.indexOf('@') < 0) continue;
-    if (!SSO_EMAIL_RE.test(v)) continue;
-    if (seen[v]) continue;
-    seen[v] = true;
-    out.push(v);
+function api_ssoLogin() {
+  let email = '';
+  try { email = String(Session.getActiveUser().getEmail() || '').trim(); }
+  catch (eSession) { email = ''; }
+  try {
+    return ssoLoginWithEmail(email);
+  } catch (err) {
+    return { success: false, reason: 'error', error: err.toString() };
   }
-  return out;
-}
-
-/**
- * 許可ドメイン一覧の正規化（正規化・形式検証・重複除去・上限）。
- */
-function sanitizeSsoDomainList(list) {
-  const out = [];
-  const seen = {};
-  const arr = Array.isArray(list) ? list : String(list == null ? '' : list).split(/[\s,;]+/);
-  for (let i = 0; i < arr.length && out.length < SSO_MAX_ENTRIES; i++) {
-    const v = normalizeSsoDomain(arr[i]);
-    if (!v || v.indexOf('.') < 0) continue;
-    if (!SSO_DOMAIN_RE.test(v)) continue;
-    if (seen[v]) continue;
-    seen[v] = true;
-    out.push(v);
-  }
-  return out;
-}
-
-/**
- * SSO設定の取得（PropertiesService のみを読む）。
- * 主キー SSO_SETTINGS_V1 が無い場合は、個別キー SSO_ALLOWED_EMAILS /
- * SSO_ALLOWED_DOMAINS（手動設定）から復元する。
- */
-function getSsoSettings() {
-  let o = null;
-  let ps = null;
-  try { ps = PropertiesService.getScriptProperties(); } catch (e) { ps = null; }
-
-  if (ps) {
-    try {
-      const raw = ps.getProperty(SSO_SETTINGS_PROP);
-      if (raw) o = JSON.parse(raw);
-    } catch (eParse) { o = null; }
-
-    if (!o || typeof o !== 'object') {
-      o = {};
-      try {
-        const eRaw = ps.getProperty(SSO_ALLOWED_EMAILS_PROP);
-        if (eRaw) o.allowed_emails = JSON.parse(eRaw);
-      } catch (eEmails) { /* 個別キーが壊れていても致命的にしない */ }
-      try {
-        const dRaw = ps.getProperty(SSO_ALLOWED_DOMAINS_PROP);
-        if (dRaw) o.allowed_domains = JSON.parse(dRaw);
-      } catch (eDomains) { /* 同上 */ }
-      // 個別キーだけで運用する場合、明示的な enabled が存在しないため
-      // 「許可リストが1件以上あるなら有効」とみなす（運用の利便性）。
-      const nE = (Array.isArray(o.allowed_emails) ? o.allowed_emails : []).length;
-      const nD = (Array.isArray(o.allowed_domains) ? o.allowed_domains : []).length;
-      o.enabled = (nE > 0 || nD > 0);
-    }
-  }
-  if (!o || typeof o !== 'object') o = {};
-
-  return {
-    enabled: o.enabled === true,
-    allowed_emails: sanitizeSsoEmailList(o.allowed_emails || []),
-    allowed_domains: sanitizeSsoDomainList(o.allowed_domains || []),
-    updated_at: String(o.updated_at || ''),
-    updated_by: String(o.updated_by || '')
-  };
-}
-
-/**
- * メールアドレスがSSO許可リストに一致するか。
- *   ① 許可メールアドレスと完全一致
- *   ② 許可ドメインと完全一致（example.ed.jp）
- *   ③ 許可ドメインのサブドメイン（sub.example.ed.jp）
- */
-function isSsoEmailAllowed(email, settings) {
-  const em = String(email == null ? '' : email).trim().toLowerCase();
-  if (!em || em.indexOf('@') < 0) return false;
-
-  const s = settings || getSsoSettings();
-  const emails = sanitizeSsoEmailList((s && s.allowed_emails) || []);
-  for (let i = 0; i < emails.length; i++) {
-    if (emails[i] === em) return true;
-  }
-
-  const domains = sanitizeSsoDomainList((s && s.allowed_domains) || []);
-  const host = em.slice(em.indexOf('@') + 1);
-  for (let j = 0; j < domains.length; j++) {
-    const d = domains[j];
-    if (host === d) return true;
-    if (host.length > d.length && host.slice(-(d.length + 1)) === '.' + d) return true;
-  }
-  return false;
-}
-
-/**
- * SSO設定の保存（管理者のみ）。PropertiesService のみに書く。
- */
-function saveSsoSettings(teacher, incoming) {
-  if (!isAdminTeacher(teacher)) {
-    throw new Error('SSO設定を変更できるのは管理者のみです');
-  }
-  const inc = incoming || {};
-  const next = {
-    enabled: inc.enabled === true,
-    allowed_emails: sanitizeSsoEmailList(inc.allowed_emails || []),
-    allowed_domains: sanitizeSsoDomainList(inc.allowed_domains || []),
-    updated_at: Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm'),
-    updated_by: String((teacher && teacher.email) || '')
-  };
-
-  const ps = PropertiesService.getScriptProperties();
-  ps.setProperty(SSO_SETTINGS_PROP, JSON.stringify(next));
-  // 管理・手動編集用のミラー（内容は主キーと同一）
-  ps.setProperty(SSO_ALLOWED_EMAILS_PROP, JSON.stringify(next.allowed_emails));
-  ps.setProperty(SSO_ALLOWED_DOMAINS_PROP, JSON.stringify(next.allowed_domains));
-  return next;
 }
 
 /**
  * メールアドレスを受け取ってSSO認証を行う本体（Session に依存しないので試験可能）。
- *  成功時は handleTeacherLogin と同一形状（token / teacher / schools）を返す。
+ *   成功時は handleTeacherLogin と同一形状（token / teacher / schools）を返す。
  */
 function ssoLoginWithEmail(email) {
   const em = String(email == null ? '' : email).trim().toLowerCase();
 
   // ① メールアドレスが取得できない（デプロイ設定が「全員（匿名）」等）
   if (!em) {
-    return {
-      success: false,
-      reason: 'no_email',
-      error: 'このGoogleアカウントからメールアドレスを取得できませんでした（Webアプリのデプロイ設定が「全員（匿名を含む）」になっている可能性があります）。上の欄から管理者パスワードを入力してログインしてください。'
-    };
+    return { success: false, reason: 'no_email', error: SSO_NO_EMAIL_MESSAGE };
   }
 
-  // ② 許可リストに一致しない（児童アカウント・未登録メール・SSO無効時）
-  const settings = getSsoSettings();
-  if (settings.enabled !== true || !isSsoEmailAllowed(em, settings)) {
-    return { success: false, reason: 'not_allowed', email: em, error: SSO_DENY_MESSAGE };
-  }
-
-  // ③ 教員マスタに存在しない（許可リストに載っていても教員でなければ拒否）
+  // ② 教員マスタ（アカウント管理）に登録済みか
   let teacher = null;
   try { teacher = getTeacherSettings(em); } catch (eTeacher) { teacher = null; }
   if (!teacher || !teacher.email) {
+    // 児童アカウント・未登録アカウントはここで必ず落ちる
     return { success: false, reason: 'not_registered', email: em, error: SSO_DENY_MESSAGE };
   }
 
-  // ④ 最終ログイン日時の記録（記録できなくても認証は成立させる）
+  // ③ その教員の「Google SSO許可」が有効か
+  if (parseSsoAllowedFlag(teacher.sso_allowed) !== true) {
+    return { success: false, reason: 'sso_disabled', email: em, error: SSO_DENY_MESSAGE };
+  }
+
+  // 最終ログイン日時の記録（失敗してもログインは成立させる）
   try {
     const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
     ensureTeacherHeaders(sheet);
@@ -7714,7 +7630,7 @@ function ssoLoginWithEmail(email) {
     }
   } catch (eLast) { /* 最終ログインの記録失敗はログイン成否に影響させない */ }
 
-  // ⑤ 正規セッションの発行（手動ログインと同一のトークン生成）
+  // 正規セッションの発行（手動ログインと同一のトークン生成）
   const token = generateToken(teacher);
   return {
     success: true,
@@ -7723,54 +7639,6 @@ function ssoLoginWithEmail(email) {
     teacher: teacher,
     schools: CONFIG.SCHOOL_LIST
   };
-}
-
-/**
- * 【google.script.run】GoogleアカウントSSOログイン。
- * アクセス中のGoogleアカウントを取得し、許可リスト照合のうえ正規セッションを発行する。
- */
-function api_ssoLogin() {
-  let email = '';
-  try { email = String(Session.getActiveUser().getEmail() || '').trim(); }
-  catch (eSession) { email = ''; }
-  try {
-    return ssoLoginWithEmail(email);
-  } catch (err) {
-    return { success: false, error: err.toString() };
-  }
-}
-
-/**
- * 【google.script.run】SSO設定の取得（読み取りは全教員可・変更可否の判断材料に is_admin を返す）。
- */
-function api_getSsoSettings(token) {
-  try {
-    const auth = verifyToken(token);
-    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const currentTeacher = resolveCurrentTeacher(auth.teacher);
-    return {
-      success: true,
-      settings: getSsoSettings(),
-      is_admin: isAdminTeacher(currentTeacher)
-    };
-  } catch (err) {
-    return { success: false, error: err.toString() };
-  }
-}
-
-/**
- * 【google.script.run】SSO設定の保存（管理者のみ）。
- */
-function api_saveSsoSettings(token, settings) {
-  try {
-    const auth = verifyToken(token);
-    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const currentTeacher = resolveCurrentTeacher(auth.teacher);
-    const saved = saveSsoSettings(currentTeacher, settings || {});
-    return { success: true, message: 'SSO設定を保存しました', settings: saved };
-  } catch (err) {
-    return { success: false, error: err.toString() };
-  }
 }
 
 // ============================================================================
