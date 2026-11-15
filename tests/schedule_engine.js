@@ -491,7 +491,7 @@ function runIn(expr) { return vm.runInContext(expr, M); }
 
   // ------------------------------------------------------------ G. 不変条件
   const manifest = JSON.parse(manifestRaw);
-  check('不変条件: version は v1.6.4 のまま', manifest.version === '1.6.4', manifest.version);
+  check('不変条件: version は v1.6.5', manifest.version === '1.6.5', manifest.version);
   check('不変条件: default_popup を持たない', !manifest.action || !manifest.action.default_popup);
   check('不変条件: alarms 権限がある（追加不要）',
     Array.isArray(manifest.permissions) && manifest.permissions.indexOf('alarms') >= 0, manifest.permissions);
