@@ -218,7 +218,7 @@
             <span id="teacherSettingsBtnLabel">設定 (クラス・URL)</span>
           </button>
 
-          <!-- AI監視設定ボタン（管理者のみ） -->
+          <!-- サイト監視設定ボタン（管理者のみ） -->
           <button id="monitorSettingsBtn" onclick="openMonitoringModal()" title="学習に関係のないサイトの監視設定（管理者のみ）" class="hidden flex items-center space-x-1.5 bg-rose-700 hover:bg-rose-800 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-rose-500">
             <svg class="w-4 h-4 text-rose-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
@@ -1296,7 +1296,7 @@
     </div>
   </div>
 
-  <!-- ==================== モーダル: AI監視設定（管理者のみ・システム全体） ==================== -->
+  <!-- ==================== モーダル: サイト監視設定（管理者のみ・システム全体） ==================== -->
   <div id="monitorModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[65] hidden flex items-center justify-center p-3 sm:p-4">
     <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden">
       <div class="p-5 border-b flex items-center justify-between bg-slate-50 shrink-0">
@@ -1306,7 +1306,7 @@
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
             </svg>
           </span>
-          <span>AI監視設定（システム全体）</span>
+          <span>サイト監視設定（システム全体）</span>
         </h3>
         <button onclick="closeModal('monitorModal')" class="text-slate-400 hover:text-slate-600">✕</button>
       </div>
@@ -1316,7 +1316,7 @@
         <div class="bg-rose-50 border border-rose-200 rounded-xl p-4 flex items-start space-x-3">
           <input type="checkbox" id="monitorEnabledToggle" class="w-5 h-5 mt-0.5 text-rose-600 rounded shrink-0">
           <label for="monitorEnabledToggle" class="cursor-pointer select-none">
-            <span class="block text-sm font-bold text-rose-900">AI監視を有効にする（システム全体）</span>
+            <span class="block text-sm font-bold text-rose-900">サイト監視を有効にする（システム全体）</span>
             <span class="block text-[11px] text-rose-700 mt-1 leading-relaxed">
               有効にすると、児童が学習に関係のないサイトを開いたときに、端末一覧の氏名の横へ
               <span class="font-bold">⚠ 注意</span> マークが表示されます。<br>
@@ -2699,7 +2699,7 @@
       const settingsLabel = document.getElementById('teacherSettingsBtnLabel');
       if (settingsLabel) settingsLabel.textContent = isAdminUser() ? '設定 (クラス・URL)' : '設定 (URL・規制)';
 
-      // AI監視設定は「システム全体」に効くため、管理者(ADMIN)のみに表示する。
+      // サイト監視設定は「システム全体」に効くため、管理者(ADMIN)のみに表示する。
       const monitorBtn = document.getElementById('monitorSettingsBtn');
       if (monitorBtn) monitorBtn.classList.toggle('hidden', !isAdminUser());
 
@@ -4652,7 +4652,7 @@
           ? `<span class="text-slate-400 text-[11px]">クラス未設定</span>`
           : `<span class="text-slate-700 font-semibold text-[11px]">${escapeHtml(d.class_name)}</span>`;
 
-        // AI監視: 学習に関係のないサイトを開いている児童の氏名の横に注意マークを出す。
+        // サイト監視: 学習に関係のないサイトを開いている児童の氏名の横に注意マークを出す。
         // 監視がOFFのときは GAS 側が monitor_flag=false を返すため、ここには表示されない
         // （＝システム全体のON/OFFがそのまま表示に反映される）。
         const monitorBadge = d.monitor_flag
@@ -5650,7 +5650,7 @@
       else container.classList.add('hidden');
     }
 
-    // ==================== AI監視設定（システム全体・管理者のみ） ====================
+    // ==================== サイト監視設定（システム全体・管理者のみ） ====================
     // 監視は「システム全体」の設定なので、ON/OFF とドメイン辞書は管理者だけが変更できる。
     // 一般教員が呼び出してもサーバー側(saveMonitoringSettings)で拒否される（二重の防御）。
 
@@ -5703,7 +5703,7 @@
       const enabled = !!(toggle && toggle.checked);
 
       if (enabled && blocked.length === 0) {
-        showAlertModal('設定を確認してください', 'AI監視を有効にするには、非学習ドメイン辞書に1件以上のドメインを登録してください。', 'warning');
+        showAlertModal('設定を確認してください', 'サイト監視を有効にするには、非学習ドメイン辞書に1件以上のドメインを登録してください。', 'warning');
         return;
       }
 
@@ -5717,7 +5717,7 @@
             learning_domains: learning
           }
         });
-        showToast(enabled ? 'AI監視を有効にしました' : 'AI監視を無効にしました', 'success');
+        showToast(enabled ? 'サイト監視を有効にしました' : 'サイト監視を無効にしました', 'success');
         closeModal('monitorModal');
         // 注意マークの表示／非表示を即座に反映する
         refreshSuppressedUntil = 0;

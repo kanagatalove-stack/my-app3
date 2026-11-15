@@ -86,7 +86,7 @@ let code = '';
   'normalizeSchoolName','resolveCanonicalSchool','canonicalizeIncomingSchool',
   // ---- 行解決（行番号キャッシュは廃止。毎回シートから引き直す） ----
   'hbLog','hbResolveRowByStudentId',
-  //  §2 応答組み立て・AI監視・新規登録（processHeartbeat から切り出した関数）
+  //  §2 応答組み立て・サイト監視・新規登録（processHeartbeat から切り出した関数）
   'buildHeartbeatResponse','hbApplyMonitor','hbRegisterDevice',
   //  §3 本体
   'processHeartbeat'

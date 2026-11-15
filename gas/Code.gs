@@ -83,7 +83,7 @@ const CONFIG = {
     // スクリーンショットを撮影・アップロードする（結果は 画面情報 シートに保存）。
     '画面情報要求日時',
     '画面情報更新日時',
-    // AI監視（学習に関係のないサイトの検知）用の列。
+    // サイト監視（学習に関係のないサイトの検知）用の列。
     // システム全体のON/OFF が管理者により切り替えられる。OFF のときは
     // getAllDevices 側で「要注意=false」に伏せて返すため、管理画面の注意マークは消える。
     // ※ 既存シートには ensureDeviceHeaders が末尾へ自動追加する（後方互換）。
@@ -1126,7 +1126,7 @@ function doPost(e) {
       return jsonResponse({ success: true, data: data });
     }
 
-    // D1. AI監視設定の取得（読み取りは全教員可。変更可否の判断材料として is_admin を返す）
+    // D1. サイト監視設定の取得（読み取りは全教員可。変更可否の判断材料として is_admin を返す）
     if (action === 'get_monitor_settings') {
       return jsonResponse({
         success: true,
@@ -1135,7 +1135,7 @@ function doPost(e) {
       });
     }
 
-    // D1-2. AI監視設定の保存（システム全体・管理者のみ）
+    // D1-2. サイト監視設定の保存（システム全体・管理者のみ）
     if (action === 'save_monitor_settings') {
       const saved = saveMonitoringSettings(currentTeacher, payload.settings || {});
       return jsonResponse({ success: true, message: '監視設定を保存しました', settings: saved });
@@ -2429,7 +2429,7 @@ function canonicalizeIncomingSchool(raw) {
   return '';
 }
 
-// ==================== AI監視（学習に関係のないサイトの検知） ====================
+// ==================== サイト監視（学習に関係のないサイトの検知） ====================
 // 判定方式はハイブリッド:
 //   (a) あらかじめ用意したドメイン辞書（学習ドメイン / 非学習ドメイン）
 //   (b) 先生が登録するリスト（端末の「許可URLリスト」「規制URLリスト」）
@@ -2600,7 +2600,83 @@ function saveMonitoringSettings(teacher, incoming) {
   PropertiesService.getScriptProperties().setProperty(MONITOR_PROP_KEY, JSON.stringify(next));
   // 一覧の読み取りキャッシュを捨てて、次の取得で新しい設定を反映させる
   if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache();
+  // 【サイト監視】R41: 各校は独立したGAS環境のため、親の設定は子GASへも配らないと
+  //   子配下の児童を判定できない（子の getMonitoringSettings() が既定 false のままになる）。
+  //   既存の shard_apply 同梱経路（即時並列プッシュ＋保留キュー）を再利用する。
+  try {
+    if (typeof shardPropagateMonitorSettings === 'function') shardPropagateMonitorSettings(next);
+  } catch (eProp) { /* 伝播に失敗しても親の設定保存は成立させる */ }
   return next;
+}
+
+/**
+ * 【サイト監視】子GAS側: 親から届いた監視設定を PropertiesService に保存する。
+ *
+ * R41 では親子で PropertiesService が完全に独立しているため、親と同一キー
+ * （MONITOR_SETTINGS_V1）を使っても競合しない。同一キーにすることで
+ * 子GASでも既存の getMonitoringSettings() をそのまま使える。
+ */
+function shardChildApplyMonitorSettings(incoming) {
+  if (!incoming || typeof incoming !== 'object') return null;
+  try {
+    const next = {
+      enabled: incoming.enabled === true,
+      learning_domains: sanitizeMonitorDomainList(incoming.learning_domains || []),
+      blocked_domains: sanitizeMonitorDomainList(incoming.blocked_domains || []),
+      updated_at: String(incoming.updated_at || ''),
+      updated_by: String(incoming.updated_by || '')
+    };
+    // 辞書が空で届いた場合は既定辞書で補う（全サイト注意になる事故を防ぐ）
+    if (!next.learning_domains.length) next.learning_domains = MONITOR_DEFAULT_LEARNING_DOMAINS.slice();
+    if (!next.blocked_domains.length) next.blocked_domains = MONITOR_DEFAULT_BLOCKED_DOMAINS.slice();
+    PropertiesService.getScriptProperties().setProperty(MONITOR_PROP_KEY, JSON.stringify(next));
+    if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache();
+    return { saved: true, enabled: next.enabled };
+  } catch (e) {
+    return { saved: false, error: String((e && e.message) ? e.message : e) };
+  }
+}
+
+/**
+ * 【サイト監視】親GAS側: 監視設定を全子GASへ伝播する。
+ *
+ * 既存の shard_apply へ schedules を同封するのと同じ経路を使う。
+ * student_ids を空にした専用リクエストなので、子はポリシー変更を行わず
+ * 設定の保存だけを行う（shardApplyFromParent の早期 return 経路）。
+ * 応答は待たず保留キューへ積む（R41 の並列配信速度を落とさない）。
+ */
+function shardPropagateMonitorSettings(settings) {
+  if (!isShardParent()) return { skipped: true, reason: 'not_parent' };
+  try {
+    const cfg = shardConfigCached();
+    const urls = shardAllChildUrls(cfg);
+    if (!urls.length) return { skipped: true, reason: 'no_child' };
+
+    const s = settings || getMonitoringSettings();
+    const body = JSON.stringify({
+      action: 'shard_apply',
+      shard_secret: cfg.sec,
+      student_ids: [],
+      monitor_settings: s
+    });
+    const requests = [];
+    for (let i = 0; i < urls.length; i++) {
+      requests.push({
+        url: urls[i], method: 'post', contentType: 'application/json',
+        payload: body, muteHttpExceptions: true
+      });
+    }
+    try {
+      if (typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
+          typeof shardQueuePending === 'function' && shardQueuePending(requests)) {
+        return { sent: urls.length, deferred: true };
+      }
+    } catch (eq) { /* 保留が使えなければ同期送信へ */ }
+    shardFetchMany(requests);
+    return { sent: urls.length, deferred: false };
+  } catch (e) {
+    return { error: String(e) };
+  }
 }
 
 /**
@@ -2854,7 +2930,7 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
 }
 
 /**
- * AI監視（学習に関係のないサイトの検知）。
+ * サイト監視（学習に関係のないサイトの検知）。
  * URL が変わったときだけ呼ばれ、4列が連続している場合のみ 1 回の getRange でまとめて書く。
  * 監視が OFF のときは列に一切触らない（履歴を保持したまま、表示側で伏せる）。
  */
@@ -2971,7 +3047,7 @@ function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActiv
     newRow[headerMap['現在開いているURL'] - 1] = currentUrl;
     newRow[headerMap['最終同期日時'] - 1] = now;
 
-    // AI監視: 初回登録時点のURLも判定する（監視OFFなら何もしない＝既定は空欄）。
+    // サイト監視: 初回登録時点のURLも判定する（監視OFFなら何もしない＝既定は空欄）。
     let newMon = { flagged: false, reason: '', host: '' };
     try {
       newMon = evaluateUrlForMonitoring(
@@ -3087,7 +3163,20 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
     if (!cur || cur === '未設定') schoolFill = true;
   }
 
-  if (!urlChanged && !syncDue && !schoolFill) {
+  // 【サイト監視】監視が有効なときは毎回判定する（urlChanged 限定をやめる）。
+  //   従来は URL が変わったときしか判定しなかったため、
+  //    ・設定をONにした直後（URLは変わっていない）
+  //    ・同じタブを見続けている児童
+  //   が検知されなかった。インメモリの辞書照合は数ミリ秒で、
+  //   シートへの書き込みは「状態が変わったとき」だけなので I/O も増えない。
+  let monEnabled = false;
+  try {
+    if (typeof getMonitoringSettings === 'function') {
+      monEnabled = getMonitoringSettings().enabled === true;
+    }
+  } catch (eMon) { monEnabled = false; }
+
+  if (!urlChanged && !syncDue && !schoolFill && !monEnabled) {
     // 何も書かない → シートへは書かない（読み取りのみで応答）
     hbLog('heartbeat: 書き込み不要 row=' + rowNum +
       ' elapsed=' + (new Date().getTime() - t0) + 'ms');
@@ -3123,11 +3212,11 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
     }
   }
 
-  // ---- AI監視（URLが変わったときだけ判定。毎回の同期で辞書照合しない＝GASを軽く保つ） ----
-  if (urlChanged) hbApplyMonitor(sheet, rowNum, row, headerMap, currentUrl, now);
+  // ---- サイト監視（監視が有効なときは毎回判定する） ----
+  if (monEnabled) hbApplyMonitor(sheet, rowNum, row, headerMap, currentUrl, now);
 
   hbLog('heartbeat: 書き込み完了 row=' + rowNum + ' urlChanged=' + urlChanged +
-    ' syncDue=' + syncDue + ' schoolFill=' + schoolFill +
+    ' syncDue=' + syncDue + ' schoolFill=' + schoolFill + ' monitor=' + monEnabled +
     ' elapsed=' + (new Date().getTime() - t0) + 'ms');
 
   return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
@@ -3558,7 +3647,7 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
     // 画面一覧用の制御列（列が無い既存シートでも安全に '' を返す）
     const reqColIdx = headerMap['画面情報要求日時'];
     const shotColIdx = headerMap['画面情報更新日時'];
-    // AI監視の列（既存シートでも ensureDeviceHeaders により末尾へ自動追加される）
+    // サイト監視の列（既存シートでも ensureDeviceHeaders により末尾へ自動追加される）
     const monFlagIdx = headerMap['要注意'];
     const monReasonIdx = headerMap['注意理由'];
     const monUrlIdx = headerMap['要注意URL'];
@@ -5190,6 +5279,14 @@ function shardApplyFromParent(payload) {
     }
   }
 
+  // 【サイト監視】親が保存した監視設定を受け取り、子の PropertiesService へ保存する。
+  //   これが無いと子GASのハートビート判定が常に enabled:false になり、
+  //   子配下の児童に「注意」が出ない（本不具合の本丸）。
+  let monitorSaved = null;
+  if (payload && payload.monitor_settings) {
+    monitorSaved = shardChildApplyMonitorSettings(payload.monitor_settings);
+  }
+
   // 【子GAS自動判別】shard_apply を受けた痕跡を残す。
   //   SHARD_CHILD_MODE の設定漏れがあっても、次回以降のハートビートで
   //   子GASとして判別できるようにする（設定漏れで制限が届かない事故の対策）。
@@ -5230,7 +5327,8 @@ function shardApplyFromParent(payload) {
     // ka 伝達だけの呼び出しは正常（ポリシー変更なし）。
     // 【フェーズ5】ただし schedules は「ポリシーではない」ため、児童IDが空でも
     //   保存結果を必ず返す。返さないと親が「同期できたか」を確認できない。
-    return { success: true, applied: 0, ka_active: kaApplied, schedules: scheduleSaved };
+    return { success: true, applied: 0, ka_active: kaApplied,
+      schedules: scheduleSaved, monitor_settings: monitorSaved };
   }
 
   // 行の用意結果。try の外で宣言する（return が try の外にあるため、
@@ -5273,7 +5371,9 @@ function shardApplyFromParent(payload) {
     ka_active: kaApplied,
     ensure: ensureResult,
     // 【フェーズ5】スケジュールを保存できたかを親が確認できるようにする
-    schedules: scheduleSaved
+    schedules: scheduleSaved,
+    // 【サイト監視】監視設定を保存できたかを親が確認できるようにする
+    monitor_settings: monitorSaved
   };
 }
 
@@ -5746,7 +5846,14 @@ function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
   }
 
   const baseData = getAllDevices(filterSchool, teacher, includeUnassigned);
-  const data = shardMergeDevices(baseData, filterSchool, teacher, includeUnassigned);
+  const mergedData = shardMergeDevices(baseData, filterSchool, teacher, includeUnassigned);
+  // 【サイト監視】集約結果にも表示の伏せ処理を適用する。
+  //   子GASから返る monitor_flag は子の設定に基づくため、親の設定がOFFなら
+  //   親と同様に伏せる必要がある（これをしないと子の注意マークだけ残る）。
+  //   ※ 監視設定の保存時は invalidateDevicesCache() が dev_v を進めるため、
+  //     この集約キャッシュ（キーに dev_v を含む）も自動的に失効する。
+  const data = (typeof applyMonitorVisibility === 'function')
+    ? applyMonitorVisibility(mergedData) : mergedData;
 
   if (cache) {
     try { cache.put(cacheKey, JSON.stringify(data), SHARD_LIST_CACHE_TTL); } catch (e) {}
@@ -7358,7 +7465,7 @@ function api_getArchivedStudents(token) {
   }
 }
 
-// ---- AI監視設定 API (google.script.run 用) ----
+// ---- サイト監視設定 API (google.script.run 用) ----
 
 function api_getMonitorSettings(token) {
   try {
