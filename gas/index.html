@@ -1364,6 +1364,80 @@
             <div id="archiveListBox" class="text-[11px] text-slate-400">「読み込む」を押すと卒業生シートの内容を表示します。</div>
           </div>
 
+          <!-- ===== 【Request N】予約実行型 年次更新（新年度の一括切替） ===== -->
+          <div class="border-2 border-indigo-200 bg-indigo-50/40 rounded-xl p-4 space-y-3">
+            <div class="flex items-start space-x-2">
+              <span class="p-1.5 bg-indigo-100 text-indigo-600 rounded-lg shrink-0">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+              </span>
+              <div>
+                <h4 class="font-bold text-slate-800 text-sm">🗓 予約実行型 年次更新（新年度の一括切替）</h4>
+                <p class="text-[11px] text-slate-500 leading-relaxed mt-1">
+                  3月のうちに「実行予定日時」と「次年度の児童・教員CSV」を登録しておくと、指定日時に自動で
+                  前年度データを整理し、次年度の名簿へ切り替えます。管理画面を開いた時点でも
+                  「予約日時を過ぎて未実行」なら自動実行されます。
+                </p>
+              </div>
+            </div>
+
+            <!-- 1. 実行予定日時 -->
+            <div>
+              <label for="annualReserveAt" class="block text-[11px] font-bold text-slate-700 mb-1">① 実行予定日時（日本時間）</label>
+              <input type="datetime-local" id="annualReserveAt"
+                     class="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 bg-white">
+              <p class="text-[11px] text-slate-500 mt-1">例: 2027-04-01 06:00（4月1日朝に自動切替）</p>
+            </div>
+
+            <!-- 2. 次年度 児童リストCSV -->
+            <div>
+              <label for="annualReserveStudentFile" class="block text-[11px] font-bold text-slate-700 mb-1">② 次年度 児童リストCSV</label>
+              <input type="file" id="annualReserveStudentFile" accept=".csv,.txt,.xlsx,.xls"
+                     onchange="onAnnualReserveStudentFile(this)"
+                     class="w-full text-[11px] text-slate-600 file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:text-[11px] file:font-semibold file:bg-indigo-100 file:text-indigo-700 hover:file:bg-indigo-200">
+              <p class="text-[11px] text-slate-500 mt-1">列: メールアドレス・児童ID・氏名・学校名・学年・クラス（児童IDは空ならメールから生成）</p>
+              <div id="annualReserveStudentPreview" class="text-[11px] text-slate-400 mt-1 whitespace-pre-wrap break-all">未選択</div>
+            </div>
+
+            <!-- 3. 次年度 教員リストCSV -->
+            <div>
+              <label for="annualReserveTeacherFile" class="block text-[11px] font-bold text-slate-700 mb-1">③ 次年度 教員リストCSV</label>
+              <input type="file" id="annualReserveTeacherFile" accept=".csv,.txt,.xlsx,.xls"
+                     onchange="onAnnualReserveTeacherFile(this)"
+                     class="w-full text-[11px] text-slate-600 file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:text-[11px] file:font-semibold file:bg-indigo-100 file:text-indigo-700 hover:file:bg-indigo-200">
+              <p class="text-[11px] text-slate-500 mt-1">列: 教員ID(メール)・パスワード・氏名・所属学校・権限・対象クラス・Google SSO許可（空欄は許可）</p>
+              <div id="annualReserveTeacherPreview" class="text-[11px] text-slate-400 mt-1 whitespace-pre-wrap break-all">未選択</div>
+            </div>
+
+            <!-- 4. 前年度データ削除オプション -->
+            <div class="bg-white border border-indigo-200 rounded-lg p-3 flex items-start space-x-3">
+              <input type="checkbox" id="annualReserveClearPrev" checked
+                     class="w-5 h-5 mt-0.5 text-indigo-600 rounded shrink-0">
+              <label for="annualReserveClearPrev" class="cursor-pointer select-none">
+                <span class="block text-xs font-bold text-slate-800">④ 前年度データを削除する（デフォルトON）</span>
+                <span class="block text-[11px] text-slate-600 mt-1 leading-relaxed">
+                  前年度の「端末一覧」（児童端末の行データ）を削除します。R41 分散構成では
+                  全子GASの端末一覧も並列でクリアします。<br>
+                  <span class="font-bold text-rose-700">教員マスタ・管理アカウント・各種設定シートは削除しません。</span>
+                </span>
+              </label>
+            </div>
+
+            <!-- 5. 操作ボタン -->
+            <div class="flex flex-wrap items-center gap-2">
+              <button id="annualReserveSaveBtn" onclick="saveAnnualReservation()"
+                      class="px-4 py-2 text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg shadow-sm transition">年次更新を予約保存</button>
+              <button id="annualReserveRunNowBtn" onclick="runAnnualReservationNow()"
+                      class="px-4 py-2 text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg shadow-sm transition">今すぐテスト実行／即時反映</button>
+              <button id="annualReserveCancelBtn" onclick="cancelAnnualReservation()"
+                      class="px-4 py-2 text-xs font-bold bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg transition">予約をキャンセル</button>
+              <button onclick="refreshAnnualReservationStatus()"
+                      class="px-3 py-2 text-[11px] font-semibold bg-white border border-slate-300 hover:bg-slate-50 text-slate-600 rounded-lg transition">状態を再読み込み</button>
+            </div>
+
+            <!-- 予約ステータス表示 -->
+            <div id="annualReserveStatusBox" class="text-[11px] text-slate-400">予約状態を読み込み中...</div>
+          </div>
+
         </div>
 
       </div>
@@ -2997,6 +3071,14 @@
             runner.api_runAnnualRollover(authToken, payload.data || payload);
           } else if (act === 'get_archived_students') {
             runner.api_getArchivedStudents(authToken);
+          } else if (act === 'annual_reservation_save') {
+            runner.api_annualReservationSave(authToken, payload.data || payload);
+          } else if (act === 'annual_reservation_status') {
+            runner.api_annualReservationStatus(authToken);
+          } else if (act === 'annual_reservation_cancel') {
+            runner.api_annualReservationCancel(authToken);
+          } else if (act === 'annual_rollover_run_now') {
+            runner.api_annualRolloverRunNow(authToken, payload.data || payload);
           } else if (act === 'get_monitor_settings') {
             runner.api_getMonitorSettings(authToken);
           } else if (act === 'save_monitor_settings') {
@@ -5982,6 +6064,10 @@
       if (anBtn) anBtn.className = isAnnual ? activeCls : idleCls;
       // 児童タブへ切り替えた際に登録済み児童一覧を最新化
       if (isStudents) loadStudentList();
+      // 【Request N】年次更新タブを開いたら予約状態を取得する。
+      //   このAPIは「予約日時を過ぎて未実行なら実行する」フォールバック判定も行うため、
+      //   管理者が画面を開くだけで未実行の年次更新が自動実行される。
+      if (isAnnual && typeof refreshAnnualReservationStatus === 'function') refreshAnnualReservationStatus();
     }
 
     // 登録済み児童一覧を取得（管理者は全校。一般教員は自校＋未設定のみ）
@@ -6445,6 +6531,218 @@
         ).join('<br>') + (list.length > 500 ? '<br>…他 ' + (list.length - 500) + ' 件' : '');
       } catch (err) {
         box.innerHTML = `<span class="text-rose-500">読み込み失敗: ${escapeHtml(err.message)}</span>`;
+      }
+    }
+
+    // ==================== 【Request N】予約実行型 年次更新 ====================
+    //   3月のうちに「実行予定日時」「次年度 児童CSV」「次年度 教員CSV」を登録すると、
+    //   指定日時に GAS 側の時刻トリガーが自動で年次更新を実行する。
+    //   CSV の解析はサーバー側（gas/Code.gs の parseAnnualCsv_）で行い、
+    //   ここではプレビュー表示のために同じ規則でブラウザ側でも分解する。
+    let annualReserveStudentCsv = '';
+    let annualReserveTeacherCsv = '';
+
+    // CSV を「行×列」に分解する（"..." 内のカンマ・改行・"" に対応）
+    function annualCsvSplit(text) {
+      const s = String(text || '').replace(/^\uFEFF/, '');
+      const rows = []; let row = []; let f = ''; let q = false;
+      for (let i = 0; i < s.length; i++) {
+        const c = s.charAt(i);
+        if (q) {
+          if (c === '"') { if (s.charAt(i + 1) === '"') { f += '"'; i++; } else { q = false; } }
+          else f += c;
+          continue;
+        }
+        if (c === '"') q = true;
+        else if (c === ',') { row.push(f); f = ''; }
+        else if (c === '\r') { /* CRLF の CR は無視 */ }
+        else if (c === '\n') { row.push(f); rows.push(row); row = []; f = ''; }
+        else f += c;
+      }
+      if (f !== '' || row.length) { row.push(f); rows.push(row); }
+      return rows
+        .map(function (r) { return r.map(function (v) { return String(v == null ? '' : v).trim(); }); })
+        .filter(function (r) { return r.some(function (v) { return v !== ''; }); });
+    }
+
+    function annualReservePreviewHtml(text) {
+      const rows = annualCsvSplit(text);
+      if (rows.length < 2) return '<span class="text-rose-500">データ行がありません（1行目をヘッダーにしてください）</span>';
+      const head = rows[0];
+      const body = rows.slice(1);
+      let html = `<b class="text-slate-700">${body.length} 件</b> <span class="text-slate-500">（列: ${escapeHtml(head.join(' / '))}）</span>`;
+      html += '<div class="mt-1 space-y-0.5 text-slate-600">' +
+        body.slice(0, 8).map(function (r) { return '・' + escapeHtml(r.join(' / ')); }).join('<br>') + '</div>';
+      if (body.length > 8) html += `<div class="text-slate-400">…他 ${body.length - 8} 件</div>`;
+      return html;
+    }
+
+    async function onAnnualReserveStudentFile(input) {
+      const box = document.getElementById('annualReserveStudentPreview');
+      const f = input.files && input.files[0];
+      if (!f) { annualReserveStudentCsv = ''; if (box) box.textContent = '未選択'; return; }
+      try {
+        annualReserveStudentCsv = await f.text();
+        if (box) box.innerHTML = annualReservePreviewHtml(annualReserveStudentCsv);
+      } catch (e) {
+        annualReserveStudentCsv = '';
+        if (box) box.innerHTML = '<span class="text-rose-500">読み込みエラー: ' + escapeHtml(e.message) + '</span>';
+      }
+    }
+
+    async function onAnnualReserveTeacherFile(input) {
+      const box = document.getElementById('annualReserveTeacherPreview');
+      const f = input.files && input.files[0];
+      if (!f) { annualReserveTeacherCsv = ''; if (box) box.textContent = '未選択'; return; }
+      try {
+        annualReserveTeacherCsv = await f.text();
+        if (box) box.innerHTML = annualReservePreviewHtml(annualReserveTeacherCsv);
+      } catch (e) {
+        annualReserveTeacherCsv = '';
+        if (box) box.innerHTML = '<span class="text-rose-500">読み込みエラー: ' + escapeHtml(e.message) + '</span>';
+      }
+    }
+
+    function annualReserveReadForm() {
+      const atEl = document.getElementById('annualReserveAt');
+      const clEl = document.getElementById('annualReserveClearPrev');
+      return {
+        run_at: (atEl && atEl.value ? atEl.value : '').trim(),
+        clear_previous: !!(clEl && clEl.checked),
+        student_csv: annualReserveStudentCsv,
+        teacher_csv: annualReserveTeacherCsv
+      };
+    }
+
+    function annualReserveStatusHtml(plan, fallback) {
+      if (!plan) return '<span class="text-slate-400">予約は登録されていません。</span>';
+      const st = String(plan.status || 'pending');
+      let badge = '';
+      if (st === 'done') badge = '<span class="px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 font-bold">実行完了</span>';
+      else if (st === 'running') badge = '<span class="px-2 py-0.5 rounded bg-amber-100 text-amber-700 font-bold">実行中</span>';
+      else if (st === 'error') badge = '<span class="px-2 py-0.5 rounded bg-rose-100 text-rose-700 font-bold">エラー</span>';
+      else if (plan.is_due) badge = '<span class="px-2 py-0.5 rounded bg-amber-100 text-amber-700 font-bold">期限到来（未実行）</span>';
+      else badge = '<span class="px-2 py-0.5 rounded bg-indigo-100 text-indigo-700 font-bold">待機中</span>';
+      let html = badge + ' <span class="text-slate-600">実行予定: ' + escapeHtml(plan.run_at_text || '-') + '</span>';
+      if (plan.ran_at_text) html += ' <span class="text-slate-600">／ 実行完了日時: ' + escapeHtml(plan.ran_at_text) + '</span>';
+      const c = plan.counts || null;
+      if (c) {
+        html += '<div class="mt-1 text-slate-600">取込件数: 児童 追加' + (c.students_added || 0) +
+          ' / 更新' + (c.students_updated || 0) + ' / 削除' + (c.students_removed || 0) +
+          ' ・ 教員 追加' + (c.teachers_added || 0) + ' / 更新' + (c.teachers_updated || 0) + '</div>';
+        if (c.child_urls) {
+          html += '<div class="text-slate-600">R41子GAS: ' + (c.child_ok || 0) + ' / ' + c.child_urls +
+            ' 校クリア成功' + (c.child_failed ? '（失敗 ' + c.child_failed + ' 校）' : '') + '</div>';
+        }
+        if (c.previous_rows_deleted) {
+          html += '<div class="text-slate-600">前年度 端末行の削除: ' + c.previous_rows_deleted + ' 行</div>';
+        }
+      } else {
+        html += '<div class="mt-1 text-slate-600">予定内容: 児童 ' + (plan.student_count || 0) +
+          ' 件 / 教員 ' + (plan.teacher_count || 0) + ' 件 ・ 前年度データ削除 ' +
+          (plan.clear_previous ? 'あり' : 'なし') + '</div>';
+      }
+      if (plan.last_error) html += '<div class="mt-1 text-rose-600">エラー: ' + escapeHtml(plan.last_error) + '</div>';
+      if (fallback && fallback.due && fallback.executed) {
+        html += '<div class="mt-1 text-emerald-700 font-bold">予約日時を過ぎていたため自動実行しました。</div>';
+      }
+      return html;
+    }
+
+    async function refreshAnnualReservationStatus() {
+      const box = document.getElementById('annualReserveStatusBox');
+      if (!box) return;
+      if (!isAdminUser()) {
+        box.innerHTML = '<span class="text-slate-400">予約の管理は管理者のみ表示されます。</span>';
+        return;
+      }
+      try {
+        const res = await apiRequest({ action: 'annual_reservation_status' });
+        box.innerHTML = annualReserveStatusHtml((res && res.plan) || null, (res && res.fallback) || null);
+      } catch (err) {
+        box.innerHTML = '<span class="text-rose-500">状態取得に失敗: ' + escapeHtml(err.message) + '</span>';
+      }
+    }
+
+    async function saveAnnualReservation() {
+      if (!isAdminUser()) { showAlertModal('権限がありません', '管理者のみ操作できます。', 'error'); return; }
+      const form = annualReserveReadForm();
+      if (!form.run_at) {
+        showAlertModal('実行予定日時を指定してください', '例: 2027-04-01 06:00 のように、次年度に切り替える日時を入力してください。', 'warning');
+        return;
+      }
+      if (!String(form.student_csv).trim() && !String(form.teacher_csv).trim()) {
+        showAlertModal('CSVが未選択です', '次年度の児童リスト、または教員リストのCSVを読み込んでください。', 'warning');
+        return;
+      }
+      const btn = document.getElementById('annualReserveSaveBtn');
+      try {
+        btn.disabled = true; const orig = btn.textContent; btn.textContent = '保存中...';
+        const res = await apiRequest({ action: 'annual_reservation_save', data: form });
+        const p = (res && res.plan) || {};
+        btn.textContent = orig;
+        const warn = [].concat(p.student_errors || [], p.teacher_errors || []);
+        showAlertModal('年次更新を予約保存しました',
+          '実行予定: ' + (p.run_at_text || form.run_at) +
+          '\n児童: ' + (p.student_count || 0) + ' 件 / 教員: ' + (p.teacher_count || 0) + ' 件' +
+          '\n前年度データ削除: ' + (p.clear_previous ? 'あり' : 'なし') +
+          (warn.length ? '\n\n警告:\n' + warn.slice(0, 10).join('\n') : ''), 'success');
+        await refreshAnnualReservationStatus();
+      } catch (err) {
+        showAlertModal('予約の保存に失敗しました', err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '保存中...') btn.textContent = '年次更新を予約保存';
+      }
+    }
+
+    async function runAnnualReservationNow() {
+      if (!isAdminUser()) { showAlertModal('権限がありません', '管理者のみ操作できます。', 'error'); return; }
+      const form = annualReserveReadForm();
+      const hasCsv = !!String(form.student_csv).trim() || !!String(form.teacher_csv).trim();
+      const msg = hasCsv
+        ? 'この内容で年次更新を「今すぐ」実行します。\n前年度データ削除がONの場合、端末一覧の児童行が削除されます。\nよろしいですか？'
+        : '保存済みの予約内容で年次更新を「今すぐ」実行します。\nよろしいですか？';
+      if (!confirm(msg)) return;
+      const btn = document.getElementById('annualReserveRunNowBtn');
+      try {
+        btn.disabled = true; const orig = btn.textContent; btn.textContent = '実行中...';
+        const res = await apiRequest({ action: 'annual_rollover_run_now', data: form });
+        const r = (res && res.result) || {};
+        const c = r.counts || {};
+        btn.textContent = orig;
+        showAlertModal('年次更新 実行完了',
+          (r.executed ? '実行しました。' : '実行済みのためスキップしました。') +
+          '\n実行日時: ' + (r.ran_at_text || '-') +
+          '\n児童: 追加' + (c.students_added || 0) + ' / 更新' + (c.students_updated || 0) + ' / 削除' + (c.students_removed || 0) +
+          '\n教員: 追加' + (c.teachers_added || 0) + ' / 更新' + (c.teachers_updated || 0) +
+          (c.child_urls ? '\nR41子GAS: ' + (c.child_ok || 0) + ' / ' + c.child_urls + ' 校クリア成功' : ''), 'success');
+        await refreshAnnualReservationStatus();
+        await loadStudentList().catch(function () {});
+        await loadDevices(true).catch(function () {});
+      } catch (err) {
+        showAlertModal('年次更新の実行に失敗しました', err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '実行中...') btn.textContent = '今すぐテスト実行／即時反映';
+      }
+    }
+
+    async function cancelAnnualReservation() {
+      if (!isAdminUser()) { showAlertModal('権限がありません', '管理者のみ操作できます。', 'error'); return; }
+      if (!confirm('年次更新の予約をキャンセルします。よろしいですか？')) return;
+      const btn = document.getElementById('annualReserveCancelBtn');
+      try {
+        btn.disabled = true; const orig = btn.textContent; btn.textContent = '処理中...';
+        const res = await apiRequest({ action: 'annual_reservation_cancel' });
+        btn.textContent = orig;
+        showAlertModal('予約のキャンセル', (res && res.message) || 'キャンセルしました', 'success');
+        await refreshAnnualReservationStatus();
+      } catch (err) {
+        showAlertModal('キャンセルに失敗しました', err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '処理中...') btn.textContent = '予約をキャンセル';
       }
     }
 

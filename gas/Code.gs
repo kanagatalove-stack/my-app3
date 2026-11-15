@@ -1068,6 +1068,10 @@ function doPost(e) {
     if (action === 'shard_apply') {
       return jsonResponse(shardApplyFromParent(payload));
     }
+    // 【Request N】年次更新の専用クリーンアップ指令（子GASの前年度行を全削除）
+    if (action === 'shard_annual_clear') {
+      return jsonResponse(shardAnnualClearFromParent(payload));
+    }
     if (action === 'shard_push') {
       return jsonResponse(shardUpsertTelemetryFromChild(payload));
     }
@@ -5285,6 +5289,12 @@ function shardApplyFromParent(payload) {
   if (!shardSecretMatches(payload && payload.shard_secret)) {
     return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
   }
+  // 【Request N】年次更新：前年度データの一斉クリア指令。
+  //   親の年次更新から呼ばれ、自校の「端末一覧」のヘッダー以外を全削除する。
+  //   ポリシー適用など他の処理は一切行わない（早期 return）。
+  if (payload && payload.annual_clear === true) {
+    return shardAnnualClearLocalDevices_();
+  }
   // ① 教員稼働状態の同期（親コンソールにしかログインしないため、子は親から受け取る）。
   //    子の既存の ka 機構（touchTeacherConsole / releaseTeacherConsole）をそのまま使う。
   //    これにより子の isTeacherConsoleActive() が正しく true になり、端末が同期を続けられる。
@@ -9005,4 +9015,1177 @@ function api_overrideSchedule(authToken, scheduleId, actionType) {
     override_type: actionType,
     token: authToken
   }, teacher);
+}
+
+// =====================================================================
+// 【Request N】予約実行型 年次更新（新年度の一括切替）
+//
+//   管理者は 3月のうちに「実行予定日時」「次年度 児童CSV」「次年度 教員CSV」
+//   「前年度データ削除の可否」を登録しておく。指定日時になると
+//   ScriptApp の時刻トリガーが自動発火し、
+//     ① 前年度データの自動クリア（親シート＋R41 全子GASへ並列プッシュ）
+//     ② 次年度 児童リストの反映（新入生追加・進級更新・卒業生整理）
+//     ③ 次年度 教員リストの反映（11列マスタ・Google SSO許可を含む）
+//     ④ 完了記録の保存
+//   を順に実行する。
+//
+//   ★ 設計上の要点
+//     - 予約データは PropertiesService のみに保存する（シートに書かない）。
+//       1プロパティ 9KB 制限に対して、gzip+base64 → 8,000文字ずつ分割保存する。
+//     - トリガーは「その日時ちょうど 1 回」＋「1時間ごとの保険」の二段構え。
+//       さらに管理画面を開いた時点でも「予約日時を過ぎて未実行なら実行」する
+//       フォールバック判定を入れる（トリガー権限や遅延への備え）。
+//     - 二重実行は withWriteLock（LockService）と status フラグの二重ガードで防ぐ。
+//     - 子GASが 0 台の学校（単一GASモード）では UrlFetchApp を一切呼ばず、
+//       親シートのクリアと CSV 反映のみを正常完了させる。
+// =====================================================================
+
+/** 予約本体（メタ情報）を保持するプロパティキー */
+const ANNUAL_PLAN_PROP = 'ANNUAL_ROLLOVER_PLAN_V1';
+/** 予約本体の分割チャンクの接頭辞 */
+const ANNUAL_PLAN_CHUNK_PREFIX = 'ANNUAL_ROLLOVER_PLAN_V1__C';
+/** 1プロパティの安全上限（GAS の 9KB 制限に対する余裕） */
+const ANNUAL_PLAN_MAX_CHARS = 8000;
+/** 分割チャンク数のメタキー */
+const ANNUAL_PLAN_CHUNK_COUNT = 'ANNUAL_ROLLOVER_PLAN_V1__N';
+/** 分割数の上限（40 × 8000 ≒ 320,000 文字） */
+const ANNUAL_PLAN_CHUNKS_MAX = 40;
+/** 予約実行トリガーのハンドラ名（1回だけ発火するもの） */
+const ANNUAL_TRIGGER_FN = 'annualRolloverTriggered_';
+/** 保険用の定期トリガーのハンドラ名 */
+const ANNUAL_PERIODIC_FN = 'annualRolloverPeriodicTick_';
+/** タイムゾーン（日本時間）のオフセット（ミリ秒） */
+const ANNUAL_JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+/**
+ * 現在時刻（ミリ秒）。テストから固定できるようにフックを設ける。
+ * ※ GAS 本番では ANNUAL_TEST_NOW_MS が未定義なので Date.now() を返す。
+ */
+function annualNowMs_() {
+  if (typeof ANNUAL_TEST_NOW_MS !== 'undefined' &&
+      typeof ANNUAL_TEST_NOW_MS === 'number' && ANNUAL_TEST_NOW_MS > 0) {
+    return ANNUAL_TEST_NOW_MS;
+  }
+  return Date.now();
+}
+
+/** 2桁ゼロ詰め */
+function annualPad2_(v) {
+  const s = String(v);
+  return s.length < 2 ? '0' + s : s;
+}
+
+/** ミリ秒 → "YYYY/MM/DD HH:mm"（日本時間） */
+function annualFormatRunAt_(ms) {
+  const n = Number(ms || 0);
+  if (!n) return '';
+  const t = new Date(n + ANNUAL_JST_OFFSET_MS);
+  return t.getUTCFullYear() + '/' + annualPad2_(t.getUTCMonth() + 1) + '/' +
+    annualPad2_(t.getUTCDate()) + ' ' + annualPad2_(t.getUTCHours()) + ':' +
+    annualPad2_(t.getUTCMinutes());
+}
+
+/** ミリ秒 → "YYYY/MM/DD HH:mm:ss"（日本時間） */
+function annualFormatRunAtFull_(ms) {
+  const n = Number(ms || 0);
+  if (!n) return '';
+  const t = new Date(n + ANNUAL_JST_OFFSET_MS);
+  return annualFormatRunAt_(n) + ':' + annualPad2_(t.getUTCSeconds());
+}
+
+/** 現在時刻をシート記法（YYYY/MM/DD HH:mm:ss）で返す */
+function annualNowText_() {
+  return annualFormatRunAtFull_(annualNowMs_());
+}
+
+/**
+ * "YYYY-MM-DDTHH:mm" / "YYYY-MM-DD HH:mm" / "YYYY/MM/DD HH:mm[:ss]"
+ * を日本時間として解釈し、ミリ秒を返す。不正なら 0。
+ */
+function annualParseRunAt_(value) {
+  const s = String(value == null ? '' : value).trim();
+  if (!s) return 0;
+  const m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return 0;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const hh = Number(m[4]);
+  const mi = Number(m[5]);
+  const ss = Number(m[6] || 0);
+  if (!(y >= 2000 && y <= 2100)) return 0;
+  if (!(mo >= 1 && mo <= 12)) return 0;
+  if (!(d >= 1 && d <= 31)) return 0;
+  if (!(hh >= 0 && hh <= 23)) return 0;
+  if (!(mi >= 0 && mi <= 59)) return 0;
+  if (!(ss >= 0 && ss <= 59)) return 0;
+  const ms = Date.UTC(y, mo - 1, d, hh, mi, ss) - ANNUAL_JST_OFFSET_MS;
+  const chk = new Date(ms + ANNUAL_JST_OFFSET_MS);
+  // 2/30 のような存在しない日付を弾く
+  if (chk.getUTCFullYear() !== y || chk.getUTCMonth() !== mo - 1 || chk.getUTCDate() !== d) return 0;
+  return ms;
+}
+
+// ---------------------------------------------------------------------
+// 予約データの保存（PropertiesService のみ・容量対策つき）
+// ---------------------------------------------------------------------
+
+/** JSON 文字列を gzip+base64 に圧縮する（縮まなければ生JSONのまま） */
+function annualEncode_(obj) {
+  const json = JSON.stringify(obj);
+  try {
+    if (typeof Utilities !== 'undefined' && Utilities &&
+        typeof Utilities.gzip === 'function' && typeof Utilities.base64Encode === 'function' &&
+        typeof Utilities.newBlob === 'function') {
+      const gz = Utilities.gzip(Utilities.newBlob(json, 'application/json', 'plan.json'));
+      const b64 = Utilities.base64Encode(gz.getBytes());
+      if (b64 && b64.length > 0 && b64.length < json.length) {
+        return { mode: 'gz', payload: b64 };
+      }
+    }
+  } catch (e) { /* 圧縮できない環境では生JSONで保存する */ }
+  return { mode: 'raw', payload: json };
+}
+
+/** 文字列を固定長で分割する */
+function annualChunk_(s, size) {
+  const str = String(s == null ? '' : s);
+  const n = Math.max(1, Math.ceil(str.length / size));
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(str.substr(i * size, size));
+  return out;
+}
+
+/** 予約データを消す（メタ＋全チャンク） */
+function annualPlanClear_() {
+  let removed = 0;
+  try {
+    if (typeof PropertiesService === 'undefined') return { removed: 0 };
+    const props = PropertiesService.getScriptProperties();
+    const all = props.getProperties() || {};
+    for (const k in all) {
+      if (k === ANNUAL_PLAN_PROP || k === ANNUAL_PLAN_CHUNK_COUNT ||
+          k.indexOf(ANNUAL_PLAN_CHUNK_PREFIX) === 0) {
+        try { props.deleteProperty(k); removed++; } catch (eD) { /* 個別失敗は無視 */ }
+      }
+    }
+  } catch (e) { /* プロパティが使えない環境では何もしない */ }
+  return { removed: removed };
+}
+
+/** 予約データを保存する（既存の予約は置き換え） */
+function annualPlanSave_(plan) {
+  if (typeof PropertiesService === 'undefined') {
+    return { chunks: 0, chars: 0, mode: 'raw', stored: false };
+  }
+  const props = PropertiesService.getScriptProperties();
+  const enc = annualEncode_(plan);
+  const chunks = annualChunk_(enc.payload, ANNUAL_PLAN_MAX_CHARS);
+  if (chunks.length > ANNUAL_PLAN_CHUNKS_MAX) {
+    throw new Error('予約データが大きすぎます（児童・教員CSVを分割して登録してください）');
+  }
+  annualPlanClear_();
+  const patch = {};
+  patch[ANNUAL_PLAN_PROP] = JSON.stringify({
+    v: 1, mode: enc.mode, chunks: chunks.length, saved_at_ms: annualNowMs_()
+  });
+  for (let i = 0; i < chunks.length; i++) {
+    patch[ANNUAL_PLAN_CHUNK_PREFIX + i] = chunks[i];
+  }
+  patch[ANNUAL_PLAN_CHUNK_COUNT] = String(chunks.length);
+  props.setProperties(patch, false);
+  return { chunks: chunks.length, chars: enc.payload.length, mode: enc.mode, stored: true };
+}
+
+/** 予約データを読み出す（無ければ null） */
+function annualPlanLoad_() {
+  try {
+    if (typeof PropertiesService === 'undefined') return null;
+    const props = PropertiesService.getScriptProperties();
+    const metaRaw = props.getProperty(ANNUAL_PLAN_PROP);
+    if (!metaRaw) return null;
+    let meta = null;
+    try { meta = JSON.parse(metaRaw); } catch (eM) { meta = null; }
+    if (!meta || typeof meta !== 'object') return null;
+    const n = Number(meta.chunks || 0);
+    if (!(n >= 1) || n > ANNUAL_PLAN_CHUNKS_MAX) return null;
+    let payload = '';
+    for (let i = 0; i < n; i++) {
+      const part = props.getProperty(ANNUAL_PLAN_CHUNK_PREFIX + i);
+      if (part == null) return null; // チャンク欠落＝破損として扱う
+      payload += part;
+    }
+    let json = payload;
+    if (meta.mode === 'gz') {
+      try {
+        if (typeof Utilities === 'undefined' || !Utilities ||
+            typeof Utilities.base64Decode !== 'function' || typeof Utilities.ungzip !== 'function') {
+          return null;
+        }
+        const bytes = Utilities.base64Decode(payload);
+        json = Utilities.ungzip(Utilities.newBlob(bytes)).getDataAsString();
+      } catch (eG) { return null; }
+    }
+    let plan = null;
+    try { plan = JSON.parse(json); } catch (eP) { return null; }
+    return (plan && typeof plan === 'object') ? plan : null;
+  } catch (e) { return null; }
+}
+
+/** 画面に返すための要約（CSV全文は返さない＝応答を軽くする） */
+function annualPlanPublicView_(plan) {
+  if (!plan) return null;
+  const students = Array.isArray(plan.students) ? plan.students : [];
+  const teachers = Array.isArray(plan.teachers) ? plan.teachers : [];
+  const at = Number(plan.run_at_ms || 0);
+  const status = String(plan.status || 'pending');
+  return {
+    status: status,
+    run_at_ms: at,
+    run_at_text: plan.run_at_text || annualFormatRunAt_(at),
+    clear_previous: plan.clear_previous !== false,
+    created_at_ms: Number(plan.created_at_ms || 0),
+    created_at_text: annualFormatRunAtFull_(plan.created_at_ms),
+    created_by: plan.created_by || '',
+    ran_at_ms: Number(plan.ran_at_ms || 0),
+    ran_at_text: plan.ran_at_text || '',
+    counts: plan.counts || null,
+    student_count: students.length,
+    teacher_count: teachers.length,
+    student_sample: students.slice(0, 30),
+    teacher_sample: teachers.slice(0, 30),
+    student_errors: (plan.student_errors || []).slice(0, 20),
+    teacher_errors: (plan.teacher_errors || []).slice(0, 20),
+    last_error: plan.last_error || '',
+    is_due: !!(at && status !== 'done' && annualNowMs_() >= at)
+  };
+}
+
+// ---------------------------------------------------------------------
+// CSV パース（RFC4180 準拠の最小実装）
+// ---------------------------------------------------------------------
+
+/**
+ * CSV テキストを行×列の配列へ変換する。
+ *   - BOM を除去する
+ *   - "..." で囲まれたフィールド内のカンマ・改行・"" を正しく扱う
+ *   - CRLF / LF / CR いずれの改行にも対応
+ *   - 全セルが空の行は捨てる
+ */
+function annualParseCsv_(text) {
+  const s = String(text == null ? '' : text).replace(/^\uFEFF/, '');
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuote = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charAt(i);
+    if (inQuote) {
+      if (c === '"') {
+        if (s.charAt(i + 1) === '"') { field += '"'; i++; }
+        else { inQuote = false; }
+      } else {
+        field += c;
+      }
+      continue;
+    }
+    if (c === '"') { inQuote = true; }
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\r') { /* CRLF の CR は無視（LF 側で行を閉じる） */ }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else { field += c; }
+  }
+  if (field !== '' || row.length > 0) { row.push(field); rows.push(row); }
+
+  const out = [];
+  for (let r = 0; r < rows.length; r++) {
+    const cells = rows[r];
+    let any = false;
+    const trimmed = [];
+    for (let c2 = 0; c2 < cells.length; c2++) {
+      const v = String(cells[c2] == null ? '' : cells[c2]).trim();
+      trimmed.push(v);
+      if (v !== '') any = true;
+    }
+    if (any) out.push(trimmed);
+  }
+  return out;
+}
+
+/** ヘッダー比較用の正規化（空白・括弧・大文字小文字の揺れを吸収） */
+function annualNormHeader_(h) {
+  return String(h == null ? '' : h)
+    .replace(/[\s\u3000]/g, '')
+    .replace(/[（）()【】\[\]「」]/g, '')
+    .toLowerCase();
+}
+
+/** メールアドレスらしいか */
+function annualLooksLikeEmail_(s) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s == null ? '' : s).trim());
+}
+
+/** メールのローカル部から児童IDを作る（例: taro.yamada@… → taro.yamada） */
+function annualStudentIdFromEmail_(email) {
+  const e = String(email == null ? '' : email).trim().toLowerCase();
+  const at = e.indexOf('@');
+  const local = at > 0 ? e.slice(0, at) : e;
+  return local.replace(/[^0-9a-z._-]/g, '');
+}
+
+/**
+ * 次年度 児童リストCSV をパースする。
+ *   想定列: メール（必須）・児童ID・氏名・学校名・学年・クラス
+ *   児童IDが空ならメールのローカル部から生成する。
+ */
+function parseAnnualStudentCsv_(text) {
+  const rows = annualParseCsv_(text);
+  const empt = { students: [], errors: [], headers: [], total: 0 };
+  if (!rows.length) { empt.errors.push('CSVが空です'); return empt; }
+
+  const headers = rows[0];
+  const map = {};
+  for (let i = 0; i < headers.length; i++) {
+    const h = annualNormHeader_(headers[i]);
+    if (!h) continue;
+    if (map.email === undefined && (h.indexOf('メール') >= 0 || h === 'email' || h === 'mail')) map.email = i;
+    else if (map.student_id === undefined && (h.indexOf('児童id') >= 0 || h === 'id' || h === 'studentid')) map.student_id = i;
+    else if (map.name === undefined && (h.indexOf('氏名') >= 0 || h === '名前' || h === 'name')) map.name = i;
+    else if (map.school === undefined && (h.indexOf('学校') >= 0 || h === 'school')) map.school = i;
+    else if (map.grade === undefined && (h.indexOf('学年') >= 0 || h === 'grade')) map.grade = i;
+    else if (map.class_name === undefined && (h.indexOf('クラス') >= 0 || h.indexOf('組') >= 0 || h === 'class')) map.class_name = i;
+  }
+
+  const students = [];
+  const errors = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    const get = function (k) {
+      const idx = map[k];
+      if (idx === undefined || idx === null) return '';
+      return String(cells[idx] == null ? '' : cells[idx]).trim();
+    };
+    const email = get('email');
+    let sid = get('student_id');
+    if (!sid) sid = annualStudentIdFromEmail_(email);
+    if (!sid) {
+      errors.push((r + 1) + '行目: 児童IDもメールアドレスも無いためスキップしました');
+      continue;
+    }
+    students.push({
+      student_id: sid,
+      email: email,
+      name: get('name'),
+      school_name: get('school'),
+      grade: normalizeDigits(get('grade')),
+      class_name: get('class_name')
+    });
+  }
+  return { students: students, errors: errors, headers: headers, total: rows.length - 1 };
+}
+
+/**
+ * 次年度 教員リストCSV をパースする。
+ *   想定列（TEACHER_COLUMNS と同一の11列）:
+ *     教員ID(メールアドレス)・パスワード・氏名・所属学校・権限・対象クラス・
+ *     登録URL情報・個別ホワイトリスト・個別ブラックリスト・最終ログイン日時・
+ *     Google SSO許可
+ */
+function parseAnnualTeacherCsv_(text) {
+  const rows = annualParseCsv_(text);
+  const empt = { teachers: [], errors: [], headers: [], total: 0 };
+  if (!rows.length) { empt.errors.push('CSVが空です'); return empt; }
+
+  const headers = rows[0];
+  const map = {};
+  for (let i = 0; i < headers.length; i++) {
+    const h = annualNormHeader_(headers[i]);
+    if (!h) continue;
+    if (map.email === undefined && (h.indexOf('メール') >= 0 || h.indexOf('教員id') >= 0 || h === 'email' || h === 'id')) map.email = i;
+    else if (map.password === undefined && (h.indexOf('パスワード') >= 0 || h === 'password' || h === 'pass')) map.password = i;
+    else if (map.name === undefined && (h.indexOf('氏名') >= 0 || h === '名前' || h === 'name')) map.name = i;
+    else if (map.school === undefined && (h.indexOf('所属学校') >= 0 || h.indexOf('学校') >= 0 || h === 'school')) map.school = i;
+    else if (map.role === undefined && (h.indexOf('権限') >= 0 || h === 'role')) map.role = i;
+    else if (map.classes === undefined && (h.indexOf('対象クラス') >= 0 || h.indexOf('クラス') >= 0)) map.classes = i;
+    else if (map.sso === undefined && (h.indexOf('sso') >= 0 || h.indexOf('シングルサインオン') >= 0)) map.sso = i;
+    else if (map.urls === undefined && (h.indexOf('登録url') >= 0 || h.indexOf('url情報') >= 0)) map.urls = i;
+    else if (map.white === undefined && h.indexOf('ホワイト') >= 0) map.white = i;
+    else if (map.black === undefined && h.indexOf('ブラック') >= 0) map.black = i;
+    else if (map.last_login === undefined && h.indexOf('最終ログイン') >= 0) map.last_login = i;
+  }
+
+  const teachers = [];
+  const errors = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    const get = function (k) {
+      const idx = map[k];
+      if (idx === undefined || idx === null) return '';
+      return String(cells[idx] == null ? '' : cells[idx]).trim();
+    };
+    const email = get('email').toLowerCase();
+    if (!annualLooksLikeEmail_(email)) {
+      errors.push((r + 1) + '行目: メールアドレスが不正なためスキップしました');
+      continue;
+    }
+    const ssoRaw = get('sso');
+    teachers.push({
+      email: email,
+      password: get('password'),
+      name: get('name'),
+      school_name: get('school'),
+      role: get('role') ? get('role').toUpperCase() : 'TEACHER',
+      classes: get('classes'),
+      registered_urls: get('urls'),
+      whitelist: get('white'),
+      blacklist: get('black'),
+      last_login: get('last_login'),
+      has_sso: map.sso !== undefined,
+      sso_raw: ssoRaw,
+      sso_allowed: parseSsoAllowedFlag(ssoRaw)
+    });
+  }
+  return { teachers: teachers, errors: errors, headers: headers, total: rows.length - 1 };
+}
+
+// ---------------------------------------------------------------------
+// ScriptApp トリガー（指定日時 1 回 ＋ 1時間ごとの保険）
+// ---------------------------------------------------------------------
+
+/** 保険用の定期トリガーが既にあるか */
+function annualHasPeriodicTrigger_() {
+  try {
+    if (typeof ScriptApp === 'undefined' || !ScriptApp ||
+        typeof ScriptApp.getProjectTriggers !== 'function') return false;
+    const trs = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < trs.length; i++) {
+      let h = '';
+      try { h = trs[i].getHandlerFunction(); } catch (eH) { h = ''; }
+      if (h === ANNUAL_PERIODIC_FN) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+/** 予約実行トリガー（1回発火）を全削除する */
+function annualRemoveTriggers_() {
+  let removed = 0;
+  try {
+    if (typeof ScriptApp === 'undefined' || !ScriptApp ||
+        typeof ScriptApp.getProjectTriggers !== 'function') return { removed: 0 };
+    const trs = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < trs.length; i++) {
+      let h = '';
+      try { h = trs[i].getHandlerFunction(); } catch (eH) { h = ''; }
+      if (h === ANNUAL_TRIGGER_FN) {
+        try { ScriptApp.deleteTrigger(trs[i]); removed++; } catch (eD) {}
+      }
+    }
+  } catch (e) {}
+  return { removed: removed };
+}
+
+/**
+ * 指定日時に発火するトリガーを張り直す。
+ * 併せて「1時間ごとの保険トリガー」も 1 本だけ用意する。
+ */
+function annualInstallTrigger_(atMs) {
+  const ms = Number(atMs || 0);
+  if (!ms) return { ok: false, error: '実行予定日時が不正です' };
+  if (typeof ScriptApp === 'undefined' || !ScriptApp ||
+      typeof ScriptApp.newTrigger !== 'function') {
+    return { ok: false, error: 'トリガーを作成できない環境です（フォールバック判定で実行します）' };
+  }
+  annualRemoveTriggers_();
+  // 過去日時を渡すと ScriptApp が例外を投げるため、最低1分後にする
+  const when = new Date(Math.max(ms, annualNowMs_() + 60000));
+  ScriptApp.newTrigger(ANNUAL_TRIGGER_FN).timeBased().at(when).create();
+  let periodic = false;
+  try {
+    if (!annualHasPeriodicTrigger_()) {
+      ScriptApp.newTrigger(ANNUAL_PERIODIC_FN).timeBased().everyHours(1).create();
+      periodic = true;
+    }
+  } catch (eP) { periodic = false; }
+  return {
+    ok: true,
+    at_ms: when.getTime(),
+    at_text: annualFormatRunAt_(when.getTime()),
+    periodic_created: periodic
+  };
+}
+
+// ---------------------------------------------------------------------
+// シート操作の小道具
+// ---------------------------------------------------------------------
+
+/** シートの 2 行目以降（ヘッダー以外）を全削除し、削除行数を返す */
+function annualClearSheetBody_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  const rows = lastRow - 1;
+  sheet.deleteRows(2, rows);
+  return rows;
+}
+
+/** 学年とクラスから「1年1組」形式のクラス名を組み立てる */
+function annualComposeClass_(s) {
+  const grade = normalizeDigits(String((s && s.grade) || '').trim()).replace(/[^0-9]/g, '');
+  const cls = String((s && s.class_name) || '').trim();
+  if (!cls) return grade ? (grade + '年') : '';
+  if (cls.indexOf('年') >= 0) return cls;
+  if (!grade) return cls;
+  return grade + '年' + cls;
+}
+
+/** 児童 1 行分の配列を作る（DEVICE_COLUMNS 幅） */
+function annualBuildStudentRow_(headerMap, s) {
+  const width = CONFIG.DEVICE_COLUMNS.length;
+  const row = [];
+  for (let i = 0; i < width; i++) row.push('');
+  const put = function (name, val) {
+    const idx = headerMap[name];
+    if (idx && idx >= 1 && idx <= width) row[idx - 1] = val;
+  };
+  put('児童ID', String((s && s.student_id) || ''));
+  put('学校名', String((s && s.school_name) || ''));
+  put('氏名', String((s && s.name) || ''));
+  put('クラス', annualComposeClass_(s));
+  return row;
+}
+
+/** 既存の児童行の名簿列だけを更新する（他端末の状態列は触らない） */
+function annualWriteStudentCells_(sheet, headerMap, rowNum, s) {
+  const put = function (name, val) {
+    const idx = headerMap[name];
+    if (!idx) return;
+    try { sheet.getRange(rowNum, idx, 1, 1).setValue(val); } catch (e) {}
+  };
+  put('学校名', String((s && s.school_name) || ''));
+  put('氏名', String((s && s.name) || ''));
+  put('クラス', annualComposeClass_(s));
+}
+
+/** 教員 1 行分の配列を作る（TEACHER_COLUMNS 幅・11列） */
+function annualBuildTeacherRow_(headerMap, t) {
+  const width = CONFIG.TEACHER_COLUMNS.length;
+  const row = [];
+  for (let i = 0; i < width; i++) row.push('');
+  const put = function (name, val) {
+    const idx = headerMap[name];
+    if (idx && idx >= 1 && idx <= width) row[idx - 1] = val;
+  };
+  put('教員ID(メールアドレス)', String((t && t.email) || '').toLowerCase());
+  put('パスワード', String((t && t.password) || ''));
+  put('氏名', String((t && t.name) || ''));
+  put('所属学校', String((t && t.school_name) || ''));
+  put('権限', String((t && t.role) || 'TEACHER').toUpperCase());
+  put('対象クラス', String((t && t.classes) || ''));
+  put('登録URL情報', String((t && t.registered_urls) || ''));
+  put('個別ホワイトリスト', String((t && t.whitelist) || ''));
+  put('個別ブラックリスト', String((t && t.blacklist) || ''));
+  put('Google SSO許可', parseSsoAllowedFlag(t && t.sso_allowed) ? 'TRUE' : 'FALSE');
+  return row;
+}
+
+/** 既存の教員行を更新する（CSV で空の列は既存値を残す） */
+function annualWriteTeacherCells_(sheet, headerMap, rowNum, t) {
+  const put = function (name, val, force) {
+    const idx = headerMap[name];
+    if (!idx) return;
+    const v = String(val == null ? '' : val);
+    if (!force && v === '') return;
+    try { sheet.getRange(rowNum, idx, 1, 1).setValue(v); } catch (e) {}
+  };
+  put('氏名', (t && t.name) || '', false);
+  put('所属学校', (t && t.school_name) || '', false);
+  put('権限', (t && t.role) ? String(t.role).toUpperCase() : '', false);
+  put('対象クラス', (t && t.classes) || '', false);
+  put('パスワード', (t && t.password) || '', false);
+  put('登録URL情報', (t && t.registered_urls) || '', false);
+  put('個別ホワイトリスト', (t && t.whitelist) || '', false);
+  put('個別ブラックリスト', (t && t.blacklist) || '', false);
+  // SSO 列が CSV に存在するときだけ上書きする（無い場合は既存設定を尊重）
+  if (t && t.has_sso !== false) {
+    put('Google SSO許可', parseSsoAllowedFlag(t.sso_allowed) ? 'TRUE' : 'FALSE', true);
+  }
+}
+
+// ---------------------------------------------------------------------
+// ① 前年度データの自動クリア（親シート ＋ R41 全子GASへ並列プッシュ）
+// ---------------------------------------------------------------------
+
+/**
+ * 前年度の端末・児童行データを全削除する。
+ *   - 親（自校）シートの「端末一覧」はヘッダー以外を全削除
+ *   - R41 分散モードでは全子GASへ annual_clear 指令を並列プッシュし、
+ *     各子GASが自分の「端末一覧」のヘッダー以外を全削除する
+ *   - 子GAS が 0 台（単一GASモード）の学校では通信せずに正常終了する
+ */
+function annualClearPreviousData_() {
+  const out = {
+    parent_rows: 0,
+    parent_error: '',
+    child_urls: 0,
+    child_ok: 0,
+    child_failed: 0,
+    child_skipped: 0
+  };
+
+  // (1) 親シート（自校の端末一覧）
+  try {
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    try { ensureDeviceHeaders(sheet); } catch (eH) {}
+    out.parent_rows = annualClearSheetBody_(sheet);
+  } catch (eP) {
+    out.parent_error = String(eP && eP.message ? eP.message : eP);
+  }
+
+  // (2) R41 子GAS への並列クリア伝播
+  let urls = [];
+  try {
+    if (typeof isShardParent === 'function' && isShardParent()) {
+      urls = shardAllChildUrls(shardConfigCached()) || [];
+    }
+  } catch (eU) { urls = []; }
+  urls = Array.isArray(urls) ? urls.filter(function (u) { return String(u || '').trim() !== ''; }) : [];
+  out.child_urls = urls.length;
+  if (!urls.length) {
+    // 子GAS未登録（単一GAS構成）の学校：ここで正常終了する
+    out.child_skipped = 0;
+    return out;
+  }
+
+  let secret = '';
+  try {
+    if (typeof PropertiesService !== 'undefined') {
+      secret = String(PropertiesService.getScriptProperties().getProperty(SHARD_SECRET_PROP) || '').trim();
+    }
+  } catch (eSec) { secret = ''; }
+
+  const reqs = [];
+  for (let i = 0; i < urls.length; i++) {
+    reqs.push({
+      url: urls[i],
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        action: 'shard_apply',
+        annual_clear: true,
+        shard_secret: secret,
+        cleared_by: 'annual_rollover'
+      }),
+      muteHttpExceptions: true
+    });
+  }
+
+  let res = [];
+  try { res = shardFetchMany(reqs) || []; } catch (eF) { res = []; }
+  for (let j = 0; j < reqs.length; j++) {
+    const r = res[j];
+    if (!r) { out.child_failed++; continue; }
+    let ok = false;
+    try {
+      const code = (typeof r.getResponseCode === 'function') ? Number(r.getResponseCode()) : 0;
+      const body = (typeof r.getContentText === 'function') ? r.getContentText() : '';
+      if (code >= 200 && code < 300) {
+        try { const jb = JSON.parse(body); ok = !!(jb && jb.success); } catch (eJ) { ok = false; }
+      }
+    } catch (eR) { ok = false; }
+    if (ok) out.child_ok++; else out.child_failed++;
+  }
+  return out;
+}
+
+/**
+ * 子GAS 側：自分の「端末一覧」シートのヘッダー以外を全削除する。
+ * shardApplyFromParent から annual_clear 指令を受けて呼ばれる。
+ */
+function shardAnnualClearFromParent(payload) {
+  if (!isShardChild() && !isShardParent()) {
+    return { success: false, error: '子GASとして構成されていません' };
+  }
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  return shardAnnualClearLocalDevices_();
+}
+
+function shardAnnualClearLocalDevices_() {
+  try {
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    try { ensureDeviceHeaders(sheet); } catch (eH) {}
+    const cleared = annualClearSheetBody_(sheet);
+    try { if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache(); } catch (eC) {}
+    return { success: true, cleared: cleared, sheet: CONFIG.DEVICE_SHEET_NAME };
+  } catch (e) {
+    return { success: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+// ---------------------------------------------------------------------
+// ② 次年度 児童リストの反映 / ③ 次年度 教員リストの反映
+// ---------------------------------------------------------------------
+
+/**
+ * 次年度の児童リストを「端末一覧」へ反映する。
+ *   - 新入生は行を追加
+ *   - 進級（学年・クラス変更）は既存行を更新
+ *   - pruneMissing=true のときは新リストに無い児童＝卒業生を削除する
+ *     （前年度データをクリアした場合は空になっているので何もしない）
+ */
+function annualApplyStudents_(students, opts) {
+  const o = opts || {};
+  const out = { added: 0, updated: 0, skipped: 0, removed: 0 };
+  const list = Array.isArray(students) ? students : [];
+  if (!list.length) return out;
+
+  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+  try { ensureDeviceHeaders(sheet); } catch (eH) {}
+  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+  const idCol = headerMap['児童ID'] || 1;
+
+  const lastRow = sheet.getLastRow();
+  const existing = {};
+  if (lastRow >= 2) {
+    const ids = sheet.getRange(2, idCol, lastRow - 1, 1).getValues();
+    for (let i = 0; i < ids.length; i++) {
+      const key = String(ids[i][0] == null ? '' : ids[i][0]).trim();
+      if (key) existing[key] = i + 2;
+    }
+  }
+
+  // 卒業生の整理（新リストに存在しない児童を下から削除）
+  if (o.pruneMissing) {
+    const keep = {};
+    for (let k = 0; k < list.length; k++) {
+      const sid = String((list[k] && list[k].student_id) || '').trim();
+      if (sid) keep[sid] = true;
+    }
+    const delRows = [];
+    for (const sid2 in existing) {
+      if (!keep[sid2]) delRows.push(existing[sid2]);
+    }
+    delRows.sort(function (a, b) { return b - a; });
+    for (let d = 0; d < delRows.length; d++) {
+      try { sheet.deleteRow(delRows[d]); out.removed++; } catch (eD) {}
+    }
+  }
+
+  const appendRows = [];
+  for (let j = 0; j < list.length; j++) {
+    const s = list[j] || {};
+    const sid = String(s.student_id || '').trim();
+    if (!sid) { out.skipped++; continue; }
+    const rowNum = existing[sid];
+    if (rowNum) {
+      annualWriteStudentCells_(sheet, headerMap, rowNum, s);
+      out.updated++;
+    } else {
+      appendRows.push(annualBuildStudentRow_(headerMap, s));
+      out.added++;
+    }
+  }
+  if (appendRows.length) {
+    const width = CONFIG.DEVICE_COLUMNS.length;
+    const start = sheet.getLastRow() + 1;
+    sheet.getRange(start, 1, appendRows.length, width).setValues(appendRows);
+  }
+  return out;
+}
+
+/**
+ * 次年度の教員リストを「教員マスタ」へ反映する（11列・Google SSO許可を含む）。
+ *   - 異動で去った教員の整理は「管理者が CSV に載せない」ことで実現する
+ *     （自動削除はしない：誤操作でログイン不能になる事故を避けるため）
+ *   - 新任教員は行を追加、既存教員は担当クラス・権限などを更新
+ */
+function annualApplyTeachers_(teachers) {
+  const out = { added: 0, updated: 0, skipped: 0 };
+  const list = Array.isArray(teachers) ? teachers : [];
+  if (!list.length) return out;
+
+  const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
+  try { ensureTeacherHeaders(sheet); } catch (eH) {}
+  const headerMap = getHeaderMap(sheet, CONFIG.TEACHER_COLUMNS);
+  const idCol = headerMap['教員ID(メールアドレス)'] || 1;
+
+  const lastRow = sheet.getLastRow();
+  const existing = {};
+  if (lastRow >= 2) {
+    const ids = sheet.getRange(2, idCol, lastRow - 1, 1).getValues();
+    for (let i = 0; i < ids.length; i++) {
+      const key = String(ids[i][0] == null ? '' : ids[i][0]).trim().toLowerCase();
+      if (key) existing[key] = i + 2;
+    }
+  }
+
+  const appendRows = [];
+  for (let j = 0; j < list.length; j++) {
+    const t = list[j] || {};
+    const email = String(t.email || '').trim().toLowerCase();
+    if (!email) { out.skipped++; continue; }
+    const rowNum = existing[email];
+    if (rowNum) {
+      annualWriteTeacherCells_(sheet, headerMap, rowNum, t);
+      out.updated++;
+    } else {
+      appendRows.push(annualBuildTeacherRow_(headerMap, t));
+      out.added++;
+    }
+  }
+  if (appendRows.length) {
+    const width = CONFIG.TEACHER_COLUMNS.length;
+    const start = sheet.getLastRow() + 1;
+    sheet.getRange(start, 1, appendRows.length, width).setValues(appendRows);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------
+// 年次更新の実行本体（①〜③をまとめて行い、件数を返す）
+// ---------------------------------------------------------------------
+
+function annualExecutePlan_(plan) {
+  const p = plan || {};
+  const counts = {
+    cleared_parent_rows: 0,
+    previous_rows_deleted: 0,
+    child_urls: 0,
+    child_ok: 0,
+    child_failed: 0,
+    students_added: 0,
+    students_updated: 0,
+    students_removed: 0,
+    students_skipped: 0,
+    teachers_added: 0,
+    teachers_updated: 0,
+    teachers_skipped: 0
+  };
+
+  const clearPrev = p.clear_previous !== false;
+  if (clearPrev) {
+    const cl = annualClearPreviousData_();
+    counts.cleared_parent_rows = cl.parent_rows || 0;
+    counts.previous_rows_deleted = cl.parent_rows || 0;
+    counts.child_urls = cl.child_urls || 0;
+    counts.child_ok = cl.child_ok || 0;
+    counts.child_failed = cl.child_failed || 0;
+    if (cl.parent_error) counts.parent_error = cl.parent_error;
+  }
+
+  const st = annualApplyStudents_(p.students || [], { pruneMissing: !clearPrev });
+  counts.students_added = st.added || 0;
+  counts.students_updated = st.updated || 0;
+  counts.students_removed = st.removed || 0;
+  counts.students_skipped = st.skipped || 0;
+
+  const te = annualApplyTeachers_(p.teachers || []);
+  counts.teachers_added = te.added || 0;
+  counts.teachers_updated = te.updated || 0;
+  counts.teachers_skipped = te.skipped || 0;
+
+  return counts;
+}
+
+/**
+ * 予約を実行する（二重実行防止つき）。
+ *   - withWriteLock（LockService）で同時実行を直列化
+ *   - ロック取得後に予約を読み直し、既に done なら何もしない
+ *   - 実行前に status='running' を保存し、異常終了時は 'error' を残す
+ */
+function annualRolloverExecutor(opts) {
+  const o = opts || {};
+  const source = String(o.source || 'manual');
+
+  const plan0 = annualPlanLoad_();
+  if (!plan0) return { success: false, executed: false, reason: 'no_plan', error: '予約が登録されていません' };
+  if (plan0.status === 'done') {
+    return { success: true, executed: false, reason: 'already_done', ran_at_text: plan0.ran_at_text || '' };
+  }
+
+  let result = null;
+  try {
+    result = withWriteLock(function () {
+      // ロック取得後に読み直す（他実行が先に完了している可能性がある）
+      const fresh = annualPlanLoad_();
+      if (!fresh) return { success: false, executed: false, reason: 'no_plan' };
+      if (fresh.status === 'done') {
+        return { success: true, executed: false, reason: 'already_done', ran_at_text: fresh.ran_at_text || '' };
+      }
+
+      fresh.status = 'running';
+      fresh.run_started_at_ms = annualNowMs_();
+      try { annualPlanSave_(fresh); } catch (eS) {}
+
+      let counts = null;
+      try {
+        counts = annualExecutePlan_(fresh);
+      } catch (eX) {
+        fresh.status = 'error';
+        fresh.last_error = String(eX && eX.message ? eX.message : eX);
+        fresh.last_error_at_ms = annualNowMs_();
+        try { annualPlanSave_(fresh); } catch (eS2) {}
+        return {
+          success: false, executed: false, reason: 'error',
+          error: String(eX && eX.message ? eX.message : eX)
+        };
+      }
+
+      fresh.status = 'done';
+      fresh.ran_at_ms = annualNowMs_();
+      fresh.ran_at_text = annualFormatRunAtFull_(fresh.ran_at_ms);
+      fresh.counts = counts;
+      fresh.last_error = '';
+      try { annualPlanSave_(fresh); } catch (eS3) {}
+      try { annualRemoveTriggers_(); } catch (eR) {}
+      invalidateAnnualCaches_();
+
+      return {
+        success: true,
+        executed: true,
+        ran_at_text: fresh.ran_at_text,
+        counts: counts,
+        source: source
+      };
+    });
+  } catch (eLock) {
+    // withWriteLock は競合時に例外を投げる
+    return {
+      success: false, executed: false, reason: 'locked',
+      error: String(eLock && eLock.message ? eLock.message : eLock)
+    };
+  }
+  return result || { success: false, executed: false, reason: 'unknown' };
+}
+
+/** 年次更新後に読み取りキャッシュを捨てる */
+function invalidateAnnualCaches_() {
+  try { if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache(); } catch (e) {}
+  try {
+    if (typeof CacheService !== 'undefined' && CacheService) {
+      CacheService.getScriptCache().remove('shard_ga_v');
+    }
+  } catch (e2) {}
+}
+
+/**
+ * フォールバック判定：予約日時を過ぎて未実行の予約があれば、その場で実行する。
+ * 管理画面アクセス時（api_annualReservationStatus）と定期トリガーから呼ばれる。
+ */
+function annualRolloverFallbackCheck_() {
+  let plan = null;
+  try { plan = annualPlanLoad_(); } catch (eL) { return { checked: false, reason: 'load_error', executed: false }; }
+  if (!plan) return { checked: true, due: false, executed: false, reason: 'no_plan' };
+  if (plan.status === 'done') return { checked: true, due: false, executed: false, reason: 'already_done' };
+
+  const at = Number(plan.run_at_ms || 0);
+  if (!at) return { checked: true, due: false, executed: false, reason: 'no_datetime' };
+  if (annualNowMs_() < at) {
+    return {
+      checked: true, due: false, executed: false, reason: 'not_yet',
+      at_text: plan.run_at_text || annualFormatRunAt_(at)
+    };
+  }
+  const res = annualRolloverExecutor({ source: 'fallback' });
+  return {
+    checked: true,
+    due: true,
+    executed: !!(res && res.executed),
+    result: res
+  };
+}
+
+/** 時刻トリガーのハンドラ（1回発火） */
+function annualRolloverTriggered_() {
+  const res = annualRolloverExecutor({ source: 'trigger' });
+  try {
+    Logger.log('[ANNUAL] trigger fired: ' + JSON.stringify({
+      success: res.success, executed: res.executed, reason: res.reason || ''
+    }));
+  } catch (e) {}
+  return res;
+}
+
+/** 保険用・1時間ごとのハンドラ */
+function annualRolloverPeriodicTick_() {
+  const fb = annualRolloverFallbackCheck_();
+  try {
+    Logger.log('[ANNUAL] periodic tick: ' + JSON.stringify({
+      due: fb.due, executed: fb.executed, reason: fb.reason || ''
+    }));
+  } catch (e) {}
+  return fb;
+}
+
+// ---------------------------------------------------------------------
+// google.script.run API（管理者専用）
+// ---------------------------------------------------------------------
+
+/** 認証＋管理者判定の共通部。失敗時は { error: {...} } を返す。 */
+function annualAuthAdmin_(token) {
+  const auth = verifyToken(token);
+  if (!auth || !auth.valid) {
+    return { ok: false, res: { success: false, need_auth: true, error: '認証セッションが無効です' } };
+  }
+  let teacher = auth.teacher;
+  try { teacher = resolveCurrentTeacher(auth.teacher); } catch (e) { teacher = auth.teacher; }
+  if (!isAdminTeacher(teacher)) {
+    return { ok: false, res: { success: false, error: '年次更新の操作は管理者のみ実行できます' } };
+  }
+  return { ok: true, teacher: teacher || {} };
+}
+
+/**
+ * 予約を保存する。
+ * payload = { run_at, student_csv, teacher_csv, clear_previous }
+ */
+function api_annualReservationSave(token, payload) {
+  try {
+    const a = annualAuthAdmin_(token);
+    if (!a.ok) return a.res;
+
+    const p = payload || {};
+    const atMs = annualParseRunAt_(p.run_at);
+    if (!atMs) {
+      return { success: false, error: '実行予定日時が不正です（例: 2027-04-01T06:00）' };
+    }
+    const st = parseAnnualStudentCsv_(p.student_csv || '');
+    const te = parseAnnualTeacherCsv_(p.teacher_csv || '');
+    if (!st.students.length && !te.teachers.length) {
+      return {
+        success: false,
+        error: '児童・教員のいずれのCSVにもデータ行がありません（ヘッダー行とデータ行を確認してください）',
+        student_errors: st.errors || [],
+        teacher_errors: te.errors || []
+      };
+    }
+
+    const plan = {
+      run_at_ms: atMs,
+      run_at_text: annualFormatRunAt_(atMs),
+      clear_previous: p.clear_previous === undefined ? true : !!p.clear_previous,
+      students: st.students,
+      teachers: te.teachers,
+      student_errors: st.errors || [],
+      teacher_errors: te.errors || [],
+      student_total: st.total || 0,
+      teacher_total: te.total || 0,
+      created_at_ms: annualNowMs_(),
+      created_by: String((a.teacher && a.teacher.email) || ''),
+      status: 'pending',
+      ran_at_ms: 0,
+      ran_at_text: '',
+      counts: null,
+      last_error: ''
+    };
+
+    const saved = annualPlanSave_(plan);
+    let trigger = null;
+    try { trigger = annualInstallTrigger_(atMs); } catch (eT) {
+      trigger = { ok: false, error: String(eT && eT.message ? eT.message : eT) };
+    }
+
+    return {
+      success: true,
+      message: '年次更新を予約保存しました',
+      plan: annualPlanPublicView_(plan),
+      storage: saved,
+      trigger: trigger
+    };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+}
+
+/** 予約の状態を返す（予約日時を過ぎていれば自動実行するフォールバック付き） */
+function api_annualReservationStatus(token) {
+  try {
+    const a = annualAuthAdmin_(token);
+    if (!a.ok) return a.res;
+
+    let fallback = null;
+    try { fallback = annualRolloverFallbackCheck_(); } catch (eF) {
+      fallback = { checked: false, executed: false, reason: 'error' };
+    }
+    const plan = annualPlanLoad_();
+    return {
+      success: true,
+      plan: plan ? annualPlanPublicView_(plan) : null,
+      fallback: fallback
+    };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+}
+
+/** 予約をキャンセルする（実行済みは不可） */
+function api_annualReservationCancel(token) {
+  try {
+    const a = annualAuthAdmin_(token);
+    if (!a.ok) return a.res;
+
+    const plan = annualPlanLoad_();
+    if (!plan) {
+      return { success: true, cancelled: false, message: 'キャンセルする予約はありません' };
+    }
+    if (plan.status === 'done') {
+      return { success: false, cancelled: false, error: '実行済みの年次更新はキャンセルできません' };
+    }
+    const cleared = annualPlanClear_();
+    const tr = annualRemoveTriggers_();
+    return {
+      success: true,
+      cancelled: true,
+      message: '予約をキャンセルしました',
+      removed_props: cleared.removed || 0,
+      removed_triggers: tr.removed || 0
+    };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+}
+
+/**
+ * 今すぐ実行（テスト実行／即時反映）。
+ * 予約が未保存で CSV が渡された場合は、先に同じ設定で保存してから実行する。
+ */
+function api_annualRolloverRunNow(token, payload) {
+  try {
+    const a = annualAuthAdmin_(token);
+    if (!a.ok) return a.res;
+
+    const p = payload || {};
+    const hasCsv = !!(String(p.student_csv || '').trim() || String(p.teacher_csv || '').trim());
+    if (hasCsv) {
+      // その場の CSV を正として保存し直す（run_at 未指定なら現在時刻）
+      const runAt = p.run_at || annualFormatRunAt_(annualNowMs_()).replace(/\//g, '-').replace(' ', 'T');
+      const saved = api_annualReservationSave(token, {
+        run_at: runAt,
+        clear_previous: p.clear_previous,
+        student_csv: p.student_csv,
+        teacher_csv: p.teacher_csv
+      });
+      if (!saved || !saved.success) return saved || { success: false, error: '予約の保存に失敗しました' };
+    } else if (!annualPlanLoad_()) {
+      return { success: false, error: '実行する予約がありません（CSVを読み込んでください）' };
+    }
+
+    const res = annualRolloverExecutor({ source: 'run_now' });
+    if (!res || !res.success) {
+      return {
+        success: false,
+        error: (res && res.error) || '年次更新の実行に失敗しました',
+        result: res
+      };
+    }
+    return {
+      success: true,
+      message: res.executed ? '年次更新を即時反映しました' : '年次更新は実行済みです',
+      result: res,
+      plan: annualPlanPublicView_(annualPlanLoad_())
+    };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
 }
