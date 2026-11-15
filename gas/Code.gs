@@ -915,7 +915,14 @@ function doGet(e) {
       if (!auth.valid) {
         return jsonResponse({ success: false, error: '認証が必要です。ログインし直してください。', need_auth: true });
       }
-      const data = getAllDevices(params.school_name, auth.teacher, parseBoolean(params.include_unassigned));
+      // 【Request L】管理画面（api_getAllDevices）と同じ集約経路に統一する。
+      //   以前はここだけ getAllDevices を直接呼んでいたため、親GASモードでも
+      //   この経路（api=list）でだけ子GASの端末が見えなかった。
+      //   SHARD_MODE=false のときは getShardMergedDevices 内部で
+      //   getAllDevices をそのまま返す＝従来と完全同一の挙動。
+      const currentTeacher = resolveCurrentTeacher(auth.teacher);
+      const data = getShardMergedDevices(
+        params.school_name, currentTeacher, parseBoolean(params.include_unassigned));
       return jsonResponse({ success: true, data: data, teacher: auth.teacher });
     }
 
@@ -5571,6 +5578,13 @@ function shardPropagateKaState(active) {
         if (last && (nowMs - last) < 30000) return { throttled: true };
         cache.put(k, String(nowMs), 180);
       } catch (e) { /* キャッシュ不可時は毎回送る */ }
+    } else {
+      // 【Request L】解除（false）時は間引きタイムスタンプを必ず捨てる。
+      //   残したままだと、解除直後に再稼働したとき 30 秒の間引きに阻まれ、
+      //   active=true が子GASへ配られず、子担当の端末が「同期停止」のまま固まる。
+      try {
+        CacheService.getScriptCache().remove('shard_ka_ts');
+      } catch (eKa) { /* キャッシュ不可時は何もしない（送信自体は続行） */ }
     }
 
     const body = JSON.stringify({
@@ -6574,6 +6588,50 @@ function shardDropPending(doneKeys) {
  * 返り値: { requests: [送信するリクエスト], sources: [[元の保留キー]] }
  *   sources[i] は requests[i] が担当する元の保留。送信成功時にそれだけを除去する。
  */
+/**
+ * 【Request L】保留キュー統合時の schedules マージ。
+ *
+ *   保留キューの統合（coalesce）は児童単位で patch を合流させるが、
+ *   payload を作り直すときに schedules を素通ししていなかったため、
+ *   先にキューへ入っていた schedules（＝予約・時間制限タイマー）が
+ *   後続の保留で上書きされて消えることがあった。
+ *
+ *   仕様:
+ *     ・後続（next）に schedules が無ければ、既存（prev）をそのまま保持する。
+ *     ・両方に schedules がある場合は by_student を児童単位でマージし、
+ *       同じ児童だけ後続の値を優先する（他の児童の予約は脱落させない）。
+ *     ・文字列で渡ってきた場合は JSON として解釈を試みる（壊れていれば相手側を採る）。
+ */
+function shardMergeSchedulesForCoalesce(prev, next) {
+  if (next === undefined || next === null) return prev;
+  if (prev === undefined || prev === null) return next;
+  let p = prev, n = next;
+  if (typeof p === 'string') { try { p = JSON.parse(p); } catch (eP) { p = null; } }
+  if (typeof n === 'string') { try { n = JSON.parse(n); } catch (eN) { n = null; } }
+  const isObj = function (v) { return !!v && typeof v === 'object' && !Array.isArray(v); };
+  if (!isObj(p)) return next;
+  if (!isObj(n)) return prev;
+
+  const out = {};
+  const pk = Object.keys(p);
+  for (let i = 0; i < pk.length; i++) out[pk[i]] = p[pk[i]];
+  const nk = Object.keys(n);
+  for (let j = 0; j < nk.length; j++) {
+    const key = nk[j];
+    if (key === 'by_student' && isObj(out.by_student) && isObj(n.by_student)) {
+      const merged = {};
+      const aKeys = Object.keys(out.by_student);
+      for (let a = 0; a < aKeys.length; a++) merged[aKeys[a]] = out.by_student[aKeys[a]];
+      const bKeys = Object.keys(n.by_student);
+      for (let b = 0; b < bKeys.length; b++) merged[bKeys[b]] = n.by_student[bKeys[b]];
+      out.by_student = merged;
+    } else {
+      out[key] = n[key];
+    }
+  }
+  return out;
+}
+
 function shardCoalescePending(reqs) {
   const list = Array.isArray(reqs) ? reqs : [];
   const requests = [];
@@ -6581,6 +6639,8 @@ function shardCoalescePending(reqs) {
   const order = [];
   const state = {};
   const secrets = {};
+  // 【Request L】子GASごとの schedules を保持する器（統合時に脱落させない）
+  const schedulesByUrl = {};
 
   for (let i = 0; i < list.length; i++) {
     const r = list[i] || {};
@@ -6599,6 +6659,13 @@ function shardCoalescePending(reqs) {
     const url = String(r.url || '');
     if (!state[url]) { state[url] = {}; order.push(url); }
     secrets[url] = body.shard_secret;
+    // 【Request L】schedules（予約・時間制限タイマー）は後続の保留で消さず、
+    //   統合して保持する。後続に無ければ既存をそのまま残す。
+    if (body.schedules !== undefined && body.schedules !== null) {
+      schedulesByUrl[url] = (schedulesByUrl[url] === undefined)
+        ? body.schedules
+        : shardMergeSchedulesForCoalesce(schedulesByUrl[url], body.schedules);
+    }
     const ids = body.student_ids;
     const cm = body.class_map || {};
     const patch = body.patch || {};
@@ -6638,17 +6705,20 @@ function shardCoalescePending(reqs) {
     }
     for (let s = 0; s < sigOrder.length; s++) {
       const b = buckets[sigOrder[s]];
+      // 【Request L】統合後の payload にも schedules を必ず引き継ぐ
+      const outBody = {
+        action: 'shard_apply',
+        shard_secret: secrets[url],
+        student_ids: b.ids,
+        class_map: b.classMap,
+        patch: b.patch
+      };
+      if (schedulesByUrl[url] !== undefined) outBody.schedules = schedulesByUrl[url];
       requests.push({
         url: url,
         method: 'post',
         contentType: 'application/json',
-        payload: JSON.stringify({
-          action: 'shard_apply',
-          shard_secret: secrets[url],
-          student_ids: b.ids,
-          class_map: b.classMap,
-          patch: b.patch
-        }),
+        payload: JSON.stringify(outBody),
         muteHttpExceptions: true
       });
       sources.push(b.keys);

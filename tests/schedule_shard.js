@@ -788,9 +788,20 @@ console.log('===== I. 不変条件 =====');
   // 東粟倉小学校は廃校
   check('東粟倉小学校は存在しない', src.indexOf('東粟倉') < 0);
 
-  // 保留キューの合流処理には手を入れていない（確定仕様2）
+  // 【Request L】保留キューの合流処理は schedules を「保持・マージ」する（旧仕様2を反転）
+  //   統合元に schedules があり統合先に無い場合は既存を保持し、
+  //   両方にある場合は児童単位でマージする（同じ児童のみ後続優先）。
   const coal = extractFn('shardCoalescePending');
-  check('保留キューに schedules のマージ処理を足していない', coal.indexOf('schedules') < 0);
+  const coalHelper = extractFn('shardMergeSchedulesForCoalesce');
+  check('保留キューは schedules を保持する器を持つ', coal.indexOf('schedulesByUrl') >= 0);
+  check('保留キューは schedules を取り込む', /schedulesByUrl\[url\]\s*=/.test(coal));
+  check('保留キューは schedules を統合 payload へ引き継ぐ',
+    /outBody\.schedules\s*=\s*schedulesByUrl\[url\]/.test(coal));
+  check('保留キューは schedules マージ用ヘルパを使う',
+    coal.indexOf('shardMergeSchedulesForCoalesce') >= 0);
+  check('schedules マージヘルパが存在する', coalHelper.length > 0 && coalHelper.length > 100);
+  check('マージヘルパは後続に schedules が無ければ既存を返す',
+    /if\s*\(next\s*===\s*undefined\s*\|\|\s*next\s*===\s*null\)\s*return\s*prev/.test(coalHelper));
 }
 
 console.log('\n===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
