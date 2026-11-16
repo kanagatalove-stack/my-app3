@@ -3101,6 +3101,11 @@
             runner.api_cancelSchedule(authToken, payload.schedule_id || payload.id);
           } else if (act === 'override_schedule') {
             runner.api_overrideSchedule(authToken, payload.schedule_id || payload.id, payload.action_type || payload.override_type);
+          } else if (act === 'update_schedule' || act === 'schedule_update') {
+            // 【Request P 修正】予約の編集。google.script.run 連鎖に分岐が無く
+            //   「未対応のアクション: update_schedule」で失敗していた。
+            //   doPost（G6）と同じく schedule_id を維持したまま行を書き換える。
+            runner.api_updateSchedule(authToken, payload);
           } else {
             reject(new Error('未対応のアクション: ' + act));
           }
@@ -3410,6 +3415,30 @@
     }
     function schPad2(n) { return ('0' + n).slice(-2); }
     function schKeyFromParts(y, mo, da) { return y + '/' + schPad2(mo) + '/' + schPad2(da); }
+    // 【Request P 修正】<input type="date"> が受け付けるのは YYYY-MM-DD のみ。
+    //   シート由来の日付（Date / ISO / "2026/11/10" / 英語表記）を JST 壁時計で
+    //   YYYY-MM-DD へ正規化する。変換できない場合は空文字（＝空欄のまま）。
+    function schDateInputValue(raw) {
+      if (raw === null || raw === undefined || raw === '') return '';
+      if (Object.prototype.toString.call(raw) === '[object Date]') {
+        const t = raw.getTime();
+        if (!isFinite(t)) return '';
+        const p = schJstParts(t);
+        return p.y + '-' + schPad2(p.mo) + '-' + schPad2(p.da);
+      }
+      const s = String(raw).trim();
+      if (!s) return '';
+      const m = /^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/.exec(s);
+      if (m) return m[1] + '-' + schPad2(Number(m[2])) + '-' + schPad2(Number(m[3]));
+      // 英語表記 "Tue Nov 10 2026 00:00:00 GMT+0900 (日本標準時)"
+      const e = /^(?:[A-Za-z]{3}\s+)?([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})/.exec(s);
+      if (e) {
+        const MON = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const mo = MON.indexOf(e[1].toUpperCase());
+        if (mo >= 0) return e[3] + '-' + schPad2(mo + 1) + '-' + schPad2(Number(e[2]));
+      }
+      return '';
+    }
     function schTodayKey() {
       const p = schJstParts(Date.now());
       return schKeyFromParts(p.y, p.mo, p.da);
@@ -3693,7 +3722,7 @@
     }
 
     // 対象校の選択肢を作る（非管理者は自校で固定・変更不可＝承認済み仕様）
-    function renderScheduleModalTargets() {
+    function renderScheduleModalTargets(keepStudents) {
       const scope = (typeof getTeacherScopeSchool === 'function') ? getTeacherScopeSchool() : '';
       const schSel = document.getElementById('scheduleSchool');
       if (schSel) {
@@ -3708,7 +3737,7 @@
           : 'w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2';
         schSel.title = scope ? '所属校に固定されています（変更できません）' : '';
       }
-      refreshScheduleClasses();
+      refreshScheduleClasses(keepStudents);
     }
 
     // 学校に応じたクラス一覧と個別児童リスト（既存 devicesData を流用＝承認済み）
@@ -3722,6 +3751,43 @@
     }
 
     // 【Request P】チェック状態を唯一の保持先（隠し input #scheduleClass）へ反映する。
+    // 【Request P 修正】児童IDの表記ゆれ（メール形式 / 大文字小文字 / 前後空白）を吸収する。
+    //   シートの「児童ID」は運用でメール形式が混ざるため、ローカル部でも同一人物とみなす。
+    function scheduleStudentIdKey(id) {
+      let v = String(id === null || id === undefined ? '' : id).trim().toLowerCase();
+      if (!v) return '';
+      const at = v.indexOf('@');
+      if (at > 0) v = v.slice(0, at);
+      return v;
+    }
+    function scheduleStudentIdsMatch(a, b) {
+      const ka = scheduleStudentIdKey(a);
+      const kb = scheduleStudentIdKey(b);
+      return !!ka && ka === kb;
+    }
+
+    // 【Request P 修正】描画済みの児童チェックボックスへ選択状態を反映する。
+    function applyScheduleStudentCheckboxes() {
+      const box = document.getElementById('scheduleStudentBox');
+      if (!box || !box.querySelectorAll) return;
+      const picked = Array.from(scheduleSelectedStudentIds || []);
+      const boxes = box.querySelectorAll('input[type="checkbox"]');
+      for (let i = 0; i < boxes.length; i++) {
+        const v = boxes[i].value;
+        boxes[i].checked = picked.some(function (x) { return scheduleStudentIdsMatch(x, v); });
+      }
+    }
+
+    // 【Request P 修正】描画済みのクラスチェックボックスへ選択状態を反映する。
+    function applyScheduleClassCheckboxes() {
+      const box = document.getElementById('scheduleClassBox');
+      if (!box || !box.querySelectorAll) return;
+      const boxes = box.querySelectorAll('input[type="checkbox"]');
+      for (let i = 0; i < boxes.length; i++) {
+        boxes[i].checked = scheduleSelectedClassNames.has(String(boxes[i].value));
+      }
+    }
+
     function syncScheduleClassValue() {
       const hidden = document.getElementById('scheduleClass');
       const v = Array.from(scheduleSelectedClassNames).join(',');
@@ -3738,7 +3804,10 @@
       syncScheduleClassValue();
     }
 
-    function refreshScheduleClasses() {
+    // 【Request P 修正】keepStudents=true のときは児童の選択状態を消さない。
+    //   編集モーダルは「描画 → 復元」の順で動くため、描画のたびに選択を
+    //   全消しすると復元したチェックが必ず外れる（実機で発生した不具合）。
+    function refreshScheduleClasses(keepStudents) {
       const schSel = document.getElementById('scheduleSchool');
       const clsSel = document.getElementById('scheduleClass');
       const school = schSel ? String(schSel.value || '') : '';
@@ -3780,14 +3849,20 @@
               const id = String(d.student_id || '');
               const cls = String(d.class_name || '未割当');
               const nm = String(d.student_name || id);
+              const onStu = Array.from(scheduleSelectedStudentIds || []).some(function (x) {
+                return scheduleStudentIdsMatch(x, id);
+              });
               return '<label class="flex items-center space-x-1.5 text-[11px] text-slate-600 px-1 py-0.5">'
-                + '<input type="checkbox" value="' + escapeHtml(id) + '" onchange="toggleScheduleStudent(this.value, this.checked)" class="rounded border-slate-300">'
+                + '<input type="checkbox" value="' + escapeHtml(id) + '"' + (onStu ? ' checked' : '')
+                + ' onchange="toggleScheduleStudent(this.value, this.checked)" class="rounded border-slate-300">'
                 + '<span class="truncate">' + escapeHtml(nm) + ' <span class="text-slate-400">(' + escapeHtml(cls) + ')</span></span>'
                 + '</label>';
             }).join('')
           : '<p class="text-[11px] text-slate-400">対象児童がいません（端末一覧を先に読み込んでください）。</p>';
       }
-      scheduleSelectedStudentIds = new Set();
+      // 【Request P 修正】新規登録では選択を初期化する。編集モーダルは
+      //   keepStudents=true で呼び、復元済みの選択を保つ。
+      if (!keepStudents) scheduleSelectedStudentIds = new Set();
       toggleScheduleTargetFields();
     }
 
@@ -3852,8 +3927,11 @@
       set('scheduleFilterMode', 'BLACKLIST');
       set('scheduleWhitelist', '');
       set('scheduleBlacklist', '');
-      set('scheduleDateFrom', today);
-      set('scheduleDateTo', today);
+      // 【Request P 修正】新規モーダルも同じ罠を踏む。schTodayKey() は
+      //   'yyyy/MM/dd' を返すため、そのまま type="date" に入れると空欄になる。
+      //   input には YYYY-MM-DD で入れる（内部の日付計算は従来どおりキー形式）。
+      set('scheduleDateFrom', schDateInputValue(today));
+      set('scheduleDateTo', schDateInputValue(today));
       set('scheduleStartTime', '19:00');
       set('scheduleEndTime', '20:00');
       set('scheduleRepeat', 'NONE');
@@ -3986,8 +4064,11 @@
       const bl = Array.isArray(row.blacklist_urls) ? row.blacklist_urls.join('\n') : String(row.blacklist_urls || '');
       set('scheduleWhitelist', wl);
       set('scheduleBlacklist', bl);
-      set('scheduleDateFrom', String(row.date_from || ''));
-      set('scheduleDateTo', String(row.date_to || ''));
+      // 【Request P 修正】<input type="date"> は YYYY-MM-DD 以外を受け付けず、
+      //   スラッシュ形式（サーバの date_from は "2026/11/10"）を代入すると
+      //   無言で空欄になる（実機で発生した不具合）。必ず正規化してから設定する。
+      set('scheduleDateFrom', schDateInputValue(row.date_from));
+      set('scheduleDateTo', schDateInputValue(row.date_to));
       set('scheduleStartTime', String(row.start_time || ''));
       set('scheduleEndTime', String(row.end_time || ''));
       set('scheduleRepeat', String(row.repeat || 'NONE'));
@@ -4002,7 +4083,8 @@
 
       // 学校の選択肢を作ってから、その予約の学校を選び直す
       //   （非管理者は自校固定なので、値は自校のまま）
-      renderScheduleModalTargets();
+      // 【Request P 修正】keepStudents=true で描画し、復元済みの児童選択を消さない。
+      renderScheduleModalTargets(true);
       const schSel = document.getElementById('scheduleSchool');
       if (schSel && row.school_name) {
         const want = String(row.school_name);
@@ -4016,20 +4098,21 @@
           schSel.value = want;
         }
       }
-      refreshScheduleClasses();
-      // refreshScheduleClasses が選択を絞り込むため、復元した選択を再度反映する
+      // 【Request P 修正】学校を確定させてから再描画する（児童選択は保持）。
+      //   refreshScheduleClasses は「いまの学校に無いクラス」を選択から落とすため、
+      //   クラス選択はここで明示的に復元し直す。
+      refreshScheduleClasses(true);
       scheduleSelectedClassNames = new Set(clsList.filter(function (c) { return c; }));
-      const classBox = document.getElementById('scheduleClassBox');
-      if (classBox && classBox.querySelectorAll) {
-        const boxes = classBox.querySelectorAll('input[type="checkbox"]');
-        for (let i = 0; i < boxes.length; i++) {
-          const b = boxes[i];
-          b.checked = scheduleSelectedClassNames.has(String(b.value));
-        }
-      }
+      applyScheduleClassCheckboxes();
       syncScheduleClassValue();
+      // 児童チェックボックスは描画完了後にまとめて checked を立てる
+      //   （ID 表記ゆれは scheduleStudentIdsMatch が吸収する）。
+      applyScheduleStudentCheckboxes();
 
       toggleScheduleTargetFields();
+      // 対象種別の表示切替は上で済んでいるので、最後に児童チェックを再度立てる
+      //   （hidden の付け外しでブラウザがチェックを保持しない実装差に備える）。
+      applyScheduleStudentCheckboxes();
       openModal('scheduleModal');
     }
 
