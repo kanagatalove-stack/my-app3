@@ -1097,16 +1097,20 @@ console.log('===== Q. 伝播経路（宛先解決とフォールバック） ===
       r.sent.length === 1 && r.sent[0].schedules.by_student.s1.windows[0].blacklist);
   })();
 
-  // ③ 表記不一致＋子GASが1つだけ（R41: 1校=1子GAS）→ 唯一の子へフォールバック
+  // ③ 【R49】既知クラスが SHARD_MAP_V1 に無い → 唯一の子GASへ流さない（親GASのみで運用）
+  //     旧仕様（1校=1子GASなので唯一の子へフォールバック）は、子GASを持たない
+  //     クラスの児童行が子シートへ勝手に作られる実機不具合の原因だったため廃止した。
   (function () {
     const r = runChain({ row: STUDENT_ROW, entries: ENTRIES, map: { '1-1': 'https://child1.example/exec' } });
-    check('Q7 表記不一致でも唯一の子GASへフォールバックする', r.sent.length === 1, r.sent.length);
-    check('Q8 フォールバック時も schedules が同封される',
-      r.sent.length === 1 && !!r.sent[0].schedules && !!r.sent[0].schedules.by_student.s1,
-      r.sent.length === 1 && r.sent[0].schedules && Object.keys(r.sent[0].schedules.by_student));
-    check('Q9 フォールバックした事実をログに残す（静かに落とさない）',
-      r.warns.some(function (m) { return m.indexOf('SHARD_MAP_V1') >= 0 && m.indexOf('フォールバック') >= 0; }),
+    check('Q7 既知クラスがマップ未登録なら唯一の子GASへ送らない', r.sent.length === 0, r.sent.length);
+    check('Q8 送らないので schedules も同封されない',
+      r.sent.length === 0, r.sent.length);
+    check('Q9 スキップした事実をログに残す（静かに落とさない）',
+      r.warns.some(function (m) { return m.indexOf('SHARD_MAP_V1') >= 0 && m.indexOf('親GASのみで運用') >= 0; }),
       r.warns);
+    check('Q9b スキップ理由を戻り値でも返す（無言の成功にしない）',
+      !!r.res && r.res.skipped === true && r.res.reason === 'no_assigned_child' && r.res.unassigned === 1,
+      r.res);
   })();
 
   // ④ 宛先が本当に無い（子GAS 2つ・どれも不一致・既定URLなし）→ 明示的に失敗を返す
@@ -1116,19 +1120,30 @@ console.log('===== Q. 伝播経路（宛先解決とフォールバック） ===
       map: { '1-1': 'https://childA.example/exec', '2-1': 'https://childB.example/exec' }
     });
     check('Q10 宛先不明は sent:[] のまま', r.sent.length === 0, r.sent.length);
-    check('Q11 宛先不明は黙って成功にせず no_route を返す',
-      !!r.res && r.res.reason === 'no_route' && r.res.dropped === 1, r.res);
+    // 【R49】既知クラス（5年1組）がマップに無いケースなので、理由は no_assigned_child。
+    //   いずれにせよ「黙って成功」にはせず、skipped と理由を必ず返す（ガード維持）。
+    check('Q11 宛先不明は黙って成功にせず理由を返す',
+      !!r.res && r.res.skipped === true && r.res.reason === 'no_assigned_child' && r.res.unassigned === 1, r.res);
     check('Q12 宛先不明はログにも残す', r.warns.length > 0, r.warns.length);
   })();
 
-  // ⑤ 既定URLがあればそちらへ送る（従来動作の維持）
+  // ⑤ 既定URLは「クラスが未取得・不明」の児童にだけ効く（【R49】で範囲を限定）
   (function () {
+    // クラス不明（未設定）の児童 → 既定URLへ送る（従来動作の維持）
     const r = runChain({
+      row: STUDENT_ROW, entries: [['s1', '第一小学校', '未設定']],
+      map: { '1-1': 'https://childA.example/exec' }, def: 'https://def.example/exec'
+    });
+    check('Q13 クラス不明の児童は既定URLへ送る',
+      r.sent.length === 1 && r.res.sent[0].url === 'https://def.example/exec', r.res);
+
+    // 既知クラス（5年1組）がマップ未登録 → 既定URLがあっても送らない
+    const r2 = runChain({
       row: STUDENT_ROW, entries: ENTRIES,
       map: { '1-1': 'https://childA.example/exec' }, def: 'https://def.example/exec'
     });
-    check('Q13 既定URLがあるときは既定URLへ送る',
-      r.sent.length === 1 && r.res.sent[0].url === 'https://def.example/exec', r.res);
+    check('Q13b 既知クラス未割当は既定URLがあっても送らない',
+      r2.sent.length === 0 && r2.res.reason === 'no_assigned_child', r2.res);
   })();
 
   // ⑥ 索引が「空配列」で固まってもシート読みへ落ちる（[] は truthy の罠）

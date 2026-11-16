@@ -5291,10 +5291,46 @@ function shardEnsureDeviceRows(idList, classMap) {
       if (id) existing[id] = true;
     }
 
+    // 【R49】担当クラス所有権ガード（二重防御）。
+    //   親は「この子GASへ解決した児童」だけを class_map に載せて送ってくる。
+    //   したがって class_map に無い児童は「自シャードの担当外」であり、
+    //   たとえ指示が届いても 未登録児童 の行を勝手に作ってはいけない
+    //   （実機: 子GASを持たない 3年1組 の児童行が 5年1組用の子シートへ復活した）。
+    //   ※ 既に自シートに居る児童は従来どおり何もしない（作成もしない）。
+    const assignedKeys = {};
+    if (classMap && typeof classMap === 'object') {
+      const ck = Object.keys(classMap);
+      for (let i = 0; i < ck.length; i++) {
+        const nk = (typeof normalizeIdKey === 'function')
+          ? normalizeIdKey(ck[i]) : String(ck[i] || '').trim().toLowerCase();
+        if (nk) assignedKeys[nk] = true;
+      }
+    }
+    const assignedList = Object.keys(assignedKeys);
+    const isOwnedByThisShard = function (id) {
+      const nk = (typeof normalizeIdKey === 'function')
+        ? normalizeIdKey(id) : String(id || '').trim().toLowerCase();
+      if (!nk) return false;
+      if (assignedKeys[nk]) return true;
+      // メール形式／ローカル部などの表記ゆれを相互吸収する（R41 の ID 照合と同じ規則）
+      if (typeof idKeysMatch_ === 'function') {
+        for (let i = 0; i < assignedList.length; i++) {
+          if (idKeysMatch_(assignedList[i], id)) return true;
+        }
+      }
+      return false;
+    };
+
     let created = 0;
+    let skippedOutOfScope = 0;
     for (let k = 0; k < idList.length; k++) {
       const id = String(idList[k] || '').trim();
       if (!id || existing[id]) continue;
+      if (!isOwnedByThisShard(id)) {
+        // 担当外クラスの児童は行を作らない（親GASのみで運用する）。
+        skippedOutOfScope++;
+        continue;
+      }
       const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
       newRow[headerMap['児童ID'] - 1] = id;
       newRow[headerMap['学校名'] - 1] = '未設定';
@@ -5305,6 +5341,12 @@ function shardEnsureDeviceRows(idList, classMap) {
       sheet.appendRow(newRow);
       existing[id] = true;
       created++;
+    }
+    if (skippedOutOfScope) {
+      try {
+        Logger.log('[SHARD] ensure: 担当外クラスのため行を作成しませんでした ' +
+          skippedOutOfScope + '件（class_map に無い児童）');
+      } catch (eLg) {}
     }
     return created;
   });
@@ -6933,22 +6975,39 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
 
     const groups = {}; // url -> [studentId]
     const groupClasses = {}; // url -> { studentId: 元のクラス名 }
-    let droppedCount = 0;
+    const urlById = {}; // studentId -> 解決済みURL（予約の同封先と共有する）
+    let droppedCount = 0;      // クラス不明＋既定URL無しで宛先が決まらなかった児童
+    let unassignedCount = 0;   // 既知クラスだが担当子GASが無い児童（親GASのみで運用）
     for (let i = 0; i < entries.length; i++) {
       const id = String(entries[i][0] || '').trim();
       if (!id) continue;
       if (!isAll && !(idSet && idSet.has(id))) continue;
       const rawClass = String(entries[i][2] || '').trim();
       const cls = normalizeShardClass(rawClass);
-      // クラス一致 → 空キー既定 → SHARD_DEFAULT_URL → 唯一の子GAS の順で解決する
-      const url = idx[cls] || emptyDef || defUrl || singleChildUrl;
-      if (!url) { droppedCount++; continue; }
-      // 一致しなかった理由を残す（表記揺れ／マップ未登録の切り分け用）。
-      if (!idx[cls] && rawClass) {
-        shardWarnOnce('cls-fb:' + cls + '|' + url,
+      // 【R49】宛先解決の順序を「クラス一致 → 空キー既定 → SHARD_DEFAULT_URL」に限定し、
+      //   「唯一の子GAS」フォールバックは“クラスが未取得・不明”の児童だけに許す。
+      //
+      //   従来は既知クラス（例: 3年1組）が SHARD_MAP_V1 に無くても singleChildUrl へ
+      //   流していたため、子GASを持たないクラスの児童が 5年1組用の子GASへ送られ、
+      //   子シートに「未登録児童」行が勝手に作られる実機不具合になっていた。
+      //   子GASを持たないクラスは親GASのみで運用する（送らない・行も作らせない）。
+      let url = '';
+      if (cls && idx[cls]) {
+        url = idx[cls];
+      } else if (cls) {
+        unassignedCount++;
+        shardWarnOnce('cls-skip:' + cls,
           'SHARD_MAP_V1 にクラス「' + rawClass + '」（正規化: ' + cls + '）がありません。' +
-          'フォールバック先へ送ります（' + url + '）。');
+          'このクラスは親GASのみで運用します（担当子GASが無いため子へは送りません）。');
+        continue;
+      } else {
+        // クラス未取得・不明の児童だけがフォールバック対象。
+        url = emptyDef || defUrl || singleChildUrl;
+        if (!url) { droppedCount++; continue; }
+        shardWarnOnce('cls-fb:' + rawClass + '|' + url,
+          'クラスが未取得の児童「' + id + '」を既定の子GASへ送ります（' + url + '）。');
       }
+      urlById[id] = url;
       if (!groups[url]) groups[url] = [];
       groups[url].push(id);
       // 子のシートで行を作るときにクラスを埋めるため、元の表記のまま渡す。
@@ -6957,11 +7016,17 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
     }
 
     // 宛先が 1 つも無いのに児童が居た＝設定不備。成功に見せず理由を返す。
-    if (droppedCount > 0 && !Object.keys(groups).length) {
-      shardWarnOnce('no-route:' + droppedCount,
-        'SHARD_MAP_V1 のどのクラスにも一致せず、既定URLも無いため伝播先がありません（対象 ' +
-        droppedCount + ' 名）。子GASへは何も送られていません。');
-      return { skipped: true, reason: 'no_route', dropped: droppedCount };
+    if (!Object.keys(groups).length && (droppedCount > 0 || unassignedCount > 0)) {
+      if (droppedCount > 0) {
+        shardWarnOnce('no-route:' + droppedCount,
+          'SHARD_MAP_V1 のどのクラスにも一致せず、既定URLも無いため伝播先がありません（対象 ' +
+          droppedCount + ' 名）。子GASへは何も送られていません。');
+        return { skipped: true, reason: 'no_route', dropped: droppedCount,
+          unassigned: unassignedCount };
+      }
+      // 【R49】既知クラスだが担当子GASが無い（親GASのみで運用するクラス）。
+      //   子GASへは送らないのが正しいが、「無言の成功」にはしない。
+      return { skipped: true, reason: 'no_assigned_child', unassigned: unassignedCount };
     }
 
     const urls = Object.keys(groups);
@@ -6988,7 +7053,11 @@ function shardPropagatePolicy(studentIds, patch, forceSync) {
           for (let i = 0; i < entries.length; i++) {
             const sid0 = String(entries[i][0] || '').trim();
             if (!sid0) continue;
-            const u0 = idx[normalizeShardClass(entries[i][2])] || emptyDef || defUrl || singleChildUrl;
+            // 【R49】上で決めた宛先をそのまま使う。
+            //   ここで旧フォールバック連鎖を再計算すると、担当子GASを持たない
+            //   クラスの児童が entriesByUrl に混ざり、子へ予約だけが送られる
+            //   （＝子シートに行が作られる）抜け道になる。
+            const u0 = urlById[sid0];
             if (!u0) continue;
             if (!entriesByUrl[u0]) entriesByUrl[u0] = [];
             entriesByUrl[u0].push([sid0, String(entries[i][1] || ''), String(entries[i][2] || '')]);
