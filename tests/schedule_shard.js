@@ -233,6 +233,8 @@ const FNS = [
   // 児童IDの表記ゆれ吸収（メール全体 / ローカル部）— deviceMatchesSchedule_ が使う
   'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
   // スケジュール中核（子）
+  'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
+  'scheduleActiveDetailFromCache_',
   'deviceMatchesSchedule_', 'readScheduleRows_',
   'buildSchedulePayloadForDevice_', 'buildHeartbeatResponse',
   // フェーズ5（子）

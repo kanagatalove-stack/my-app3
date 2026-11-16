@@ -1260,6 +1260,12 @@ function doPost(e) {
       return jsonResponse(handleOverrideSchedule_(payload, currentTeacher));
     }
 
+    // G6. 【Request P】予約の編集（schedule_id は維持し、既存行を書き換える）
+    //   有効/手動解除/手動解除日時（16/17/18）と 作成者/作成日時（19/20）には触れない。
+    if (action === 'update_schedule' || action === 'schedule_update') {
+      return jsonResponse(handleUpdateSchedule_(payload, currentTeacher));
+    }
+
     // H. 単一児童端末の更新（他校の児童は更新不可）
     if (action === 'update_single') {
       const targetStudent = getDeviceByStudentId(payload.student_id);
@@ -3649,6 +3655,16 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
     if (typeof readScheduleRows_ === 'function') schRows = readScheduleRows_();
   } catch (eSch) { schRows = []; }
 
+  // 【Request P】R41 子GAS は予約シートを持たない。親GAS が PropertiesService
+  //   経由で配った展開済みウィンドウのキャッシュからバッジを判定する。
+  //   シートへの書き戻しは行わない（読み取り専用の集計）。
+  let schCache = null;
+  let schChildMode = false;
+  try { schChildMode = (typeof isShardChild === 'function' && isShardChild()); } catch (eCM) { schChildMode = false; }
+  if (schChildMode) {
+    try { schCache = shardLoadScheduleCache_(); } catch (eSC) { schCache = null; }
+  }
+
   // 教員の所属学校スコープ（管理者は全校）
   const scopeInfo = getTeacherScopeInfo(teacher);
   const restrictToOwnSchool = scopeInfo.type === 'school' || scopeInfo.type === 'unknown';
@@ -3708,6 +3724,17 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
     const monUrlIdx = headerMap['要注意URL'];
     const monAtIdx = headerMap['注意検知日時'];
 
+    // 【Request P】「予約実行中」バッジの材料（1端末ぶん）。
+    //   単一GAS: 予約シートの行をメモリ上で判定 / 子GAS: 親から配られたウィンドウで判定。
+    let schDetail = { active: false, count: 0, ids: [], types: [], label: '' };
+    try {
+      schDetail = schChildMode
+        ? scheduleActiveDetailFromCache_(schCache, studentId, now)
+        : scheduleActiveDetail_(schRows, studentId, String(row[headerMap['クラス'] - 1] || ''), schoolName, now);
+    } catch (eSD) {
+      schDetail = { active: false, count: 0, ids: [], types: [], label: '' };
+    }
+
     results.push({
       student_id: studentId,
       school_name: schoolName,
@@ -3735,11 +3762,13 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
       // 【スケジュール】いま時間制限（タイマー）が効いている端末か。
       //   教員一覧に「予約により制限中」を出すための読み取り専用フラグ。
       //   シートへの書き戻しは一切しない（集計は読み取り時のみ）。
-      schedule_active: (function () {
-        try {
-          return isAnyScheduleActive_(schRows, studentId, String(row[headerMap['クラス'] - 1] || ''), schoolName, now);
-        } catch (e) { return false; }
-      })()
+      // 【Request P】「予約実行中」バッジ。active に加えて、どの予約が効いているかを
+      //   一目で分かる表示名（label）と件数・ID を返す（読み取り専用）。
+      schedule_active: schDetail.active,
+      schedule_active_label: schDetail.label,
+      schedule_active_count: schDetail.count,
+      schedule_active_ids: schDetail.ids,
+      schedule_active_types: schDetail.types
     });
   }
 
@@ -7954,10 +7983,26 @@ function deviceMatchesSchedule_(row, studentId, normClassName, schoolName) {
   if (!row) return false;
   const sid = String(studentId || '').trim();
   const tt = String(row.targetType || '').trim().toLowerCase();
+
+  // 【Request P】school（全校生徒）: 学校名が一致すればその学校の全児童が対象。
+  //   学校名が空の全校予約は「管理者が全校に配る予約」として全児童を対象にする。
+  if (tt === 'school') {
+    if (!row.schoolName) return true;
+    if (!schoolName) return false;
+    return schoolNamesMatch(row.schoolName, schoolName);
+  }
+
   if (tt === 'class') {
-    const rc = String(row.className || '').trim();
-    if (!rc) return false;
-    if (normalizeClassName(rc) !== String(normClassName || '')) return false;
+    // 【Request P】クラス名はカンマ区切りで複数指定できる（シートは1セルに保存）。
+    //   どれか1つでも一致すればその端末は対象。
+    const list = scheduleClassList_(row.className);
+    if (!list.length) return false;
+    const cn = String(normClassName || '');
+    let hit = false;
+    for (let i = 0; i < list.length; i++) {
+      if (normalizeClassName(list[i]) === cn) { hit = true; break; }
+    }
+    if (!hit) return false;
     // 学校名が入っていれば一致確認（表記ゆれは schoolNamesMatch で吸収）
     if (row.schoolName && schoolName && !schoolNamesMatch(row.schoolName, schoolName)) return false;
     return true;
@@ -8073,7 +8118,12 @@ function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs,
         start_ms: w.start_ms,
         end_ms: w.end_ms,
         start_jst: schMsToJstStr_(w.start_ms),
-        end_jst: schMsToJstStr_(w.end_ms)
+        end_jst: schMsToJstStr_(w.end_ms),
+        // 【Request P】教員一覧の「予約実行中」バッジ用の表示情報。
+        //   拡張機能（端末）は未知フィールドを無視するので後方互換。
+        label: scheduleActiveLabel_(r),
+        target_type: r.targetType,
+        target_label: scheduleTargetLabel_(r)
       };
       if (w.start_ms <= now && now < w.end_ms) {
         if (payload.active.length < maxActive) payload.active.push(item);
@@ -8212,7 +8262,13 @@ function shardBuildWindowsForStudent_(rows, studentId, className, schoolName, no
         whitelist: normalizeHostListToArray_(r.whitelist),
         blacklist: normalizeHostListToArray_(r.blacklist),
         start_ms: wins[w].start_ms,
-        end_ms: wins[w].end_ms
+        end_ms: wins[w].end_ms,
+        // 【Request P】R41 子GAS でも「予約実行中」バッジを出せるよう、
+        //   子に予約シートを持たせずに済む表示情報をウィンドウへ同封する。
+        label: scheduleActiveLabel_(r),
+        target_type: r.targetType,
+        target_label: scheduleTargetLabel_(r),
+        school_name: String(r.schoolName || '')
       });
     }
   }
@@ -8326,7 +8382,12 @@ function shardSchedulePayloadFromCache_(studentId, nowMs) {
       start_ms: w.start_ms,
       end_ms: w.end_ms,
       start_jst: schMsToJstStr_(w.start_ms),
-      end_jst: schMsToJstStr_(w.end_ms)
+      end_jst: schMsToJstStr_(w.end_ms),
+      // 【Request P】親が同封したバッジ表示情報をそのまま引き継ぐ
+      //   （子は予約シートを持たないため、ここで落とすとバッジが出せない）。
+      label: String(w.label || scheduleActiveLabel_(w)),
+      target_type: String(w.target_type || ''),
+      target_label: String(w.target_label || '')
     };
     if (w.start_ms <= now && now < w.end_ms) active.push(item);
     else if (w.start_ms > now) upcoming.push(item);
@@ -8399,26 +8460,45 @@ function propagateScheduleToChildren_(schedRow) {
     }
 
     const ids = [];
+    const seen = {};
+    const pushId = function (v) {
+      const s = String(v || '').trim();
+      if (!s || seen[s]) return;
+      seen[s] = true;
+      ids.push(s);
+    };
     if (schedRow.targetType === 'student') {
       const list = Array.isArray(schedRow.studentIds) ? schedRow.studentIds : [];
-      for (let i = 0; i < list.length; i++) {
-        const s = String(list[i] || '').trim();
-        if (s) ids.push(s);
-      }
-    } else {
-      // クラス対象: 索引から該当クラスの児童IDを集める（シート全読みはしない）
+      for (let i = 0; i < list.length; i++) pushId(list[i]);
+    } else if (schedRow.targetType === 'school') {
+      // 【Request P】全校生徒対象: 同一校の全端末へ配信する（他校は絶対に含めない）
       let entries = [];
       try { entries = (typeof shardDeviceEntries === 'function') ? (shardDeviceEntries() || []) : []; }
       catch (eE) { entries = []; }
-      const cn = normalizeClassName(schedRow.className);
+      for (let i = 0; i < entries.length; i++) {
+        const entrySchool = String(entries[i][1] || '');
+        if (schedRow.schoolName && entrySchool &&
+            !schoolNamesMatch(schedRow.schoolName, entrySchool)) continue;
+        if (schedRow.schoolName && !entrySchool) continue;
+        pushId(entries[i][0]);
+      }
+    } else {
+      // クラス対象: 索引から該当クラスの児童IDを集める（シート全読みはしない）
+      //   【Request P】クラス名はカンマ区切りの複数指定に対応（いずれかに一致すれば対象）。
+      let entries = [];
+      try { entries = (typeof shardDeviceEntries === 'function') ? (shardDeviceEntries() || []) : []; }
+      catch (eE) { entries = []; }
+      const clsList = scheduleClassList_(schedRow.className);
+      const cnSet = {};
+      for (let k = 0; k < clsList.length; k++) cnSet[normalizeClassName(clsList[k])] = true;
       for (let i = 0; i < entries.length; i++) {
         const sid = String(entries[i][0] || '').trim();
         if (!sid) continue;
-        if (normalizeClassName(entries[i][2]) !== cn) continue;
+        if (!cnSet[normalizeClassName(entries[i][2])]) continue;
         // 学校名が入っていれば一致確認（表記ゆれは schoolNamesMatch で吸収）
         if (schedRow.schoolName && entries[i][1] &&
             !schoolNamesMatch(schedRow.schoolName, entries[i][1])) continue;
-        ids.push(sid);
+        pushId(sid);
       }
     }
     if (!ids.length) {
@@ -8444,8 +8524,53 @@ function propagateScheduleToChildren_(schedRow) {
  * 一覧表示用の軽量判定（予約行を1回読んだだけで全端末ぶんを判定する）。
  * getAllDevices から呼ぶため、シート読みは呼び出し側で1回に畳む。
  */
-function isAnyScheduleActive_(rows, studentId, className, schoolName, nowMs) {
-  if (!rows || !rows.length) return false;
+/**
+ * 予約の対象クラス文字列（カンマ区切り）を配列へ分解する。
+ *   【Request P】「1年1組,1年2組」のような複数指定と、従来の単一クラスを同一に扱う。
+ *   区切りはカンマ・読点・スラッシュ・中黒（教員の手入力ゆれを吸収）。
+ */
+function scheduleClassList_(raw) {
+  if (Array.isArray(raw)) {
+    return raw.map(function (x) { return String(x === null || x === undefined ? '' : x).trim(); })
+      .filter(Boolean);
+  }
+  return String(raw === null || raw === undefined ? '' : raw)
+    .split(/[,、\/／・]+/)
+    .map(function (s) { return s.trim(); })
+    .filter(Boolean);
+}
+
+/** 予約実行中バッジの表示名（備考があればそれ、無ければ制限タイプ）。 */
+function scheduleActiveLabel_(r) {
+  const note = String((r && r.note) || '').trim();
+  if (note) return note;
+  const t = String((r && r.type) || 'url_block').toLowerCase();
+  return t === 'screen_lock' ? '画面ロック' : 'URL制限';
+}
+
+/** 予約1件の対象を人が読める形にする（一覧APIの target_label）。 */
+function scheduleTargetLabel_(r) {
+  if (!r) return '';
+  const tt = String(r.targetType || 'class').toLowerCase();
+  if (tt === 'student') {
+    const n = Array.isArray(r.studentIds) ? r.studentIds.length : 0;
+    return '個別 ' + n + '名';
+  }
+  if (tt === 'school') return '全校生徒';
+  const list = scheduleClassList_(r.className);
+  return list.length ? list.join('・') : '';
+}
+
+/**
+ * いま効いている予約の詳細（教員一覧のバッジ表示用）。
+ *   単一GAS はこの関数を「予約シートの行」に対して呼ぶ。
+ *   R41 子GAS は親から配られた展開済みウィンドウを別経路で判定する
+ *   （shardSchedulePayloadFromCache_ が label を運ぶ）。
+ *   シートへの書き戻しは一切しない（読み取り専用の集計）。
+ */
+function scheduleActiveDetail_(rows, studentId, className, schoolName, nowMs) {
+  const out = { active: false, count: 0, ids: [], types: [], label: '' };
+  if (!rows || !rows.length) return out;
   const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
   const sid = String(studentId || '').trim();
   const cn = normalizeClassName(className);
@@ -8460,11 +8585,77 @@ function isAnyScheduleActive_(rows, studentId, className, schoolName, nowMs) {
       weekdays: parseWeekdays_(r.weekdaysRaw)
     };
     const wins = expandScheduleWindows_(sched, now, 2 * 86400000);
+    let hit = false;
     for (let k = 0; k < wins.length; k++) {
-      if (wins[k].start_ms <= now && now < wins[k].end_ms) return true;
+      if (wins[k].start_ms <= now && now < wins[k].end_ms) { hit = true; break; }
     }
+    if (!hit) continue;
+    out.active = true;
+    out.count++;
+    if (out.ids.indexOf(r.id) < 0) out.ids.push(r.id);
+    const t = String(r.type || '').toLowerCase();
+    if (out.types.indexOf(t) < 0) out.types.push(t);
+    if (!out.label) out.label = scheduleActiveLabel_(r);
   }
-  return false;
+  return out;
+}
+
+/** 旧APIの後方互換（真偽値だけを返す）。 */
+function isAnyScheduleActive_(rows, studentId, className, schoolName, nowMs) {
+  return scheduleActiveDetail_(rows, studentId, className, schoolName, nowMs).active;
+}
+
+/**
+ * 【Request P】R41 子GAS 用:「予約実行中」バッジの詳細。
+ *   子GAS に予約シートは持たせない。親GAS が PropertiesService 経由で配った
+ *   展開済みウィンドウ（by_student）だけを見て、いま効いている予約を数える。
+ *   表示名（label）も親が計算してウィンドウに同封しているため、子は再解釈しない。
+ */
+function scheduleActiveDetailFromCache_(cache, studentId, nowMs) {
+  const out = { active: false, count: 0, ids: [], types: [], label: '' };
+  if (!cache || typeof cache !== 'object' || !cache.by_student) return out;
+  const sid = String(studentId || '').trim();
+  if (!sid) return out;
+
+  // 親→子で student_id の表記（メール全体／ローカル部）が揺れるため、
+  //   shardSchedulePayloadFromCache_ と同じ二段構えで照合する。
+  let rec = null;
+  try {
+    const want = normalizeIdKey(sid);
+    const keys = Object.keys(cache.by_student || {});
+    for (let i = 0; i < keys.length; i++) {
+      if (normalizeIdKey(keys[i]) === want) { rec = cache.by_student[keys[i]]; break; }
+    }
+    if (!rec) {
+      const cands = [];
+      for (let j = 0; j < keys.length; j++) {
+        if (idKeysMatch_(keys[j], sid)) cands.push(keys[j]);
+      }
+      // 候補が1件に絞れたときだけ採用（誤配信を避ける）
+      if (cands.length === 1) rec = cache.by_student[cands[0]];
+    }
+  } catch (eK) { return out; }
+  if (!rec || !Array.isArray(rec.windows)) return out;
+
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const overridden = Array.isArray(rec.overridden_ids) ? rec.overridden_ids : [];
+  for (let i = 0; i < rec.windows.length; i++) {
+    const w = rec.windows[i];
+    if (!w) continue;
+    // 端末側 isScheduleActiveAt と同じ「開始を含み終了を含まない」判定
+    if (!(Number(w.start_ms) <= now && now < Number(w.end_ms))) continue;
+    if (w.id && overridden.indexOf(w.id) >= 0) continue;
+    out.active = true;
+    out.count++;
+    if (w.id && out.ids.indexOf(w.id) < 0) out.ids.push(w.id);
+    const t = String(w.type || '').toLowerCase();
+    if (t && out.types.indexOf(t) < 0) out.types.push(t);
+    if (!out.label) out.label = String(w.label || '');
+  }
+  if (out.active && !out.label) {
+    out.label = out.types.indexOf('screen_lock') >= 0 ? '画面ロック' : 'URL制限';
+  }
+  return out;
 }
 
 // ============================================================================
@@ -8511,6 +8702,8 @@ function validateScheduleInput_(p) {
     targetType: String(src.target_type || src.targetType || '').trim().toLowerCase(),
     schoolName: String(src.school_name || src.schoolName || '').trim(),
     className: String(src.class_name || src.className || '').trim(),
+    // 【Request P】クラスは複数指定できる。シートは1セルなのでカンマ区切りで保持する。
+    classNames: [],
     studentIds: [],
     type: String(src.type || src.restriction_type || 'url_block').trim().toLowerCase(),
     filterMode: String(src.filter_mode || src.filterMode || 'BLACKLIST').trim().toUpperCase(),
@@ -8528,8 +8721,9 @@ function validateScheduleInput_(p) {
   };
 
   // --- 対象種別 ---
-  if (norm.targetType !== 'class' && norm.targetType !== 'student') {
-    errs.push('対象種別は class か student を指定してください');
+  //   【Request P】school（全校生徒）を追加。class は複数指定できる。
+  if (norm.targetType !== 'class' && norm.targetType !== 'student' && norm.targetType !== 'school') {
+    errs.push('対象種別は class / student / school を指定してください');
   }
 
   // --- 児童ID（student のとき） ---
@@ -8543,8 +8737,22 @@ function validateScheduleInput_(p) {
   if (norm.targetType === 'student' && norm.studentIds.length === 0) {
     errs.push('児童IDを1つ以上指定してください');
   }
-  if (norm.targetType === 'class' && !norm.className) {
-    errs.push('クラス名を指定してください');
+  if (norm.targetType === 'class') {
+    // 【Request P】class_names（配列）/ class_name（カンマ区切り文字列）の両方を受ける。
+    const rawClasses = src.class_names || src.classNames || src.class_name || src.className || '';
+    norm.classNames = scheduleClassList_(rawClasses);
+    if (!norm.classNames.length) {
+      errs.push('クラス名を1つ以上指定してください');
+    }
+    // シートへは 1 セルにカンマ区切りで書く（列追加なし・後方互換）。
+    norm.className = norm.classNames.join(',');
+  } else {
+    norm.classNames = [];
+    norm.className = '';
+  }
+  // school は学校名が必須（管理者の全校配布は schoolName='' を許容する）
+  if (norm.targetType === 'school' && !norm.schoolName) {
+    // 教員の所属校で補完されるため、ここでは空でもエラーにしない。
   }
 
   // --- 制限タイプ ---
@@ -8623,8 +8831,32 @@ function authorizeScheduleTarget_(norm, teacher) {
       }
     }
     // クラス境界（「対象クラス」は権限の境界）
-    if (!isClassInTeacherScope(norm.className, teacher)) {
-      return { ok: false, error: '対象クラスの権限がありません: ' + norm.className };
+    //   【Request P】複数クラスの場合は「すべて」が権限内であること。
+    const clsList = Array.isArray(norm.classNames) && norm.classNames.length
+      ? norm.classNames : scheduleClassList_(norm.className);
+    for (let i = 0; i < clsList.length; i++) {
+      if (!isClassInTeacherScope(clsList[i], teacher)) {
+        return { ok: false, error: '対象クラスの権限がありません: ' + clsList[i] };
+      }
+    }
+    return { ok: true };
+  }
+
+  // 【Request P】school: 自校の教員は自校全体を対象にできる（他校へは越境不可）。
+  if (norm.targetType === 'school') {
+    if (scope.type === 'school' || scope.type === 'unknown') {
+      if (!norm.schoolName) {
+        norm.schoolName = scope.school || '';
+      } else if (!schoolNamesMatch(norm.schoolName, scope.school)) {
+        return { ok: false, error: '自校以外の学校全体は予約できません' };
+      } else {
+        norm.schoolName = scope.school;
+      }
+    }
+    // 「対象クラス」制限のある教員は、クラス境界を越える全校予約を作れない。
+    //   （学年主任が「校内全部」に制限をかけてしまう事故を防ぐ）
+    if (getTeacherTargetClasses(teacher).length > 0) {
+      return { ok: false, error: '対象クラスが限定されているため、全校生徒は予約できません' };
     }
     return { ok: true };
   }
@@ -8715,7 +8947,22 @@ function isScheduleRowInTeacherScope_(row, teacher) {
     if (!schoolNamesMatch(row.schoolName, scope.school)) return false;
   }
   if (row.targetType === 'class') {
-    return isClassInTeacherScope(row.className, teacher);
+    // 【Request P】複数クラスの行は、1つでも権限内なら「触れる」
+    //   （取消・解除は行単位のため。作成・編集は authorizeScheduleTarget_ が全件検査する）
+    const list = scheduleClassList_(row.className);
+    if (!list.length) return isClassInTeacherScope(row.className, teacher);
+    for (let i = 0; i < list.length; i++) {
+      if (isClassInTeacherScope(list[i], teacher)) return true;
+    }
+    return false;
+  }
+  // 【Request P】school: 学校境界のみで判定（クラス境界は全クラスを含むため）
+  if (row.targetType === 'school') {
+    if (isAdminTeacher(teacher)) return true;
+    if (row.schoolName && (scope.type === 'school' || scope.type === 'unknown')) {
+      return schoolNamesMatch(row.schoolName, scope.school);
+    }
+    return true;
   }
   if (row.targetType === 'student') {
     const scoped = scopeStudentIdsForTeacher(row.studentIds || [], teacher);
@@ -8756,6 +9003,11 @@ function scheduleRowToJson_(r, nowMs) {
     start_time: r.startTime,
     end_time: r.endTime,
     weekdays: parseWeekdays_(r.weekdaysRaw),
+    // 【Request P】複数クラス・全校生徒を画面がそのまま表示できるようにする。
+    target_label: scheduleTargetLabel_(r),
+    class_list: scheduleClassList_(r.className),
+    // 予約実行中バッジに出す表示名（備考 → 制限タイプの順で採用）
+    active_label: scheduleActiveLabel_(r),
     enabled: r.enabled,
     overridden: r.overridden,
     override_at: r.overrideAt,
@@ -8786,7 +9038,8 @@ function handleSaveSchedule_(payload, teacher) {
     id: generateScheduleId_(),
     targetType: v.norm.targetType,
     schoolName: v.norm.schoolName,
-    className: v.norm.targetType === 'class' ? v.norm.className : '',
+    className: v.norm.targetType === 'class' ? v.norm.classNames.join(',') : '',
+    // 【Request P】school（全校生徒）はクラスも児童も持たない（学校名だけで対象が決まる）
     studentIds: v.norm.targetType === 'student' ? v.norm.studentIds : [],
     type: v.norm.type,
     filterMode: v.norm.filterMode,
@@ -8877,6 +9130,136 @@ function handleListSchedules_(payload, teacher) {
   out.sort(function (a, b) { return String(a.created_at).localeCompare(String(b.created_at)); });
 
   return { success: true, data: out, count: out.length, server_time_ms: nowMs, server_time: schNowJstSec_() };
+}
+
+/**
+ * update_schedule … 既存予約を編集する（行は残す・更新日時を記録する）
+ *
+ *   【Request P】設計確定：
+ *     - 予約ID（schedule_id）は維持する（監査ログの連続性を保つ）。
+ *     - 対象行の内容だけを書き換え、列21「更新日時」を必ず更新する。
+ *     - 有効/手動解除（列16/17/18）と作成者・作成日時（列19/20）は触らない。
+ *     - 権限判定は作成時と同じ authorizeScheduleTarget_ を通す（越境不可）。
+ *     - 「予約そのものを止める」のは cancel、「今回だけ解除」は override。編集はこの3つ目。
+ */
+function handleUpdateSchedule_(payload, teacher) {
+  const id = String((payload && (payload.schedule_id || payload.id)) || '').trim();
+  if (!id) return { success: false, error: 'スケジュールIDが必要です', error_code: 'validation_failed' };
+
+  // --- 1) 対象行を探す（他校・権限外は 1 件も触れない） ---
+  const rows = readScheduleRows_();
+  let target = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].id === id) { target = rows[i]; break; }
+  }
+  if (!target) {
+    return { success: false, error: 'スケジュールが見つかりません: ' + id, error_code: 'not_found' };
+  }
+  if (!isScheduleRowInTeacherScope_(target, teacher)) {
+    return { success: false, error: 'この予約を編集する権限がありません', error_code: 'forbidden' };
+  }
+
+  // --- 2) 入力の正規化と検証（新規作成とまったく同じ規則を通す） ---
+  //   部分更新（変更した項目だけ送る）でも壊れないよう、未指定は既存値で補う。
+  const src = {};
+  const srcIn = (payload && typeof payload === 'object') ? payload : {};
+  const pick = function (camel, snake, cur) {
+    const v = (srcIn[snake] !== undefined) ? srcIn[snake]
+      : ((srcIn[camel] !== undefined) ? srcIn[camel] : cur);
+    return v;
+  };
+  src.target_type = pick('targetType', 'target_type', target.targetType);
+  src.school_name = pick('schoolName', 'school_name', target.schoolName);
+  src.class_name = pick('className', 'class_name',
+    (target.className || ''));
+  src.class_names = srcIn.class_names || srcIn.classNames;
+  src.student_ids = pick('studentIds', 'student_ids', (target.studentIds || []).join(','));
+  src.type = pick('type', 'restriction_type', target.type);
+  src.filter_mode = pick('filterMode', 'filter_mode', target.filterMode || 'BLACKLIST');
+  src.whitelist_urls = pick('whitelistUrls', 'whitelist_urls', (target.whitelist || []).join('\n'));
+  src.blacklist_urls = pick('blacklistUrls', 'blacklist_urls', (target.blacklist || []).join('\n'));
+  src.date_from = pick('dateFrom', 'date_from', target.dateFrom);
+  src.date_to = pick('dateTo', 'date_to', target.dateTo);
+  src.repeat = pick('repeat', 'repeat', target.repeat);
+  src.start_time = pick('startTime', 'start_time', target.startTime);
+  src.end_time = pick('endTime', 'end_time', target.endTime);
+  src.weekdays = (srcIn.weekdays !== undefined) ? srcIn.weekdays : target.weekdaysRaw;
+  src.note = pick('note', 'note', target.note);
+
+  const v = validateScheduleInput_(src);
+  if (!v.ok) {
+    return { success: false, error: v.errors.join(' / '), error_code: 'validation_failed', errors: v.errors };
+  }
+  const authz = authorizeScheduleTarget_(v.norm, teacher);
+  if (!authz.ok) {
+    return { success: false, error: authz.error, error_code: 'forbidden' };
+  }
+
+  // --- 3) 書き換える列だけを patch にする ---
+  //   有効(16)/手動解除(17)/手動解除日時(18)/作成者(19)/作成日時(20) は保持する。
+  const nowStr = schNowJstSec_();
+  const isUrlBlock = (v.norm.type === 'url_block');
+  const patch = {
+    '対象種別': v.norm.targetType,
+    '学校名': v.norm.schoolName,
+    'クラス名': v.norm.targetType === 'class' ? v.norm.classNames.join(',') : '',
+    '児童ID': v.norm.targetType === 'student' ? v.norm.studentIds.join(',') : '',
+    '制限タイプ': v.norm.type,
+    'URL規制モード': isUrlBlock ? v.norm.filterMode : '',
+    '許可URLリスト': isUrlBlock ? hostListToSheetString_(v.norm.whitelist) : '',
+    '規制URLリスト': isUrlBlock ? hostListToSheetString_(v.norm.blacklist) : '',
+    '開始日': v.norm.dateFrom,
+    '終了日': v.norm.dateTo,
+    '繰り返し': v.norm.repeat,
+    '開始時刻': v.norm.startTime,
+    '終了時刻': v.norm.endTime,
+    '曜日': (v.norm.repeat === 'WEEKLY' && v.norm.weekdays.length) ? v.norm.weekdays.join(',') : '',
+    '更新日時': nowStr,
+    '備考': v.norm.note
+  };
+  withWriteLock(function () { updateScheduleCells_(target.rowIndex, patch); });
+
+  // --- 4) 編集後の行を返す（シート再読込はしない＝性能） ---
+  const saved = {
+    rowIndex: target.rowIndex,
+    id: target.id,
+    targetType: v.norm.targetType,
+    schoolName: String(v.norm.schoolName || '').trim(),
+    className: patch['クラス名'],
+    studentIds: v.norm.targetType === 'student' ? v.norm.studentIds : [],
+    type: v.norm.type,
+    filterMode: isUrlBlock ? String(v.norm.filterMode || '').trim().toUpperCase() : '',
+    whitelist: isUrlBlock ? normalizeHostListToArray_(v.norm.whitelist) : [],
+    blacklist: isUrlBlock ? normalizeHostListToArray_(v.norm.blacklist) : [],
+    dateFrom: v.norm.dateFrom,
+    dateTo: v.norm.dateTo,
+    repeat: v.norm.repeat,
+    startTime: v.norm.startTime,
+    endTime: v.norm.endTime,
+    weekdaysRaw: (v.norm.repeat === 'WEEKLY' && v.norm.weekdays.length) ? v.norm.weekdays.join(',') : '',
+    enabled: target.enabled,
+    overridden: target.overridden,
+    overrideAt: target.overrideAt,
+    createdBy: target.createdBy,
+    createdAt: target.createdAt,
+    updatedAt: nowStr,
+    note: v.norm.note
+  };
+
+  Logger.log('[SCHEDULE] updated id=' + target.id + ' target=' + v.norm.targetType +
+    ' by=' + String((teacher && teacher.email) || '') + ' row=' + target.rowIndex);
+
+  // 編集内容を子GASへ即時伝播（子は丸ごと置き換えなので取消も同時に反映される）
+  const shardProp = propagateScheduleToChildren_(saved);
+
+  return {
+    success: true,
+    message: '予約を更新しました',
+    schedule: scheduleRowToJson_(saved, new Date().getTime()),
+    row_index: target.rowIndex,
+    updated_at: nowStr,
+    shard: shardProp
+  };
 }
 
 /** cancel_schedule … 予約そのものを止める（有効=FALSE／行は残す） */
@@ -9003,6 +9386,23 @@ function api_cancelSchedule(authToken, scheduleId) {
   var teacher = extractTeacherFromToken_(authToken);
   if (!teacher) return apiNeedAuth_();
   return handleCancelSchedule_({ schedule_id: scheduleId, id: scheduleId, token: authToken }, teacher);
+}
+
+/** 【Request P】予約の編集（予約IDは維持）。学校名未指定なら教員の所属校で補う。 */
+function api_updateSchedule(authToken, scheduleData) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  var payload = (scheduleData && typeof scheduleData === 'object') ? scheduleData : {};
+  payload.token = authToken;
+  if (!payload.scheduleId && !payload.schedule_id && payload.id) {
+    payload.scheduleId = payload.id;
+    payload.schedule_id = payload.id;
+  }
+  if (!payload.schoolName && !payload.school_name && teacher.school) {
+    payload.schoolName = teacher.school;
+    payload.school_name = teacher.school;
+  }
+  return handleUpdateSchedule_(payload, teacher);
 }
 
 function api_overrideSchedule(authToken, scheduleId, actionType) {

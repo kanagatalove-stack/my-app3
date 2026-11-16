@@ -386,6 +386,9 @@ function runIn(expr) { return vm.runInContext(expr, M); }
     'normalizeSchoolName', 'schoolNamesMatch', 'resolveCanonicalSchool', 'isAllSchoolsName',
     'normalizeClassName',
     'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    // 【Request P】複数クラス／全校生徒対応で deviceMatchesSchedule_ が
+    //   scheduleClassList_ を呼ぶようになったため、抽出対象に加える。
+    'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
     'deviceMatchesSchedule_', 'readScheduleRows_',
     // 【フェーズ5】buildHeartbeatResponse は resolveSchedulePayloadForDevice_ を経由する。
     //   子GAS判定（isShardChild）が false ならローカル読みにフォールバックする。

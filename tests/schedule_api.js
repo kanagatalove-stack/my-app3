@@ -228,6 +228,8 @@ const FNS = [
   // --- 児童IDの表記ゆれ吸収（メール全体 / @より前のローカル部） ---
   'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
   // --- スケジュール中核 ---
+  // 【Request P】複数クラス／全校生徒対応のヘルパー（deviceMatchesSchedule_ が依存）
+  'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_', 'scheduleActiveDetail_',
   'deviceMatchesSchedule_', 'readScheduleRows_', 'isAnyScheduleActive_',
   // --- CRUD ---
   'schNowJstSec_', 'generateScheduleId_', 'validateScheduleInput_',
@@ -855,6 +857,10 @@ console.log('===== P. URLリストの配列化（文字列 → string[]） =====
       extractFn('normalizeUserLocalPart_'),
       extractFn('idKeysMatch_'),
       extractFn('emptySchedulePayload_'),
+      // 【Request P】shardSchedulePayloadFromCache_ は各窓に表示用 label を同封する
+      extractFn('scheduleClassList_'),
+      extractFn('scheduleActiveLabel_'),
+      extractFn('scheduleTargetLabel_'),
       extractFn('shardLoadScheduleCache_'),
       extractFn('shardSchedulePayloadFromCache_'),
       extractFn('schPad2_'), extractFn('schMsToJstStr_')
@@ -1002,6 +1008,8 @@ console.log('===== Q. 伝播経路（宛先解決とフォールバック） ===
     'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_', 'parseBoolean',
     'normalizeHostListToArray_', 'hostListToSheetString_',
     'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    // 【Request P】複数クラス／全校生徒対応の表示メタデータ用ヘルパー
+    'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
     'deviceMatchesSchedule_', 'shardBuildWindowsForStudent_', 'shardBuildScheduleByStudent_',
     'shardMapIndexFromMap', 'shardMapDefaultFromEmptyKey',
     'shardPropagatePolicy', 'propagateScheduleToChildren_'
@@ -1153,6 +1161,7 @@ console.log('===== R. 保存→伝播の発火保証 =====');
     'scopeStudentIdsForTeacher', 'parseBoolean',
     'normalizeHostListToArray_', 'hostListToSheetString_',
     'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_', 'scheduleActiveDetail_',
     'deviceMatchesSchedule_', 'readScheduleRows_', 'isAnyScheduleActive_',
     'schNowJstSec_', 'generateScheduleId_', 'validateScheduleInput_',
     'authorizeScheduleTarget_', 'appendScheduleRow_', 'updateScheduleCells_',
@@ -1334,6 +1343,7 @@ console.log('===== S. 子GASの自動判別（設定漏れの救済） =====');
     'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_', 'parseBoolean',
     'normalizeClassName', 'schoolNamesMatch', 'normalizeSchoolName',
     'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
     'deviceMatchesSchedule_', 'shardBuildWindowsForStudent_', 'shardBuildScheduleByStudent_',
     'emptySchedulePayload_',
     'shardLoadScheduleCache_', 'shardSaveScheduleCache_',
@@ -1525,7 +1535,8 @@ console.log('===== T. 児童IDの表記ゆれ吸収（メール全体 ⇄ ロー
     'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
     'normalizeHostListToArray_', 'hostListToSheetString_',
     'normalizeClassName', 'normalizeSchoolName', 'schoolNamesMatch',
-    'deviceMatchesSchedule_',
+    'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
+    'deviceMatchesSchedule_', 'scheduleActiveDetailFromCache_',
     'emptySchedulePayload_', 'shardLoadScheduleCache_', 'shardSchedulePayloadFromCache_',
     'schPad2_', 'schMsToJstStr_'
   ];
@@ -1957,7 +1968,8 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
     'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
     'normalizeHostListToArray_', 'hostListToSheetString_',
     'normalizeClassName', 'normalizeSchoolName', 'schoolNamesMatch',
-    'deviceMatchesSchedule_', 'emptySchedulePayload_',
+    'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
+    'deviceMatchesSchedule_', 'scheduleActiveDetailFromCache_', 'emptySchedulePayload_',
     'shardLoadScheduleCache_', 'shardSchedulePayloadFromCache_',
     'schPad2_', 'schMsToJstStr_',
     'propRaw', 'propBool', 'cfgWarn',
