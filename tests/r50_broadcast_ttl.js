@@ -91,6 +91,11 @@ vm.createContext(ctx);
 
 let code = '';
 ['maskStaleBroadcast_', 'parseBroadcastIssuedMs_', 'broadcastTtlMs_',
+ // 【r51】buildHeartbeatResponse は制御状態キャッシュと負荷バックオフも通す。
+ //   このスイートは CacheService を持たないが、各ヘルパーは try/typeof で
+ //   安全側（＝シート値・従来周期）に落ちるため、TTL 検証には影響しない。
+ 'hbStateCacheKey_', 'hbReadStateCache_',
+ 'hbReadLoad_', 'hbIsBackoffActive_', 'hbThrottleIntervalSec_',
  'buildHeartbeatResponse', 'parseBoolean', 'parseUrlList'].forEach(n => {
   code += extract(n) + '\n';
 });

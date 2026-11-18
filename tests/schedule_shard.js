@@ -239,6 +239,11 @@ const FNS = [
   'buildSchedulePayloadForDevice_',
   // 【r50】一斉表示の TTL マスク（親・子どちらの応答経路でも同じ関数を通す）
   'broadcastTtlMs_', 'parseBroadcastIssuedMs_', 'maskStaleBroadcast_',
+  // 【r51】性能3点（先行返却・過負荷バックオフ・初回即時応答）のヘルパー群。
+  //   shardApplyFromParent は bulkUpdate* 経由で hbPrimeControlState_ を呼ぶ。
+  'hbStateCacheKey_', 'hbReadStateCache_', 'hbWriteStateCache_',
+  'hbPrimeStateCacheMany_', 'hbPrimeControlState_',
+  'hbActiveIntervalSec_', 'hbReadLoad_', 'hbIsBackoffActive_', 'hbThrottleIntervalSec_',
   'buildHeartbeatResponse',
   // フェーズ5（子）
   'emptySchedulePayload_', 'shardSaveScheduleCache_', 'shardLoadScheduleCache_',
@@ -253,6 +258,14 @@ FNS.forEach(n => pieces.push(extractFn(n)));
 // 【r50】一斉表示 TTL の最低値（数値の var は extractConst で拾えないため直接抜く）
 pieces.push((src.match(/^var BROADCAST_TTL_MIN_MS\s*=\s*[^;\n]+;/m) ||
   ['var BROADCAST_TTL_MIN_MS = 120000;'])[0]);
+// 【r51】性能ヘルパーが参照する数値定数（本番と同じ値）
+['HB_STATE_CACHE_PREFIX', 'HB_STATE_CACHE_SEC', 'HB_STATE_CACHE_CHUNK',
+ 'HB_LOAD_CACHE_KEY', 'HB_LOAD_WINDOW_MS', 'HB_LOAD_SLOW_MS',
+ 'HB_LOAD_SLOW_RATIO', 'HB_LOAD_ERR_RATIO', 'HB_BACKOFF_SEC',
+ 'HB_BACKOFF_HOLD_MS'].forEach(function (n) {
+  const m = src.match(new RegExp('^var ' + n + '\\s*=[^;\\n]+;', 'm'));
+  if (m) pieces.push(m[0]);
+});
 
 // --- ハーネス側スタブ ---
 pieces.push('function getTargetSheet(name){ var s = __SHEETS[name]; if(!s) throw new Error("no sheet: "+name); return s; }');

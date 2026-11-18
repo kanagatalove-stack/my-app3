@@ -3020,6 +3020,339 @@ function maskStaleBroadcast_(broadcastUrl, broadcastId, nowMs, syncIntervalSec) 
   return { broadcast_url: url, broadcast_id: id };
 }
 
+// ============================================================================
+// 【高速化】制御状態のメモリ先行キャッシュ（CacheService）
+//
+//  背景（実機計測）
+//    端末起動・接続直後の1回目の操作だけ 26〜30 秒かかり、一度反映された後の
+//    2回目以降は 5〜6 秒で全端末揃う。原因は「ハートビート応答のたびに
+//    スプレッドシートを読み書きし、シートロック待ちで詰まる」こと。
+//
+//  方針
+//    教員の制御操作（ロック／解除／一斉表示／URL規制）を受けた時点で、
+//    その状態を CacheService に即時反映する。buildHeartbeatResponse は
+//    キャッシュがあればそれを最優先で使い、シートの読み書き完了を待たない。
+//    （シートへの永続化は従来どおり行う。キャッシュは「先に返す」ためだけ。）
+//
+//  安全側
+//    キャッシュが無い／壊れている／期限切れのときは従来どおりシート値を返す。
+//    つまりキャッシュは「高速化の上乗せ」であり、正しさの前提にはしない。
+// ============================================================================
+
+var HB_STATE_CACHE_PREFIX = 'hb_state:';
+var HB_STATE_CACHE_SEC = 600; // 10分（教員操作の間隔より十分長い）
+
+/** 端末1台ぶんの制御状態キャッシュキー。 */
+function hbStateCacheKey_(studentId) {
+  var id = String(studentId || '').trim();
+  if (!id) return '';
+  // 単体で切り出して実行するテストでは normalizeIdKey が無い場合がある（typeof ガード）。
+  var norm = (typeof normalizeIdKey === 'function') ? normalizeIdKey(id) : id.toLowerCase();
+  var pfx = (typeof HB_STATE_CACHE_PREFIX === 'string' && HB_STATE_CACHE_PREFIX)
+    ? HB_STATE_CACHE_PREFIX : 'hb_state:';
+  return pfx + norm;
+}
+
+/**
+ * 制御状態を CacheService へ即時反映する（シート書き込みと並行して呼ぶ）。
+ * 失敗しても本処理は止めない（キャッシュは高速化の上乗せ）。
+ */
+function hbWriteStateCache_(studentId, state) {
+  try {
+    var key = hbStateCacheKey_(studentId);
+    if (!key) return false;
+    var cur = {};
+    try {
+      var raw = CacheService.getScriptCache().get(key);
+      if (raw) cur = JSON.parse(raw) || {};
+    } catch (e0) { cur = {}; }
+    var next = {};
+    var k0 = Object.keys(cur);
+    for (var i = 0; i < k0.length; i++) next[k0[i]] = cur[k0[i]];
+    var ks = Object.keys(state || {});
+    for (var j = 0; j < ks.length; j++) {
+      if (state[ks[j]] === undefined) continue;
+      next[ks[j]] = state[ks[j]];
+    }
+    next.__at = new Date().getTime();
+    var sec = (typeof HB_STATE_CACHE_SEC === 'number' && HB_STATE_CACHE_SEC > 0)
+      ? HB_STATE_CACHE_SEC : 600;
+    CacheService.getScriptCache().put(key, JSON.stringify(next), sec);
+    return true;
+  } catch (e) { return false; }
+}
+
+/** 制御状態キャッシュを読む。無ければ null（＝シート値へフォールバック）。 */
+function hbReadStateCache_(studentId) {
+  try {
+    var key = hbStateCacheKey_(studentId);
+    if (!key) return null;
+    var raw = CacheService.getScriptCache().get(key);
+    if (!raw) return null;
+    var o = JSON.parse(raw);
+    if (!o || typeof o !== 'object') return null;
+    return o;
+  } catch (e) { return null; }
+}
+
+/**
+ * 制御状態キャッシュを消す（キャッシュとシートの食い違いを残さないため）。
+ */
+function hbClearStateCache_(studentId) {
+  var key = hbStateCacheKey_(studentId);
+  if (!key) return false;
+  try { CacheService.getScriptCache().remove(key); return true; }
+  catch (e) { return false; }
+}
+
+// 複数児童へ同じ制御状態を「書き込み前」にまとめて先行反映するための補助。
+//   CacheService の getAll / putAll を使い、1,600 台でも呼び出し回数を数回に抑える
+//   （1台ずつ get+put すると全校一斉操作で数千回のキャッシュ往復になり本末転倒）。
+var HB_STATE_CACHE_CHUNK = 90; // getAll / putAll の1回あたり上限に対する安全値
+
+/**
+ * 複数児童の制御状態をキャッシュへ先行反映する（シート setValues の「前」に呼ぶ）。
+ *   既存キャッシュがあれば項目単位でマージする（ロックだけ更新しても
+ *   URL規制の先行値が消えない）。失敗しても本処理は止めない。
+ */
+function hbPrimeStateCacheMany_(studentIds, state) {
+  var list = Array.isArray(studentIds) ? studentIds : (studentIds ? [studentIds] : []);
+  if (!list.length) return 0;
+  var keys = [];
+  var seen = {};
+  for (var i = 0; i < list.length; i++) {
+    var k = hbStateCacheKey_(list[i]);
+    if (!k || seen[k]) continue;
+    seen[k] = true;
+    keys.push(k);
+  }
+  if (!keys.length) return 0;
+
+  var nowMs = new Date().getTime();
+  var sks = Object.keys(state || {});
+  var written = 0;
+  var chunkSize = (typeof HB_STATE_CACHE_CHUNK === 'number' && HB_STATE_CACHE_CHUNK > 0)
+    ? HB_STATE_CACHE_CHUNK : 90;
+  var sec = (typeof HB_STATE_CACHE_SEC === 'number' && HB_STATE_CACHE_SEC > 0)
+    ? HB_STATE_CACHE_SEC : 600;
+  try {
+    var cache = CacheService.getScriptCache();
+    for (var c = 0; c < keys.length; c += chunkSize) {
+      var chunk = keys.slice(c, c + chunkSize);
+      var cur = {};
+      try { cur = cache.getAll(chunk) || {}; } catch (eAll) { cur = {}; }
+      var put = {};
+      for (var j = 0; j < chunk.length; j++) {
+        var kk = chunk[j];
+        var merged = {};
+        try { if (cur[kk]) merged = JSON.parse(cur[kk]) || {}; } catch (eP) { merged = {}; }
+        for (var m = 0; m < sks.length; m++) {
+          if (state[sks[m]] === undefined) continue;
+          merged[sks[m]] = state[sks[m]];
+        }
+        merged.__at = nowMs;
+        put[kk] = JSON.stringify(merged);
+      }
+      cache.putAll(put, sec);
+      written += Object.keys(put).length;
+    }
+    return written;
+  } catch (e) {
+    return written;
+  }
+}
+
+/**
+ * ハートビート応答の最終処理。処理時間を負荷観測へ記録してから応答を返す。
+ *   hbRecordLoad_ は CacheService だけを触る（シートI/Oゼロ）ので、
+ *   ここで1回フックするだけで全校1,600台ぶんの負荷を観測できる。
+ */
+function hbFinishHeartbeat_(res, t0) {
+  try {
+    var elapsed = new Date().getTime() - Number(t0 || 0);
+    hbRecordLoad_(elapsed, false, new Date().getTime());
+  } catch (e) { /* 観測できなくても応答は必ず返す */ }
+  return res;
+}
+
+/**
+ * 一括操作（ロック／一斉表示／URL規制）の直前に呼ぶ先行反映。
+ *   'ALL' や配列でない指定は、対象児童が確定できないため何もしない
+ *   （その場合も従来どおりシート書き込み後の応答で正しくなる）。
+ */
+function hbPrimeControlState_(studentIds, state) {
+  if (!Array.isArray(studentIds) || !studentIds.length) return 0;
+  try {
+    return hbPrimeStateCacheMany_(studentIds, state);
+  } catch (e) { return 0; }
+}
+
+// ----------------------------------------------------------------------------
+// 【初回接続】端末を眠らせないための「初回応答」判定
+//
+//  実機症状: 接続直後・経路切替直後の1回目だけ 26〜30 秒かかる。
+//  原因の一つが「初回応答で ka_active=false を返してしまい、端末が
+//  20〜30 秒のアイドル（同期停止）へ入る」こと。子GASは親から KA_SESSIONS の
+//  押し出しを受けるまで isTeacherConsoleActive() が false になるため、
+//  経路切替直後の初回だけ誤って「眠れ」と指示していた。
+//
+//  対策: 「行が無い（＝新規）」または「最終同期日時が空（＝未同期）」の初回だけ、
+//  ka_active=true / sync_interval_sec=1.5 を返して端末を起こしたままにする。
+//  暴走防止のため、同一端末には HB_FIRST_CONTACT_SEC 秒に1回しか発動しない
+//  （＝眠っている端末が永久に 1.5 秒ポーリングし続けることはない）。
+// ----------------------------------------------------------------------------
+var HB_FIRST_CONTACT_PREFIX = 'hb_fc:';
+var HB_FIRST_CONTACT_SEC = 120;
+
+/**
+ * 稼働中の同期周期（既定 1.5 秒）。
+ *   ACTIVE_SYNC_INTERVAL_SEC は Code.gs の const だが、関数を単体で切り出して
+ *   実行するテストでは未定義になり得るため typeof ガードを挟む
+ *   （＝テストのために関数が壊れない。本番では常に const の値を返す）。
+ */
+function hbActiveIntervalSec_() {
+  try {
+    if (typeof ACTIVE_SYNC_INTERVAL_SEC === 'number' && ACTIVE_SYNC_INTERVAL_SEC > 0) {
+      return ACTIVE_SYNC_INTERVAL_SEC;
+    }
+  } catch (e) { /* 未定義環境では既定値へ */ }
+  return 1.5;
+}
+
+function hbFirstContactKey_(studentId) {
+  var raw = String(studentId == null ? '' : studentId).trim();
+  if (!raw) return '';
+  var id = (typeof normalizeIdKey === 'function') ? normalizeIdKey(raw) : raw.toLowerCase();
+  if (!id) return '';
+  var pfx = (typeof HB_FIRST_CONTACT_PREFIX === 'string' && HB_FIRST_CONTACT_PREFIX)
+    ? HB_FIRST_CONTACT_PREFIX : 'hb_fc:';
+  return pfx + id;
+}
+
+/**
+ * この応答が「初回接続（または経路切替直後の初回）」かどうか。
+ *   ・最終同期日時が入っていれば初回ではない（false）
+ *   ・初回なら1度だけ true を返し、以降 HB_FIRST_CONTACT_SEC 秒は false
+ *   ※ キャッシュ不可時は false（＝従来どおりの挙動。無駄な常時ポーリングはしない）
+ */
+function hbIsFirstContact_(studentId, row, headerMap, nowMs) {
+  var syncCol = headerMap ? headerMap['最終同期日時'] : 0;
+  var lastSync = (syncCol && row) ? String(row[syncCol - 1] || '').trim() : '';
+  // 一度でも同期済みの行は「初回」ではない（＝アイドル復帰は通常判定に任せる）
+  if (lastSync) return false;
+  var key = hbFirstContactKey_(studentId);
+  if (!key) return false;
+  try {
+    var cache = CacheService.getScriptCache();
+    if (cache.get(key)) return false;
+    var holdSec = (typeof HB_FIRST_CONTACT_SEC === 'number' && HB_FIRST_CONTACT_SEC > 0)
+      ? HB_FIRST_CONTACT_SEC : 120;
+    cache.put(key, String(Number(nowMs) || new Date().getTime()), holdSec);
+    return true;
+  } catch (e) { return false; }
+}
+
+// ============================================================================
+// 【負荷保護】過負荷時の動的バックオフ（14校同時ピーク）
+//
+//  ACTIVE_SYNC_INTERVAL_SEC = 1.5 を基本最速値とし、GAS の同時実行制限や
+//  シート処理遅延の兆候が出たときだけ sync_interval_sec を一時的に緩和する。
+//  負荷が下がれば即 1.5 秒へ戻す（下げっぱなしにしない）。
+//
+//  観測はメモリ上（CacheService）の「直近の重さ」だけで行い、シートには触らない。
+// ============================================================================
+
+var HB_LOAD_CACHE_KEY = 'hb_load_v1';
+var HB_LOAD_WINDOW_MS = 60000;        // 直近60秒の観測で判断する
+var HB_LOAD_SLOW_MS = 2500;           // 1回のハートビートが2.5秒超なら「遅い」
+var HB_LOAD_SLOW_RATIO = 0.25;        // 遅い割合が25%を超えたら緩和
+var HB_LOAD_ERR_RATIO = 0.10;         // エラー率が10%を超えたら緩和
+var HB_BACKOFF_SEC = 4;               // 緩和中の周期（3〜5秒の範囲内）
+var HB_BACKOFF_HOLD_MS = 30000;       // 緩和は最低30秒続ける（ばたつき防止）
+
+/**
+ * 直近の負荷観測を読む。
+ *   { slow: 遅い件数, total: 総件数, err: エラー件数, since: 観測開始ms, until: 緩和期限ms }
+ */
+function hbReadLoad_() {
+  var empty = { slow: 0, total: 0, err: 0, since: 0, until: 0 };
+  try {
+    var lk = (typeof HB_LOAD_CACHE_KEY === 'string' && HB_LOAD_CACHE_KEY)
+      ? HB_LOAD_CACHE_KEY : 'hb_load_v1';
+    var raw = CacheService.getScriptCache().get(lk);
+    if (!raw) return empty;
+    var o = JSON.parse(raw);
+    if (!o || typeof o !== 'object') return empty;
+    return {
+      slow: Number(o.slow) || 0, total: Number(o.total) || 0,
+      err: Number(o.err) || 0, since: Number(o.since) || 0,
+      until: Number(o.until) || 0
+    };
+  } catch (e) { return empty; }
+}
+
+function hbWriteLoad_(o) {
+  try {
+    var lk = (typeof HB_LOAD_CACHE_KEY === 'string' && HB_LOAD_CACHE_KEY)
+      ? HB_LOAD_CACHE_KEY : 'hb_load_v1';
+    CacheService.getScriptCache().put(lk, JSON.stringify(o || {}), 300);
+  } catch (e) {}
+}
+
+/**
+ * 1回のハートビート処理時間を記録し、過負荷なら緩和期限を延ばす。
+ *   シートには一切触らない（書き込み負荷ゼロ）。
+ */
+function hbRecordLoad_(elapsedMs, isError, nowMs) {
+  var now = Number(nowMs) || new Date().getTime();
+  var o = hbReadLoad_();
+  // 観測窓を過ぎたらカウントをリセットする（古い重さを引きずらない）
+  if (!o.since || (now - o.since) > HB_LOAD_WINDOW_MS) {
+    o.since = now; o.slow = 0; o.total = 0; o.err = 0;
+  }
+  o.total++;
+  if (Number(elapsedMs) > HB_LOAD_SLOW_MS) o.slow++;
+  if (isError) o.err++;
+
+  var slowRatio = o.total ? (o.slow / o.total) : 0;
+  var errRatio = o.total ? (o.err / o.total) : 0;
+  var overloaded = (o.total >= 4) &&
+    (slowRatio > HB_LOAD_SLOW_RATIO || errRatio > HB_LOAD_ERR_RATIO);
+  if (overloaded) {
+    var until = now + HB_BACKOFF_HOLD_MS;
+    if (until > o.until) o.until = until; // 期限は延ばす方向のみ
+    try {
+      Logger.log('[LOAD] 過負荷を検知: slow=' + o.slow + '/' + o.total +
+        ' err=' + o.err + '/' + o.total +
+        ' → sync_interval_sec を ' + HB_BACKOFF_SEC + ' 秒へ緩和（〜' + o.until + '）');
+    } catch (eL) {}
+  }
+  hbWriteLoad_(o);
+  return o;
+}
+
+/**
+ * 過負荷中か（緩和期限が未来なら true）。
+ */
+function hbIsBackoffActive_(nowMs) {
+  var now = Number(nowMs) || new Date().getTime();
+  var o = hbReadLoad_();
+  return !!(o.until && now < o.until);
+}
+
+/**
+ * 端末へ配布する同期周期(秒)を、過負荷なら緩和して返す。
+ *   ・通常       … そのまま（=1.5）
+ *   ・過負荷     … HB_BACKOFF_SEC（4秒）
+ *   ・0（非稼働）… 0 のまま（緩和しない。眠っている端末は起きない）
+ */
+function hbThrottleIntervalSec_(baseSec, nowMs) {
+  var base = Number(baseSec);
+  if (!isFinite(base) || base <= 0) return 0;
+  if (!hbIsBackoffActive_(nowMs)) return base;
+  return Math.max(base, HB_BACKOFF_SEC);
+}
+
 /**
  * ハートビート応答を1か所で組み立てる（3経路の重複を排除し、項目の欠けを防ぐ）。
  */
@@ -3066,15 +3399,33 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
     kaInfo ? kaInfo.sync_interval_sec : 0
   );
 
+  // 【高速化】制御状態のメモリ先行キャッシュ。
+  //   教員の操作時点で CacheService へ即時反映済みなので、シートの読み書き完了を
+  //   待たずにここで最新状態を採用して返す（初回・直後の反映遅延を解消する）。
+  //   キャッシュが無い／壊れているときは従来どおりシート値をそのまま使う。
+  var hbCached = hbReadStateCache_(studentId);
+  var effLock = parseBoolean(row[headerMap['画面ロック'] - 1]);
+  var effFilter = String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase();
+  var effWhite = parseUrlList(row[headerMap['許可URLリスト'] - 1]);
+  var effBlack = parseUrlList(row[headerMap['規制URLリスト'] - 1]);
+  if (hbCached) {
+    if (typeof hbCached.screen_lock === 'boolean') effLock = hbCached.screen_lock;
+    if (hbCached.filter_mode) effFilter = String(hbCached.filter_mode).toUpperCase();
+    if (Array.isArray(hbCached.whitelist_urls)) effWhite = hbCached.whitelist_urls;
+    if (Array.isArray(hbCached.blacklist_urls)) effBlack = hbCached.blacklist_urls;
+  }
+  // 【負荷保護】過負荷時のみ sync_interval_sec を緩和する（負荷が下がれば即 1.5 へ戻る）
+  var effSyncSec = hbThrottleIntervalSec_(kaInfo ? kaInfo.sync_interval_sec : 0, serverTimeMs);
+
   return {
     student_id: studentId,
     school_name: String(row[headerMap['学校名'] - 1] || ''),
     student_name: String(row[headerMap['氏名'] - 1] || ''),
     class_name: String(row[headerMap['クラス'] - 1] || ''),
-    screen_lock: parseBoolean(row[headerMap['画面ロック'] - 1]),
-    filter_mode: String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase(),
-    whitelist_urls: parseUrlList(row[headerMap['許可URLリスト'] - 1]),
-    blacklist_urls: parseUrlList(row[headerMap['規制URLリスト'] - 1]),
+    screen_lock: effLock,
+    filter_mode: effFilter,
+    whitelist_urls: effWhite,
+    blacklist_urls: effBlack,
     // 【TTLマスク済み】期限切れは '' / '' になる（3分以内なら通常どおり返る）。
     broadcast_url: bcMasked.broadcast_url,
     broadcast_id: bcMasked.broadcast_id,
@@ -3084,7 +3435,8 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
     monitor_flag: monFlagCol ? parseBoolean(row[monFlagCol - 1]) : false,
     monitor_reason: monReasonCol ? String(row[monReasonCol - 1] || '') : '',
     ka_active: kaActive,
-    sync_interval_sec: kaInfo.sync_interval_sec,
+    // 【負荷保護】通常は 1.5 秒のまま。過負荷のときだけ一時的に緩和（4秒）する。
+    sync_interval_sec: effSyncSec,
     idle_drift_until: kaInfo.idle_drift_until,
     server_time: now,
     // 【フェーズ3】端末の時計補正とスケジュール判定のための配信契約。
@@ -3275,10 +3627,10 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   const incomingSchool = canonicalizeIncomingSchool(schoolNameRaw);
 
   // 教員コンソールの稼働有無に応じた児童端末の同期周期を配布する（非稼働=0＝同期しない）。
-  const kaInfo = (typeof computeKaInterval === 'function')
+  let kaInfo = (typeof computeKaInterval === 'function')
     ? computeKaInterval(isTeacherConsoleActive() ? ACTIVE_SYNC_INTERVAL_SEC : 0, new Date().getTime())
     : { ka_active: false, sync_interval_sec: 0, idle_drift_until: 0 };
-  const kaActive = kaInfo.ka_active;
+  let kaActive = kaInfo.ka_active;
 
   const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
   const nowMs = new Date().getTime();
@@ -3297,7 +3649,28 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   if (resolved.rowNum < 0) {
     // 未登録 → 新規自動登録へ（重複防止のため書き込みロック内で再確認する）
     hbLog('heartbeat: 未登録のため新規登録へ id=' + studentId);
-    return hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now);
+    // 初回接続（行がまだ無い）ので、登録直後の1回目から稼働周期で配る。
+    if (hbIsFirstContact_(studentId, null, headerMap, nowMs)) {
+      kaInfo = { ka_active: true, sync_interval_sec: hbActiveIntervalSec_(), idle_drift_until: 0 };
+      kaActive = true;
+    }
+    return hbFinishHeartbeat_(
+      hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now),
+      t0);
+  }
+
+  // 【初回接続】未同期の端末（新規・経路切替直後）は、ここで一度だけ
+  //   「稼働中」と同じ周期（1.5秒）を返してアイドル入りを防ぐ。
+  //   子GASは親から KA_SESSIONS の押し出しを受けるまで非稼働と判定してしまうため、
+  //   初回応答が ka_active=false になると端末が 20〜30 秒眠り、実機の
+  //   「最初の1回だけ 26〜30 秒」に直結していた。
+  //   ※ 発動は同一端末につき HB_FIRST_CONTACT_SEC 秒に1回だけ（暴走しない）。
+  if (hbIsFirstContact_(studentId, resolved.row, headerMap, nowMs)) {
+    var fcInterval = hbActiveIntervalSec_();
+    kaInfo = { ka_active: true, sync_interval_sec: fcInterval, idle_drift_until: 0 };
+    kaActive = true;
+    hbLog('heartbeat: 初回接続のため稼働周期を先行配布 id=' + studentId +
+      ' interval=' + fcInterval);
   }
 
   const row = resolved.row;
@@ -3347,7 +3720,8 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
     // 何も書かない → シートへは書かない（読み取りのみで応答）
     hbLog('heartbeat: 書き込み不要 row=' + rowNum +
       ' elapsed=' + (new Date().getTime() - t0) + 'ms');
-    return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
+    return hbFinishHeartbeat_(
+      buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now), t0);
   }
 
   // ここから先は書き込みが必要（sheet は手順1で開済み）
@@ -3386,7 +3760,7 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
     ' syncDue=' + syncDue + ' schoolFill=' + schoolFill + ' monitor=' + monEnabled +
     ' elapsed=' + (new Date().getTime() - t0) + 'ms');
 
-  return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
+  return hbFinishHeartbeat_(buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now), t0);
 }
 
 /**
@@ -4381,6 +4755,10 @@ function bulkUpdateScreenLock(studentIds, lockState) {
   const __bt = function (label) {
     try { if (typeof bulkTraceMark === 'function') bulkTraceMark(label); } catch (e) {}
   };
+  // 【高速化】シート書き込み（最大15秒のロック待ちを含む）より前に、
+  //   制御状態を CacheService へ先行反映する。端末の次のハートビートは
+  //   シート書き込みの完了を待たずに最新状態を受け取れる。
+  hbPrimeControlState_(studentIds, { screen_lock: parseBoolean(lockState) });
   return withWriteLock(function () {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
@@ -4420,6 +4798,14 @@ function bulkUpdateScreenLock(studentIds, lockState) {
 // 一斉表示URLを配信し、実行IDを生成して返す。
 // ※ 実行IDの生成は必ずロック内で行い、同時配信でも別IDとなることを保証する。
 function bulkUpdateBroadcastUrl(studentIds, targetUrl, broadcastId) {
+  // 【高速化】先行反映。実行IDはロック内で採番するため、ここでは
+  //   呼び出し側が確定済みのIDがある場合だけ先行して配る（無ければシート値に任せる）。
+  if (broadcastId) {
+    hbPrimeControlState_(studentIds, {
+      broadcast_url: String(targetUrl == null ? '' : targetUrl),
+      broadcast_id: String(broadcastId)
+    });
+  }
   return withWriteLock(function () {
     const bcId = broadcastId || generateBroadcastId();
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
@@ -4459,6 +4845,19 @@ function bulkUpdateBroadcastUrl(studentIds, targetUrl, broadcastId) {
 }
 
 function bulkUpdateFilterMode(studentIds, filterMode, whitelistUrls, blacklistUrls) {
+  // 【高速化】先行反映（シート書き込み・ロック待ちの前に配る）。
+  (function () {
+    const st = { filter_mode: String(filterMode == null ? '' : filterMode) };
+    try {
+      if (whitelistUrls !== undefined && whitelistUrls !== null) {
+        st.whitelist_urls = parseUrlList(hostListToSheetString_(whitelistUrls));
+      }
+      if (blacklistUrls !== undefined && blacklistUrls !== null) {
+        st.blacklist_urls = parseUrlList(hostListToSheetString_(blacklistUrls));
+      }
+    } catch (eW) { /* 変換できなくてもモードだけは先行反映する */ }
+    hbPrimeControlState_(studentIds, st);
+  })();
   return withWriteLock(function () {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);

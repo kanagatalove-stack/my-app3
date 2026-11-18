@@ -115,7 +115,12 @@ const ctx = {
   Logger: { log(){} }
 };
 // load needed functions
-const names = ['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','resolveTeacherScopeSchoolName','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isDeviceInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','withWriteLock','generateBroadcastId','bulkUpdateScreenLock','bulkUpdateBroadcastUrl','bulkUpdateFilterMode','updateSingleDevice','parseBoolean','normalizeHostListToArray_','hostListToSheetString_'];
+const names = ['getHeaderMap','normalizeSchoolName','schoolNamesMatch','resolveCanonicalSchool','resolveTeacherScopeSchoolName','getTeacherScopeInfo','isAllSchoolsName','normalizeClassName','getTeacherTargetClasses','isClassInTeacherScope','isDeviceInTeacherScope','isAdminTeacher','scopeStudentIdsForTeacher','withWriteLock','generateBroadcastId',
+ // 【r51】一括操作は CacheService へ先行反映してからシートへ書く。
+ //   このスイートは CacheService を持たないが、ヘルパーは try で安全側に落ちる
+ //   （＝先行反映はスキップされ、シート書き込みの検証は従来どおり成立する）。
+ 'hbStateCacheKey_','hbPrimeStateCacheMany_','hbPrimeControlState_',
+ 'bulkUpdateScreenLock','bulkUpdateBroadcastUrl','bulkUpdateFilterMode','updateSingleDevice','parseBoolean','parseUrlList','normalizeHostListToArray_','hostListToSheetString_'];
 let code = '';
 // constants used by functions
 code += 'const SCHOOL_ALIASES = ' + JSON.stringify({

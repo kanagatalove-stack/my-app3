@@ -90,6 +90,11 @@ let code = '';
   //  【r50】buildHeartbeatResponse は一斉表示の TTL マスクを通す。
   //    期限切れの一斉表示実行IDを空文字に落とすためのヘルパー群。
   'broadcastTtlMs_','parseBroadcastIssuedMs_','maskStaleBroadcast_',
+  //  【r51】性能3点（CacheService先行返却・過負荷バックオフ・初回即時応答）
+  //    これらは buildHeartbeatResponse / processHeartbeat から呼ばれる。
+  'hbStateCacheKey_','hbReadStateCache_','hbIsFirstContact_','hbFirstContactKey_',
+  'hbActiveIntervalSec_','hbReadLoad_','hbIsBackoffActive_','hbThrottleIntervalSec_',
+  'hbFinishHeartbeat_','hbRecordLoad_','hbWriteLoad_',
   'buildHeartbeatResponse','hbApplyMonitor','hbRegisterDevice',
   //  §3 本体
   'processHeartbeat'
@@ -104,6 +109,13 @@ function extractLineConst(name) {
 // 【r50】一斉表示 TTL の最低値（数値の var は extractConst で拾えないため直接抜く）
 const __ttlVar = src.match(/^var BROADCAST_TTL_MIN_MS\s*=\s*[^;\n]+;/m);
 code += (__ttlVar ? __ttlVar[0] : 'var BROADCAST_TTL_MIN_MS = 120000;') + '\n';
+// 【r51】性能ヘルパーが参照する数値定数（本番と同じ値をそのまま渡す）
+['HB_FIRST_CONTACT_PREFIX','HB_FIRST_CONTACT_SEC','HB_LOAD_CACHE_KEY',
+ 'HB_LOAD_WINDOW_MS','HB_LOAD_SLOW_MS','HB_LOAD_SLOW_RATIO','HB_LOAD_ERR_RATIO',
+ 'HB_BACKOFF_SEC','HB_BACKOFF_HOLD_MS'].forEach(function (n) {
+  const m = src.match(new RegExp('^var ' + n + '\\s*=[^;\\n]+;', 'm'));
+  if (m) code += m[0] + '\n';
+});
 code += extractLineConst('HB_DEBUG_LOG') + '\n';
 code += extractLineConst('HB_LOG_PREFIX') + '\n';
 vm.createContext(ctx);
