@@ -87,6 +87,9 @@ let code = '';
   // ---- 行解決（行番号キャッシュは廃止。毎回シートから引き直す） ----
   'hbLog','hbResolveRowByStudentId',
   //  §2 応答組み立て・サイト監視・新規登録（processHeartbeat から切り出した関数）
+  //  【r50】buildHeartbeatResponse は一斉表示の TTL マスクを通す。
+  //    期限切れの一斉表示実行IDを空文字に落とすためのヘルパー群。
+  'broadcastTtlMs_','parseBroadcastIssuedMs_','maskStaleBroadcast_',
   'buildHeartbeatResponse','hbApplyMonitor','hbRegisterDevice',
   //  §3 本体
   'processHeartbeat'
@@ -98,6 +101,9 @@ function extractLineConst(name) {
   if (!m) throw new Error('not found const: ' + name);
   return m[0];
 }
+// 【r50】一斉表示 TTL の最低値（数値の var は extractConst で拾えないため直接抜く）
+const __ttlVar = src.match(/^var BROADCAST_TTL_MIN_MS\s*=\s*[^;\n]+;/m);
+code += (__ttlVar ? __ttlVar[0] : 'var BROADCAST_TTL_MIN_MS = 120000;') + '\n';
 code += extractLineConst('HB_DEBUG_LOG') + '\n';
 code += extractLineConst('HB_LOG_PREFIX') + '\n';
 vm.createContext(ctx);

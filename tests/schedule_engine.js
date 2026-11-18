@@ -393,9 +393,16 @@ function runIn(expr) { return vm.runInContext(expr, M); }
     // 【フェーズ5】buildHeartbeatResponse は resolveSchedulePayloadForDevice_ を経由する。
     //   子GAS判定（isShardChild）が false ならローカル読みにフォールバックする。
     'resolveSchedulePayloadForDevice_',
-    'buildSchedulePayloadForDevice_', 'buildHeartbeatResponse'
+    'buildSchedulePayloadForDevice_',
+    // 【r50】buildHeartbeatResponse は一斉表示の TTL マスクを通す。
+    //   期限切れの一斉表示実行IDを空文字に落とすためのヘルパー群。
+    'broadcastTtlMs_', 'parseBroadcastIssuedMs_', 'maskStaleBroadcast_',
+    'buildHeartbeatResponse'
   ];
   GAS_FNS.forEach(n => gasPieces.push(extractFn(gasSrc, n)));
+  // 【r50】一斉表示 TTL の最低値（数値の var は extractConst で拾えないため直接抜く）
+  gasPieces.push((gasSrc.match(/^var BROADCAST_TTL_MIN_MS\s*=\s*[^;\n]+;/m) ||
+    ['var BROADCAST_TTL_MIN_MS = 120000;'])[0]);
   gasPieces.push('function getTargetSheet(name){ return __SHEETS[name]; }');
   // 【フェーズ5】このスイートは「子GASではない」単体GASとして検証する。
   //   子GAS経路（PropertiesService キャッシュ）は schedule_shard.js で検証する。

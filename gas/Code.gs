@@ -2929,6 +2929,97 @@ function hbResolveRowByStudentId(sheet, headerMap, studentId) {
   return { rowNum: -1, row: null, total: total, orphanRowNum: orphanRowNum };
 }
 
+// ============================================================================
+// 一斉表示（ブロードキャスト）の TTL マスク
+//
+//  実機症状
+//    対象端末がログアウト／シャットダウンでオフラインになった後、再度ログイン・
+//    連携した「初回同期」だけ、過去に実行した一斉表示URLのサイトが新しいタブで
+//    1つ自動的に開いてしまう（2回目以降は発生しない）。
+//
+//  原因
+//    [1] シートの I列(一斉表示URL) / J列(一斉表示実行ID `bc_<ms>_<rand>`) に
+//        過去の指示値が残ったままになっている。
+//    [2] 端末(v1.6.5)の「実行済みID記憶」(storage.last_broadcast_id) は
+//        ログアウト／シャットダウンで揮発する。再連携の初回ハートビート応答で
+//        古い `bc_<ms>_<rand>` を受け取ると「新規の一斉表示指示」と判定して
+//        タブを開いてしまう。
+//
+//  対策（GAS側のみ・シート書き込み負荷ゼロ）
+//    端末へ返すポリシー応答を組み立てるこの1か所で、メモリ上のタイムスタンプ
+//    比較だけを行い、期限切れの一斉表示を空文字へマスクする。
+//    extension/ は v1.6.5 のまま一切変更しない。
+//
+//  有効期限(TTL)
+//    Math.max(120000, sync_interval_sec * 1000 * 3)
+//    ・最低 2 分（120,000ms）
+//    ・ポーリング間隔が長い現場では「間隔の3倍」まで許容し、
+//      正当な一斉表示が届く前にマスクされる事故を防ぐ。
+//
+//  安全側フォールバック
+//    `bc_<ms>_<rand>` から有効な数値が取れない古い／不正なIDは期限切れ扱い。
+//    ただし ID 自体が空のときは、そのまま空（何もしない）。
+// ============================================================================
+
+// 一斉表示の最低有効期限（2分）。ポーリング間隔が長い場合はこの3倍まで延ばす。
+var BROADCAST_TTL_MIN_MS = 120000;
+
+/**
+ * 一斉表示の有効期限(ms)を返す。
+ *   既定 120,000ms（2分）。sync_interval_sec が 40 秒を超える場合のみ
+ *   「間隔 × 3」の方が長くなるため、その値を使う。
+ */
+function broadcastTtlMs_(syncIntervalSec) {
+  var base = BROADCAST_TTL_MIN_MS;
+  var iv = Number(syncIntervalSec);
+  if (!isFinite(iv) || iv <= 0) return base;
+  var byInterval = iv * 1000 * 3;
+  return byInterval > base ? byInterval : base;
+}
+
+/**
+ * 実行ID `bc_<issuedMs>_<rand>` から発行時刻(epoch ms)を取り出す。
+ *   取り出せない（空・旧形式・数値でない）ときは 0 を返す＝呼び出し側で期限切れ扱い。
+ */
+function parseBroadcastIssuedMs_(broadcastId) {
+  var id = String(broadcastId || '').trim();
+  if (!id) return 0;
+  var m = /^bc_(\d{10,16})(?:_|$)/.exec(id);
+  if (!m) return 0;
+  var ms = Number(m[1]);
+  if (!isFinite(ms) || ms <= 0) return 0;
+  return ms;
+}
+
+/**
+ * 期限切れの一斉表示を空文字へマスクする（シートには一切書き込まない）。
+ *   戻り値は必ず { broadcast_url: string, broadcast_id: string }。
+ */
+function maskStaleBroadcast_(broadcastUrl, broadcastId, nowMs, syncIntervalSec) {
+  var url = String(broadcastUrl == null ? '' : broadcastUrl).trim();
+  var id = String(broadcastId == null ? '' : broadcastId).trim();
+
+  // ID が空＝そもそも一斉表示の指示が無い。何も返さない。
+  if (!id) return { broadcast_url: '', broadcast_id: '' };
+
+  var issuedMs = parseBroadcastIssuedMs_(id);
+  // 旧形式・不正なIDは、再起動時の誤爆を防ぐため安全側で期限切れ扱いにする。
+  if (!issuedMs) return { broadcast_url: '', broadcast_id: '' };
+
+  var now = Number(nowMs);
+  if (!isFinite(now) || now <= 0) return { broadcast_url: '', broadcast_id: '' };
+
+  // 未来方向のズレは期限切れとしない（端末時計ではなくサーバ時刻で比較するため
+  // 通常は起きないが、負の経過時間で誤ってマスクしないようガードする）。
+  var elapsed = now - issuedMs;
+  if (elapsed < 0) return { broadcast_url: url, broadcast_id: id };
+
+  var ttl = broadcastTtlMs_(syncIntervalSec);
+  if (elapsed > ttl) return { broadcast_url: '', broadcast_id: '' };
+
+  return { broadcast_url: url, broadcast_id: id };
+}
+
 /**
  * ハートビート応答を1か所で組み立てる（3経路の重複を排除し、項目の欠けを防ぐ）。
  */
@@ -2961,6 +3052,20 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
     try { Logger.log('[SCHEDULE] payload build failed: ' + eSch); } catch (eLog) {}
   }
 
+  // 【一斉表示 TTL マスク】端末の再起動・再連携の「初回同期」だけ、過去の
+  //   一斉表示URLが勝手に開く不具合への対策。
+  //   シートの I列/J列には過去の指示値が残ったままで、端末側の実行済みID記憶は
+  //   ログアウト／シャットダウンで揮発するため、古い `bc_<ms>_<rand>` が
+  //   「新規指示」と誤判定されていた。
+  //   ここでメモリ上のタイムスタンプ比較だけを行い、期限切れは空文字にする。
+  //   ※ シートへの書き込みは一切しない（書き込み負荷ゼロ）。
+  var bcMasked = maskStaleBroadcast_(
+    row[headerMap['一斉表示URL'] - 1],
+    row[headerMap['一斉表示実行ID'] - 1],
+    serverTimeMs,
+    kaInfo ? kaInfo.sync_interval_sec : 0
+  );
+
   return {
     student_id: studentId,
     school_name: String(row[headerMap['学校名'] - 1] || ''),
@@ -2970,8 +3075,9 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
     filter_mode: String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase(),
     whitelist_urls: parseUrlList(row[headerMap['許可URLリスト'] - 1]),
     blacklist_urls: parseUrlList(row[headerMap['規制URLリスト'] - 1]),
-    broadcast_url: String(row[headerMap['一斉表示URL'] - 1] || '').trim(),
-    broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || '').trim(),
+    // 【TTLマスク済み】期限切れは '' / '' になる（3分以内なら通常どおり返る）。
+    broadcast_url: bcMasked.broadcast_url,
+    broadcast_id: bcMasked.broadcast_id,
     current_url: String(row[headerMap['現在開いているURL'] - 1] || ''),
     screen_request_at: reqCol ? String(row[reqCol - 1] || '').trim() : '',
     screenshot_at: shotCol ? String(row[shotCol - 1] || '').trim() : '',

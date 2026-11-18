@@ -236,7 +236,10 @@ const FNS = [
   'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
   'scheduleActiveDetailFromCache_',
   'deviceMatchesSchedule_', 'readScheduleRows_',
-  'buildSchedulePayloadForDevice_', 'buildHeartbeatResponse',
+  'buildSchedulePayloadForDevice_',
+  // 【r50】一斉表示の TTL マスク（親・子どちらの応答経路でも同じ関数を通す）
+  'broadcastTtlMs_', 'parseBroadcastIssuedMs_', 'maskStaleBroadcast_',
+  'buildHeartbeatResponse',
   // フェーズ5（子）
   'emptySchedulePayload_', 'shardSaveScheduleCache_', 'shardLoadScheduleCache_',
   'shardSchedulePayloadFromCache_', 'resolveSchedulePayloadForDevice_',
@@ -247,6 +250,9 @@ const FNS = [
   'shardApplyFromParent', 'shardPropagatePolicy'
 ];
 FNS.forEach(n => pieces.push(extractFn(n)));
+// 【r50】一斉表示 TTL の最低値（数値の var は extractConst で拾えないため直接抜く）
+pieces.push((src.match(/^var BROADCAST_TTL_MIN_MS\s*=\s*[^;\n]+;/m) ||
+  ['var BROADCAST_TTL_MIN_MS = 120000;'])[0]);
 
 // --- ハーネス側スタブ ---
 pieces.push('function getTargetSheet(name){ var s = __SHEETS[name]; if(!s) throw new Error("no sheet: "+name); return s; }');
