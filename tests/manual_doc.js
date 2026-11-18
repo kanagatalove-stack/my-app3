@@ -245,6 +245,149 @@ ok(src.indexOf(mf.version) >= 0,
   '説明書が manifest.json の版数(' + mf.version + ')に追随している');
 ok(!/1\.6\.3 を配布/.test(src), '古い「1.6.3 を配布」の指示が残っていない');
 
+
+// ---------- 10. 追加章（予約スケジュール / Q&A / 権限 / マイ設定 / 年次更新 / 導入設定） ----------
+// 章を差し替え・追記したので、その章が「実際に存在し、中身が入っているか」を固定する。
+function section(startRe, endRe) {
+  const m = startRe.exec(src);
+  if (!m) return '';
+  const rest = src.slice(m.index + m[0].length);
+  const n = endRe.exec(rest);
+  return n ? rest.slice(0, n.index) : rest;
+}
+
+// 章番号が 1..15 で連番（差し替え時に番号が飛んだり重複したりしていないか）
+const chapNums = (src.match(/^##\s+(\d+)\.\s+/gm) || [])
+  .map(s2 => parseInt(/^##\s+(\d+)\./.exec(s2)[1], 10));
+ok(chapNums.length === 15, '本文の章は15章', 'count=' + chapNums.length);
+ok(chapNums.every((n, i) => n === i + 1), '章番号が1から連番', chapNums.join(','));
+
+// 目次に新章(13/14/15)のリンクが入っている
+['13', '14', '15'].forEach(n => {
+  ok(new RegExp('\\]\\(#' + n + '-').test(src), '目次に第' + n + '章のリンクがある');
+});
+
+// 挿絵が増えた（＝ SVG が各章に入っている）
+ok(svgOpen >= 30, 'インラインSVGが十分な枚数ある', 'count=' + svgOpen);
+
+[['第8章(予約スケジュール)', /^## 8\. 予約スケジュール/m, /^## 9\. /m],
+ ['第11章(初期設定)', /^## 11\. /m, /^## 12\. /m],
+ ['第13章(権限)', /^## 13\. /m, /^## 14\. /m],
+ ['第14章(マイ設定)', /^## 14\. /m, /^## 15\. /m],
+ ['第15章(年次更新)', /^## 15\. /m, /^## 付録A/m]].forEach(r => {
+  const body = section(r[1], r[2]);
+  const n = (body.match(/<svg/g) || []).length;
+  ok(n >= 1, r[0] + 'にインラインSVGの挿絵がある', 'svg=' + n);
+});
+
+// ---------- 10-1. 第8章 予約スケジュール ----------
+const sec8 = section(/^## 8\. 予約スケジュール/m, /^## 9\. /m);
+ok(/対象の選び方/.test(sec8), '第8章に「対象の選び方」の節がある');
+ok(/全校生徒/.test(sec8), '対象の選び方に「全校生徒」がある');
+ok(/児童を個別に選ぶ/.test(sec8), '対象の選び方に「児童を個別に選ぶ」がある');
+ok(/予約の編集/.test(sec8), '「予約の編集」の節がある');
+ok(/実行中/.test(sec8), '実行中のバッジに触れている');
+ok(/再読込/.test(sec8), '一覧に出ないときの対処(再読込)がある');
+ok(/時間の窓/.test(sec8), '予約が「時間の窓」で動くことが書かれている');
+ok(/手動解除/.test(sec8), '第8章に手動解除の説明がある');
+
+// ---------- 10-2. 第9章 トラブルQ&A ----------
+const sec9 = section(/^## 9\. 困ったときは/m, /^## 10\. /m);
+['9-1. 症状から探す', '9-2. 予約スケジュールのQ&A',
+ '9-3. エラーメッセージから探す', '9-4. それでも解決しないとき'].forEach(h => {
+  ok(sec9.indexOf(h) >= 0, 'Q&Aの小見出し「' + h + '」がある');
+});
+['未対応のアクション', '権限がありません', '共有シークレットが一致しません',
+ '子GASとして構成されていません'].forEach(msg => {
+  ok(sec9.indexOf(msg) >= 0, 'エラー表に「' + msg + '」がある');
+});
+ok(/\[SHARD\]/.test(sec9) && /\[SCHEDULE\]/.test(sec9),
+  'ログの見分け方([SHARD]/[SCHEDULE])が書かれている');
+ok(/写真/.test(sec9), '解決しないときの伝達事項(画面の写真)がある');
+ok(/間違えた/.test(sec9), '「解除と取消を間違えた」Q&Aがある');
+ok(/何もしなくてよい/.test(sec9), '手動解除の戻し方が書かれている');
+
+// ---------- 10-3. 第11章 導入時設定（スクリプトプロパティ） ----------
+const sec11 = section(/^## 11\. 初期設定の手順/m, /^## 12\. /m);
+ok(sec11.indexOf('ステップ 2-2') >= 0, 'ステップ2-2(スクリプトプロパティ)がある');
+ok(sec11.indexOf('ステップ 2-3') >= 0, 'ステップ2-3(学校ごとに子GASを追加)がある');
+['SHARD_MODE', 'SHARD_SECRET', 'SHARD_MAP_V1', 'SHARD_DEFAULT_URL',
+ 'SHARD_CHILD_MODE', 'SHARD_PARENT_URL', 'SPREADSHEET_ID',
+ 'setupSpreadsheet', 'getShardSettingsForAdmin'].forEach(k => {
+  ok(sec11.indexOf(k) >= 0, '第11章に「' + k + '」の記載がある');
+});
+ok(/`SHARD_MODE`\s*\|\s*`true`/.test(sec11), '親GASは SHARD_MODE=true');
+ok(/`SHARD_CHILD_MODE`\s*\|\s*`true`/.test(sec11), '子GASは SHARD_CHILD_MODE=true');
+ok(/`SHARD_MODE`\s*\|\s*`false`/.test(sec11), '子GASは SHARD_MODE=false');
+ok(/SHARD_MODE` と `SHARD_CHILD_MODE` を両方 `true` にしない/.test(sec11),
+  '「両方 true にしない」注意がある');
+ok(/secret_configured/.test(sec11), '設定確認(secret_configured)の見方がある');
+ok(/"":\s*"https/.test(sec11), 'SHARD_MAP_V1 に空キー(既定)の例がある');
+ok(/親GASのみで運用/.test(sec11), '担当子GASが無いクラスの扱いが書かれている');
+ok(/スクリプト プロパティ|スクリプトプロパティ/.test(sec11),
+  '設定場所（プロジェクトの設定→スクリプトプロパティ）が書かれている');
+
+// ---------- 10-4. 第13章 ADMIN と TEACHER の違い ----------
+const sec13 = section(/^## 13\. /m, /^## 14\. /m);
+ok(/ADMIN/.test(sec13) && /TEACHER/.test(sec13), '第13章でADMINとTEACHERを比較している');
+['13-1. できることの比較表', '13-2. 「担当クラス」という権限の境界',
+ '13-3. アカウントの列（教員マスタ）'].forEach(h => {
+  ok(sec13.indexOf(h) >= 0, '第13章の小見出し「' + h + '」がある');
+});
+ok(/○/.test(sec13) && /✕/.test(sec13), '比較表に○/✕が使われている');
+ok(/空欄/.test(sec13) && /全クラス/.test(sec13), '担当クラス空欄=全クラスの説明がある');
+ok(/ALL/.test(sec13) && /指定なし/.test(sec13), '全クラス扱いの別表記が書かれている');
+ok(/カンマ/.test(sec13), '複数クラスのカンマ区切りが書かれている');
+ok(/教員マスタ/.test(sec13), '教員マスタの列の説明がある');
+ok(/Google SSO許可/.test(sec13), '「Google SSO許可」列がある');
+ok(/未設定/.test(sec13), 'クラス未設定の児童の扱いが書かれている');
+
+// ---------- 10-5. 第14章 マイ設定とアカウント管理 ----------
+const sec14 = section(/^## 14\. /m, /^## 15\. /m);
+['14-1. マイ設定', '14-2. アカウント管理',
+ '14-3. 教員の一括インポート（CSV）'].forEach(h => {
+  ok(sec14.indexOf(h) >= 0, '第14章の小見出し「' + h + '」がある');
+});
+ok(sec14.indexOf('マイ設定（個別URL・規制URL）') >= 0,
+  'マイ設定の画面タイトルが載っている');
+ok(sec14.indexOf('教員アカウント設定（対象クラス・個別URL・規制URL）') >= 0,
+  'ADMINで変わる画面タイトルが載っている');
+['教員アカウント', '児童アカウント', '年次更新・一括インポート'].forEach(t => {
+  ok(sec14.indexOf(t) >= 0, 'アカウント管理のタブ「' + t + '」がある');
+});
+ok(/新規登録/.test(sec14) && /編集/.test(sec14) && /削除/.test(sec14),
+  '新規登録・編集・削除の手順がある');
+ok(/メールアドレス（教員ID）は変更できません/.test(sec14),
+  'メールアドレス変更不可が明記されている');
+ok(/ADMIN を2人以上/.test(sec14), 'ADMINを2人以上残す注意がある');
+ok(/Google SSO/.test(sec14), 'パスワードとSSOの関係が書かれている');
+['email', 'password', 'name', 'school', 'role', 'target_class'].forEach(c => {
+  ok(sec14.indexOf(c) >= 0, 'CSV列「' + c + '」がある');
+});
+ok(/既にあれば更新/.test(sec14), 'CSVインポートの更新/追加の挙動が書かれている');
+ok(/\*\*\+ 新規登録\*\*/.test(sec14) || /＋ 新規登録/.test(sec14),
+  '「＋ 新規登録」ボタンの記載がある');
+
+// ---------- 10-6. 第15章 年次更新設定 ----------
+const sec15 = section(/^## 15\. /m, /^## 付録A/m);
+['15-1. 2通りのやり方', '15-2. 今すぐ実行する手順', '15-3. 予約実行型 年次更新',
+ '15-4. 年次更新で消えるもの・残るもの', '15-5. 年次更新のQ&A'].forEach(h => {
+  ok(sec15.indexOf(h) >= 0, '第15章の小見出し「' + h + '」がある');
+});
+ok(/今すぐ実行/.test(sec15) && /予約実行型/.test(sec15), '2通りのやり方が書かれている');
+ok(/前年度データ削除/.test(sec15), '前年度データ削除のON/OFFが書かれている');
+ok(/予約をキャンセル/.test(sec15), '予約のキャンセル方法が書かれている');
+ok(/年次更新を予約保存/.test(sec15), '予約保存のボタン名がある');
+ok(/取り消せません/.test(sec15), '取り消せない注意がある');
+ok(/プレビュー/.test(sec15), 'プレビューで人数確認する手順がある');
+ok(/バージョン履歴/.test(sec15), '間違えたときの戻し方(バージョン履歴)がある');
+ok(/卒業生/.test(sec15), '卒業生シートへの退避が書かれている');
+
+// ---------- 10-7. 全章そろっている ----------
+ok(h2.length >= 18, '章・付録が18以上ある', 'count=' + h2.length);
+// src.length は UTF-16 の文字数（日本語は1文字=1）。バイト数ではない点に注意。
+ok(src.length > 90000, 'マニュアルは十分な分量がある', 'chars=' + src.length + ' bytes=' + Buffer.byteLength(src, 'utf8'));
+
 // ---------- 結果 ----------
 console.log('===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
 process.exit(fail ? 1 : 0);
