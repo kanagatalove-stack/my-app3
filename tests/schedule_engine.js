@@ -379,15 +379,45 @@ function runIn(expr) { return vm.runInContext(expr, M); }
 
   const GAS_FNS = [
     'getHeaderMap', 'parseBoolean', 'parseUrlList',
+    'normalizeHostListToArray_', 'hostListToSheetString_',
     'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
     'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
     'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_',
     'normalizeSchoolName', 'schoolNamesMatch', 'resolveCanonicalSchool', 'isAllSchoolsName',
-    'normalizeClassName', 'deviceMatchesSchedule_', 'readScheduleRows_',
-    'buildSchedulePayloadForDevice_', 'buildHeartbeatResponse'
+    'normalizeClassName',
+    'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+    // 【Request P】複数クラス／全校生徒対応で deviceMatchesSchedule_ が
+    //   scheduleClassList_ を呼ぶようになったため、抽出対象に加える。
+    'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
+    'deviceMatchesSchedule_', 'readScheduleRows_',
+    // 【フェーズ5】buildHeartbeatResponse は resolveSchedulePayloadForDevice_ を経由する。
+    //   子GAS判定（isShardChild）が false ならローカル読みにフォールバックする。
+    'resolveSchedulePayloadForDevice_',
+    'buildSchedulePayloadForDevice_',
+    // 【r50】buildHeartbeatResponse は一斉表示の TTL マスクを通す。
+    //   期限切れの一斉表示実行IDを空文字に落とすためのヘルパー群。
+    'broadcastTtlMs_', 'parseBroadcastIssuedMs_', 'maskStaleBroadcast_',
+    // 【r51】性能3点（先行返却・過負荷バックオフ・初回即時応答）のヘルパー群
+    'hbStateCacheKey_', 'hbReadStateCache_', 'hbActiveIntervalSec_',
+    'hbReadLoad_', 'hbIsBackoffActive_', 'hbThrottleIntervalSec_',
+    'buildHeartbeatResponse'
   ];
   GAS_FNS.forEach(n => gasPieces.push(extractFn(gasSrc, n)));
+  // 【r50】一斉表示 TTL の最低値（数値の var は extractConst で拾えないため直接抜く）
+  gasPieces.push((gasSrc.match(/^var BROADCAST_TTL_MIN_MS\s*=\s*[^;\n]+;/m) ||
+    ['var BROADCAST_TTL_MIN_MS = 120000;'])[0]);
+  // 【r51】性能ヘルパーが参照する数値定数（本番と同じ値）
+  ['HB_LOAD_CACHE_KEY', 'HB_LOAD_WINDOW_MS', 'HB_LOAD_SLOW_MS',
+   'HB_LOAD_SLOW_RATIO', 'HB_LOAD_ERR_RATIO', 'HB_BACKOFF_SEC',
+   'HB_BACKOFF_HOLD_MS'].forEach(function (n) {
+    const m = gasSrc.match(new RegExp('^var ' + n + '\\s*=[^;\\n]+;', 'm'));
+    if (m) gasPieces.push(m[0]);
+  });
   gasPieces.push('function getTargetSheet(name){ return __SHEETS[name]; }');
+  // 【フェーズ5】このスイートは「子GASではない」単体GASとして検証する。
+  //   子GAS経路（PropertiesService キャッシュ）は schedule_shard.js で検証する。
+  gasPieces.push('function isShardChild(){ return false; }');
+  gasPieces.push('function shardLoadScheduleCache_(){ return null; }');
   gasPieces.push([
     'function ensureScheduleHeaders(sheet){',
     '  if (sheet.getLastColumn() === 0) {',
@@ -481,7 +511,7 @@ function runIn(expr) { return vm.runInContext(expr, M); }
 
   // ------------------------------------------------------------ G. 不変条件
   const manifest = JSON.parse(manifestRaw);
-  check('不変条件: version は v1.6.4 のまま', manifest.version === '1.6.4', manifest.version);
+  check('不変条件: version は v1.6.5', manifest.version === '1.6.5', manifest.version);
   check('不変条件: default_popup を持たない', !manifest.action || !manifest.action.default_popup);
   check('不変条件: alarms 権限がある（追加不要）',
     Array.isArray(manifest.permissions) && manifest.permissions.indexOf('alarms') >= 0, manifest.permissions);

@@ -6,6 +6,14 @@
  * ・ロック解除の全タブ高速反映
  */
 
+// 【ブートストラップ用】親GASの Web アプリ URL（/exec）。
+//   Managed Storage ポリシー（gas_url / gas_url_map）が未配布の端末でも、
+//   ここに親の /exec を入れておけば初回同期が成立し、親が assigned_gas_url を
+//   返して以降は子GASへ直接つながる（1校240台を子GASへ分散する R41 構成の入口）。
+//   ※ 空のままなら端末は通信できない。その事実は sync_diag とコンソールへ
+//     必ず出す（無言で停止させない）。
+const DEFAULT_GAS_URL = '';
+
 // デフォルト設定
 const DEFAULT_CONFIG = {
   student_id: '',
@@ -47,6 +55,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   } else if (alarm.name === 'wakeAlarm') {
     // 非稼働中でも「先生が復帰したか」だけを軽く確認する（シート非接触の短い応答）。
     probeWake();
+  } else if (alarm.name === 'schedulePoll') {
+    // 【低速ポーリング】教員コンソールが閉じられたままでも、予約を保持している端末は
+    //   5 分ごとに起床して親／子GASへハートビートを送り、新規予約を取りこぼさない。
+    //   （時間制限タイマーが実機で発動しない問題の対策。未割り当て・予約ゼロの端末は
+    //      maybeSync 側が同期せずアラームも解除するため、通信負荷は増えない）
+    maybeSync();
   } else if (alarm.name === 'scheduleEdge' || alarm.name === 'scheduleTick') {
     // 【フェーズ3】スケジュール（タイマー）の境界発動。
     //   scheduleEdge … 開始/終了時刻ちょうどに1回だけ起こす（本命）
@@ -128,6 +142,8 @@ function applyRemoteKeepalive(payload) {
       lastSyncMs = 0;          // 稼働へ切替時は次回 ping で即同期し、素早く反映する
       ensureSyncLoop();        // 稼働中のみアラームを登録（状態遷移時だけ）
       clearIdleDriftAlarm();
+      // 稼働中は通常同期が走るため、低速ポーリングは不要（二重起床を防ぐ）。
+      clearSlowPoll();
     }
     // 稼働中は起こしプローブ不要（通常同期が走っているため）。止めて通信を増やさない。
     clearWakeProbe();
@@ -138,29 +154,87 @@ function applyRemoteKeepalive(payload) {
     // 猶予が尽きた後も「先生が復帰したか」だけは拾えるようにする。
     // 間隔は時間帯で切り替える（平日日中=1分固定／夜間・土日祝=10分）。
     ensureWakeProbe();
+    // 【低速ポーリング】予約を保持している／子GASへ割り当て済みの端末だけは、
+    //   猶予が尽きた後も 5 分周期で起床させる。これが無いと「教員が管理画面を閉じた
+    //   まま新しい予約を作る」ケースで端末が永久に眠り、時間制限タイマーが発動しない。
+    if (scheduleInterestActive()) ensureSlowPoll();
+    else clearSlowPoll();
   }
 }
 
 // ==================== 同期のレート制御 ====================
-//  ・稼働中（管理アプリが稼働中）      : 1.5 秒 … 指示を 3 秒以内に反映
-//  ・非稼働・猶予期間内               : 1 秒上限の低頻度で再確認（管理アプリの再起動を拾う）
-//  ・非稼働・猶予期間外               : 同期しない（doPost を出さない＝通信負荷ゼロ）
+//  ・稼働中（管理アプリが稼働中）        : 1.5 秒 … 指示を 3 秒以内に反映
+//  ・非稼働・猶予期間内                 : 1 秒上限の低頻度で再確認（管理アプリの再起動を拾う）
+//  ・非稼働・猶予期間外＋予約/子GASあり : 5 分周期の低速ポーリング（予約の取りこぼし防止）
+//  ・非稼働・猶予期間外＋予約も子GASも無: 同期しない（doPost を出さない＝通信負荷ゼロ）
 const ACTIVE_SYNC_MS = 1500;
-const IDLE_SYNC_MS = 0;         // 非稼働時は定期ポーリングをしない（0＝常にスキップ）
+const IDLE_SYNC_MS = 0;         // 非稼働時は 1.5 秒の速いポーリングをしない（0＝常にスキップ）
 const IDLE_DRIFT_MS = 1000;     // 猶予期間中の再確認レート上限（1 秒）
 const IDLE_DRIFT_ALARM_MIN = 5 / 60; // 猶予期間中の再確認アラーム周期（5 秒）
+// 【低速ポーリング】v1.6.4 修正
+//   教員コンソールを閉じたまま新しい予約が作られると、従来は端末が完全に眠ってしまい
+//   予約が永久に届かなかった（＝時間制限タイマーが実機で発動しない本命の原因）。
+//   そこで「予約を保持している端末」と「子GASへ割り当て済みの端末」に限り、
+//   非稼働・猶予終了後も 5 分周期で起床して予約の到着を確認する。
+//   未割り当てかつ予約ゼロの端末は従来どおり「通信ゼロ」を維持する（無駄な doPost を出さない）。
+const SLOW_POLL_MS = 5 * 60 * 1000;
+const SLOW_POLL_ALARM = 'schedulePoll';
+const SLOW_POLL_ALARM_MIN = 5;
 let lastSyncMs = 0;
+// 【初回ブートストラップの番人】この Service Worker の生存期間で
+//   「一度でも送信を試みたか」。false の間は稼働判定をバイパスして必ず1回送る。
+let hasSyncedOnce = false;
+
+/**
+ * 「予約を取りこぼせない端末か」を判定する（低速ポーリングの可否）。
+ *   教員コンソールを閉じたまま新規予約が作成されても、端末が完全に眠っていると
+ *   予約が永久に届かず、時間制限タイマーが実機で発動しない。
+ *   そこで次のいずれかに該当する端末だけ、非稼働・猶予終了後も 5 分周期で起床する。
+ *     ① 子GASへ割り当て済み（＝親から配られた予約を子GASが保持している）
+ *     ② 予約キャッシュ（active / upcoming）を 1 件以上保持している
+ *   未割り当てかつ予約ゼロの端末は、従来どおり「通信ゼロ」を維持する。
+ *   ※ 単体検証（VM へ関数だけを切り出した環境）では宣言が無い場合があるため typeof で守る。
+ */
+function scheduleInterestActive() {
+  if (typeof shardAssignedCache !== 'undefined' && shardAssignedCache) return true;
+  if (typeof scheduleCache !== 'undefined' && scheduleCache && scheduleCache.schedules) {
+    const s = scheduleCache.schedules;
+    const a = Array.isArray(s.active) ? s.active.length : 0;
+    const u = Array.isArray(s.upcoming) ? s.upcoming.length : 0;
+    if ((a + u) > 0) return true;
+  }
+  return false;
+}
 
 function maybeSync() {
   const now = Date.now();
+
+  // 【初回ブートストラップ】未同期の端末は keepaliveActive / idleDrift の判定より
+  //   先に「必ず1回」送る。教員コンソールを閉じていても、ここで親GASから
+  //   assigned_gas_url を取得しないと、以後の子GASへのハートビートが永久に
+  //   始まらない（実機で「子GASの実行数がゼロ」になった正体）。
+  if (!hasSyncedOnce) {
+    hasSyncedOnce = true;
+    lastSyncMs = now;
+    syncWithGas();
+    return;
+  }
+
   let interval;
   if (keepaliveActive) {
     interval = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
   } else if (idleDriftUntil && now < idleDriftUntil) {
     interval = IDLE_DRIFT_MS; // 猶予期間のみ低頻度で再確認する
+  } else if (scheduleInterestActive()) {
+    // 【低速ポーリング】非稼働・猶予終了でも、予約保持または子GAS割り当て済みなら
+    //   5 分周期で起床して予約の到着を確認する（時間制限タイマーの取りこぼし防止）。
+    interval = SLOW_POLL_MS;
+    ensureSlowPoll();
   } else {
-    // 非稼働かつ猶予終了 → 同期しない。猶予用アラームが残っていれば止める。
+    // 非稼働・猶予終了・予約も子GASも無し → 同期しない（doPost を出さない＝通信負荷ゼロ）。
+    //   猶予用／低速ポーリング用アラームが残っていれば止める。
     clearIdleDriftAlarm();
+    clearSlowPoll();
     return;
   }
   if (now - lastSyncMs < interval) return;
@@ -203,6 +277,24 @@ function scheduleIdleDrift() {
 /** 猶予期間用の再確認アラームを止める。 */
 function clearIdleDriftAlarm() {
   try { chrome.alarms.clear('idleDriftAlarm'); } catch (e) {}
+}
+
+/**
+ * 低速ポーリング用アラーム（5 分周期）を登録する。
+ *   教員コンソールが閉じられていても、予約を持つ端末は 5 分ごとに起床して
+ *   親／子GASへハートビートを送り、新規予約を受け取る。
+ *   MV3 の Service Worker は 30 秒で停止するため、アラームが唯一の継続手段になる。
+ *   ※ 既に登録済みでも chrome.alarms.create は同名を上書きするため冪等。
+ */
+function ensureSlowPoll() {
+  try {
+    chrome.alarms.create(SLOW_POLL_ALARM, { periodInMinutes: SLOW_POLL_ALARM_MIN });
+  } catch (e) {}
+}
+
+/** 低速ポーリング用アラームを止める（予約も子GAS割り当ても無くなったとき）。 */
+function clearSlowPoll() {
+  try { chrome.alarms.clear(SLOW_POLL_ALARM); } catch (e) {}
 }
 
 // ==================== 非稼働時の「起こしプローブ」 ====================
@@ -582,7 +674,18 @@ async function initializeClient() {
 
     // GAS URLが設定されていれば即座に自動同期を実行！
     if (initialGasUrl) {
+      hasSyncedOnce = true; // 初回同期を実行済み（maybeSync の二重発火を防ぐ）
       await syncWithGas();
+    } else {
+      // 【無言停止の根絶】URL が無い＝端末は1件も送信できない。
+      //   旧実装はここで何も出さずに終わっていたため、
+      //   「実行数ゼロ・エラーも出ない」という最悪の切り分け不能状態になった。
+      console.warn('[EduAgent] GAS WebアプリURLが未設定のため同期できません。'
+        + ' 管理ポリシーの gas_url / gas_url_map を配布するか、'
+        + ' background.js の DEFAULT_GAS_URL に親GASの /exec を設定してください。');
+      await recordSyncDiag(false, 'no_gas_url',
+        'GAS WebアプリURLが未設定です（管理ポリシーの gas_url / gas_url_map、'
+        + ' または background.js の DEFAULT_GAS_URL を設定してください）');
     }
 
     // 【フェーズ3】保存済みの予約から制限状態と境界アラームを復元する。
@@ -695,7 +798,13 @@ function resolveGasUrl(data) {
       }
     }
   }
-  return direct;
+  // 4) 最後の砦: 埋め込みの既定（親GASの /exec）。
+  //   Managed Storage ポリシー未配布の端末はここが唯一の通信先になる。
+  //   これが空だと端末は1件も送信できないため、呼び出し側で必ず診断を残す。
+  //   typeof ガードは、この関数だけを単体で切り出して検証するテスト環境
+  //   （DEFAULT_GAS_URL を注入しない sandbox）でも ReferenceError にしないため。
+  const embedded = (typeof DEFAULT_GAS_URL === 'string') ? DEFAULT_GAS_URL.trim() : '';
+  return direct || embedded;
 }
 
 // ==================== 子GAS分散（SHARD_MODE）: 動的ルーティング ====================
@@ -718,6 +827,16 @@ const SHARD_COOLDOWN_MS = 30 * 60 * 1000;    // 切り戻し後30分は再割り
 //   これにより 1.5 秒ごとの判定で余分なストレージ読み取りを行わない。
 let shardAssignedCache = '';
 let shardFailCount = 0;
+
+// 【バトンタッチ（即時ハートビート）】v1.6.4 修正
+//   親GASから新しい assigned_gas_url（子GAS）を受け取った直後は、端末の通信先が
+//   親→子へ切り替わった第1報で終わってしまい、子GAS側には「端末が存在する」ことも
+//   「予約を配るべき相手」であることも一切伝わっていなかった（実機で子GASの実行数ゼロ）。
+//   そこで「割り当てが確定した」ことをこのフラグで1回だけ持ち越し、syncWithGas() の
+//   finally（＝syncInFlight のガード解放直後）で消費して子GAS宛てに2回目の同期を発火する。
+//   ※ フラグは必ず消費時に false へ戻すため、子GASが assigned_gas_url を返さないことも
+//     相まって無限再入にはならない（1割り当てにつき1回限りのバトンタッチ）。
+let shardHandoffPending = false;
 
 function shardAssignedUrl(data) {
   return String((data && data.assigned_gas_url) || '').trim();
@@ -771,6 +890,13 @@ async function applyShardAssignment(resJson, data, usedUrl, talkingToParent) {
     try { await chrome.storage.local.set(patch); } catch (e) {}
     shardAssignedCache = String(patch.assigned_gas_url || '');
     shardFailCount = 0;
+
+    // 【バトンタッチ】新しい子GAS URL を保存した瞬間に「2通目を送る」意図を立てる。
+    //   ここで直接 syncWithGas() を呼ぶと、呼び出し元の syncWithGas() がまだ
+    //   syncInFlight=true のためガードに弾かれて**無言で捨てられる**（実機で子GASの
+    //   実行数がゼロだった原因そのもの）。フラグに留め、ガード解放後に発火させる。
+    //   ※ 空文字（＝親へ切り戻し）では立てない。子GASへ送る意味がないため。
+    if (patch.assigned_gas_url) shardHandoffPending = true;
   }
 }
 
@@ -1040,6 +1166,22 @@ async function syncWithGas() {
     } catch (e2) {}
   } finally {
     syncInFlight = false;
+
+    // 【バトンタッチ＝即時ハートビート】v1.6.4 修正
+    //   親から新しい assigned_gas_url（子GAS）を受けた回は、この finally で
+    //   ガードが下りた「まさにこの一点」でのみ、子GAS宛ての2回目の同期を1回発火する。
+    //   ・applyShardAssignment() の中から呼ぶと syncInFlight=true のままなので
+    //     先頭のガードに弾かれ、子GASへは一歩も届かない（実機の実行数ゼロの正体）。
+    //   ・フラグは消費時に必ず false に戻すため、1割り当てにつき1回限り。
+    //     子GASは assigned_gas_url を返さないため、次回以降フラグは立たない。
+    //   ・setTimeout(0) で現在のマイクロタスク列を抜けてから再入する
+    //     （finally の中で await せず、呼び出し元の完了を待たせない）。
+    if (shardHandoffPending) {
+      shardHandoffPending = false;
+      try {
+        setTimeout(function () { syncWithGas(); }, 0);
+      } catch (e) {}
+    }
   }
 }
 
@@ -1825,6 +1967,52 @@ let broadcastGuardUntil = 0;
 let broadcastTabId = null;
 // 同一配信IDの二重オープン防止
 let lastBroadcastOpenedId = '';
+// 【要件2】同一URLの二重オープン防止（時間窓）。
+//   GAS側で broadcast_id を統一しても、経路（親/子直送/保留キューflush）の
+//   重複やID再発番が起きると同じページが2枚開く。ここは最後の安全網として
+//   「直近30秒以内に同じURLを自動オープン済みなら、IDが違っても開かない」を担う。
+const BROADCAST_DEDUP_WINDOW_MS = 30000;
+let lastBroadcastUrls = [];   // [{ url: string, at: number }]
+
+// URLの比較用正規化（末尾スラッシュ・大文字小文字・既定ポート差を吸収）
+function normalizeBroadcastUrl(u) {
+  let v = String(u || '').trim();
+  if (!v) return '';
+  if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+  try {
+    const parsed = new URL(v);
+    let host = parsed.hostname.toLowerCase();
+    let port = parsed.port;
+    if ((parsed.protocol === 'https:' && port === '443') ||
+        (parsed.protocol === 'http:' && port === '80')) port = '';
+    let path = parsed.pathname || '/';
+    if (path.length > 1 && path.charAt(path.length - 1) === '/') path = path.slice(0, -1);
+    return parsed.protocol.toLowerCase() + '//' + host + (port ? ':' + port : '') +
+      path + (parsed.search || '');
+  } catch (e) {
+    return v.replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+// 直近に同じURLを自動オープンしたか（時間窓内）。判定と記録を同時に行う。
+//   true  = 開いてよい（記録した）
+//   false = 窓内で同一URLを既に開いている（抑止）
+//   空URL（配信の解除）は対象外＝常に true。
+function claimBroadcastUrlOnce(url, nowMs) {
+  const now = (typeof nowMs === 'number') ? nowMs : Date.now();
+  const key = normalizeBroadcastUrl(url);
+  if (!key) return true;
+  const win = (typeof BROADCAST_DEDUP_WINDOW_MS === 'number' && BROADCAST_DEDUP_WINDOW_MS > 0)
+    ? BROADCAST_DEDUP_WINDOW_MS : 30000;
+  lastBroadcastUrls = (Array.isArray(lastBroadcastUrls) ? lastBroadcastUrls : []).filter(function (e) {
+    return e && typeof e.at === 'number' && (now - e.at) < win;
+  });
+  for (let i = 0; i < lastBroadcastUrls.length; i++) {
+    if (lastBroadcastUrls[i].url === key) return false;   // 窓内で同一URL → 抑止
+  }
+  lastBroadcastUrls.push({ url: key, at: now });
+  return true;
+}
 
 /**
  * 一斉配信直後に保護すべきタブかどうかを判定する。
@@ -1850,6 +2038,15 @@ async function openBroadcastUrl(url, broadcastId) {
     let validUrl = url;
     if (!validUrl.startsWith('http://') && !validUrl.startsWith('https://')) {
       validUrl = 'https://' + validUrl;
+    }
+    // 【要件2】IDが違っても、直近30秒以内に同じURLを開いていれば開かない。
+    //   これが無いと、経路の重複やID再発番で同じページが2枚開く（実機症状）。
+    //   空URL（配信の解除）は対象外。
+    //   抑止した場合も「処理済みID」だけは記録し、以降の再送も弾けるようにする。
+    if (!claimBroadcastUrlOnce(validUrl)) {
+      if (broadcastId) lastBroadcastOpenedId = broadcastId;
+      console.log('[EduAgent] 同一URLの二重オープンを抑止:', validUrl);
+      return;
     }
     if (broadcastId) lastBroadcastOpenedId = broadcastId;
 

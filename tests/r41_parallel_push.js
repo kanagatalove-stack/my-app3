@@ -30,15 +30,27 @@ check('shardInlineKick 関数は無い', src.indexOf('shardInlineKick') < 0);
 check('inlineKick の指定は1箇所も残っていない', src.indexOf('inlineKick') < 0);
 check('kickNow の分岐も残っていない', src.indexOf('kickNow') < 0);
 
-// shardPropagatePolicy は 2 引数に戻っていること
-check('shardPropagatePolicy は2引数（studentIds, patch）',
-  /function\s+shardPropagatePolicy\s*\(\s*studentIds\s*,\s*patch\s*\)/.test(src));
+// shardPropagatePolicy は R41 で「opts オブジェクト」を廃止して位置引数に戻した。
+//   フェーズ5 で第3引数 forceSync（スケジュール同封時は保留キューを使わず即時送信）を
+//   足したが、R41 が禁じた「opts オブジェクト渡し」ではないことは維持する。
+check('shardPropagatePolicy は位置引数（studentIds, patch[, forceSync]）',
+  /function\s+shardPropagatePolicy\s*\(\s*studentIds\s*,\s*patch\s*(?:,\s*forceSync\s*)?\)/.test(src));
+check('shardPropagatePolicy に opts オブジェクトを渡していない',
+  !/shardPropagatePolicy\([^)]*\{\s*opts\s*:/.test(src));
 
 // doPost の 4 経路は opts を渡さない
+//   【r52】個別操作（update_single）は applySingleControl_ に統一した。
+//     applySingleControl_ は「① 親キャッシュ先行反映 → ② 子GASへ即時同期転送
+//     （forceSync=true / deferred 禁止）→ ③ シート永続化」を1か所で行うため、
+//     doPost からの直接呼び出しは 3 箇所＋ヘルパー経由 1 箇所＝合計4経路になる。
 const dopostStart = src.indexOf('function doPost(');
 const dopostHead = src.slice(dopostStart, src.indexOf('\nfunction ', dopostStart + 10));
 const callSites = (dopostHead.match(/shardPropagatePolicy\(/g) || []).length;
-check('doPost の shardPropagatePolicy 呼び出しは4箇所', callSites === 4, callSites);
+const helperSites = (dopostHead.match(/applySingleControl_\(/g) || []).length;
+check('doPost の子GAS伝達は合計4経路（直接3＋個別統一経路1）',
+  callSites === 3 && helperSites === 1, { direct: callSites, single: helperSites });
+check('個別操作は applySingleControl_ 経由（forceSync=true で deferred にしない）',
+  /function applySingleControl_\([^)]*\)[\s\S]{0,3000}?shardPropagatePolicy\(\s*\[studentId\]\s*,\s*patch\s*,\s*true\s*\)/.test(src));
 check('doPost は第3引数を渡さない',
   !/shardPropagatePolicy\([^;]*\)\s*,\s*\{\s*inlineKick/.test(dopostHead));
 

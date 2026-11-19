@@ -84,7 +84,10 @@ check('background に KEEPALIVE_START / KEEPALIVE_STOP ハンドラがある',
 check('GAS 連動の稼働フラグ（keepaliveActive）で管理', /keepaliveActive/.test(bgJs));
 check('GAS の ka_active を反映して同期周期を切替（applyRemoteKeepalive）', /applyRemoteKeepalive/.test(bgJs));
 check('keepalive_active を storage に保存', /chrome\.storage\.local\.set\(\{[\s\S]{0,80}?keepalive_active:/.test(bgJs));
-check('非稼働時は定期ポーリングを停止して doPost を 0 にする（IDLE_SYNC_MS=0）', /IDLE_SYNC_MS\s*=\s*0/.test(bgJs) && /maybeSync/.test(bgJs));
+check('非稼働時は高頻度ポーリングを停止して doPost を抑制（IDLE_SYNC_MS=0）', /IDLE_SYNC_MS\s*=\s*0/.test(bgJs) && /maybeSync/.test(bgJs));
+check('予約保持／子GAS割り当て済みの端末だけ 5 分周期の低速ポーリングを残す',
+  /const SLOW_POLL_MS = 5 \* 60 \* 1000;/.test(bgJs) && /scheduleInterestActive/.test(bgJs) &&
+  /alarm\.name === 'schedulePoll'/.test(bgJs));
 
 console.log('===== ④(動的) セッション開始/停止でアクティブが切替わる =====');
 check('開始前はセッションIDが無い', ctx.__kaId() === null, ctx.__kaId());

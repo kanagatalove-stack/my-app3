@@ -196,7 +196,8 @@ async function main() {
     // 親子の突き合わせ統合（split-brain 解消の本体）
     'shardMergeDeviceRow',
     // 児童ID照合と親名簿照会（クラス未取得の端末を救う経路）
-    'normalizeIdKey','findStudentById','shardLookupStudent','readShardParentUrl',
+    'normalizeIdKey','normalizeUserLocalPart_','idKeysMatch_','idMatchesAny_',
+    'findStudentById','shardLookupStudent','readShardParentUrl',
     'shardLookupFromParent','hbChildIdentityLookup','hbApplyChildIdentity'
   ].forEach(n => { gasBundle += extract(gasSrc, n) + '\n'; });
 
@@ -1097,7 +1098,12 @@ async function main() {
     // 【R38】api_bulkLock は Boolean() ではなく parseBoolean() でロック状態を解釈する。
     //   Boolean("false") === true のため、文字列の "false"（＝解除）が
     //   ロックに化けていた。抽出対象に parseBoolean を加える。
-    ['api_bulkLock', 'api_bulkBroadcast', 'api_bulkFilter', 'api_updateSingle', 'parseBoolean']
+    // 【r52】個別操作は applySingleControl_（先行反映→子GASへ即時同期転送→永続化）を
+    //   必ず通る。api_updateSingle から呼ばれるため抽出対象へ加える。
+    //   ※ applySingleControl_ は hbPrimeControlState_ を typeof ガードで呼ぶため、
+    //     このスイート（CacheService 無し）でも安全側に落ちる。
+    ['api_bulkLock', 'api_bulkBroadcast', 'api_bulkFilter', 'api_updateSingle',
+     'applySingleControl_', 'parseBoolean']
       .forEach(function (n) { b += extract(gasSrc, n) + '\n'; });
     vm.runInContext(b, c3);
     return c3;

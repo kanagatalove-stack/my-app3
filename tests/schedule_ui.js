@@ -70,6 +70,15 @@ __T = {
   setTeacher: function (t) { currentTeacher = t; },
   setDevices: function (a) { devicesData = a; },
   resetStudents: function () { scheduleSelectedStudentIds = new Set(); },
+  // 【Request P】複数クラス選択・編集モードの橋渡し
+  setClasses: function (arr) { scheduleSelectedClassNames = new Set(arr || []); syncScheduleClassValue(); },
+  getClasses: function () { return Array.from(scheduleSelectedClassNames); },
+  toggleScheduleClass: toggleScheduleClass,
+  syncScheduleClassValue: syncScheduleClassValue,
+  scheduleClassListFromValue: scheduleClassListFromValue,
+  openScheduleEditModal: openScheduleEditModal,
+  getEditingId: function () { return scheduleEditingId; },
+  setEditingId: function (v) { scheduleEditingId = String(v || ''); },
   addStudent: function (id) { scheduleSelectedStudentIds.add(id); },
   studentsSize: function () { return scheduleSelectedStudentIds.size; },
   stubApi: function (fn) { apiRequest = fn; },
@@ -154,7 +163,18 @@ function row(over) {
 }
 
 function setVals(obj) {
-  Object.keys(obj).forEach(function (k) { el(k).value = obj[k]; });
+  Object.keys(obj).forEach(function (k) {
+    el(k).value = obj[k];
+    // 【Request P】クラス名セル（隠し input）は「選択済みクラスのカンマ結合」が正。
+    //   画面と同じく、値を書き込んだら Set 側も同期させる（分割規則も本番と同一）。
+    if (k === 'scheduleClass') {
+      const list = String(obj[k] === null || obj[k] === undefined ? '' : obj[k])
+        .split(/[,、\/／・]+/)
+        .map(function (x) { return x.trim(); })
+        .filter(Boolean);
+      T.setClasses(list);
+    }
+  });
 }
 function setChecks(obj) {
   Object.keys(obj).forEach(function (k) { el(k).checked = obj[k]; });
@@ -487,7 +507,11 @@ function setChecks(obj) {
     check('非管理者の学校選択は無効化', el('scheduleSchool').disabled === true);
     const box = el('scheduleStudentBox').innerHTML;
     check('個別児童は自校のみ列挙', box.indexOf('a@example.com') !== -1 && box.indexOf('b@example.com') !== -1 && box.indexOf('c@example.com') === -1);
-    check('クラス一覧は自校のみ', el('scheduleClass').innerHTML.indexOf('5年1組') !== -1 && el('scheduleClass').innerHTML.indexOf('5年2組') !== -1);
+    // 【Request P】クラスは単一 select ではなくチェックボックス一覧（複数選択可）になった。
+    check('クラス一覧は自校のみ',
+      el('scheduleClassBox').innerHTML.indexOf('5年1組') !== -1 &&
+      el('scheduleClassBox').innerHTML.indexOf('5年2組') !== -1 &&
+      el('scheduleClassBox').innerHTML.indexOf('英田小学校') === -1);
 
     T.setTeacher({ role: 'ADMIN', school: '全校管理', email: 'admin@example.com' });
     T.openScheduleModal();
@@ -559,7 +583,7 @@ function setChecks(obj) {
     // manifest は不変（v1.6.4 / alarms / default_popup なし）
     const manifestRaw = fs.readFileSync('/home/user/webapp/extension/manifest.json', 'utf8');
     const mf = JSON.parse(manifestRaw);
-    check('拡張のバージョンは v1.6.4 のまま', mf.version === '1.6.4', mf.version);
+    check('拡張のバージョンは v1.6.5', mf.version === '1.6.5', mf.version);
     check('alarms 権限を保持', (mf.permissions || []).indexOf('alarms') !== -1);
     check('default_popup を持たない（児童端末で何も出ない）', !mf.action || !mf.action.default_popup);
 

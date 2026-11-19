@@ -65,7 +65,12 @@ const FNS = [
   'schPad2_', 'schIsDate_', 'schJstParts_', 'scheduleDatePart_', 'scheduleTimePart_',
   'schedulePartsToMs_', 'schMsToJstStr_', 'schTimeOfDayMs_', 'parseWeekdays_',
   'schJstDateStr_', 'schJstDow_', 'sheetTsToMs', 'expandScheduleWindows_',
-  'normalizeSchoolName', 'normalizeClassName', 'schoolNamesMatch', 'deviceMatchesSchedule_'
+  'normalizeIdKey', 'normalizeUserLocalPart_', 'idKeysMatch_', 'idMatchesAny_',
+  'normalizeSchoolName', 'normalizeClassName', 'schoolNamesMatch',
+  // 【Request P】deviceMatchesSchedule_ は複数クラス（カンマ区切り）対応のため
+  //   scheduleClassList_ を呼ぶ。抽出漏れ＝ミニVMで ReferenceError になる。
+  'scheduleClassList_', 'scheduleActiveLabel_', 'scheduleTargetLabel_',
+  'deviceMatchesSchedule_'
 ];
 
 const pieces = [extractConst('CONFIG')];

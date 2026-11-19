@@ -3,7 +3,7 @@
   const fs0=require('fs'),path0=require('path');const PREFIX='/home/user/webapp/';
   const _rf=fs0.readFileSync;fs0.readFileSync=function(p,...a){if(typeof p==='string'&&p.startsWith(PREFIX)){p=path0.join(__dirname,'..',p.slice(PREFIX.length));}return _rf.call(this,p,...a);};
 })();
-// ===== Round 16: AI監視（学習に関係のないサイトの検知）の回帰テスト =====
+// ===== Round 16: サイト監視（学習に関係のないサイトの検知）の回帰テスト =====
 //  仕様: 判定はハイブリッド（ドメイン辞書 + 先生が登録するリスト）
 //        システム全体のON/OFF は管理者のみ操作できる
 //        監視OFFのときは注意マークを出さない（データは保持）
@@ -270,6 +270,11 @@ check('saveMonitoringSettingsFromModal の本体を抽出できた', saveFnBody.
 check('保存後に loadDevices で即時反映する', /await loadDevices\(\)/.test(saveFnBody));
 check('保存後に抑制フラグを解除して即時反映を許可する',
   /refreshSuppressedUntil\s*=\s*0/.test(saveFnBody));
+// 監視フラグ（monitor_flag）はサーバーが判定して書き込む値であり、画面側の
+// 楽観更新ではない。したがって保護レジストリを装着してはいけない
+// （装着するとサーバーが付けた注意マークを 12 秒間ブロックしてしまう）。
+check('監視設定の保存は楽観更新保護の対象外（サーバー判定値のため）',
+  !/armOptimisticGuard/.test(saveFnBody));
 
 console.log('\n===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
 process.exit(fail ? 1 : 0);

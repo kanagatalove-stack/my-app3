@@ -279,8 +279,36 @@ check('api_consoleTouch（google.script.run 経路）でも回収する',
   /function api_consoleTouch[\s\S]{0,600}?shardFlushPending\(\)/.test(src));
 check('api_consoleRelease でも回収する',
   /function api_consoleRelease[\s\S]{0,600}?shardFlushPending\(\)/.test(src));
-check('ScriptApp のトリガーは完全に撤去された',
-  src.indexOf('newTrigger') < 0 && src.indexOf('getProjectTriggers') < 0);
+// 【Request N】年次更新の「予約実行」のために ScriptApp の時刻トリガーを使う。
+//   ただし R34 が撤去した「保留キューの自動フラッシュ用トリガー」は復活させない
+//   （＝伝播はビーコン駆動のまま。トリガー経由のポーリングへ戻さない）。
+check('R34: 保留キューの自動フラッシュ用トリガーは撤去されたまま',
+  src.indexOf('shardQueueDeferred') < 0 && src.indexOf('shardRunDeferredPropagate') < 0);
+check('R34: newTrigger は年次更新の2ハンドラ以外に使わない',
+  (function () {
+    // 実装は定数渡し（newTrigger(ANNUAL_TRIGGER_FN) 等）なので、定数を解決して判定する。
+    const constMap = {};
+    const cr = /^const (ANNUAL_[A-Z_]*(?:TRIGGER|PERIODIC)[A-Z_]*)\s*=\s*'([^']+)';/gm;
+    let cm;
+    while ((cm = cr.exec(src)) !== null) constMap[cm[1]] = cm[2];
+    const allowed = { annualRolloverTriggered_: 1, annualRolloverPeriodicTick_: 1 };
+
+    const hits = src.match(/newTrigger\(\s*([A-Za-z0-9_']+)\s*\)/g) || [];
+    if (!hits.length) return false; // トリガーが1本も無いのは異常
+    return hits.every(function (h) {
+      const inner = h.replace(/^newTrigger\(\s*/, '').replace(/\s*\)$/, '');
+      let name = inner;
+      if (inner.charAt(0) === "'") name = inner.replace(/'/g, '');
+      else if (constMap[inner]) name = constMap[inner];
+      return Object.prototype.hasOwnProperty.call(allowed, name);
+    });
+  })());
+check('R34: トリガーハンドラは伝播処理を呼ばない（ビーコン駆動を維持）',
+  (function () {
+    const tr = (src.match(/function annualRolloverTriggered_\(\)[\s\S]*?\n}/) || [''])[0] +
+               (src.match(/function annualRolloverPeriodicTick_\(\)[\s\S]*?\n}/) || [''])[0];
+    return tr.indexOf('shardFlushPending') < 0 && tr.indexOf('shardPropagate') < 0;
+  })());
 check('旧名の関数が残っていない',
   src.indexOf('shardQueueDeferred') < 0 && src.indexOf('shardRunDeferredPropagate') < 0);
 
