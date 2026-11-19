@@ -1275,18 +1275,21 @@ function doPost(e) {
       if (!isDeviceInTeacherScope(targetStudent.school_name, currentTeacher, targetStudent.class_name)) {
         return jsonResponse({ success: false, error: '対象外の児童は操作できません（学校・対象クラスの範囲外）' });
       }
-      updateSingleDevice(payload.student_id, payload.data || {});
       const single = payload.data || {};
       const shardPatch = {};
       if (single.screen_lock !== undefined) shardPatch.screen_lock = parseBoolean(single.screen_lock);
       if (single.filter_mode !== undefined) shardPatch.filter_mode = single.filter_mode;
       if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
       if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
-      if (single.broadcast_url !== undefined) shardPatch.broadcast_url = single.broadcast_url;
-      // 【R41】子GASへの反映はブラウザが直接・並列で行う（親は待たない）
-      const shardSingle = Object.keys(shardPatch).length
-        ? shardPropagatePolicy([payload.student_id], shardPatch) : { skipped: true };
-      return jsonResponse({ success: true, message: '設定を更新しました', shard: shardSingle });
+      if (single.broadcast_url !== undefined) {
+        shardPatch.broadcast_url = single.broadcast_url;
+        if (single.broadcast_id) shardPatch.broadcast_id = String(single.broadcast_id);
+      }
+      // 【個別操作の統一経路】① 親キャッシュ先行反映 → ② 子GASへ即時同期転送
+      //   （forceSync=true / deferred 禁止）→ ③ シート永続化 の順で必ず通す。
+      const singleRes = applySingleControl_(payload.student_id, shardPatch, single);
+      return jsonResponse({ success: true, message: '設定を更新しました',
+        shard: singleRes.shard, broadcast_id: singleRes.broadcast_id || '' });
     }
 
     // H2. 【R41】子GASの接続情報をブラウザへ配布する
@@ -4898,7 +4901,113 @@ function bulkUpdateFilterMode(studentIds, filterMode, whitelistUrls, blacklistUr
   });
 }
 
+/**
+ * 個別操作（単体トグル）の最短経路を1か所に集約する。
+ *
+ *  実機症状: 「一斉ロック／一斉解除」は全端末4〜6秒で効くのに、児童一覧の
+ *  個別行の「画面ロック」を1人ずつ切り替えると、管理画面だけ「ロック中」に
+ *  なって端末が反応しない。
+ *
+ *  原因（二重の欠落）:
+ *    [1] 一括操作（bulkUpdate*）には CacheService 先行反映（hbPrimeControlState_）が
+ *        あるが、個別更新（updateSingleDevice）には無かった。
+ *    [2] 個別操作の子GAS転送は shardPropagatePolicy を forceSync 無しで呼んでいたため
+ *        SHARD_ASYNC_ENABLED 時に保留キューへ積まれ、deferred: true で即座に返る。
+ *        子GASは15秒周期の console_touch 回収まで指示を受け取らない。
+ *
+ *  確定方針（順序も固定）:
+ *    ① 親キャッシュへ先行反映（シートI/Oなし）
+ *    ② 子GASへ即時同期転送（forceSync=true。deferred は禁止）
+ *    ③ シートへ永続化（最後）
+ */
+function applySingleControl_(studentId, shardPatch, updateData) {
+  var patch = shardPatch || {};
+  // 呼び出し元の payload を書き換えないよう複製する
+  var ud = {};
+  try {
+    var src0 = updateData || {};
+    var ks = Object.keys(src0);
+    for (var i = 0; i < ks.length; i++) ud[ks[i]] = src0[ks[i]];
+  } catch (eCp) { ud = {}; }
+  if (patch.broadcast_id) ud.broadcast_id = patch.broadcast_id;
+
+  // ① 親キャッシュへ先行反映
+  try {
+    if (typeof hbPrimeControlState_ === 'function' && Object.keys(patch).length) {
+      var st = {};
+      if (patch.screen_lock !== undefined) st.screen_lock = parseBoolean(patch.screen_lock);
+      if (patch.filter_mode !== undefined) st.filter_mode = String(patch.filter_mode);
+      if (patch.whitelist_urls !== undefined) {
+        st.whitelist_urls = (typeof normalizeHostListToArray_ === 'function')
+          ? normalizeHostListToArray_(patch.whitelist_urls) : patch.whitelist_urls;
+      }
+      if (patch.blacklist_urls !== undefined) {
+        st.blacklist_urls = (typeof normalizeHostListToArray_ === 'function')
+          ? normalizeHostListToArray_(patch.blacklist_urls) : patch.blacklist_urls;
+      }
+      if (patch.broadcast_url !== undefined) {
+        st.broadcast_url = String(patch.broadcast_url == null ? '' : patch.broadcast_url);
+      }
+      if (patch.broadcast_id !== undefined) st.broadcast_id = String(patch.broadcast_id);
+      hbPrimeControlState_([studentId], st);
+    }
+  } catch (eP1) { /* 先行反映に失敗しても本処理は続ける */ }
+
+  // ② 子GASへ即時同期転送（forceSync=true で保留キューに積ませない）
+  var shardRes = { skipped: true };
+  if (Object.keys(patch).length && typeof shardPropagatePolicy === 'function') {
+    try { shardRes = shardPropagatePolicy([studentId], patch, true) || { skipped: true }; }
+    catch (eS) { shardRes = { error: String(eS) }; }
+  }
+
+  // ③ シートへ永続化（先行反映・転送の後）
+  var writeRes = updateSingleDevice(studentId, ud);
+  return {
+    shard: shardRes,
+    broadcast_id: (writeRes && writeRes.broadcast_id) || patch.broadcast_id || '',
+    write: writeRes || null
+  };
+}
+
 function updateSingleDevice(studentId, updateData) {
+  if (!updateData || typeof updateData !== 'object') updateData = {};
+
+  // 【高速化・不具合修正】シート書き込み（最大15秒のロック待ちを含む）より前に
+  //   制御状態を CacheService へ先行反映する。個別トグルでも一括操作と同じ
+  //   「先に返す」が効く（applySingleControl_ 経由なら二重反映になるが冪等）。
+  var primeSt = {};
+  try {
+    if (updateData.screen_lock !== undefined) primeSt.screen_lock = parseBoolean(updateData.screen_lock);
+    if (updateData.filter_mode !== undefined) primeSt.filter_mode = String(updateData.filter_mode);
+    if (updateData.whitelist_urls !== undefined) {
+      primeSt.whitelist_urls = parseUrlList(hostListToSheetString_(updateData.whitelist_urls));
+    }
+    if (updateData.blacklist_urls !== undefined) {
+      primeSt.blacklist_urls = parseUrlList(hostListToSheetString_(updateData.blacklist_urls));
+    }
+    if (updateData.broadcast_url !== undefined) {
+      primeSt.broadcast_url = String(updateData.broadcast_url == null ? '' : updateData.broadcast_url);
+    }
+    if (Object.keys(primeSt).length && typeof hbPrimeControlState_ === 'function') {
+      hbPrimeControlState_([studentId], primeSt);
+    }
+  } catch (ePrime) { /* 先行反映できなくても永続化は行う */ }
+
+  // 一斉表示の実行IDは「採番 → 先行反映 → シート書き込み」で1つだけ使う
+  //   （先行反映したIDとシートのIDがずれると、端末が同じ配信を新規扱いして2枚開く）。
+  var newBcId = '';
+  if (updateData.broadcast_url !== undefined) {
+    newBcId = String(updateData.broadcast_id || '').trim() || generateBroadcastId();
+    try {
+      if (typeof hbPrimeControlState_ === 'function') {
+        hbPrimeControlState_([studentId], {
+          broadcast_url: String(updateData.broadcast_url == null ? '' : updateData.broadcast_url),
+          broadcast_id: newBcId
+        });
+      }
+    } catch (eBc) { /* 先行反映できなくても永続化は行う */ }
+  }
+
   return withWriteLock(function () {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
@@ -4930,7 +5039,8 @@ function updateSingleDevice(studentId, updateData) {
     }
     if (updateData.broadcast_url !== undefined && headerMap['一斉表示URL']) {
       sheet.getRange(targetRow, headerMap['一斉表示URL']).setValue(updateData.broadcast_url);
-      sheet.getRange(targetRow, headerMap['一斉表示実行ID']).setValue(generateBroadcastId());
+      // 先行反映と同一のIDを書く（採番は1回だけ）
+      sheet.getRange(targetRow, headerMap['一斉表示実行ID']).setValue(newBcId || generateBroadcastId());
     }
     if (updateData.student_name !== undefined && headerMap['氏名']) {
       sheet.getRange(targetRow, headerMap['氏名']).setValue(String(updateData.student_name).trim());
@@ -4957,6 +5067,11 @@ function updateSingleDevice(studentId, updateData) {
         }]);
       }
     } catch (eIdx) {}
+
+    // 【個別操作・一斉表示ID】呼び出し元（applySingleControl_）がシートへ書いたのと
+    //   同じ実行IDを応答に載せられるよう返す。ここで返さないと個別一斉表示だけ
+    //   「2枚開き」防止のID共有が抜け落ちる。
+    return { student_id: studentId, broadcast_id: newBcId || '' };
   });
 }
 
@@ -8065,7 +8180,6 @@ function api_updateSingle(token, studentId, data) {
     if (!isDeviceInTeacherScope(targetStudent.school_name, currentTeacher, targetStudent.class_name)) {
       return { success: false, error: '対象外の児童は操作できません（学校・対象クラスの範囲外）' };
     }
-    updateSingleDevice(studentId, data || {});
     // 子GAS分散: 個別更新も子へ伝達する（doPost の update_single と同じ組み立て）
     const single = data || {};
     const shardPatch = {};
@@ -8073,10 +8187,15 @@ function api_updateSingle(token, studentId, data) {
     if (single.filter_mode !== undefined) shardPatch.filter_mode = single.filter_mode;
     if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
     if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
-    if (single.broadcast_url !== undefined) shardPatch.broadcast_url = single.broadcast_url;
-    const shardSingle = Object.keys(shardPatch).length
-      ? shardPropagatePolicy([studentId], shardPatch) : { skipped: true };
-    return { success: true, message: '設定を更新しました', shard: shardSingle };
+    if (single.broadcast_url !== undefined) {
+      shardPatch.broadcast_url = single.broadcast_url;
+      if (single.broadcast_id) shardPatch.broadcast_id = String(single.broadcast_id);
+    }
+    // 【個別操作の統一経路】① 親キャッシュ先行反映 → ② 子GASへ即時同期転送
+    //   （forceSync=true / deferred 禁止）→ ③ シート永続化 の順で必ず通す。
+    const singleRes = applySingleControl_(studentId, shardPatch, single);
+    return { success: true, message: '設定を更新しました',
+      shard: singleRes.shard, broadcast_id: singleRes.broadcast_id || '' };
   } catch (err) {
     return { success: false, error: err.toString() };
   }
