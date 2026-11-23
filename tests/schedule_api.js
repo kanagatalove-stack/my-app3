@@ -2244,9 +2244,20 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
       'let shardHandoffPending = false;\n' +
       'let shardAssignedCache = "";\n' +
       'let shardFailCount = 0;\n' +
-      'let lastHeartbeatSentMs = 0;\n';
+      'let lastHeartbeatSentMs = 0;\n' +
+      // 【v1.6.7】復帰（wake-up sync）まわりの状態（明示リスト方式: syncWithGas が触る）
+      'const WAKE_RESUME_COOLDOWN_MS = 5000;\n' +
+      'const WAKE_RETRY_DELAY_MS = 2000;\n' +
+      'const WAKE_RETRY_MAX = 2;\n' +
+      'const WAKE_RESUME_MIN_GAP_MS = 1000;\n' +
+      'let lastHeartbeatOkMs = 0;\n' +
+      'let lastWakeResumeMs = 0;\n' +
+      'let lastWakeResumeReason = \'\';\n' +
+      'let wakeRetryBudget = 0;\n' +
+      'let wakeRetryTimer = null;\n';
     const body = ['normalizeSchoolKey', 'resolveGasUrl', 'shardAssignedUrl',
-      'shardSyncMemory', 'applyShardAssignment', 'syncWithGas'].map(bgExtract).join('\n');
+      'shardSyncMemory', 'applyShardAssignment', 'syncWithGas',
+      'clearWakeRetry', 'scheduleWakeRetry'].map(bgExtract).join('\n');
     // finally の setTimeout コールバックは「戻り値を返さない」設計（呼び出し元を待たせない）。
     // そのため Promise を戻り値から拾えない。syncWithGas を包んで、発火した同期の
     // Promise をテスト側が明示的に await できるよう記録する。

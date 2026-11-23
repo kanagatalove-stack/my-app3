@@ -1160,7 +1160,7 @@ const rowVals = [
 ok('8-38 11項目の行データが11列にちょうど対応する', rowVals.length === teacherCols.length, rowVals.length);
 
 // --- 8-d. 固定仕様の不変条件（本番前の最終確認） ---
-ok('8-39 manifest は v1.6.6', manifest.version === '1.6.6', manifest.version);
+ok('8-39 manifest は v1.6.7', manifest.version === '1.6.7', manifest.version);
 ok('8-40 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
 ok('8-41 permissions が不変',
   JSON.stringify(manifest.permissions) === JSON.stringify(['storage', 'alarms', 'idle', 'tabs', 'identity', 'identity.email']),

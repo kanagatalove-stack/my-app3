@@ -94,6 +94,21 @@ let fastChainTimer = null;      // 稼働中の setTimeout チェーン（1本�
 const FAST_MIN_GAP_RATIO = 0.8; // 重複抑止しきい値（sync_interval_sec × 0.8 秒未満は再送しない）
 let lastHeartbeatStartMs = 0;   // 直近ハートビートの「送信開始」時刻（重複排除用）
 
+// 【v1.6.7】スリープ復帰（蓋を開けた／画面ロック解除／ウィンドウ復帰）の即時ハートビート。
+//   課題: 蓋を閉じてスリープ → 開けて Wi-Fi が繋がっても、次の setTimeout／chrome.alarms まで
+//         待たされるため、管理画面の「オンライン状態」へ戻るのに時間がかかっていた。
+//   方針: 復帰イベントの瞬間に 1 回だけ即時送信する。ただし通常のウィンドウ切替で毎回
+//         通信しないよう「前回の【成功】から 5 秒」のクールダウンと syncInFlight を併用する。
+const WAKE_RESUME_COOLDOWN_MS = 5000; // 前回の成功送信からこの時間未満の復帰通知は捨てる
+const WAKE_RETRY_DELAY_MS = 2000;     // 復帰直後の通信失敗は短い間隔（2 秒）で再試行する
+const WAKE_RETRY_MAX = 2;             // 短い再試行の上限（長いエラーバックオフへは入らない）
+const WAKE_RESUME_MIN_GAP_MS = 1000;  // 復帰イベント自体の連続発火をまとめる最小間隔
+let lastHeartbeatOkMs = 0;            // 直近ハートビートが「成功」した時刻（クールダウン判定用）
+let lastWakeResumeMs = 0;             // 直近の復帰通知で即時送信した時刻（連打防止）
+let lastWakeResumeReason = '';        // 直近の復帰理由（診断用: idle / focus / online）
+let wakeRetryBudget = 0;              // 復帰直後に許す短い再試行の残数
+let wakeRetryTimer = null;            // 短い再試行のタイマー（1 本だけ保持）
+
 // GAS の応答（ka_active / sync_interval_sec / idle_drift_until）を storage と同期ループへ反映する。
 // 旧形式（真偽値のみ）でも受け付ける（後方互換）。
 function applyRemoteKeepalive(payload) {
@@ -584,17 +599,84 @@ async function probeWake() {
   } catch (e) {}
 }
 
+/**
+ * 【v1.6.7】復帰通知の短い再試行タイマーを止める。
+ */
+function clearWakeRetry() {
+  if (wakeRetryTimer) {
+    try { clearTimeout(wakeRetryTimer); } catch (e) {}
+    wakeRetryTimer = null;
+  }
+}
+
+/**
+ * 【v1.6.7】Wi-Fi 再接続待ちのための「短い再試行」を 1 回だけ予約する。
+ *   蓋を開けた直後は Wi-Fi の再接続に 1〜2 秒かかるため、初回通信が
+ *   `Failed to fetch` 等で落ちる。ここで長いエラーバックオフ（30 秒〜数分）へ
+ *   入ってしまうと「オンライン復帰が遅い」実害になるので、2 秒後に短く再試行する。
+ *   予算（wakeRetryBudget）は復帰通知のたびに WAKE_RETRY_MAX へ戻し、
+ *   通常のエラー時は 0 のままなので無駄な通信は増えない。
+ *   戻り値: 予約したら true / 予算切れ・通信中なら false
+ */
+function scheduleWakeRetry() {
+  if (wakeRetryBudget <= 0) return false;
+  wakeRetryBudget--;
+  clearWakeRetry();
+  wakeRetryTimer = setTimeout(function () {
+    wakeRetryTimer = null;
+    if (syncInFlight) return; // 別の同期が走っているなら次周期に任せる（二重送信しない）
+    lastSyncMs = 0;
+    syncWithGas();
+  }, WAKE_RETRY_DELAY_MS);
+  return true;
+}
+
+/**
+ * 【v1.6.7】スリープ復帰（蓋を開けた／画面ロック解除／ネットワーク復帰）の即時ハートビート。
+ *   ・トリガー: chrome.idle.onStateChanged('active') / chrome.windows.onFocusChanged /
+ *               Service Worker の online イベント
+ *   ・クールダウン: 「前回の【成功】送信から 5 秒」未満なら捨てる。
+ *     これにより稼働中の通常のウィンドウ切替（1.5 秒ごとに成功している状態）では
+ *     一切追加の通信が発生しない。
+ *   ・既存の syncInFlight 排他制御と併用し、通信中の復帰通知も捨てる。
+ *   戻り値: 実際に即時送信を発火したら true
+ */
+function handleWakeResume(reason) {
+  const now = Date.now();
+  if (syncInFlight) return false; // 通信中は捨てる（多重送信しない）
+  // 短時間の連続発火（フォーカス往復・イベントの重複配送）をまとめて捨てる。
+  if (lastWakeResumeMs > 0 && (now - lastWakeResumeMs) < WAKE_RESUME_MIN_GAP_MS) return false;
+  // クールダウン: 前回の「成功」から一定時間経っていないなら即時送信しない。
+  if (lastHeartbeatOkMs > 0 && (now - lastHeartbeatOkMs) < WAKE_RESUME_COOLDOWN_MS) return false;
+  lastWakeResumeMs = now;
+  clearWakeRetry();                 // 予約済みの再試行は今回の送信に吸収する
+  wakeRetryBudget = WAKE_RETRY_MAX; // 復帰直後だけ短い再試行を許可する
+  lastSyncMs = 0;                   // レート制限を無視して必ず 1 回同期する
+  syncWithGas();
+  if (reason) lastWakeResumeReason = String(reason);
+  return true;
+}
+
 // ① イベント起床: 蓋を開けた／スリープから復帰して操作を再開した瞬間に 1 回だけ同期する。
 //    アラームと違い「実際に人が端末を使ったとき」しか動かないため、通信は増えない。
 //    （これが無いと、蓋の開閉だけでは SW が起きず復帰できなかった）
+//    v1.6.7: クールダウン（成功から 5 秒）付きの handleWakeResume に一本化した。
 try {
   if (chrome.idle && chrome.idle.onStateChanged) {
     chrome.idle.setDetectionInterval(60);
     chrome.idle.onStateChanged.addListener((state) => {
       if (state !== 'active') return;
-      lastSyncMs = 0;      // レート制限を無視して必ず 1 回同期する
-      syncWithGas();
+      handleWakeResume('idle');
     });
+  }
+} catch (e) {}
+
+// ② 【v1.6.7】ネットワーク復帰（Wi-Fi 再接続）の瞬間も即時同期する。
+//    Chromebook の蓋を開けた直後は Wi-Fi がまだ繋がっておらず、少し遅れて online になる。
+//    その瞬間に送れば「数秒でオンライン復帰」が成立する（クールダウンは共通）。
+try {
+  if (typeof self !== 'undefined' && self && self.addEventListener) {
+    self.addEventListener('online', function () { handleWakeResume('online'); });
   }
 } catch (e) {}
 
@@ -1233,6 +1315,12 @@ async function syncWithGas() {
 
     await recordSyncDiag(true, 'ok', '');
 
+    // 【v1.6.7】成功時刻を控える。復帰通知（handleWakeResume）のクールダウン判定は
+    //   「前回の成功から 5 秒」なので、ここでしか更新しない（送信開始では更新しない）。
+    lastHeartbeatOkMs = Date.now();
+    wakeRetryBudget = 0;   // 成功したら短い再試行の予算は使い切る
+    clearWakeRetry();
+
   } catch (err) {
     console.error('[EduAgent] 通信エラー:', err);
     try {
@@ -1240,6 +1328,10 @@ async function syncWithGas() {
       await recordSyncDiag(false, 'network',
         'GASへ到達できません（URL・ネットワーク・公開範囲を確認）: ' + detail);
     } catch (e2) {}
+    // 【v1.6.7】復帰直後（蓋を開けた／Wi-Fi 再接続中）の失敗は長いバックオフに入れない。
+    //   予算（wakeRetryBudget）は復帰通知の瞬間だけ立つ。通常運用の失敗時は 0 なので
+    //   従来どおり何もせず、GAS 側の sync_interval_sec（過負荷時 4 秒）に任せる。
+    try { scheduleWakeRetry(); } catch (e3) {}
   } finally {
     syncInFlight = false;
 
@@ -2228,9 +2320,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
  * タブ作成/更新イベントが拾えないことがある。ウィンドウのフォーカス変化（＝人が端末を操作した）
  * で SW が起きるため、ここでアクティブタブを確認して復帰判定する。
  * ※ 稼働中は resumeFromConsoleTab が即 return するため負荷はない。停止中の起床も操作時のみ。
+ * 【v1.6.7】ウィンドウ復帰（別ウィンドウから戻った／蓋を開けた）の瞬間にも即時ハートビートを
+ *   打つ。ただし handleWakeResume 側のクールダウン（成功から 5 秒）で、通常のウィンドウ切替では
+ *   追加の通信が起きない（稼働中は 1.5 秒ごとに成功しているため常にクールダウン内）。
  */
 if (chrome.windows && chrome.windows.onFocusChanged) {
-  chrome.windows.onFocusChanged.addListener(async () => {
+  chrome.windows.onFocusChanged.addListener(async (winId) => {
+    // フォーカスが「どのウィンドウにも無い」（デスクトップ・スリープ移行）は復帰ではない。
+    const NONE = (chrome.windows && chrome.windows.WINDOW_ID_NONE !== undefined)
+      ? chrome.windows.WINDOW_ID_NONE : -1;
+    if (winId !== undefined && winId === NONE) return;
+    try { handleWakeResume('focus'); } catch (e) {}
     try {
       const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       const tab = tabs && tabs[0];

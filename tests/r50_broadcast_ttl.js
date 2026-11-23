@@ -353,10 +353,10 @@ check('E9 実行IDの形式は bc_ + 10〜16桁の数値 で読み取る',
 check('E10 マスクは応答組み立ての1か所（buildHeartbeatResponse）で行う',
   /maskStaleBroadcast_/.test(hbBody) &&
   (src.match(/maskStaleBroadcast_\s*\(/g) || []).length === 2); // 定義1 + 呼び出し1
-check('E11 extension/ は変更していない（v1.6.6 のまま）',
+check('E11 extension/ は変更していない（v1.6.7 のまま）',
   (function () {
     const mf = JSON.parse(fs.readFileSync('/home/user/webapp/extension/manifest.json', 'utf8'));
-    return mf.version === '1.6.6';
+    return mf.version === '1.6.7';
   })(), JSON.parse(fs.readFileSync('/home/user/webapp/extension/manifest.json', 'utf8')).version);
 check('E12 端末の実行済みID記憶キー(last_broadcast_id)は拡張機能側のまま存在する',
   /last_broadcast_id/.test(fs.readFileSync('/home/user/webapp/extension/background.js', 'utf8')));
