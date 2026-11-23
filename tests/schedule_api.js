@@ -1827,6 +1827,8 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
         }
       },
       syncWithGas: function () { syncs.push(clock.now); return Promise.resolve(); },
+      // 【v1.6.6】稼働中 setTimeout チェーン用スタブ
+      setTimeout: function () { return 1; }, clearTimeout: function () {},
       clearIdleDriftAlarm: function () {}
     };
     vmMod.createContext(sandbox);
@@ -1844,6 +1846,11 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
       'let idleDriftUntil = 0;\n' +
       'let lastSyncMs = 0;\n' +
       'let hasSyncedOnce = false;\n' +
+      // 【v1.6.6】稼働中の高精度チェーンと重複排除用の状態（明示リスト方式）
+      'const FAST_MIN_GAP_RATIO = 0.8;\n' +
+      'let fastChainTimer = null;\n' +
+      'let lastHeartbeatStartMs = 0;\n' +
+      'let syncInFlight = false;\n' +
       'let shardAssignedCache = "";\n' +
       'let shardFailCount = 0;\n' +
       'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n' +
@@ -1948,6 +1955,8 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
         }
       },
       syncWithGas: function () { return Promise.resolve(); },
+      // 【v1.6.6】稼働中 setTimeout チェーン用スタブ
+      setTimeout: function () { return 1; }, clearTimeout: function () {},
       clearIdleDriftAlarm: function () {}
     };
     vmMod.createContext(sandbox);
@@ -1962,6 +1971,11 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
       'const DEFAULT_GAS_URL = ' + JSON.stringify(o.defaultGasUrl || '') + ';\n' +
       'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\n' +
       'let idleDriftUntil = 0;\nlet lastSyncMs = 0;\nlet hasSyncedOnce = false;\n' +
+      // 【v1.6.6】稼働中の高精度チェーンと重複排除用の状態（明示リスト方式）
+      'const FAST_MIN_GAP_RATIO = 0.8;\n' +
+      'let fastChainTimer = null;\n' +
+      'let lastHeartbeatStartMs = 0;\n' +
+      'let syncInFlight = false;\n' +
       'let shardAssignedCache = "";\nlet shardFailCount = 0;\n' +
       'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n' +
       'let shardHandoffPending = false;\n';
@@ -2324,7 +2338,9 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
           clear: function () { return Promise.resolve(true); }
         }
       },
-      syncWithGas: function () { syncs.push(clock.now); return Promise.resolve(); }
+      syncWithGas: function () { syncs.push(clock.now); return Promise.resolve(); },
+      // 【v1.6.6】稼働中 setTimeout チェーン用スタブ
+      setTimeout: function () { return 1; }, clearTimeout: function () {}
     };
     vmMod.createContext(sandbox);
     const pre =
@@ -2338,6 +2354,11 @@ console.log('===== U. 端末の初回送信トリガーと初回配信 =====');
       'let idleDriftUntil = 0;\n' +
       'let lastSyncMs = 0;\n' +
       'let hasSyncedOnce = true;\n' + // 初回ブートストラップ済み＝レート判定のみを測る
+      // 【v1.6.6】稼働中の高精度チェーンと重複排除用の状態（明示リスト方式）
+      'const FAST_MIN_GAP_RATIO = 0.8;\n' +
+      'let fastChainTimer = null;\n' +
+      'let lastHeartbeatStartMs = 0;\n' +
+      'let syncInFlight = false;\n' +
       'let shardAssignedCache = ' + JSON.stringify(o.shard || '') + ';\n' +
       'let scheduleCache = ' + JSON.stringify(o.scheduleCache || null) + ';\n';
     const body = ['maybeSync', 'scheduleInterestActive', 'ensureSlowPoll',

@@ -388,7 +388,7 @@ const DEVICES = [
   // ======================== E. 設計不変条件 ========================
   console.log('===== E. 設計不変条件 =====');
   {
-    check('拡張のバージョンは v1.6.5', manifest.version === '1.6.5', manifest.version);
+    check('拡張のバージョンは v1.6.6', manifest.version === '1.6.6', manifest.version);
     check('default_popup を持たない', !manifest.action || !manifest.action.default_popup);
     check('DEFAULT_GAS_URL は空文字', /const DEFAULT_GAS_URL = ''/.test(bgSrc));
     check('東粟倉小学校は含まれない', html.indexOf('東粟倉') === -1 && gasSrc.indexOf('東粟倉') === -1);

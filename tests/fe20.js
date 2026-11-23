@@ -339,7 +339,7 @@ check('空URLは対象外（claim が空キーで true を返す）',
   /if\s*\(\s*!key\s*\)\s*return\s+true;/.test(extract(bg, 'claimBroadcastUrlOnce')));
 check('applyPolicies の「新しいIDのときだけ」条件は維持',
   /if\s*\(\s*newBcId\s*&&\s*newBcId\s*!==\s*oldStorage\.last_broadcast_id\s*&&\s*newBcUrl\s*\)/.test(extract(bg, 'applyPolicies')));
-check('manifest の version は 1.6.5', manifest.version === '1.6.5', manifest.version);
+check('manifest の version は 1.6.6', manifest.version === '1.6.6', manifest.version);
 check('manifest に default_popup を追加していない',
   !JSON.stringify(manifest).includes('default_popup'));
 

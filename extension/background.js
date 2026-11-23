@@ -87,6 +87,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 let keepaliveActive = false; // GAS のハートビート応答 ka_active を反映
 let activeIntervalMs = 1500; // 稼働中の同期周期（GAS の sync_interval_sec で上書きされる）
 let idleDriftUntil = 0;      // 非稼働時、この時刻までは低頻度で再確認する（0=猶予なし）
+// 【v1.6.6】稼働中（ka_active=true）の高精度ポーリング用の状態。
+//   chrome.alarms は最短 30 秒でしか鳴らず、Chrome のスロットリングで更に遅れる。
+//   そこで Service Worker 内の setTimeout チェーンを主軸にし、alarms はフェイルセーフとして併存させる。
+let fastChainTimer = null;      // 稼働中の setTimeout チェーン（1本だけ保持）
+const FAST_MIN_GAP_RATIO = 0.8; // 重複抑止しきい値（sync_interval_sec × 0.8 秒未満は再送しない）
+let lastHeartbeatStartMs = 0;   // 直近ハートビートの「送信開始」時刻（重複排除用）
 
 // GAS の応答（ka_active / sync_interval_sec / idle_drift_until）を storage と同期ループへ反映する。
 // 旧形式（真偽値のみ）でも受け付ける（後方互換）。
@@ -140,25 +146,34 @@ function applyRemoteKeepalive(payload) {
     // 稼働中のバックストップ（30 秒アラーム）を確保し、猶予用アラームは不要なので止める。
     if (activeChanged) {
       lastSyncMs = 0;          // 稼働へ切替時は次回 ping で即同期し、素早く反映する
-      ensureSyncLoop();        // 稼働中のみアラームを登録（状態遷移時だけ）
+      ensureSyncLoop();        // 稼働中のみアラーム＋setTimeout チェーンを登録
       clearIdleDriftAlarm();
       // 稼働中は通常同期が走るため、低速ポーリングは不要（二重起床を防ぐ）。
       clearSlowPoll();
+    } else if (intervalChanged) {
+      // 【v1.6.6】GAS が sync_interval_sec を変えた（過負荷バックオフ 4 秒など）とき、
+      //   setTimeout チェーンの周期を即座に張り替える（GAS の負荷保護を損なわない）。
+      scheduleFastChain();
     }
     // 稼働中は起こしプローブ不要（通常同期が走っているため）。止めて通信を増やさない。
     clearWakeProbe();
-  } else if (activeChanged || driftChanged) {
-    // 非稼働: 30 秒アラームを止めて無駄な起床を止める。猶予期間だけ再開を確認する。
-    stopSyncLoop();
-    scheduleIdleDrift();
-    // 猶予が尽きた後も「先生が復帰したか」だけは拾えるようにする。
-    // 間隔は時間帯で切り替える（平日日中=1分固定／夜間・土日祝=10分）。
-    ensureWakeProbe();
-    // 【低速ポーリング】予約を保持している／子GASへ割り当て済みの端末だけは、
-    //   猶予が尽きた後も 5 分周期で起床させる。これが無いと「教員が管理画面を閉じた
-    //   まま新しい予約を作る」ケースで端末が永久に眠り、時間制限タイマーが発動しない。
-    if (scheduleInterestActive()) ensureSlowPoll();
-    else clearSlowPoll();
+  } else {
+    // 【v1.6.6】非稼働（ka_active=false）を受けた瞬間に高頻度チェーンを即時停止し、
+    //   従来の長周期 chrome.alarms スリープへ戻す（放課後・夜間の無駄な通信をゼロに）。
+    clearFastChain();
+    if (activeChanged || driftChanged) {
+      // 非稼働: 30 秒アラームを止めて無駄な起床を止める。猶予期間だけ再開を確認する。
+      stopSyncLoop();
+      scheduleIdleDrift();
+      // 猶予が尽きた後も「先生が復帰したか」だけは拾えるようにする。
+      // 間隔は時間帯で切り替える（平日日中=1分固定／夜間・土日祝=10分）。
+      ensureWakeProbe();
+      // 【低速ポーリング】予約を保持している／子GASへ割り当て済みの端末だけは、
+      //   猶予が尽きた後も 5 分周期で起床させる。これが無いと「教員が管理画面を閉じた
+      //   まま新しい予約を作る」ケースで端末が永久に眠り、時間制限タイマーが発動しない。
+      if (scheduleInterestActive()) ensureSlowPoll();
+      else clearSlowPoll();
+    }
   }
 }
 
@@ -220,10 +235,28 @@ function maybeSync() {
     return;
   }
 
-  let interval;
+  // 【v1.6.6】多重トリガーの重複排除。
+  //   setTimeout チェーン / chrome.alarms / content.js の KEEPALIVE_PING が
+  //   同時に叩いても、通信中の二重送信はここで必ず捨てる（通信量を増やさない）。
+  if (syncInFlight) return;
+
   if (keepaliveActive) {
-    interval = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
-  } else if (idleDriftUntil && now < idleDriftUntil) {
+    // 稼働中: setTimeout チェーンを主軸に sync_interval_sec（1.5 秒／バックオフ 4 秒）へ
+    //   厳密追従する。前回「送信開始」から sync_interval_sec × 0.8 秒未満の再トリガーは
+    //   重複とみなす（タイマーの 1〜2ms の揺らぎで周期が 2 倍へ落ちるのを防ぐ下限緩和）。
+    const fastInterval = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
+    const minGap = Math.max(0, Math.round(fastInterval * FAST_MIN_GAP_RATIO));
+    if (lastHeartbeatStartMs > 0) {
+      const since = lastHeartbeatStartMs > now ? -1 : (now - lastHeartbeatStartMs);
+      if (since >= 0 && since < minGap) return;
+    }
+    lastSyncMs = now;
+    syncWithGas();
+    return;
+  }
+
+  let interval;
+  if (idleDriftUntil && now < idleDriftUntil) {
     interval = IDLE_DRIFT_MS; // 猶予期間のみ低頻度で再確認する
   } else if (scheduleInterestActive()) {
     // 【低速ポーリング】非稼働・猶予終了でも、予約保持または子GAS割り当て済みなら
@@ -249,13 +282,42 @@ function maybeSync() {
  */
 function ensureSyncLoop() {
   try {
-    chrome.alarms.create('syncAlarm', { periodInMinutes: 0.5 }); // 30秒（MV3の最小値）
+    // 30秒（MV3の最小値）。SW が 30 秒アイドルで停止しても復旧できるフェイルセーフ。
+    chrome.alarms.create('syncAlarm', { periodInMinutes: 0.5 });
   } catch (e) {}
+  // 【v1.6.6】稼働中は setTimeout チェーンを主軸にする（alarms は 30 秒＋間引きで遅い）。
+  scheduleFastChain();
 }
 
-/** 稼働が終わったらバックストップ（30 秒アラーム）を止める。 */
+/**
+ * 稼働中の高精度 setTimeout チェーンを（再）スケジュールする。
+ *   sync_interval_sec（通常 1.5 秒／過負荷バックオフ時 4 秒）に厳密追従する。
+ *   チェーンは常に 1 本だけ保持し、再設定時は前のタイマーを必ず破棄する。
+ */
+function scheduleFastChain() {
+  clearFastChain();
+  if (!keepaliveActive) return;
+  const ms = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
+  fastChainTimer = setTimeout(function () {
+    fastChainTimer = null;
+    if (!keepaliveActive) return; // 稼働が終わっていたら再武装しない
+    maybeSync();
+    scheduleFastChain();
+  }, ms);
+}
+
+/** 高精度チェーンを停止する（非稼働へ戻った瞬間に呼ぶ）。 */
+function clearFastChain() {
+  if (fastChainTimer) {
+    try { clearTimeout(fastChainTimer); } catch (e) {}
+    fastChainTimer = null;
+  }
+}
+
+/** 稼働が終わったらバックストップ（30 秒アラーム）と高頻度チェーンを止める。 */
 function stopSyncLoop() {
   try { chrome.alarms.clear('syncAlarm'); } catch (e) {}
+  clearFastChain();
 }
 
 /**
@@ -539,9 +601,21 @@ try {
 // SW が停止状態から復帰したとき（端末が眠ったまま SW だけ再起動した場合）に備え、
 // 非稼働なら起こしプローブを張り直す。これが無いとアラームが失われたまま復帰できない。
 try {
-  chrome.storage.local.get(['keepalive_active'], (d) => {
+  chrome.storage.local.get(['keepalive_active', 'keepalive_interval_sec'], (d) => {
     if (chrome.runtime.lastError) return;
-    if (!(d && d.keepalive_active)) ensureWakeProbe();
+    if (d && d.keepalive_active) {
+      // 【v1.6.6】SW が 30 秒アイドルで停止した直後の復帰。
+      //   稼働中だったなら setTimeout チェーンとフェイルセーフ alarm を即座に張り直す
+      //   （これが無いと alarms の 30 秒待ちまで遅延が残る）。
+      keepaliveActive = true;
+      const sec = Number(d.keepalive_interval_sec);
+      if (isFinite(sec) && sec > 0) activeIntervalMs = Math.round(sec * 1000);
+      hasSyncedOnce = true;
+      lastSyncMs = 0;
+      ensureSyncLoop();
+    } else {
+      ensureWakeProbe();
+    }
   });
 } catch (e) {}
 
@@ -1095,6 +1169,8 @@ async function syncWithGas() {
     // 【フェーズ3】送信時刻を控える。応答受信時に往復の中央時刻を求めて
     //   サーバ時刻との差（時計補正）を NTP 風に算出するために使う。
     lastHeartbeatSentMs = Date.now();
+    // 【v1.6.6】稼働中の重複トリガー抑止用に「送信開始」時刻も控える。
+    lastHeartbeatStartMs = lastHeartbeatSentMs;
     const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     let timer = null;
     if (controller) {
