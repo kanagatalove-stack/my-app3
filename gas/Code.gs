@@ -1135,8 +1135,11 @@ function doPost(e) {
     if (action === 'get_all') {
       // 子GAS分散: 子の端末も同じ画面に並べる（教員は1画面のまま）。
       // 子GASへは並列（fetchAll）で問い合わせ、集約結果を数秒キャッシュする。
+      // 【R55】payload.fresh（または no_cache）が真なら読み取りキャッシュを迂回し、
+      //   子GASの最新 last_seen を取り直す（コンソールの自動更新・タブ復帰・操作直後）。
+      const __freshGetAll = parseBoolean(payload.fresh) || parseBoolean(payload.no_cache);
       const data = getShardMergedDevices(
-        payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
+        payload.school_name, currentTeacher, Boolean(payload.include_unassigned), __freshGetAll);
       return jsonResponse({ success: true, data: data });
     }
 
@@ -4095,7 +4098,10 @@ function getDeviceByStudentId(studentId) {
  * 教員の操作結果は次の読み取りで必ず最新が返る（誤情報を残さない）。
  * ※ CacheService が無い環境（GAS以外のテスト等）では従来どおり毎回シートを読む。
  */
-function getAllDevices(filterSchool, teacher, includeUnassigned) {
+function getAllDevices(filterSchool, teacher, includeUnassigned, fresh) {
+  // 【R55】fresh=true は読み取りキャッシュ（dev2_ 5秒）を迂回してシートを読み直す。
+  //   3引数の呼び出しは fresh=false として従来と完全に同一（キャッシュを使う）。
+  const __fresh = (fresh === true);
   const cacheEnabled = (typeof CacheService !== 'undefined');
   let devCache = null;
   let devCacheKey = '';
@@ -4110,8 +4116,10 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
         t.email || '', t.school || '', t.role || '', t.target_class || ''
       ].join('|');
       devCacheKey = 'dev2_' + version + '_' + scopeKey;
-      const hit = devCache.get(devCacheKey);
-      if (hit) return JSON.parse(hit);
+      if (!__fresh) {
+        const hit = devCache.get(devCacheKey);
+        if (hit) return JSON.parse(hit);
+      }
     } catch (e) {
       devCache = null;
     }
@@ -6566,20 +6574,29 @@ function diagShardSetup() {
   return text;
 }
 
-function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
+function getShardMergedDevices(filterSchool, teacher, includeUnassigned, fresh) {
+  // 【R55】第4引数 fresh=true は「集約キャッシュを迂回して子GASの最新 last_seen を取り直す」。
+  //   実機症状: 自動更新 ON より「OFF にして手動再読み込み」の方がオンライン/オフラインが早い。
+  //   原因は、この集約キャッシュ（shard_ga_ 4秒）と子一覧キャッシュ（shard_ls_ 4秒）が
+  //   重なって子の last_seen が数秒古いまま返ること。書き込みは dev_v を進めて両方を
+  //   捨てるため、操作直後の手動更新だけが新鮮に見えていた。
+  //   コンソールの自動更新・タブ復帰・操作直後の取得は fresh=true を送る。
+  //   ※ 3引数の呼び出し（既存経路・テスト）は fresh=false として従来と完全に同一の挙動。
+  const __fresh = (fresh === true);
   // 【DIAG-1】集約が「親モード」として動いているか。
   // false の場合、子GASには一切問い合わせず親シートの古い日時だけで判定する（＝症状の直接原因）。
   if (typeof shardDiagLog === 'function') {
     shardDiagLog('DIAG-1 集約開始 isShardParent=' + String(isShardParent()) +
       ' filterSchool=' + String(filterSchool) +
-      ' includeUnassigned=' + String(!!includeUnassigned));
+      ' includeUnassigned=' + String(!!includeUnassigned) +
+      ' fresh=' + String(__fresh));
   }
   if (!isShardParent()) {
     if (typeof shardDiagLog === 'function') {
       shardDiagLog('DIAG-2 ★親モードではありません（子GASへ問い合わせません）' +
         ' → 親GASのスクリプトプロパティ SHARD_MODE=true が必要です');
     }
-    return getAllDevices(filterSchool, teacher, includeUnassigned);
+    return getAllDevices(filterSchool, teacher, includeUnassigned, __fresh);
   }
 
   const t = teacher || {};
@@ -6591,21 +6608,30 @@ function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
   const cacheKey = 'shard_ga_' + shardHash(scopeKey) + '_' + shardDevVersion();
 
   let cache = null;
-  try {
-    if (typeof CacheService !== 'undefined') {
-      cache = CacheService.getScriptCache();
-      const hit = cache.get(cacheKey);
-      if (hit) {
-        const arr = JSON.parse(hit);
-        if (Array.isArray(arr)) return arr;
+  // 【R55】fresh のときは集約キャッシュを読まない（子GASの最新 last_seen を取り直す）。
+  if (!__fresh) {
+    try {
+      if (typeof CacheService !== 'undefined') {
+        cache = CacheService.getScriptCache();
+        const hit = cache.get(cacheKey);
+        if (hit) {
+          const arr = JSON.parse(hit);
+          if (Array.isArray(arr)) return arr;
+        }
       }
+    } catch (e) {
+      cache = null;
     }
-  } catch (e) {
-    cache = null;
+  } else {
+    if (typeof shardDiagLog === 'function') {
+      shardDiagLog('DIAG-1b fresh 指定: 集約キャッシュを迂回して子GASへ最新を問い合わせる');
+    }
+    try { if (typeof CacheService !== 'undefined') cache = CacheService.getScriptCache(); } catch (eC) { cache = null; }
   }
 
-  const baseData = getAllDevices(filterSchool, teacher, includeUnassigned);
-  const mergedData = shardMergeDevices(baseData, filterSchool, teacher, includeUnassigned);
+  // 【R55】fresh は下位の読み取りキャッシュ（dev2_ / shard_ls_）にも伝播させる。
+  const baseData = getAllDevices(filterSchool, teacher, includeUnassigned, __fresh);
+  const mergedData = shardMergeDevices(baseData, filterSchool, teacher, includeUnassigned, __fresh);
   // 【サイト監視】集約結果にも表示の伏せ処理を適用する。
   //   子GASから返る monitor_flag は子の設定に基づくため、親の設定がOFFなら
   //   親と同様に伏せる必要がある（これをしないと子の注意マークだけ残る）。
@@ -6637,12 +6663,17 @@ function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
   return data;
 }
 
-function shardFetchChildDevices(urlsOverride) {
+function shardFetchChildDevices(urlsOverride, fresh) {
   if (!isShardParent()) return [];
   try {
     const cfg = shardConfigCached();
     const urls = Array.isArray(urlsOverride) ? urlsOverride : shardAllChildUrls(cfg);
     if (!urls.length) return [];
+
+    // 【R55】fresh=true は子一覧キャッシュ（shard_ls_ 4秒）を読まずに子GASへ直接問い合わせる。
+    //   コンソールの自動更新が「子の last_seen を最速で反映する」ための経路。
+    //   fresh=false（従来の 2引数呼び出し・1引数呼び出し）は今までどおりキャッシュを使う。
+    const __fresh = (fresh === true);
 
     // 集約結果の短時間キャッシュ（3〜5秒）。
     // キーに dev_v を混ぜるため、教員がロック/配信/規制を行うと自動的に無効化される。
@@ -6652,10 +6683,12 @@ function shardFetchChildDevices(urlsOverride) {
     try {
       if (typeof CacheService !== 'undefined') {
         cache = CacheService.getScriptCache();
-        const hit = cache.get(cacheKey);
-        if (hit) {
-          const arr = JSON.parse(hit);
-          if (Array.isArray(arr)) return arr;
+        if (!__fresh) {
+          const hit = cache.get(cacheKey);
+          if (hit) {
+            const arr = JSON.parse(hit);
+            if (Array.isArray(arr)) return arr;
+          }
         }
       }
     } catch (e) {
@@ -6663,7 +6696,8 @@ function shardFetchChildDevices(urlsOverride) {
     }
 
     if (typeof shardDiagLog === 'function') {
-      shardDiagLog('DIAG-6 子GASへ問い合わせ 台数=' + urls.length + ' ' + urls.join(' , '));
+      shardDiagLog('DIAG-6 子GASへ問い合わせ 台数=' + urls.length +
+        ' fresh=' + String(__fresh) + ' ' + urls.join(' , '));
     }
     const body = JSON.stringify({ action: 'shard_list', shard_secret: cfg.sec });
     const requests = [];
@@ -6928,7 +6962,7 @@ function shardMergeDeviceRow(parentDev, childDev) {
   return out;
 }
 
-function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
+function shardMergeDevices(base, filterSchool, teacher, includeUnassigned, fresh) {
   if (!isShardParent()) return base;
   try {
     const cfg = shardConfigCached();
@@ -6937,7 +6971,10 @@ function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
     const urls = shardUrlsForTeacher(cfg, teacher);
     if (!urls.length) return base;
 
-    const childList = shardFetchChildDevices(urls);
+    // 【R55】fresh は子一覧キャッシュ（shard_ls_ 4秒）にも伝播させる。
+    //   これをしないと「集約キャッシュは迂回したのに子の行は 4 秒前」となり、
+    //   自動更新の反映遅延が残る。
+    const childList = shardFetchChildDevices(urls, fresh === true);
     const childDiag = (childList && childList._diag) || null;
     if (typeof shardDiagLog === 'function') {
       shardDiagLog('DIAG-12 子から受領=' + (Array.isArray(childList) ? childList.length : -1) +
@@ -8031,7 +8068,7 @@ function shardClientConfig() {
   }
 }
 
-function api_getAllDevices(token, schoolName, includeUnassigned) {
+function api_getAllDevices(token, schoolName, includeUnassigned, fresh) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
@@ -8041,7 +8078,10 @@ function api_getAllDevices(token, schoolName, includeUnassigned) {
     // google.script.run 経由のときだけ子GASの端末が見えなかった（経路による差）。
     // 集約（親＋子の統合）を通る getShardMergedDevices に統一する。
     // SHARD_MODE=false のときは内部で getAllDevices をそのまま返す＝従来と完全同一。
-    const data = getShardMergedDevices(schoolName, currentTeacher, Boolean(includeUnassigned));
+    // 【R55】第4引数 fresh=true で読み取りキャッシュを迂回し、子GASの最新 last_seen を
+    //   取り直す（自動更新・タブ復帰・操作直後の取得用）。3引数の呼び出しは従来どおり。
+    const data = getShardMergedDevices(
+      schoolName, currentTeacher, Boolean(includeUnassigned), parseBoolean(fresh));
     return { success: true, data: data };
   } catch (err) {
     return { success: false, error: err.toString() };

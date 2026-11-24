@@ -932,7 +932,8 @@ async function main() {
     };
     vm.createContext(c2);
     let b = 'const SHEET_TZ_OFFSET_MS = 9 * 60 * 60 * 1000;\n';
-    ['sheetTsToMs', 'shardMergeDeviceRow', 'shardMergeDevices',
+    // 【R55】api_getAllDevices が fresh 引数を parseBoolean で解釈するため明示リストへ追加。
+    ['parseBoolean', 'sheetTsToMs', 'shardMergeDeviceRow', 'shardMergeDevices',
       'api_getAllDevices', 'api_consoleTouch', 'api_consoleRelease']
       .forEach(function (n) { b += extract(gasSrc, n) + '\n'; });
     vm.runInContext(b, c2);

@@ -227,7 +227,7 @@
           </label>
 
           <!-- 更新ボタン -->
-          <button id="refreshBtn" onclick="loadDevices()" class="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-indigo-400">
+          <button id="refreshBtn" onclick="refreshDevicesManual()" class="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-indigo-400">
             <svg id="refreshSpinner" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
             </svg>
@@ -2030,8 +2030,52 @@
     // ==================================================================
     const SCREEN_FETCH_TIMEOUT_MS = 12000;  // 画面情報（子GAS・親/exec 共通）
     const WRITE_FETCH_TIMEOUT_MS = 25000;   // 書き込み系（従来の挙動を壊さない余裕）
+    const LIST_FETCH_TIMEOUT_MS = 12000;    // 【R55】端末一覧（get_all）の /exec 直送
     function isDirectFetchAction(act) {
       return act === 'get_screens' || act === 'request_screens';
+    }
+
+    // ==================================================================
+    // 【R55】端末一覧（get_all）の /exec 直送
+    //
+    //   自動更新は 4 秒周期で一覧を取り直す。しかし get_all が
+    //   google.script.run を通ると、裏の callback?nocache_id= ポーリングで
+    //   往復に 3.6〜7.1 秒かかる（R36 の実測）。「周期 4 秒なのに画面は
+    //   10 秒前の状態」という体感の直接原因がこれ。
+    //   書き込み系・画面情報系と同じ /exec 直送に揃え、往復を 1 回分にする。
+    //
+    //   失敗（URL未設定・ネットワーク断・タイムアウト）は呼び出し側で
+    //   従来の google.script.run 経路へ退避する（挙動を壊さない）。
+    //   認証切れ（need_auth）は退避しない（再ログイン導線を二重に走らせない）。
+    // ==================================================================
+    async function apiRequestDirectList(payload) {
+      const apiUrl = getApiUrl();
+      if (!apiUrl) {
+        const e = new Error('GAS APIエンドポイントが取得できません。');
+        e.noFallback = false;
+        throw e;
+      }
+      const body = Object.assign({}, payload);
+      if (authToken) body.token = authToken;
+      const res = await eduFetchWithTimeout(apiUrl, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        redirect: 'follow'
+      }, LIST_FETCH_TIMEOUT_MS);
+      const data = await res.json();
+      if (data && data.need_auth) {
+        logout();
+        const e = new Error('セッションの有効期限が切れました。再ログインしてください。');
+        e.noFallback = true;
+        throw e;
+      }
+      if (data && data.success === false) {
+        const e = new Error(data.error || 'リクエスト処理に失敗しました');
+        e.noFallback = true;   // サーバーが明示的に拒否＝退避しても同じ結果
+        throw e;
+      }
+      return data;
     }
 
     // fetch に上限時間を付ける。AbortController が無い環境では素の fetch。
@@ -3011,6 +3055,20 @@
       // 【R43】画面情報（get_screens / request_screens）も /exec 直送にする。
       //   google.script.run の callback ポーリング往復（3.6〜7.1秒）を無くすため。
       const __screenAction = isDirectFetchAction(payload && payload.action);
+      // 【R55】端末一覧（get_all）は /exec 直送。google.script.run の callback ポーリング
+      //   往復（実測 3.6〜7.1 秒）を無くし、自動更新の 4 秒周期を実効化する。
+      //   失敗（URL未設定・ネットワーク断・タイムアウト）は従来経路（google.script.run）へ
+      //   退避するので、環境差で一覧が取れなくなることはない。
+      const __listAction = !!(payload && payload.action === 'get_all');
+      if (__listAction) {
+        try {
+          return await apiRequestDirectList(payload);
+        } catch (eList) {
+          const __hasRunner = (typeof google !== 'undefined' && google.script && google.script.run);
+          if ((eList && eList.noFallback) || !__hasRunner) throw eList;
+          // ここから下の従来経路へ落ちる（退避）
+        }
+      }
       if (__directFetch) {
         // 【R37】応答を待たず、送信と「完全同時（0ms）」に子GASビーコンを撃つ。
         //   親シートの書き込みと子シートの書き込みを時間軸で重ねるため。
@@ -3155,12 +3213,51 @@
       return data;
     }
 
-    // 自動更新の制御
+    // ==================== 自動更新の制御（R55） ====================
     // 既定は「オフ（手動更新メイン）」。児童情報はログイン後に一度読み込み、以降は
     // 教員が指示（ロック/配信/規制/画面取得）したときだけ通信する運用のため、
-    // 5秒ごとの自動取得は標準では行わない（通信・GAS実行回数の節約）。
+    // 自動取得は標準では行わない（通信・GAS実行回数の節約）。
     // 教員が明示的にオンにした場合のみ自動更新し、その選択は localStorage に保存する。
+    //
+    // 【R55 実機不具合の修正】
+    //   症状: 自動更新を ON にしていても、ON を OFF にして手動「再読み込み」を押した方が
+    //         オンライン／オフラインの反映が早い。
+    //   原因は「呼ぶ関数の違い」ではなく、次の 3 点だった。
+    //     ① 一覧取得（get_all）が google.script.run の callback ポーリング経路
+    //        （実測 3.6〜7.1 秒の往復）を通っていた。手動も同じ経路なので、
+    //        自動更新は毎周期この往復待ちを払い、結果として「反映が遅い」体感になる。
+    //     ② GAS 側に 3 段の読み取りキャッシュ（dev2_ 5 秒 / shard_ga_ 4 秒 /
+    //        shard_ls_ 4 秒）があり、子GAS の最新 last_seen が数秒古いまま返る。
+    //        書込は dev_v を進めてキャッシュを捨てるため、操作直後の手動更新だけが
+    //        「新鮮」に見えていた（＝手動の方が早い、という錯覚の正体）。
+    //     ③ 自動更新の周期が固定で、通信中の次周期が重なると多重リクエストになり、
+    //        古い応答が後から届いて画面を巻き戻すことがあった。
+    //   対策:
+    //     ・取得経路を 1 本化（refreshDevicesNow → loadDevices）。自動更新・
+    //       タブ復帰・操作直後のいずれも同じ loadDevices を fresh 指定で呼ぶ。
+    //     ・get_all を /exec 直送にして往復待ちを無くす（失敗時は従来経路へ退避）。
+    //     ・fresh 指定で GAS 側の読み取りキャッシュを迂回し、子GAS の最新
+    //       last_seen まで取り直す（Code.gs の第4引数 fresh）。
+    //     ・isFetching による排他制御（多重リクエストを作らない）。
+    //     ・周期は 4 秒（3〜5 秒要件）。連続失敗時のみ 8 秒へ自動緩和する。
+    //     ・document.hidden の間はポーリングを止め、復帰した瞬間に 1 回取得する。
+    const AUTO_REFRESH_INTERVAL_MS = 4000;      // 既定周期（3〜5 秒要件の中央値）
+    const AUTO_REFRESH_MAX_INTERVAL_MS = 8000;  // 連続失敗時の緩和上限
+    const AUTO_REFRESH_TICK_MS = 1000;          // 内部の刻み（経過時間で間引く）
+    const AUTO_REFRESH_FAIL_STREAK = 3;         // この回数連続で失敗したら緩和する
+
     let autoRefreshBound = false;
+    let autoRefreshOn = false;                  // 教員が ON にしているか
+    let autoRefreshVisibilityBound = false;     // visibilitychange の二重登録防止
+    let autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS; // 現在の実効周期
+    let autoRefreshNextAt = 0;                  // 次に取得してよい時刻（0＝即時）
+    let autoRefreshFailStreak = 0;              // 連続失敗回数
+    // 通信中フラグ（in-flight ガード）。loadDevices が立て、完了時に必ず下ろす。
+    //   ※ 手動更新は常に許可する。ガードするのは自動更新／復帰／操作直後の
+    //     「タイマー起点」の取得だけ（教員の明示操作を握りつぶさない）。
+    let isFetching = false;
+    let refreshTriggerSource = '';              // 直近の取得トリガ（診断用）
+
     function setupAutoRefresh() {
       const toggle = document.getElementById('autoRefreshToggle');
       if (!toggle) return;
@@ -3173,31 +3270,131 @@
         autoRefreshBound = true;
         toggle.addEventListener('change', () => {
           try { localStorage.setItem('edu_auto_refresh', toggle.checked ? '1' : '0'); } catch (e) {}
-          if (toggle.checked) startAutoRefresh();
-          else stopAutoRefresh();
+          if (toggle.checked) {
+            startAutoRefresh();
+            refreshDevicesNow('toggle');
+          } else {
+            stopAutoRefresh();
+          }
         });
       }
+      bindAutoRefreshVisibility();
       if (toggle.checked) startAutoRefresh();
       else stopAutoRefresh();
     }
 
+    // 自動更新の開始。周期は「1 秒刻みのタイマー＋経過時間判定」で実現する。
+    //   setInterval を周期そのもので張ると、動的緩和（8 秒）へ切り替えるたびに
+    //   タイマーを張り直す必要があり、張り直しの隙間で取得が飛ぶ。
+    //   1 秒刻みにしておけば、周期の変更は変数 1 つの書き換えで済む。
     function startAutoRefresh() {
       stopAutoRefresh();
-      autoRefreshTimer = setInterval(() => {
-        loadDevices(true);
-      }, 5000);
+      autoRefreshOn = true;
+      autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
+      autoRefreshFailStreak = 0;
+      autoRefreshNextAt = Date.now() + autoRefreshIntervalMs;
+      autoRefreshTimer = setInterval(autoRefreshTick, AUTO_REFRESH_TICK_MS);
     }
 
     function stopAutoRefresh() {
+      autoRefreshOn = false;
       if (autoRefreshTimer) {
         clearInterval(autoRefreshTimer);
         autoRefreshTimer = null;
       }
     }
 
+    // タイマーの 1 刻み。実際に取得するかをここで判定する。
+    function autoRefreshTick() {
+      if (!autoRefreshOn) return;
+      // 【省電力】タブが非表示（他タブ／最小化／画面ロック）の間は取得しない。
+      if (isTabHidden()) return;
+      const now = Date.now();
+      if (autoRefreshNextAt && now < autoRefreshNextAt) return;
+      autoRefreshNextAt = now + autoRefreshIntervalMs;
+      refreshDevicesNow('auto');
+    }
+
+    // タブが非表示か（document.hidden）。判定できない環境では「表示中」とみなす。
+    function isTabHidden() {
+      try {
+        return !!(typeof document !== 'undefined' && document && document.hidden === true);
+      } catch (e) { return false; }
+    }
+
+    // タブの表示状態の監視。非表示中はポーリングを止め、復帰した瞬間に 1 回取得する。
+    function bindAutoRefreshVisibility() {
+      if (autoRefreshVisibilityBound) return;
+      autoRefreshVisibilityBound = true;
+      try {
+        if (typeof document !== 'undefined' && document &&
+            typeof document.addEventListener === 'function') {
+          document.addEventListener('visibilitychange', onAutoRefreshVisibilityChange);
+        }
+        if (typeof window !== 'undefined' && window &&
+            typeof window.addEventListener === 'function') {
+          // visibilitychange が発火しない環境（一部の埋め込み）への保険。
+          window.addEventListener('focus', onAutoRefreshVisibilityChange);
+        }
+      } catch (e) {}
+    }
+
+    function onAutoRefreshVisibilityChange() {
+      if (!autoRefreshOn) return;
+      if (isTabHidden()) {
+        // 非表示になったら次の機会を無効化しておく（tick 側でも止まる）。
+        autoRefreshNextAt = 0;
+        return;
+      }
+      // 復帰: 緩和を解除し、タイマーを待たずに即座に 1 回取得する。
+      autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
+      autoRefreshFailStreak = 0;
+      autoRefreshNextAt = 0;
+      refreshDevicesNow('visible');
+    }
+
+    // タイマー起点の取得は必ずここを通す（in-flight ガード付き）。
+    //   戻り値: 実際に取得を開始したら true、多重／即時取得できないとき false。
+    function refreshDevicesNow(trigger) {
+      if (isFetching) return false;   // 通信中は次周期に任せる（多重リクエスト禁止）
+      refreshTriggerSource = trigger || 'auto';
+      try {
+        loadDevices(true, { fresh: true, trigger: refreshTriggerSource });
+      } catch (e) {
+        return false;
+      }
+      return true;
+    }
+
+    // 手動「再読み込み」ボタンの入口。
+    //   自動更新と同じ loadDevices（fresh 指定）を通すので取得経路は完全に同一。
+    //   教員の明示操作なので in-flight ガードでは止めない（loadSeq が古い応答を捨てる）。
+    //   併せて自動更新の次回時刻をリセットし、直後の二重取得を避ける。
+    function refreshDevicesManual() {
+      refreshTriggerSource = 'manual';
+      autoRefreshNextAt = Date.now() + autoRefreshIntervalMs;
+      try {
+        loadDevices(false, { fresh: true, trigger: 'manual' });
+      } catch (e) {}
+    }
+
+    // 取得結果を周期制御へフィードバックする（失敗が続いたときだけ緩和）。
+    function noteRefreshResult(ok) {
+      if (ok) {
+        autoRefreshFailStreak = 0;
+        autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
+        return;
+      }
+      autoRefreshFailStreak++;
+      if (autoRefreshFailStreak < AUTO_REFRESH_FAIL_STREAK) return;
+      const relaxed = AUTO_REFRESH_INTERVAL_MS * Math.pow(2, autoRefreshFailStreak - AUTO_REFRESH_FAIL_STREAK + 1);
+      autoRefreshIntervalMs = Math.min(relaxed, AUTO_REFRESH_MAX_INTERVAL_MS);
+      autoRefreshNextAt = Date.now() + autoRefreshIntervalMs;
+    }
+
     // ==================== 同時使用時の競合対策（フロント側） ====================
     // 同じ学校に複数の教員が同時ログインし、各クラスで操作する運用を想定する。
-    //  - loadSeq: 自動更新(5秒)と手動更新が重なった場合に、古い応答が新しい応答を
+    //  - loadSeq: 自動更新と手動更新が重なった場合に、古い応答が新しい応答を
     //    上書きしてしまう（＝直前の操作結果が一瞬巻き戻って見える）のを防ぐ。
     //  - refreshSuppressedUntil: 一括操作の直後は自動更新の反映を少し止め、
     //    サーバー反映前の古い状態が一瞬表示されるのを防ぐ。
@@ -3280,8 +3477,17 @@
       if (Object.keys(g).length === 0) delete optimisticGuard[dev.student_id];
     }
 
-    // 端末データの取得
-    async function loadDevices(isSilent = false) {
+    // 端末データの取得（手動「再読み込み」・自動更新・タブ復帰・操作直後の共通経路）
+    //
+    //   【R55】第2引数 opts:
+    //     fresh   … true で GAS 側の読み取りキャッシュを迂回し、子GASの最新 last_seen を
+    //               取り直す（自動更新／タブ復帰／操作直後は常に true。手動も fresh）。
+    //     trigger … 取得の発火元（'manual' / 'auto' / 'visible' / 'mutation' / 'toggle'）。
+    //   手動「再読み込み」と自動更新は同じこの関数を通るので、取得経路は完全に同一。
+    async function loadDevices(isSilent = false, opts) {
+      const __o = opts || {};
+      const __trigger = __o.trigger || (isSilent ? 'auto' : 'manual');
+      const __fresh = (__o.fresh === true);
       // 一括操作直後の自動更新は、サーバー反映が完了するまで抑止する
       // （手動更新 isSilent=false は常に許可する）
       if (isSilent && Date.now() < refreshSuppressedUntil) return;
@@ -3290,6 +3496,10 @@
       if (!isSilent && spinner) spinner.classList.add('animate-spin');
 
       const mySeq = ++loadSeq;
+      // 通信中フラグ（in-flight ガード）。タイマー起点の呼び出しは
+      // refreshDevicesNow 側でこのフラグを見て多重リクエストを作らない。
+      isFetching = true;
+      let __ok = false;
       try {
         const scopeSchool = getTeacherScopeSchool();
         const includeUnassigned = document.getElementById('includeUnassignedCheckbox')?.checked ?? true;
@@ -3304,7 +3514,9 @@
         const res = await apiRequest({
           action: 'get_all',
           school_name: schoolFilter,
-          include_unassigned: scopeSchool ? true : includeUnassigned
+          include_unassigned: scopeSchool ? true : includeUnassigned,
+          // 【R55】読み取りキャッシュを迂回して子GASの最新 last_seen を取り直す
+          fresh: __fresh
         });
 
         // 新しい取得が始まっていたら、この（古い）応答は破棄する
@@ -3324,6 +3536,7 @@
           updateClassFilterOptions();
           renderDevices();
           updateStatistics();
+          __ok = true;
         } else {
           throw new Error((res && res.error) || '端末データを受信できませんでした');
         }
@@ -3337,6 +3550,10 @@
           showToast('データ取得エラー: ' + err.message, 'error');
         }
       } finally {
+        isFetching = false;
+        // 【R55】取得結果を自動更新の周期制御へフィードバックする
+        //   （成功＝既定周期へ戻す／失敗が続いたときだけ緩和する）。
+        try { noteRefreshResult(__ok); } catch (eN) {}
         if (!isSilent && spinner) spinner.classList.remove('animate-spin');
       }
     }
@@ -5422,7 +5639,9 @@
           const delay = (typeof o.refreshDelay === 'number') ? o.refreshDelay : 1500;
           setTimeout(function () {
             if (seq !== mutationSeq) return;
-            try { loadDevices(true); } catch (e) {}
+            // 【R55】操作直後も「最新ステータス取得」＝fresh 経路で取り直す。
+            //   タイマーを待たずに取得するので、画面と実機状態がズレない。
+            try { loadDevices(true, { fresh: true, trigger: 'mutation' }); } catch (e) {}
           }, delay);
         }
       }).catch(function (err) {
