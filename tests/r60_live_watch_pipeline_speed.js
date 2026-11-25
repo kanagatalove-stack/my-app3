@@ -16,7 +16,7 @@
 //    D. 拡張機能は LIVE_WATCH_LOOP_MS === 800 / LIVE_WATCH_TARGET_MAX_B64 === 8000
 //       ＋ タブ切り替え（tabs.onActivated）で即時キャプチャ
 //    E. 親GAS はフレームをキャッシュしない（毎回 shardFetchMany）
-//    F. 出荷物 v1.6.12（固定仕様の維持）
+//    F. 出荷物 v1.6.13（固定仕様の維持）
 // =============================================================================
 'use strict';
 
@@ -537,9 +537,9 @@ async function main() {
     /if \(!urls\.length\) return local;/.test(framesBody));
 
   // ===========================================================================
-  // F. 出荷物 v1.6.12（固定仕様の維持）
+  // F. 出荷物 v1.6.13（固定仕様の維持）
   // ===========================================================================
-  console.log('===== F. v1.6.12 出荷物と固定仕様 =====');
+  console.log('===== F. v1.6.13 出荷物と固定仕様 =====');
 
   function zipEntry(zipPath, entry) {
     return execSync(
@@ -557,7 +557,7 @@ async function main() {
   }
 
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-  check('F1 extension/manifest.json の version は 1.6.12', manifest.version === '1.6.12', manifest.version);
+  check('F1 extension/manifest.json の version は 1.6.13', manifest.version === '1.6.13', manifest.version);
   check('F2 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
   const perms = (manifest.permissions || []).slice().sort().join(',');
   check('F3 権限は既存のまま（新規権限の追加なし＝再同意プロンプトを出さない）',
@@ -565,15 +565,15 @@ async function main() {
   check("F4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 
   const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-  check('F5 dist/store.zip の manifest.version は 1.6.12', sm.version === '1.6.12', sm.version);
+  check('F5 dist/store.zip の manifest.version は 1.6.13', sm.version === '1.6.13', sm.version);
   check('F6 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
   const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-  check('F7 dist/direct.zip の manifest.version も 1.6.12', dm.version === '1.6.12', dm.version);
+  check('F7 dist/direct.zip の manifest.version も 1.6.13', dm.version === '1.6.13', dm.version);
   check('F8 dist/direct.zip は検証用（popup.html 同梱）',
     !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
   const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-  check("F9 dist/update.xml の version は 1.6.12", /version='1\.6\.12'/.test(xml),
+  check("F9 dist/update.xml の version は 1.6.13", /version='1\.6\.13'/.test(xml),
     (xml.match(/version='[^']+'/g) || []).join(' '));
 
   const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'dist/managed_policy.json'), 'utf8'));

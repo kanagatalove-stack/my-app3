@@ -213,6 +213,9 @@
               <span id="currentTeacherSchool" class="bg-indigo-800 px-2 py-0.5 rounded text-[11px] font-bold text-indigo-100">-</span>
               <span>|</span>
               <span id="currentTeacherClassBadge" class="bg-indigo-900/90 border border-indigo-400/40 px-2 py-0.5 rounded text-[11px] font-semibold text-amber-300">対象: 未設定</span>
+              <!-- 【R62】デプロイ反映の目視確認用。親GASの版数がここに出る。 -->
+              <span>|</span>
+              <span id="appVersionBadge" title="管理画面（親GAS）の版数。デプロイ反映の確認に使用します。" class="bg-emerald-900/80 border border-emerald-400/40 px-2 py-0.5 rounded text-[11px] font-mono font-bold text-emerald-200">v1.6.13</span>
             </div>
           </div>
         </div>
@@ -3482,10 +3485,34 @@
       if (!autoRefreshOn) return;
       // 【省電力】タブが非表示（他タブ／最小化／画面ロック）の間は取得しない。
       if (isTabHidden()) return;
+      // 【R62】ライブ視聴中は端末一覧の自動更新を「実通信ごと」休止する。
+      //   get_all と live_watch_frames が同時に google.script.run を叩くと、
+      //   GAS の同時実行枠とブラウザ側 RPC キューが詰まり、ライブ視聴の
+      //   1 往復が 15〜18 秒まで悪化する（実機で観測）。
+      //   視聴タイルが 1 件以上ある間は自動更新をスキップし、映像取得に
+      //   通信を独占させる。全タイルを閉じた瞬間に自動再開する。
+      if (isLiveWatchStreaming()) {
+        autoRefreshNextAt = Date.now() + autoRefreshIntervalMs;
+        return;
+      }
       const now = Date.now();
       if (autoRefreshNextAt && now < autoRefreshNextAt) return;
       autoRefreshNextAt = now + autoRefreshIntervalMs;
       refreshDevicesNow('auto');
+    }
+
+    /**
+     * 【R62】ライブ視聴中か（視聴タイルが 1 件以上）。
+     *   ・true の間は端末一覧の自動更新（get_all）を実通信ごとスキップする。
+     *   ・liveWatchSlots はこの関数より後で宣言されるため、参照は try で包む
+     *     （スクリプト評価前に呼ばれても ReferenceError にしない）。
+     */
+    function isLiveWatchStreaming() {
+      try {
+        return Array.isArray(liveWatchSlots) && liveWatchSlots.length > 0;
+      } catch (e) {
+        return false;
+      }
     }
 
     // タブが非表示か（document.hidden）。判定できない環境では「表示中」とみなす。

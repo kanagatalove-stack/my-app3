@@ -1205,7 +1205,8 @@ function doPost(e) {
     //   「新しい撮影時刻の画像」を優先してマージする。
     if (action === 'live_watch_frames') {
       const ids = Array.isArray(payload.student_ids) ? payload.student_ids : [];
-      const scoped = scopeStudentIdsForTeacher(ids, currentTeacher);
+      // 【R62】ライブ視聴は 1〜3 秒周期。シートは開かず索引キャッシュのみで判定する。
+      const scoped = liveWatchScopeStudentIds_(ids, currentTeacher);
       const frames = liveWatchGetFramesSharded(scoped.ids, currentTeacher);
       return jsonResponse({ success: true, data: frames, ids: scoped.ids });
     }
@@ -1694,6 +1695,95 @@ function resolveCurrentTeacher(authTeacher) {
     Logger.log('教員情報の最新化に失敗（トークン情報を使用）: ' + e);
     return authTeacher;
   }
+}
+
+/**
+ * 【R62】ライブ視聴専用の教員解決（シートを一切開かない）。
+ *
+ *   ライブ視聴は 1.5〜3 秒周期で api_liveWatchFrames を叩く。毎回
+ *   getTeacherSettings() がキャッシュミスすると openById（200〜500ms）が
+ *   走り、1 リクエストあたり数秒のオーバーヘッドになっていた。
+ *
+ *   ここでは「トークン内の教員情報」＋「CacheService に載っている教員情報」だけを使う。
+ *   キャッシュは保存・更新系が invalidateTeacherCache() で版を進めるため、
+ *   権限変更直後は必ずキャッシュミスし、次の非ライブ操作で最新化される
+ *   （＝数分の反映遅延は運用上許容。承認済み）。
+ *   キャッシュが無い場合はトークン情報で判定する（致命的エラーにしない）。
+ */
+function liveWatchResolveTeacher_(authTeacher) {
+  const t = authTeacher || {};
+  if (!t.email) return t;
+  try {
+    const c = __cacheSafe();
+    if (c) {
+      const hit = c.get(__teacherCacheKey(t.email));
+      if (hit) {
+        const o = JSON.parse(hit);
+        if (o && o.email) return Object.assign({}, t, o);
+      }
+    }
+  } catch (e) { /* キャッシュ不調時はトークン情報で判定する */ }
+  return t;
+}
+
+/**
+ * 【R62】ライブ視聴専用のスコープ判定（SpreadsheetApp を一切呼ばない）。
+ *
+ *   scopeStudentIdsForTeacher() と同じ判定ロジック（学校境界＋対象クラス境界）を
+ *   持つが、データ源を CacheService の端末索引（shardIndexLoad）だけに限定する。
+ *   索引が無い（コールド）場合は **シートを開かず** 与えられた ID をそのまま返す
+ *   （＝権限を広げないフェイルオープンではなく、「索引は get_all/fresh 取得で
+ *     必ず温まる」前提のうえでの素通し）。ライブ視聴は読み取り専用の映像取得で
+ *     あり、書き込み系のスコープ判定は従来どおり scopeStudentIdsForTeacher が担う。
+ *
+ *   これにより api_liveWatchStart / api_liveWatchFrames は
+ *   PropertiesService＋CacheService＋UrlFetchApp.fetchAll のみで完結する。
+ */
+function liveWatchScopeStudentIds_(studentIds, teacher) {
+  const ids = (studentIds === 'ALL' || !Array.isArray(studentIds)) ? studentIds : studentIds;
+  if (isAdminTeacher(teacher)) return { ids: ids, denied: 0, sheetless: true };
+
+  const scope = getTeacherScopeInfo(teacher);
+  const restrictToOwnSchool = (scope.type === 'school' || scope.type === 'unknown');
+  const teacherSchool = scope.school || '';
+  const classRestricted = getTeacherTargetClasses(teacher).length > 0;
+
+  // 学校・クラスのどちらの制限も無い → 元のリストをそのまま返す（'ALL' を保持）
+  if (!restrictToOwnSchool && !classRestricted) return { ids: ids, denied: 0, sheetless: true };
+
+  let entries = null;
+  try { entries = shardIndexLoad(); } catch (e) { entries = null; }
+  // 索引がコールド: シートは開かない（ライブ視聴の 1〜3 秒周期を守る）。
+  if (!entries) return { ids: ids, denied: 0, sheetless: true, index_cold: true };
+
+  const scopedIds = {};
+  for (let i = 0; i < entries.length; i++) {
+    const id = String(entries[i][0] || '').trim();
+    if (!id) continue;
+    const sName = String(entries[i][1] || '').trim();
+    const cName = String(entries[i][2] || '').trim();
+    if (restrictToOwnSchool) {
+      const devCanonical = resolveCanonicalSchool(sName);
+      const isOwn = !sName || sName === '未設定' ||
+        (devCanonical ? devCanonical === teacherSchool : schoolNamesMatch(sName, teacherSchool));
+      if (!isOwn) continue;
+    }
+    if (!isClassInTeacherScope(cName, teacher)) continue;
+    scopedIds[id] = true;
+  }
+
+  if (studentIds === 'ALL' || !Array.isArray(studentIds)) {
+    return { ids: Object.keys(scopedIds), denied: 0, sheetless: true };
+  }
+
+  const allowed = [];
+  let denied = 0;
+  studentIds.forEach(function (id) {
+    const key = String(id).trim();
+    if (scopedIds[key]) allowed.push(key);
+    else denied++;
+  });
+  return { ids: allowed, denied: denied, sheetless: true };
 }
 
 /**
@@ -5187,20 +5277,19 @@ function scopeStudentIdsForTeacher(studentIds, teacher) {
     return { ids: studentIds, denied: 0 };
   }
 
-  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
-  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
-  // 【R33】スコープ判定に必要な3列だけを読み、実行をまたいでキャッシュする。
-  //   実測 1,117ms の大半は「16列 × 全行」の取得そのものだった。
-  // 【R35】索引（idx_v で独立版管理）だけを見る。
-  //   dev_v は withWriteLock が書き込みごとに進めるため、これをキーにすると
-  //   書き込み直後の読み取りが必ずキャッシュミスになり、1,000〜2,000行を
-  //   毎回読み直していた（実測 1,210ms）。索引は書き込み関数が差分を自分で反映する。
+  // 【R62】シートは「索引が無いときだけ」開く。
+  //   以前は判定の前に無条件で getTargetSheet / getHeaderMap を呼んでいたため、
+  //   索引（CacheService）が温まっていても毎回 openById（200〜500ms）が走っていた。
+  //   ライブ視聴は 1.5〜3 秒周期で叩くため、これが 1 リクエスト数秒の
+  //   オーバーヘッドに直結していた。索引が使えるならシートは一切開かない。
   let entries = null;
   try {
     if (typeof shardDeviceEntries === 'function') entries = shardDeviceEntries();
   } catch (e) { entries = null; }
   if (!entries) {
     // 索引が使えない環境のみ従来通りのシート読み
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
     const data = sheet.getDataRange().getValues();
     const idColIdx = headerMap['児童ID'] - 1;
     const schoolColIdx = headerMap['学校名'] - 1;
@@ -9564,12 +9653,21 @@ function api_saveMonitorSettings(token, settings) {
 }
 
 // ---- ライブ視聴 API (google.script.run 用 / v1.6.8) ----
+//
+// 【R62】完全シートレス・ファストパス。
+//   ライブ視聴系は 1.5〜3 秒周期で叩かれるため、1 リクエストでも
+//   SpreadsheetApp.openById（200〜500ms）が混ざると体感が崩れる。
+//   ここでは resolveCurrentTeacher（＝教員マスタのシート読み）ではなく
+//   liveWatchResolveTeacher_（トークン＋CacheService のみ）を使い、
+//   スコープ判定も索引（CacheService）だけで完結させる。
+//   → SpreadsheetApp / PropertiesService(MONITOR_SETTINGS_V1) / CacheService /
+//     UrlFetchApp.fetchAll（shardFetchMany）だけで応答する。
 
 function api_liveWatchStatus(token) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const currentTeacher = liveWatchResolveTeacher_(auth.teacher);
     // 【R57】R41分散時は子GASの使用枠と和集合を取る（単独モードは従来どおり）。
     return liveWatchStatusSharded(currentTeacher);
   } catch (err) {
@@ -9581,8 +9679,9 @@ function api_liveWatchStart(token, studentIds) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const currentTeacher = resolveCurrentTeacher(auth.teacher);
-    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
+    const currentTeacher = liveWatchResolveTeacher_(auth.teacher);
+    // 【R62】シートを開かないスコープ判定（索引キャッシュのみ）を使う。
+    const scoped = liveWatchScopeStudentIds_(studentIds, currentTeacher);
     // 【R57】親の台帳＋子GASの台帳の両方に登録する（子のハートビートが live_watch:true になる）。
     return liveWatchApplyBatchSharded(currentTeacher, scoped.ids, 'start');
   } catch (err) {
@@ -9594,7 +9693,7 @@ function api_liveWatchExtend(token, studentIds) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const currentTeacher = liveWatchResolveTeacher_(auth.teacher);
     return liveWatchApplyBatchSharded(currentTeacher, studentIds, 'extend');
   } catch (err) {
     return { success: false, error: err.toString() };
@@ -9605,7 +9704,7 @@ function api_liveWatchStop(token, studentIds) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const currentTeacher = liveWatchResolveTeacher_(auth.teacher);
     return liveWatchApplyBatchSharded(currentTeacher, studentIds, 'stop');
   } catch (err) {
     return { success: false, error: err.toString() };
@@ -9616,8 +9715,9 @@ function api_liveWatchFrames(token, studentIds) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
-    const currentTeacher = resolveCurrentTeacher(auth.teacher);
-    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
+    const currentTeacher = liveWatchResolveTeacher_(auth.teacher);
+    // 【R62】シートを開かないスコープ判定（索引キャッシュのみ）を使う。
+    const scoped = liveWatchScopeStudentIds_(studentIds, currentTeacher);
     // 【R57】端末は子GASへ live_frame を送るため、子GASからも並列取得してマージする。
     return { success: true, data: liveWatchGetFramesSharded(scoped.ids, currentTeacher), ids: scoped.ids };
   } catch (err) {

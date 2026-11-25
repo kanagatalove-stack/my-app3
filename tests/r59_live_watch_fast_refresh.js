@@ -21,7 +21,7 @@
 //    D. 拡張機能は live_watch の false → true 遷移で即座に 1 枚目を撮る
 //    E. 拡張機能は独立ループ（1.0〜1.5 秒）で撮影し、1 枚 12〜18KB に収める
 //    F. 親GAS は毎回 子GAS から最新フレームを並列取得する（古い画像を溜めない）
-//    G. 出荷物は v1.6.12（固定仕様は維持）
+//    G. 出荷物は v1.6.13（固定仕様は維持）
 // =============================================================================
 'use strict';
 
@@ -456,9 +456,9 @@ check('F6 単独モード（シャード未設定）は従来どおりローカ�
   /if \(!urls\.length\) return local;/.test(framesBody));
 
 // =============================================================================
-// G. 出荷物 v1.6.12（固定仕様の維持）
+// G. 出荷物 v1.6.13（固定仕様の維持）
 // =============================================================================
-console.log('===== G. v1.6.12 出荷物と固定仕様 =====');
+console.log('===== G. v1.6.13 出荷物と固定仕様 =====');
 
 function zipEntry(zipPath, entry) {
   return execSync(
@@ -476,7 +476,7 @@ function zipNames(zipPath) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('G1 extension/manifest.json の version は 1.6.12', manifest.version === '1.6.12', manifest.version);
+check('G1 extension/manifest.json の version は 1.6.13', manifest.version === '1.6.13', manifest.version);
 check('G2 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
 const perms = (manifest.permissions || []).slice().sort().join(',');
 check('G3 権限は既存のまま（新規権限の追加なし＝再同意プロンプトを出さない）',
@@ -484,15 +484,15 @@ check('G3 権限は既存のまま（新規権限の追加なし＝再同意プ�
 check("G4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 
 const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-check('G5 dist/store.zip の manifest.version は 1.6.12', sm.version === '1.6.12', sm.version);
+check('G5 dist/store.zip の manifest.version は 1.6.13', sm.version === '1.6.13', sm.version);
 check('G6 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
 const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-check('G7 dist/direct.zip の manifest.version も 1.6.12', dm.version === '1.6.12', dm.version);
+check('G7 dist/direct.zip の manifest.version も 1.6.13', dm.version === '1.6.13', dm.version);
 check('G8 dist/direct.zip は検証用（popup.html 同梱）',
   !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
 const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-check("G9 dist/update.xml の version は 1.6.12", /version='1\.6\.12'/.test(xml),
+check("G9 dist/update.xml の version は 1.6.13", /version='1\.6\.13'/.test(xml),
   (xml.match(/version='[^']+'/) || [])[0]);
 
 const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'dist/managed_policy.json'), 'utf8'));

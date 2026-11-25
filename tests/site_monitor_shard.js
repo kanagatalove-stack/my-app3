@@ -494,7 +494,7 @@ check('API アクション名（save_monitor_settings）も維持',
 // =====================================================================
 console.log('\n===== [H] 不変条件 =====');
 
-check('拡張機能の版数は 1.6.12', manifest.version === '1.6.12', manifest.version);
+check('拡張機能の版数は 1.6.13', manifest.version === '1.6.13', manifest.version);
 check('manifest に default_popup を追加していない',
   !JSON.stringify(manifest).includes('default_popup'));
 check('子スプレッドシートへのテレメトリ書き戻しをしていない（親シートへの転記なし）',
