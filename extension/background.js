@@ -2021,6 +2021,234 @@ async function captureLightweightLiveFrame_(windowId) {
   return null;
 }
 
+// ============================================================================
+// 【v1.6.9 / R58】画面ロック中・URL規制中の「効いている」ことの可視化
+//
+//   R57 までは、ロック画面（lock.html）・規制画面（blocked.html）を表示中は
+//   自拡張のページ（chrome-extension://）であることを理由にキャプチャを
+//   スキップしていた。また chrome:// 等の保護ページでは captureVisibleTab が
+//   失敗し、管理画面は「端末の送信を待っています…」のまま放置されていた。
+//   そのため教員は「ロック・規制が本当に効いているか」を画面上で確認できなかった。
+//
+//   R58 では次の 2 点を担保する。
+//     ① ロック中・規制中も撮影をスキップしない
+//        自拡張のロック画面／規制画面は captureVisibleTab で撮影できるため、
+//        そのまま撮って送る（教員がロック画面そのものを目視できる）。
+//     ② 撮影できない場合の状態フレーム送信
+//        chrome:// 等で captureVisibleTab が失敗しても、ロック／規制が有効なら
+//        「🔒 画面ロック中」「🚫 アクセス制限中」＋対象URL＋現在時刻を描いた
+//        JPEG を OffscreenCanvas で生成して送る（黒画面のまま放置しない）。
+//        ※ ロック中・規制中でない通常の失敗は従来どおり（ダミーは作らない）。
+//   新規権限は不要。送信経路（live_frame / screenshot）も従来のまま。
+// ============================================================================
+
+// 状態フレームの描画設定（480px 前後のサムネイルでも判別できる大きさで描く）
+const RESTRICTION_FRAME_WIDTHS = [640, 512, 400];
+const RESTRICTION_FRAME_QUALITIES = [0.55, 0.45, 0.35, 0.26];
+
+// OffscreenCanvas すら使えない環境の最終手段（32x18 の暗色プレースホルダ）。
+// 「画像が永久に来ない」よりは「規制中であることが分かる画像」を送る方が有益。
+const RESTRICTION_FRAME_STATIC =
+  'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABIMDRANCxIQDhAUExIVGywdGxgYGzYnKSAsQDlEQz85Pj1HUGZXR0thTT0+WXlaYWltcnNyRVV9hnxvhWZwcm7/2wBDARMUFBsXGzQdHTRuST5Jbm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm7/wAARCAASACADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDkKuWtrmBriSNpVBwsa5+Y+uR2qnXQaV/yD4vx/maKsuVG+EpqpOz7GXdWuIBcRxtEpOGjbPyn1ye1U66DVf8AkHy/h/MVz9FKXMgxdNU52XYKKKK1OUKKKKAP/9k=';
+
+/** 状態フレーム用のテキスト切り詰め（はみ出し防止）。 */
+function truncateFrameText_(text, max) {
+  const s = String(text === undefined || text === null ? '' : text);
+  const n = Number(max) || 0;
+  if (n <= 0 || s.length <= n) return s;
+  return s.slice(0, Math.max(0, n - 1)) + '…';
+}
+
+/**
+ * 状態フレームに描く内容（見出し・色・対象URL・現在時刻）を組み立てる。
+ *   サムネイル（横幅480px前後）でも一目で判別できるよう、短い日本語にする。
+ */
+function buildRestrictionFrameMeta_(state) {
+  const st = state || {};
+  const isBlock = st.kind === 'block';
+  let timeText = '';
+  try {
+    const d = new Date();
+    const p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+    timeText = d.getFullYear() + '/' + p2(d.getMonth() + 1) + '/' + p2(d.getDate()) +
+      ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+  } catch (e) { timeText = ''; }
+  const modeText = String(st.mode || '');
+  let modeLabel = '';
+  if (isBlock) {
+    if (modeText === 'WHITELIST') modeLabel = '規制モード: 許可リスト（指定外を制限）';
+    else if (modeText === 'BLACKLIST') modeLabel = '規制モード: 禁止リスト（指定先を制限）';
+    else modeLabel = modeText ? ('規制モード: ' + modeText) : '規制モード: URL規制中';
+  }
+  return {
+    isBlock: isBlock,
+    glyph: isBlock ? '\u{1F6AB}' : '\u{1F512}',              // 🚫 / 🔒
+    title: isBlock ? 'アクセス制限中' : '画面ロック中',
+    subtitle: isBlock
+      ? '先生の指示により、このWebサイトは規制されています'
+      : '先生の指示があるまで、端末の操作はできません',
+    accent: isBlock ? '#f59e0b' : '#ef4444',
+    urlText: truncateFrameText_(st.url || '', 58),
+    modeLabel: modeLabel,
+    modeText: modeText,
+    timeText: timeText
+  };
+}
+
+/**
+ * 指定の横幅で状態フレームを描画し JPEG の data URL を返す。
+ *   OffscreenCanvas が使えない／描画に失敗した場合は null（呼び出し側で代替）。
+ */
+async function drawRestrictionFrame_(meta, width) {
+  if (typeof OffscreenCanvas !== 'function') return null;
+  const m = meta || {};
+  const W = Math.max(240, Math.round(Number(width) || RESTRICTION_FRAME_WIDTHS[0]));
+  const H = Math.round(W * 0.5625);   // 16:9
+  try {
+    const canvas = new OffscreenCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    // 背景（濃紺）＋左のアクセントバー（ロック=赤／規制=橙）
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = m.accent || '#ef4444';
+    ctx.fillRect(0, 0, Math.max(8, Math.round(W * 0.022)), H);
+
+    const cx = Math.round(W / 2);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // ① アイコン（絵文字。描けない環境では四角にフォールバックするだけ）
+    ctx.fillStyle = '#ffffff';
+    ctx.font = Math.round(W * 0.15) + 'px sans-serif';
+    ctx.fillText(String(m.glyph || ''), cx, Math.round(H * 0.24));
+
+    // ② タイトル（サムネイルでも読める大きさ）
+    ctx.font = 'bold ' + Math.round(W * 0.098) + 'px sans-serif';
+    ctx.fillText(String(m.title || ''), cx, Math.round(H * 0.46));
+
+    // ③ サブタイトル
+    ctx.font = Math.round(W * 0.038) + 'px sans-serif';
+    ctx.fillStyle = '#cbd5e1';
+    ctx.fillText(truncateFrameText_(m.subtitle || '', 44), cx, Math.round(H * 0.58));
+
+    // ④ 対象URL と 規制モード（左寄せ）
+    ctx.textAlign = 'left';
+    const padX = Math.round(W * 0.06);
+    ctx.font = Math.round(W * 0.032) + 'px monospace';
+    ctx.fillStyle = '#94a3b8';
+    if (m.isBlock) {
+      ctx.fillText('対象URL: ' + (m.urlText || '(不明)'), padX, Math.round(H * 0.71));
+      ctx.font = Math.round(W * 0.03) + 'px sans-serif';
+      ctx.fillText(truncateFrameText_(m.modeLabel || '', 46), padX, Math.round(H * 0.80));
+    } else {
+      ctx.fillText('元の画面: ' + (m.urlText || '(不明)'), padX, Math.round(H * 0.71));
+      ctx.font = Math.round(W * 0.03) + 'px sans-serif';
+      ctx.fillText('ロックは教員の解除操作で自動的に終了します', padX, Math.round(H * 0.80));
+    }
+
+    // ⑤ 現在時刻（右下）— 「いつ時点の状態か」を教員が判断できるようにする
+    ctx.textAlign = 'right';
+    ctx.font = Math.round(W * 0.028) + 'px monospace';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText(String(m.timeText || ''), Math.round(W * 0.95), Math.round(H * 0.92));
+
+    // ⑥ 上限に収まる品質を探す
+    for (let i = 0; i < RESTRICTION_FRAME_QUALITIES.length; i++) {
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: RESTRICTION_FRAME_QUALITIES[i] });
+      const b64 = bufferToBase64_(await blob.arrayBuffer());
+      if (b64.length <= LIVE_WATCH_MAX_B64) return 'data:image/jpeg;base64,' + b64;
+    }
+    // ライブ視聴の上限には収まらないが、画像自体は生成できた（呼び出し側が再判定）
+    const last = await canvas.convertToBlob({ type: 'image/jpeg', quality: RESTRICTION_FRAME_QUALITIES[0] });
+    return 'data:image/jpeg;base64,' + bufferToBase64_(await last.arrayBuffer());
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * ロック中／規制中を示す 1 枚の JPEG を生成する（撮影できないときの代替）。
+ *   maxLen は呼び出し側の上限（ライブ視聴=30,000 / 画面一覧=42,000）。
+ *   どの横幅でも上限に収まらなければ、必ず上限内に収まる静的プレースホルダを返す。
+ */
+async function renderRestrictionStateFrame_(state, maxLen) {
+  const limit = Number(maxLen) > 0 ? Number(maxLen) : LIVE_WATCH_MAX_B64;
+  const meta = buildRestrictionFrameMeta_(state);
+  for (let i = 0; i < RESTRICTION_FRAME_WIDTHS.length; i++) {
+    const out = await drawRestrictionFrame_(meta, RESTRICTION_FRAME_WIDTHS[i]);
+    if (!out) continue;
+    const len = String(out).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+    if (len <= limit) return out;
+  }
+  return RESTRICTION_FRAME_STATIC;   // 956 文字。どの上限にも収まる
+}
+
+/**
+ * アクティブタブが「画面ロック中／URL規制中」かどうかを判定する。
+ *   ・自拡張の lock.html / blocked.html を表示中なら、その画面自体を根拠にする
+ *     （URL パラメータに元URL・規制モードが保持されている）。
+ *   ・加えてストレージのポリシー（screen_lock / filter_mode）からも判定する
+ *     （＝全タブがロック画面へ差し替わる直前の一瞬の隙間も拾う）。
+ *   戻り値: { active, kind: 'lock'|'block'|'', url, mode }
+ */
+function restrictionStateForTab_(data, tabUrl) {
+  const url = String(tabUrl || '');
+  let selfBase = '';
+  try {
+    if (chrome && chrome.runtime && typeof chrome.runtime.getURL === 'function') {
+      selfBase = chrome.runtime.getURL('');
+    }
+  } catch (e) { selfBase = ''; }
+
+  // ① 自拡張のロック画面を表示中
+  if (selfBase && url.startsWith(selfBase + 'lock.html')) {
+    let original = '';
+    try { original = new URL(url).searchParams.get('url') || ''; } catch (e) { original = ''; }
+    return { active: true, kind: 'lock', url: original, mode: '' };
+  }
+  // ② 自拡張の規制画面を表示中
+  if (selfBase && url.startsWith(selfBase + 'blocked.html')) {
+    let original = '', mode = '';
+    try {
+      const q = new URL(url).searchParams;
+      original = q.get('url') || '';
+      mode = String(q.get('mode') || '').toUpperCase();
+    } catch (e) { original = ''; mode = ''; }
+    return { active: true, kind: 'block', url: original, mode: mode };
+  }
+  // ③ ストレージのポリシー（ロック指示が出ている）
+  const d = data || {};
+  const locked = (d.screen_lock === true) || (d.screen_locked === true);
+  if (locked) return { active: true, kind: 'lock', url: url, mode: '' };
+  // ④ ストレージのポリシー（URL規制に該当している）
+  const mode = String(d.filter_mode || 'OFF').toUpperCase();
+  if (mode && mode !== 'OFF' && url) {
+    let blocked = false;
+    try {
+      blocked = evaluateUrlRestriction(url, mode, d.whitelist_urls || [], d.blacklist_urls || []);
+    } catch (e) { blocked = false; }
+    if (blocked) return { active: true, kind: 'block', url: url, mode: mode };
+  }
+  // ⑤ 撮影できないページ（chrome:// 等の特権ページ）で URL 規制が有効な場合
+  //    ・evaluateUrlRestriction は chrome:// を素通しする（＝規制対象にしない）ため
+  //      「そのページ自身がブロックされた」とは判定できない。
+  //    ・しかし規制そのものは有効なので、撮影できない状況では黒画面のまま放置せず
+  //      「🚫 規制中」の状態フレームを送る（教員が規制の効力を確認できる）。
+  //    ※ 通常の Web ページ（https 等）では従来どおりの判定に任せる（挙動不変）。
+  if (mode && mode !== 'OFF') {
+    const uncapturable = !url ||
+      url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
+      url.startsWith('about:') || url.startsWith('devtools://') ||
+      url.startsWith('chrome-search://') || url.startsWith('view-source:');
+    if (uncapturable) {
+      return { active: true, kind: 'block', url: url, mode: mode, restricted_page: true };
+    }
+  }
+  return { active: false, kind: '', url: url, mode: '' };
+}
+
 /**
  * live_watch フラグの反映（毎ハートビートで呼ばれる）。
  *   true  … 以後のポーリングで撮影・送信を開始する
@@ -2067,33 +2295,57 @@ async function liveWatchCaptureOnce() {
     if (!tab) return false;
     if (!tab.windowId) return false;
 
-    // 保護ページは captureVisibleTab では撮影できない（Chrome の仕様）。
-    // ライブ視聴は連続送信のため、画面一覧のような「撮れない通知」は送らない。
     const url = tab.url || '';
-    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
-        url.startsWith('about:') || url.startsWith('devtools://') ||
-        url.startsWith('chrome-search://') || url.startsWith('view-source:')) {
-      return false;
-    }
 
-    let raw = null;
+    // 【R58】ロック中・規制中かを先に判定する。
+    //   撮影に失敗したとき「状態フレーム」を描くかどうかの判断に使う。
+    let rest = { active: false, kind: '', url: url, mode: '' };
     try {
-      raw = await chrome.tabs.captureVisibleTab(tab.windowId, {
-        format: 'jpeg',
-        quality: LIVE_WATCH_CAPTURE_QUALITY
-      });
-    } catch (eCap) {
-      return false;
+      rest = restrictionStateForTab_(data, url);
+    } catch (eRest) {
+      rest = { active: false, kind: '', url: url, mode: '' };
     }
-    if (!raw || !/^data:image\//.test(raw)) return false;
 
-    // 【R57】縮小（OffscreenCanvas）が使えない Service Worker でも送信が
-    //   握りつぶされないよう、失敗時は撮影品質を段階的に落として再撮影する。
-    //   1 枚目が既に上限内ならそのまま使う（無駄な再撮影をしない）。
-    let dataUrl = raw;
-    const rawLen = String(raw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
-    if (rawLen > LIVE_WATCH_MAX_B64) {
-      dataUrl = await captureLightweightLiveFrame_(tab.windowId);
+    // 【R58】自拡張のロック画面（lock.html）・規制画面（blocked.html）は
+    //   chrome-extension:// ではあるが captureVisibleTab で撮影できるため、
+    //   「ロック・規制が効いていること」を教員に見せる最重要画面として撮影対象にする。
+    let selfBase = '';
+    try { selfBase = chrome.runtime.getURL(''); } catch (eSelf) { selfBase = ''; }
+    const isOwnPage = !!selfBase && url.startsWith(selfBase);
+    // Chrome の仕様で撮影できない特権ページ（自拡張ページは除く）
+    const protectedPage = !isOwnPage && (
+      url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
+      url.startsWith('about:') || url.startsWith('devtools://') ||
+      url.startsWith('chrome-search://') || url.startsWith('view-source:'));
+
+    let dataUrl = null;
+    if (!protectedPage) {
+      let raw = null;
+      try {
+        raw = await chrome.tabs.captureVisibleTab(tab.windowId, {
+          format: 'jpeg',
+          quality: LIVE_WATCH_CAPTURE_QUALITY
+        });
+      } catch (eCap) {
+        raw = null;
+      }
+      if (raw && /^data:image\//.test(raw)) {
+        // 【R57】縮小（OffscreenCanvas）が使えない Service Worker でも送信が
+        //   握りつぶされないよう、失敗時は撮影品質を段階的に落として再撮影する。
+        //   1 枚目が既に上限内ならそのまま使う（無駄な再撮影をしない）。
+        const rawLen = String(raw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+        dataUrl = rawLen > LIVE_WATCH_MAX_B64
+          ? await captureLightweightLiveFrame_(tab.windowId)
+          : raw;
+      }
+    }
+
+    // 【R58】撮れなかった場合でも、ロック中・規制中なら「その状態」を描いた
+    //   フレームを送る（管理画面を『端末の送信を待っています…』のまま放置しない）。
+    //   ※ ロック中・規制中でない通常時の失敗は、従来どおり送らない（ダミーを作らない）。
+    if (!dataUrl) {
+      if (!rest.active) return false;
+      dataUrl = await renderRestrictionStateFrame_(rest, LIVE_WATCH_MAX_B64);
     }
     if (!dataUrl) return false;
     if (!liveWatchActive) return false; // 縮小中に停止されたら送らない
@@ -2172,6 +2424,46 @@ async function notifyScreenshotBlocked(gasUrl, studentId, reason) {
   }
 }
 
+/**
+ * 【R58】画面情報（スクリーンショット）を子GASへ送る共通処理。
+ *   通常の撮影結果と「ロック中・規制中の状態フレーム」の両方から使う。
+ *   送信結果の検証（HTTP ステータス・success フラグ）は従来と同じ扱い。
+ */
+async function postScreenshotPayload_(gasUrl, studentId, dataUrl) {
+  let response = null;
+  try {
+    response = await fetch(gasUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'screenshot',
+        student_id: studentId,
+        image_data: dataUrl,
+        mime_type: 'image/jpeg'
+      }),
+      redirect: 'follow'
+    });
+  } catch (eNet) {
+    console.warn('[EduAgent] 画面情報の送信に失敗（通信）:',
+      eNet && eNet.message ? eNet.message : eNet, '(base64 ' + String(dataUrl).length + ' 文字)');
+    return false;
+  }
+  if (!response || !response.ok) {
+    console.warn('[EduAgent] 画面情報の送信が拒否されました: HTTP ' +
+      (response ? response.status : 0) + '（base64 ' + String(dataUrl).length + ' 文字）');
+    return false;
+  }
+  let body = null;
+  try { body = await response.json(); } catch (eJson) { body = null; }
+  if (body && body.success === false) {
+    console.warn('[EduAgent] 画面情報の保存に失敗:',
+      body.error_code || '', body.error || '', '(base64 ' + String(dataUrl).length + ' 文字)');
+    return false;
+  }
+  console.log('[EduAgent] 画面情報（スクリーンショット）を送信しました', String(dataUrl).length);
+  return true;
+}
+
 async function captureAndUploadScreenshot() {
   try {
     const data = await chrome.storage.local.get(null);
@@ -2193,6 +2485,15 @@ async function captureAndUploadScreenshot() {
     }
     if (!tab || !tab.windowId) return;
 
+    // 【R58】ロック中・規制中かを先に判定する（撮影失敗時の状態フレーム生成に使う）。
+    const url = tab.url || '';
+    let rest = { active: false, kind: '', url: url, mode: '' };
+    try {
+      rest = restrictionStateForTab_(data, url);
+    } catch (eRest) {
+      rest = { active: false, kind: '', url: url, mode: '' };
+    }
+
     // 【R43.2】キャプチャ不可のページ（内部ページ・拡張機能ページ）は
     //   黙って return せず、理由を必ずログに残す（原因究明のため）。
     //   画面一覧は補助機能のため、通知できなくても他の同期処理には影響させない。
@@ -2200,30 +2501,46 @@ async function captureAndUploadScreenshot() {
     //   chrome://newtab/（ログイン状態の新しいタブ）は Chrome の仕様上
     //   captureVisibleTab で撮影できず、待っても永久に画像は来ない。
     //   通知しないと教員画面の「更新待ち」が解除されないまま残る。
-    const url = tab.url || '';
-    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
-        url.startsWith('about:') || url.startsWith('devtools://')) {
-      console.warn('[EduAgent] 画面キャプチャ不可（保護されたページ）のため送信しません:', url);
-      // 画面一覧の補助機能なので、通知の成否で他の同期処理を止めない。
-      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'chrome_protected');
-      return;
+    // 【R58】ただしロック中・規制中のときは「撮れなかった」で終わらせず、
+    //   その状態を描いた画像を送る（教員が規制の効力を画面で確認できるようにする）。
+    let selfBase = '';
+    try { selfBase = chrome.runtime.getURL(''); } catch (eSelf) { selfBase = ''; }
+    const isOwnPage = !!selfBase && url.startsWith(selfBase);
+    const protectedPage = !isOwnPage && (
+      url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
+      url.startsWith('about:') || url.startsWith('devtools://'));
+
+    let raw = null;
+    if (!protectedPage) {
+      // 【R43.2】captureVisibleTab の失敗を握り潰さない。
+      //   URL 判定をすり抜ける保護ページや非アクティブウィンドウでも例外になる。
+      try {
+        raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
+      } catch (eCap) {
+        console.warn('[EduAgent] 画面キャプチャに失敗（送信しません）:',
+          eCap && eCap.message ? eCap.message : eCap);
+        raw = null;
+      }
+      if (raw && !/^data:image\//.test(raw)) raw = null;
     }
 
-    // 【R43.2】captureVisibleTab の失敗を握り潰さない。
-    //   URL 判定をすり抜ける保護ページや非アクティブウィンドウでも例外になる。
-    // 【R43.3】失敗も「撮れなかった」として通知する（理由: capture_error）。
-    let raw = null;
-    try {
-      raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
-    } catch (eCap) {
-      console.warn('[EduAgent] 画面キャプチャに失敗（送信しません）:',
-        eCap && eCap.message ? eCap.message : eCap);
-      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
-      return;
-    }
-    if (!raw || !/^data:image\//.test(raw)) {
-      console.warn('[EduAgent] 画面キャプチャ結果が画像ではありません（送信しません）');
-      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
+    // 【R58】撮れなかった（保護ページ／撮影例外）ときの分岐。
+    //   ・ロック中・規制中 → 状態フレームを生成して送る（黒画面のまま放置しない）
+    //   ・通常時          → 従来どおり「撮れなかった」を通知して終了
+    if (!raw) {
+      if (!rest.active) {
+        const reason = protectedPage ? 'chrome_protected' : 'capture_error';
+        console.warn('[EduAgent] 画面キャプチャ不可（保護されたページ）のため送信しません:', url);
+        await notifyScreenshotBlocked(effectiveGasUrl, studentId, reason);
+        return;
+      }
+      const stateFrame = await renderRestrictionStateFrame_(rest, SCREENSHOT_MAX_B64);
+      if (!stateFrame) {
+        await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
+        return;
+      }
+      console.log('[EduAgent] ロック中・規制中のため状態フレームを送信します:', rest.kind);
+      await postScreenshotPayload_(effectiveGasUrl, studentId, stateFrame);
       return;
     }
 
@@ -2232,6 +2549,14 @@ async function captureAndUploadScreenshot() {
     //   通知しないと「端末の送信待ち」のまま残り、教員が原因を知れない。
     const dataUrl = await downscaleForSheet(raw);
     if (!dataUrl) {
+      // 【R58】ロック中・規制中なら、縮小できなくても状態フレームで代替する。
+      if (rest.active) {
+        const stateFrame = await renderRestrictionStateFrame_(rest, SCREENSHOT_MAX_B64);
+        if (stateFrame) {
+          await postScreenshotPayload_(effectiveGasUrl, studentId, stateFrame);
+          return;
+        }
+      }
       console.warn('[EduAgent] 画面情報を上限サイズまで縮小できませんでした');
       await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'image_too_large');
       return;
@@ -2240,41 +2565,8 @@ async function captureAndUploadScreenshot() {
     // 【R43.2】レスポンスを検証する。
     //   R43.1 までは response.ok を見ておらず、GAS が 500 を返しても
     //   「送信しました」と出力していた（実機で原因究明を遅らせた誤ログ）。
-    let response = null;
-    try {
-      response = await fetch(effectiveGasUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'screenshot',
-          student_id: studentId,
-          image_data: dataUrl,
-          mime_type: 'image/jpeg'
-        }),
-        redirect: 'follow'
-      });
-    } catch (eNet) {
-      console.warn('[EduAgent] 画面情報の送信に失敗（通信）:',
-        eNet && eNet.message ? eNet.message : eNet, '(base64 ' + dataUrl.length + ' 文字)');
-      return;
-    }
-
-    if (!response || !response.ok) {
-      console.warn('[EduAgent] 画面情報の送信が拒否されました: HTTP ' +
-        (response ? response.status : 0) + '（base64 ' + dataUrl.length + ' 文字）');
-      return;
-    }
-
-    // GAS は 200 でも {"success":false,...} を返すことがある。成功と誤認しない。
-    let body = null;
-    try { body = await response.json(); } catch (eJson) { body = null; }
-    if (body && body.success === false) {
-      console.warn('[EduAgent] 画面情報の保存に失敗:',
-        body.error_code || '', body.error || '', '(base64 ' + dataUrl.length + ' 文字)');
-      return;
-    }
-
-    console.log('[EduAgent] 画面情報（スクリーンショット）を送信しました', dataUrl.length);
+    // 【R58】送信処理は postScreenshotPayload_ へ集約した（状態フレームと共通）。
+    await postScreenshotPayload_(effectiveGasUrl, studentId, dataUrl);
   } catch (err) {
     // captureVisibleTab はマニフェスト権限が無い/対象外ページで失敗する。
     // 画面一覧は補助機能のため、失敗しても他の同期処理には影響させない。

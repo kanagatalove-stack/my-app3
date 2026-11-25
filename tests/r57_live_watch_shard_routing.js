@@ -448,7 +448,7 @@ const eFail = call(parentEnv, 'liveWatchApplyBatchSharded', [ADMIN, ['S1'], 'sta
 check('E12 子GASへの転送が全滅しても親の操作は成功として返る（無言で固まらせない）',
   eFail.success === true && !!eFail.shard && eFail.shard.ok === 0, eFail.shard);
 
-// 拡張機能 v1.6.8 のフォールバック（OffscreenCanvas 不可でも送信を握り潰さない）
+// 拡張機能 v1.6.9 のフォールバック（OffscreenCanvas 不可でも送信を握り潰さない）
 check('E13 拡張機能は撮影品質を段階的に落とすフォールバックを持つ',
   /LIVE_WATCH_FALLBACK_QUALITIES = \[40, 28, 18, 10\]/.test(bgSrc));
 check('E14 縮小できなくても原寸が上限内なら送信する',
@@ -456,9 +456,9 @@ check('E14 縮小できなくても原寸が上限内なら送信する',
 check('E15 撮影は captureLightweightLiveFrame_ 経由（縮小失敗時に再撮影する）',
   /captureLightweightLiveFrame_\(tab\.windowId\)/.test(bgSrc));
 
-// 固定仕様（v1.6.8・権限・default_popup・DEFAULT_GAS_URL・1.5 秒）
+// 固定仕様（v1.6.9・権限・default_popup・DEFAULT_GAS_URL・1.5 秒）
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('E16 拡張機能は v1.6.8 のまま', manifest.version === '1.6.8', manifest.version);
+check('E16 拡張機能は v1.6.9 のまま', manifest.version === '1.6.9', manifest.version);
 check('E17 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
 check("E18 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 check('E19 ACTIVE_SYNC_MS（1.5 秒）は維持', /const ACTIVE_SYNC_MS = 1500;/.test(bgSrc));
