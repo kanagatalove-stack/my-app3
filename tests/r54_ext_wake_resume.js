@@ -1,12 +1,12 @@
 // ============================================================================
-// r54_ext_wake_resume.js — 拡張機能 v1.6.11: スリープ復帰（蓋を開けた直後）の即時オンライン復帰
+// r54_ext_wake_resume.js — 拡張機能 v1.6.12: スリープ復帰（蓋を開けた直後）の即時オンライン復帰
 //
 //  実機症状（v1.6.6 で反映速度は安定した後の残課題）
 //    Chromebook の蓋を閉じてスリープ → 再度開けて Wi-Fi が繋がっても、
 //    次の setTimeout / chrome.alarms まで待たされるため、
 //    管理画面の「オンライン状態」へ戻るのに時間がかかる。
 //
-//  v1.6.11 の設計（既存構造の精密化。独立ループは増やさない）
+//  v1.6.12 の設計（既存構造の精密化。独立ループは増やさない）
 //    ① 復帰イベント … chrome.idle.onStateChanged('active') /
 //                     chrome.windows.onFocusChanged / self 'online'
 //                     → handleWakeResume() が「その瞬間」に 1 回だけ即時送信する
@@ -521,7 +521,7 @@ function buildSync(o) {
   // ==========================================================================
   console.log('\n===== F. 版数と固定仕様 =====');
 
-  check('F1 manifest.version は 1.6.11', manifest.version === '1.6.11', manifest.version);
+  check('F1 manifest.version は 1.6.12', manifest.version === '1.6.12', manifest.version);
   check('F2 default_popup を設けていない（児童のアイコン操作は無反応）',
     !((manifest.action || {}).default_popup));
   check('F3 DEFAULT_GAS_URL は空文字のまま', /const DEFAULT_GAS_URL = '';/.test(bgSrc));
@@ -539,10 +539,10 @@ function buildSync(o) {
   let xml = '';
   try { xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8'); } catch (e) { xml = ''; }
 
-  check('F5 dist/store.zip の manifest.version は 1.6.11', !!sm && sm.version === '1.6.11', sm && sm.version);
+  check('F5 dist/store.zip の manifest.version は 1.6.12', !!sm && sm.version === '1.6.12', sm && sm.version);
   check('F6 dist/store.zip に default_popup が無い', !!sm && !((sm.action || {}).default_popup));
-  check('F7 dist/direct.zip の manifest.version も 1.6.11', !!dm && dm.version === '1.6.11', dm && dm.version);
-  check('F8 dist/update.xml の version は 1.6.11', /version='1\.6\.11'/.test(xml));
+  check('F7 dist/direct.zip の manifest.version も 1.6.12', !!dm && dm.version === '1.6.12', dm && dm.version);
+  check('F8 dist/update.xml の version は 1.6.12', /version='1\.6\.12'/.test(xml));
   check('F9 ストア版 background.js は extension/background.js と一致（旧版混入なし）',
     (function () {
       try {

@@ -530,9 +530,9 @@ check('F5 先行キャッシュはシートへ書き込まない（読み書きA
   !/setValue|setValues|getRange|getDataRange/.test(extract('hbPrimeStateCacheMany_')));
 check('F6 buildHeartbeatResponse は1か所のまま（3経路の重複を作らない）',
   (src.match(/^function buildHeartbeatResponse\s*\(/gm) || []).length === 1);
-check('F7 拡張機能の manifest は v1.6.11 のまま',
+check('F7 拡張機能の manifest は v1.6.12 のまま',
   JSON.parse(fs.readFileSync('/home/user/webapp/extension/manifest.json', 'utf8'))
-    .version === '1.6.11');
+    .version === '1.6.12');
 check('F8 拡張機能の DEFAULT_GAS_URL は空文字のまま',
   /const DEFAULT_GAS_URL = '';/.test(
     fs.readFileSync('/home/user/webapp/extension/background.js', 'utf8')));

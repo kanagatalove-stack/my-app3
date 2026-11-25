@@ -1925,16 +1925,21 @@ async function downscaleForSheet(dataUrl) {
 //       デバウンス 250ms で即座に 1 枚撮って送る（次の 0.8 秒を待たない）。
 //     ・1 枚あたり 5〜10KB（横幅 360px・品質 28%）へ超軽量化する。
 //     ・ACTIVE_SYNC_MS（1.5 秒）と LIVE_WATCH_MAX_B64（30,000）は維持する。
+//
+//   【R61】google.script.run 直結化に合わせて、さらに軽くする。
+//     ・1 枚あたり 6KB 前後（横幅 320px・品質 25%）へ。子GAS・親GAS 間の
+//       UrlFetchApp と google.script.run のシリアライズ時間を最小化する。
+//     ・LIVE_WATCH_MAX_B64（30,000）は上限として維持する（固定仕様）。
 // ============================================================================
 const LIVE_WATCH_MAX_B64 = 30000;          // 送信する Base64 の上限（要件: 30,000 文字以内）
-const LIVE_WATCH_TARGET_MAX_B64 = 10000;   // 【R60】目標サイズの上限（5〜10KB / 約7〜8KB）
-const LIVE_WATCH_TARGET_MIN_B64 = 5000;    // 【R60】目標サイズの下限（5KB を下回るなら画質を上げる）
-const LIVE_WATCH_TARGET_WIDTH = 360;       // 【R60】目標の横幅（360px へ軽量化）
+const LIVE_WATCH_TARGET_MAX_B64 = 8000;    // 【R61】目標サイズの上限（約6KB）
+const LIVE_WATCH_TARGET_MIN_B64 = 4000;    // 【R61】目標サイズの下限（4KB を下回るなら画質を上げる）
+const LIVE_WATCH_TARGET_WIDTH = 320;       // 【R61】目標の横幅（320px へ軽量化）
 const LIVE_WATCH_MIN_WIDTH = 200;          // 縮小の下限（これ以上は落とさない）
-// 【R60】品質は 28% を起点にする。1 枚あたり 5〜10KB（約7〜8KB）に収まり、
+// 【R61】品質は 25% を起点にする。1 枚あたり 6KB 前後に収まり、
 //   子GAS への転送・管理画面のデコード・シリアライズが最短になる。
-const LIVE_WATCH_QUALITIES = [0.28, 0.26, 0.24, 0.20, 0.16, 0.12];
-const LIVE_WATCH_CAPTURE_QUALITY = 28;     // captureVisibleTab の品質（28%）
+const LIVE_WATCH_QUALITIES = [0.25, 0.22, 0.20, 0.16, 0.12, 0.10];
+const LIVE_WATCH_CAPTURE_QUALITY = 25;     // captureVisibleTab の品質（25%）
 // 【R60】ライブ視聴専用ループの周期（0.8 秒）。ハートビート（1.5 秒）とは
 //   独立して回すため、同期通信が遅い時間帯でも画像の更新ペースを保てる。
 const LIVE_WATCH_LOOP_MS = 800;

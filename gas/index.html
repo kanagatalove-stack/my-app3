@@ -2202,57 +2202,31 @@
     }
 
     // ==================================================================
-    // 【R59】ライブ視聴フレーム（live_watch_frames）の /exec 直送
+    // 【R61】ライブ視聴フレームの /exec 直送を撤去（タイムアウト待ちの根絶）
     //
-    //   実機ではライブ視聴の画像が切り替わるまで約 6 秒かかっていた。
-    //   拡張機能は 1.5 秒で撮影・送信しているのに、管理画面側の取得が
-    //   google.script.run の callback?nocache_id= ポーリング（実測 3.6〜7.1 秒）
-    //   を通っていたため、往復待ちがそのまま「切り替わりの遅さ」になっていた。
-    //   R55 の get_all と同じく /exec へ直送し、往復を 1 回分にする。
+    //   R59〜R60 では live_watch_frames を /exec へ直送していたが、実機動画で
+    //   更新間隔が 11〜16 秒おきに悪化する現象が判明した。真因は
+    //   script.googleusercontent.com サンドボックス環境で /exec 直送の
+    //   クロスオリジン fetch が Google 認証リダイレクトを受け、
+    //   毎回 LIVE_FRAME_FETCH_TIMEOUT_MS（9 秒）まで待ってから
+    //   google.script.run へ退避していたこと（9 秒 ＋ 3 秒 ＝ 1 往復 12 秒）。
     //
-    //   ・失敗（URL未設定・ネットワーク断・タイムアウト）だけ google.script.run
-    //     へ退避する（環境差で画像が取れなくなることはない）。
-    //   ・認証切れ（need_auth）は退避しない（再ログイン導線を二重に走らせない）。
-    //   ・直送が続けて失敗する環境では、毎回タイムアウトを待つと遅くなるため
-    //     一定時間だけ従来経路を優先する（クールダウン）。
+    //   /exec 直送は「成功する環境では速いが、失敗する環境では毎回 9 秒損をする」
+    //   賭けになっていた。GAS Web アプリのサンドボックスからは同一オリジンの
+    //   google.script.run が常に最短で通るため、ライブ視聴系（start / extend /
+    //   stop / status / frames）は待機時間ゼロで最初から google.script.run を
+    //   直接呼ぶ。タイムアウト待ちが構造的に存在しなくなる。
+    //
+    //   ※ 書き込み系（bulk_*）・画面一覧（get_screens）・端末一覧（get_all）は
+    //     従来どおり /exec 直送を維持する（これらはサンドボックス外の通常の
+    //     ブラウザ文脈から呼ばれ、実測で高速に通っているため）。
     // ==================================================================
-    const LIVE_FRAME_FETCH_TIMEOUT_MS = 9000;   // フレーム取得の上限（画像 1〜数枚）
-    // 【R60】直送が使えない環境で「タイムアウト 9 秒待ち」を繰り返さないよう、
-    //   2 回連続で失敗したらクールダウンを 60 秒へ延ばす（1 回目は 10 秒）。
-    //   これで無駄な fetch タイムアウト待ちが完全に消え、画像更新のリズムが崩れない。
-    const LIVE_FRAME_DIRECT_COOLDOWN_MS = 60000;
-    const LIVE_FRAME_DIRECT_COOLDOWN_ONCE_MS = 10000;
-    let liveFramesDirectCooldownUntil = 0;
-    let liveFramesDirectFailCount = 0;
 
-    async function apiRequestDirectLiveFrames(payload) {
-      const apiUrl = getApiUrl();
-      if (!apiUrl) {
-        const e = new Error('GAS APIエンドポイントが取得できません。');
-        e.noFallback = false;
-        throw e;
-      }
-      const body = Object.assign({}, payload);
-      if (authToken) body.token = authToken;
-      const res = await eduFetchWithTimeout(apiUrl, {
-        method: 'POST',
-        body: JSON.stringify(body),
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        redirect: 'follow'
-      }, LIVE_FRAME_FETCH_TIMEOUT_MS);
-      const data = await res.json();
-      if (data && data.need_auth) {
-        logout();
-        const e = new Error('セッションの有効期限が切れました。再ログインしてください。');
-        e.noFallback = true;
-        throw e;
-      }
-      if (data && data.success === false) {
-        const e = new Error(data.error || 'リクエスト処理に失敗しました');
-        e.noFallback = true;   // サーバーが明示的に拒否＝退避しても同じ結果
-        throw e;
-      }
-      return data;
+    /** 【R61】ライブ視聴系のアクションか（すべて google.script.run 直結）。 */
+    function isLiveWatchAction(act) {
+      return act === 'live_watch_start' || act === 'live_watch_extend' ||
+             act === 'live_watch_stop' || act === 'live_watch_status' ||
+             act === 'live_watch_frames';
     }
 
     // fetch に上限時間を付ける。AbortController が無い環境では素の fetch。
@@ -3246,39 +3220,24 @@
           // ここから下の従来経路へ落ちる（退避）
         }
       }
-      // 【R59】ライブ視聴フレーム（live_watch_frames）も /exec 直送を優先する。
-      //   画像の切り替わりが約 6 秒かかっていたのは、この取得だけが
-      //   google.script.run の callback ポーリング往復（実測 3.6〜7.1 秒）を
-      //   通っていたため。R55 の get_all と同じ扱いに揃える。
-      //   直送が続けて失敗する環境では、クールダウン中だけ従来経路を優先して
-      //   毎回タイムアウトを待つ遅さを避ける（画像は必ず取れる）。
-      const __liveFramesAction = !!(payload && payload.action === 'live_watch_frames');
-      if (__liveFramesAction && Date.now() >= liveFramesDirectCooldownUntil) {
-        try {
-          const __lf = await apiRequestDirectLiveFrames(payload);
-          liveFramesDirectCooldownUntil = 0;
-          liveFramesDirectFailCount = 0;   // 【R60】成功したら連続失敗カウントを戻す
-          return __lf;
-        } catch (eLf) {
-          const __hasRunner2 = (typeof google !== 'undefined' && google.script && google.script.run);
-          if ((eLf && eLf.noFallback) || !__hasRunner2) throw eLf;
-          // 非認証の失敗のみ退避する。
-          // 【R60】2 回連続で失敗したら 60 秒、1 回目は 10 秒だけ従来経路を優先する。
-          liveFramesDirectFailCount += 1;
-          const __cd = liveFramesDirectFailCount >= 2
-            ? LIVE_FRAME_DIRECT_COOLDOWN_MS
-            : LIVE_FRAME_DIRECT_COOLDOWN_ONCE_MS;
-          liveFramesDirectCooldownUntil = Date.now() + __cd;
-          // ここから下の従来経路へ落ちる（退避）
-        }
-      }
+      // 【R61】ライブ視聴系（start / extend / stop / status / frames）は
+      //   /exec 直送を行わず、最初から google.script.run を直接呼ぶ。
+      //   GAS Web アプリのサンドボックス（script.googleusercontent.com）からは
+      //   /exec へのクロスオリジン fetch が Google 認証リダイレクトを受け、
+      //   毎回 9 秒のタイムアウトを待ってから退避していた（9 秒＋3 秒＝12 秒）。
+      //   同一オリジンの google.script.run は常に最短で通るため、待機時間ゼロで
+      //   こちらへ直結する。タイムアウト待ちが構造的に存在しなくなる。
+      const __liveWatchAction = isLiveWatchAction(payload && payload.action);
       if (__directFetch) {
         // 【R37】応答を待たず、送信と「完全同時（0ms）」に子GASビーコンを撃つ。
         //   親シートの書き込みと子シートの書き込みを時間軸で重ねるため。
         try { scheduleShardFlushRetries(); } catch (e0) {}
       }
 
-      if (!__directFetch && !__screenAction && typeof google !== 'undefined' && google.script && google.script.run) {
+      // 【R61】ライブ視聴系は __liveWatchAction で明示的に google.script.run へ直結する。
+      //   （!__directFetch && !__screenAction の条件でも通るが、意図を明示しておく）
+      if ((__liveWatchAction || (!__directFetch && !__screenAction)) &&
+          typeof google !== 'undefined' && google.script && google.script.run) {
         return new Promise((resolve, reject) => {
           const runner = google.script.run
             .withSuccessHandler(res => {
@@ -3776,28 +3735,29 @@
     //
     // 【設計】
     //   ・GAS 側のプール（全体 24 台）と管理設定（1教員あたり上限／自動タイムアウト）に従う。
-    //   ・画像は 1.3 秒間隔で取得する（1.2〜1.5 秒要件）。取得は /exec 直送で行い、
-    //     google.script.run の callback ポーリング往復（実測 3.6〜7.1 秒）を避ける。
     //   ・枠が開いている間だけ 10 秒ごとに延長を送る。GAS 側の TTL は 25 秒なので、
     //     ブラウザが強制終了しても 25 秒で自動解放される。
     //   ・枠を閉じた／タブが非表示／自動タイムアウト満了 → 即座に停止 API を呼ぶ。
     //
     // 【R59】画像の切り替わりを約 6 秒 → 1.5〜2.5 秒へ短縮する。
-    //   ① 取得経路を /exec 直送にする（上の apiRequestDirectLiveFrames）。
-    //   ② ポーリング周期を 1800ms → 1300ms（1.2〜1.5 秒の範囲）へ短縮する。
-    //   ③ 「ライブ視聴を開始」直後の 6 秒間だけ 900ms 周期で取得し、
-    //      1 枚目が届くまでの待ち時間を縮める。
     //   ④ in-flight 排他は維持し、古い応答（周回遅れ）は破棄する。
     //      → 速くしても画像が巻き戻ってちらつくことがない。
     // 【R60】「前の応答が終わった直後に次を投げる」連続パイプライン方式へ変更する。
     //   固定周期（setInterval）だと「応答が返ってから次の周期が来るまで」が必ず
     //   空き時間になり、その分だけ画像が止まって見える。
-    //   応答完了 → 最短 150〜250ms 後に次を発行する再帰 setTimeout にすることで、
-    //   通信の空き時間をゼロに近づける（google.script.run 経路でも同様）。
-    const LIVE_WATCH_PIPELINE_GAP_MS = 200;        // 通常時の待ち（150〜250ms）
-    const LIVE_WATCH_BOOT_GAP_MS = 150;            // 開始直後（最初の6秒）の待ち
+    //   応答完了 → 待ち時間の後に次を発行する再帰 setTimeout にすることで、
+    //   通信の空き時間をゼロに近づける。
+    // 【R61】/exec 直送を撤去した（上記 isLiveWatchAction のコメント参照）。
+    //   サンドボックスからの fetch は毎回 9 秒タイムアウトを待ってから退避していた
+    //   ため、11〜16 秒間隔に悪化していた。google.script.run 直結に切り替え、
+    //   応答完了後 300ms で次を発行する（往復 3 秒 ＋ 待ち 0.3 秒）。
+    //   併せて 5000ms のクライアント側セーフティタイムアウトを置き、応答が
+    //   ハングしても in-flight 排他を解放して次の周回へ必ず進める。
+    const LIVE_WATCH_PIPELINE_GAP_MS = 300;        // 通常時の待ち（応答完了後 300ms）
+    const LIVE_WATCH_BOOT_GAP_MS = 300;            // 開始直後の待ち（300ms）
     const LIVE_WATCH_BOOT_MS = 6000;               // 「開始直後」とみなす時間
     const LIVE_WATCH_EXTEND_MS = 10000;            // 延長ハートビート（TTL 25 秒より短い）
+    const LIVE_WATCH_FRAME_SAFETY_MS = 5000;       // 【R61】取得のセーフティタイムアウト（ハング解放）
     const LIVE_WATCH_FALLBACK_TIMEOUT_SEC = 180;   // 管理設定が取れないときの既定
     const LIVE_WATCH_TILE_LIMIT_FALLBACK = 3;      // 管理設定が取れないときの上限
 
@@ -4324,8 +4284,26 @@
       liveWatchFramesFetching = true;
       liveWatchFramesSeq += 1;
       const mySeq = liveWatchFramesSeq;
+      // 【R61】セーフティタイムアウト: google.script.run が応答を返さないまま
+      //   ハングしても in-flight 排他を 5000ms で解放し、次の周回へ必ず進む。
+      //   （解放しないと liveWatchFramesFetching が true のまま固まり、
+      //    画像更新が完全に止まってしまう）
+      //   ※ 発火時に「実際に 5000ms 経過したか」を検証する。テスト環境のように
+      //     setTimeout が即時実行される場合でも、経過 0ms なら発火させないため
+      //     in-flight 排他の意味が壊れない。
+      const __frameStartedAt = Date.now();
+      let __frameSafetyTimer = null;
+      const __frameSafety = new Promise(function (resolve) {
+        __frameSafetyTimer = setTimeout(function () {
+          if ((Date.now() - __frameStartedAt) < LIVE_WATCH_FRAME_SAFETY_MS) return;
+          resolve(null);
+        }, LIVE_WATCH_FRAME_SAFETY_MS);
+      });
       try {
-        const res = await apiRequest({ action: 'live_watch_frames', student_ids: wantIds });
+        const res = await Promise.race([
+          apiRequest({ action: 'live_watch_frames', student_ids: wantIds }),
+          __frameSafety
+        ]);
         // 【R59】自分より新しい要求が既に走っている／走っていたなら、
         //   この応答は周回遅れ。画面へ反映すると画像が巻き戻るので捨てる。
         if (mySeq < liveWatchFramesAppliedSeq) return;
@@ -4334,6 +4312,7 @@
       } catch (eF) {
         // 画像 1 枚の失敗で枠を閉じない（次の周で取り直す）
       } finally {
+        try { if (__frameSafetyTimer) clearTimeout(__frameSafetyTimer); } catch (eT) {}
         liveWatchFramesFetching = false;
       }
     }

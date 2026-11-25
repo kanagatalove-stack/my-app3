@@ -13,10 +13,10 @@
 //    B. 「ライブ視聴を開始」はオプティミスティック UI（0ms で待機タイル／失敗時ロールバック）
 //    C. フレーム取得は「応答完了直後 150〜250ms に次を投げる」連続パイプライン
 //       ＋ /exec 連続失敗時のクールダウンは 60 秒
-//    D. 拡張機能は LIVE_WATCH_LOOP_MS === 800 / LIVE_WATCH_TARGET_MAX_B64 === 10000
+//    D. 拡張機能は LIVE_WATCH_LOOP_MS === 800 / LIVE_WATCH_TARGET_MAX_B64 === 8000
 //       ＋ タブ切り替え（tabs.onActivated）で即時キャプチャ
 //    E. 親GAS はフレームをキャッシュしない（毎回 shardFetchMany）
-//    F. 出荷物 v1.6.11（固定仕様の維持）
+//    F. 出荷物 v1.6.12（固定仕様の維持）
 // =============================================================================
 'use strict';
 
@@ -240,13 +240,13 @@ async function main() {
 
   const gapMs = constNum(html, 'LIVE_WATCH_PIPELINE_GAP_MS');
   const bootGapMs = constNum(html, 'LIVE_WATCH_BOOT_GAP_MS');
-  const cdMs = constNum(html, 'LIVE_FRAME_DIRECT_COOLDOWN_MS');
+  const safetyMs = constNum(html, 'LIVE_WATCH_FRAME_SAFETY_MS');
   const schedFn = extract(html, 'scheduleLiveWatchPipeline');
   const tickFn = extract(html, 'liveWatchPollTick');
   const apiBody = extract(html, 'apiRequest');
 
-  check('C1 応答後の待ちは 150〜250ms', gapMs >= 150 && gapMs <= 250, gapMs);
-  check('C2 開始直後の待ちも 150〜250ms', bootGapMs >= 150 && bootGapMs <= 250, bootGapMs);
+  check('C1 応答後の待ちは 300ms（R61）', gapMs === 300, gapMs);
+  check('C2 開始直後の待ちも 300ms（R61）', bootGapMs === 300, bootGapMs);
   check('C3 再帰 setTimeout で「応答完了直後に次を投げる」',
     /setTimeout\(function \(\) \{[\s\S]{0,600}?scheduleLiveWatchPipeline\(\)/.test(schedFn));
   check('C4 タイマーは常に 1 本（張り直す前に破棄する）',
@@ -261,14 +261,21 @@ async function main() {
     /liveWatchFramesFetching = false;/.test(tickFn));
   check('C8 古い応答は捨てる（巻き戻り防止）',
     /if \(mySeq < liveWatchFramesAppliedSeq\) return;/.test(tickFn));
-  check('C9 /exec 直送のクールダウンは 60 秒', cdMs === 60000, cdMs);
-  check('C10 2 回連続で失敗したら 60 秒へ延長する（1 回目は短い）',
-    /liveFramesDirectFailCount \+= 1;/.test(apiBody) &&
-    /liveFramesDirectFailCount >= 2/.test(apiBody));
-  check('C11 直送が成功したら連続失敗カウントを戻す',
-    /liveFramesDirectFailCount = 0;/.test(apiBody));
-  check('C12 クールダウン中は従来経路（google.script.run）を使う',
-    /Date\.now\(\) >= liveFramesDirectCooldownUntil/.test(apiBody));
+  // 【R61】/exec 直送を撤去したため、クールダウン機構そのものが存在しない。
+  //   「タイムアウト待ちゼロで google.script.run 直結」を固定する。
+  check('C9 /exec 直送のタイムアウト待ちが構造的に存在しない（9 秒待ちの根絶）',
+    !/const LIVE_FRAME_FETCH_TIMEOUT_MS/.test(html) &&
+    !/function apiRequestDirectLiveFrames/.test(html));
+  check('C10 クールダウン状態変数が残っていない（無駄な待ちを排除）',
+    !/liveFramesDirectCooldownUntil/.test(apiBody) &&
+    !/liveFramesDirectFailCount/.test(apiBody));
+  check('C11 ライブ視聴系は isLiveWatchAction で google.script.run へ直結する',
+    /function isLiveWatchAction\(act\)/.test(html) &&
+    /const __liveWatchAction = isLiveWatchAction\(payload && payload\.action\);/.test(apiBody));
+  check('C12 5000ms のセーフティタイムアウトでハング時も in-flight を解放する',
+    safetyMs === 5000 &&
+    /LIVE_WATCH_FRAME_SAFETY_MS/.test(tickFn) &&
+    /Promise\.race/.test(tickFn));
 
   // ---- 実挙動（vm）: パイプラインが「応答直後に次を張る」こと ----
   const reScript = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
@@ -376,8 +383,8 @@ async function main() {
   check('C15 1 周走ると画像を取得し、応答直後に次のタイマーを張る（1 本だけ）',
     apiCalls === 1 && timers.length === 1,
     { calls: apiCalls, timers: timers.map(function (t) { return t.ms; }) });
-  check('C16 2 周目の待ちは 150〜250ms（開始直後）',
-    timers[0].ms >= 150 && timers[0].ms <= 250, timers[0].ms);
+  check('C16 2 周目の待ちは 300ms（開始直後 / R61）',
+    timers[0].ms === 300, timers[0].ms);
 
   const t1 = timers.shift();
   t1.fn();
@@ -387,8 +394,8 @@ async function main() {
 
   // 6 秒経過後も 150〜250ms を保つ
   clock.now += 6000;
-  check('C18 6 秒経過後も待ちは 150〜250ms',
-    ictx.getLiveWatchPipelineGapMs() >= 150 && ictx.getLiveWatchPipelineGapMs() <= 250,
+  check('C18 6 秒経過後も待ちは 300ms（R61）',
+    ictx.getLiveWatchPipelineGapMs() === 300,
     ictx.getLiveWatchPipelineGapMs());
 
   // 枠が 0 になったら止まる
@@ -412,7 +419,7 @@ async function main() {
   run('liveWatchSlots = []; liveWatchPollTimer = null;');
 
   // ===========================================================================
-  // D. 拡張機能: ループ 800ms / 10,000 文字 / タブ切り替え即時フック
+  // D. 拡張機能: ループ 800ms / 8,000 文字 / タブ切り替え即時フック
   // ===========================================================================
   console.log('===== D. 拡張機能のキャプチャ間隔とタブ切り替えフック =====');
 
@@ -426,10 +433,10 @@ async function main() {
   const activeSync = constNum(bgSrc, 'ACTIVE_SYNC_MS');
 
   check('D1 LIVE_WATCH_LOOP_MS === 800', loopMs === 800, loopMs);
-  check('D2 LIVE_WATCH_TARGET_MAX_B64 === 10000（約7〜8KB）', targetMax === 10000, targetMax);
-  check('D3 目標下限は 5,000 文字', targetMin === 5000, targetMin);
-  check('D4 横幅は 360px', targetWidth === 360, targetWidth);
-  check('D5 撮影品質は 28%', capQuality === 28, capQuality);
+  check('D2 LIVE_WATCH_TARGET_MAX_B64 === 8000（約6KB / R61）', targetMax === 8000, targetMax);
+  check('D3 目標下限は 4,000 文字', targetMin === 4000, targetMin);
+  check('D4 横幅は 320px', targetWidth === 320, targetWidth);
+  check('D5 撮影品質は 25%', capQuality === 25, capQuality);
   check('D6 タブ切り替えフックのデバウンスは 250ms', debounceMs === 250, debounceMs);
   check('D7 送信上限 30,000 文字は維持（固定仕様）', maxB64 === 30000, maxB64);
   check('D8 ACTIVE_SYNC_MS（1.5 秒）は維持（固定仕様）', activeSync === 1500, activeSync);
@@ -530,9 +537,9 @@ async function main() {
     /if \(!urls\.length\) return local;/.test(framesBody));
 
   // ===========================================================================
-  // F. 出荷物 v1.6.11（固定仕様の維持）
+  // F. 出荷物 v1.6.12（固定仕様の維持）
   // ===========================================================================
-  console.log('===== F. v1.6.11 出荷物と固定仕様 =====');
+  console.log('===== F. v1.6.12 出荷物と固定仕様 =====');
 
   function zipEntry(zipPath, entry) {
     return execSync(
@@ -550,7 +557,7 @@ async function main() {
   }
 
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-  check('F1 extension/manifest.json の version は 1.6.11', manifest.version === '1.6.11', manifest.version);
+  check('F1 extension/manifest.json の version は 1.6.12', manifest.version === '1.6.12', manifest.version);
   check('F2 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
   const perms = (manifest.permissions || []).slice().sort().join(',');
   check('F3 権限は既存のまま（新規権限の追加なし＝再同意プロンプトを出さない）',
@@ -558,15 +565,15 @@ async function main() {
   check("F4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 
   const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-  check('F5 dist/store.zip の manifest.version は 1.6.11', sm.version === '1.6.11', sm.version);
+  check('F5 dist/store.zip の manifest.version は 1.6.12', sm.version === '1.6.12', sm.version);
   check('F6 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
   const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-  check('F7 dist/direct.zip の manifest.version も 1.6.11', dm.version === '1.6.11', dm.version);
+  check('F7 dist/direct.zip の manifest.version も 1.6.12', dm.version === '1.6.12', dm.version);
   check('F8 dist/direct.zip は検証用（popup.html 同梱）',
     !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
   const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-  check("F9 dist/update.xml の version は 1.6.11", /version='1\.6\.11'/.test(xml),
+  check("F9 dist/update.xml の version は 1.6.12", /version='1\.6\.12'/.test(xml),
     (xml.match(/version='[^']+'/g) || []).join(' '));
 
   const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'dist/managed_policy.json'), 'utf8'));

@@ -21,7 +21,7 @@
 //    D. 拡張機能は live_watch の false → true 遷移で即座に 1 枚目を撮る
 //    E. 拡張機能は独立ループ（1.0〜1.5 秒）で撮影し、1 枚 12〜18KB に収める
 //    F. 親GAS は毎回 子GAS から最新フレームを並列取得する（古い画像を溜めない）
-//    G. 出荷物は v1.6.11（固定仕様は維持）
+//    G. 出荷物は v1.6.12（固定仕様は維持）
 // =============================================================================
 'use strict';
 
@@ -65,45 +65,50 @@ function constNum(src, name) {
 async function main() {
 
 // =============================================================================
-// A. live_watch_frames の /exec 直送（gas/index.html）
+// A. 【R61】live_watch_frames は /exec 直送をせず google.script.run 直結
+//
+//   R59〜R60 では /exec 直送を優先していたが、GAS Web アプリのサンドボックス
+//   （script.googleusercontent.com）では認証リダイレクトにより毎回 9 秒の
+//   タイムアウトを待ってから google.script.run へ退避していた（9 秒＋3 秒）。
+//   本テストでは「ライブ視聴系はタイムアウト待ちなしで google.script.run を
+//   直接呼ぶ」ことを固定する。
 // =============================================================================
-console.log('===== A. live_watch_frames の /exec 直送 =====');
+console.log('===== A. live_watch_frames の google.script.run 直結 =====');
 
 const apiBody = extract(html, 'apiRequest');
-const directLiveBody = extract(html, 'apiRequestDirectLiveFrames');
+const liveWatchCls = extract(html, 'isLiveWatchAction');
 
-check('A1 /exec 直送の専用関数 apiRequestDirectLiveFrames がある', !!directLiveBody);
-check('A2 直送は /exec へ POST する（text/plain でプリフライトを出さない）',
-  /method:\s*'POST'/.test(directLiveBody) &&
-  /'Content-Type':\s*'text\/plain;charset=utf-8'/.test(directLiveBody) &&
-  /redirect:\s*'follow'/.test(directLiveBody));
-check('A3 直送は呼び出し元の payload をそのまま送る（action を書き換えない）',
-  /Object\.assign\(\{\},\s*payload\)/.test(directLiveBody) && !/action\s*=/.test(directLiveBody));
-check('A4 直送は認証トークンを載せる', /if \(authToken\) body\.token = authToken;/.test(directLiveBody));
-check('A5 直送にタイムアウトを課す（GAS 無応答で固まらない）',
-  /eduFetchWithTimeout\(/.test(directLiveBody) && /LIVE_FRAME_FETCH_TIMEOUT_MS/.test(directLiveBody));
-
-check('A6 apiRequest に live_watch_frames の直送分岐がある',
-  /__liveFramesAction\s*=\s*!!\(payload && payload\.action === 'live_watch_frames'\)/.test(apiBody) &&
-  /apiRequestDirectLiveFrames\(payload\)/.test(apiBody));
-check('A7 直送が先（google.script.run の分岐より前）に評価される',
-  apiBody.indexOf('apiRequestDirectLiveFrames(payload)') >= 0 &&
-  apiBody.indexOf('apiRequestDirectLiveFrames(payload)') <
-    apiBody.indexOf("act === 'live_watch_frames'"));
-check('A8 認証切れ（need_auth）は退避しない（noFallback=true）',
-  /if \(data && data\.need_auth\) \{[\s\S]{0,240}?e\.noFallback = true;/.test(directLiveBody));
-check('A9 サーバーの明示的な拒否も退避しない（noFallback=true）',
-  /if \(data && data\.success === false\) \{[\s\S]{0,200}?e\.noFallback = true;/.test(directLiveBody));
-check('A10 非認証の失敗時だけ google.script.run へ退避する',
-  /catch \(eLf\) \{[\s\S]{0,300}?if \(\(eLf && eLf\.noFallback\) \|\| !__hasRunner2\) throw eLf;/.test(apiBody));
-check('A11 直送が続けて失敗する環境では一定時間だけ従来経路を優先（毎回のタイムアウト待ちを避ける）',
-  /liveFramesDirectCooldownUntil = Date\.now\(\) \+ __cd;/.test(apiBody) &&
-  /LIVE_FRAME_DIRECT_COOLDOWN_ONCE_MS/.test(html) &&
-  /Date\.now\(\) >= liveFramesDirectCooldownUntil/.test(apiBody));
-check('A12 直送が成功したらクールダウンを解除する',
-  /liveFramesDirectCooldownUntil = 0;/.test(apiBody));
-check('A13 退避先（google.script.run）に live_watch_frames の分岐が残っている（保険）',
-  /act === 'live_watch_frames'[\s\S]{0,120}?runner\.api_liveWatchFrames\(/.test(apiBody));
+check('A1 ライブ視聴系を判定する isLiveWatchAction がある', !!liveWatchCls);
+check('A2 live_watch_frames はライブ視聴系に含まれる',
+  /act === 'live_watch_frames'/.test(liveWatchCls));
+check('A3 start / extend / stop / status もライブ視聴系に含まれる',
+  /act === 'live_watch_start'/.test(liveWatchCls) &&
+  /act === 'live_watch_extend'/.test(liveWatchCls) &&
+  /act === 'live_watch_stop'/.test(liveWatchCls) &&
+  /act === 'live_watch_status'/.test(liveWatchCls));
+check('A4 /exec 直送の専用関数 apiRequestDirectLiveFrames は撤去済み',
+  !/function apiRequestDirectLiveFrames/.test(html));
+check('A5 9 秒タイムアウト定数（const LIVE_FRAME_FETCH_TIMEOUT_MS）は残っていない',
+  !/const LIVE_FRAME_FETCH_TIMEOUT_MS/.test(html));
+check('A6 apiRequest にライブ視聴フレームの直送分岐がない',
+  !/__liveFramesAction/.test(apiBody) && !/apiRequestDirectLiveFrames\(/.test(apiBody));
+check('A7 ライブ視聴系は __liveWatchAction で google.script.run へ直結する',
+  /const __liveWatchAction = isLiveWatchAction\(payload && payload\.action\);/.test(apiBody));
+check('A8 ライブ視聴系の分岐が google.script.run の呼び出し条件に含まれる',
+  apiBody.indexOf('__liveWatchAction') >= 0 &&
+  apiBody.indexOf('__liveWatchAction') < apiBody.indexOf('act === \'live_watch_frames\''));
+check('A9 退避先（google.script.run）に live_watch_frames の分岐が残っている（必須経路）',
+  /act === 'live_watch_frames'[\s\S]{0,140}?runner\.api_liveWatchFrames\(/.test(apiBody));
+check('A10 直送クールダウンの状態変数が残っていない（無駄な待ちを構造的に排除）',
+  !/liveFramesDirectCooldownUntil/.test(apiBody) &&
+  !/liveFramesDirectFailCount/.test(apiBody));
+check('A11 書き込み系・画面一覧・端末一覧の /exec 直送は維持する',
+  /function apiRequestDirectList\(payload\)/.test(html) &&
+  /function isDirectFetchAction\(act\)/.test(html) &&
+  /function isShardFlushAction\(act\)/.test(html));
+check('A12 ライブ視聴フレームの取得は 5,000ms のセーフティタイムアウトで解放する',
+  /const LIVE_WATCH_FRAME_SAFETY_MS = 5000;/.test(html) &&
+  /LIVE_WATCH_FRAME_SAFETY_MS\)/.test(html));
 
 // =============================================================================
 // B. ポーリング周期（1.2〜1.5 秒 / 開始直後 0.8〜1.0 秒）
@@ -115,8 +120,8 @@ const gapMs = constNum(html, 'LIVE_WATCH_PIPELINE_GAP_MS');
 const bootGapMs = constNum(html, 'LIVE_WATCH_BOOT_GAP_MS');
 const bootWindowMs = constNum(html, 'LIVE_WATCH_BOOT_MS');
 
-check('B1 応答後の待ちは 150〜250ms（連続パイプライン）', gapMs >= 150 && gapMs <= 250, gapMs);
-check('B2 開始直後の待ちは 150ms 以上（0.8〜1.0 秒周期の廃止）', bootGapMs >= 150 && bootGapMs <= 250, bootGapMs);
+check('B1 応答後の待ちは 300ms（R61: google.script.run 直結の連続パイプライン）', gapMs === 300, gapMs);
+check('B2 開始直後の待ちも 300ms（0.8〜1.0 秒周期の廃止）', bootGapMs === 300, bootGapMs);
 check('B3 「開始直後」は 6 秒間', bootWindowMs === 6000, bootWindowMs);
 check('B4 開始直後は短い待ちを返す（getLiveWatchPipelineGapMs）',
   /function getLiveWatchPipelineGapMs\(\)/.test(html) &&
@@ -281,11 +286,11 @@ check('C9 周回遅れの応答（通し番号が古い）は画面へ反映し�
 intervals.length = 0;
 clock.now = 5000000;
 run('liveWatchStartedAt = ' + clock.now + '; liveWatchPollTimer = null;');
-check('C10 開始直後の待ちは 150〜250ms',
-  ctx.getLiveWatchPipelineGapMs() >= 150 && ctx.getLiveWatchPipelineGapMs() <= 250, ctx.getLiveWatchPipelineGapMs());
+check('C10 開始直後の待ちは 300ms（R61）',
+  ctx.getLiveWatchPipelineGapMs() === 300, ctx.getLiveWatchPipelineGapMs());
 clock.now = 5000000 + 6000;
-check('C11 6 秒経過後も 150〜250ms を保つ（空き時間を作らない）',
-  ctx.getLiveWatchPipelineGapMs() >= 150 && ctx.getLiveWatchPipelineGapMs() <= 250, ctx.getLiveWatchPipelineGapMs());
+check('C11 6 秒経過後も 300ms を保つ（空き時間を作らない）',
+  ctx.getLiveWatchPipelineGapMs() === 300, ctx.getLiveWatchPipelineGapMs());
 run('liveWatchStartedAt = 0;');
 
 // =============================================================================
@@ -405,13 +410,13 @@ const qualities = (function () {
 })();
 
 check('E1 独立ループの周期は 800ms（R60 で短縮）', loopMs === 800, loopMs);
-check('E2 目標サイズの上限は 10,000 文字（約7〜8KB）', targetMax === 10000, targetMax);
-check('E3 目標サイズの下限は 5,000 文字', targetMin === 5000, targetMin);
+check('E2 目標サイズの上限は 8,000 文字（約6KB / R61）', targetMax === 8000, targetMax);
+check('E3 目標サイズの下限は 4,000 文字', targetMin === 4000, targetMin);
 check('E4 目標より小さい画像は「目標レンジ内」として採用する',
   /b64\.length >= LIVE_WATCH_TARGET_MIN_B64 && b64\.length <= LIVE_WATCH_TARGET_MAX_B64/.test(bgSrc));
-check('E5 縮小の目標横幅は 360px', targetWidth === 360, targetWidth);
-check('E6 撮影品質は 28%', captureQuality === 28, captureQuality);
-check('E7 縮小品質の起点は 28%', Math.abs(qualities[0] - 0.28) < 0.001, qualities[0]);
+check('E5 縮小の目標横幅は 320px', targetWidth === 320, targetWidth);
+check('E6 撮影品質は 25%', captureQuality === 25, captureQuality);
+check('E7 縮小品質の起点は 25%', Math.abs(qualities[0] - 0.25) < 0.001, qualities[0]);
 check('E8 送信の上限 30,000 文字は維持（固定仕様）', maxB64 === 30000, maxB64);
 check('E9 ACTIVE_SYNC_MS（1.5 秒）は維持（固定仕様）', activeSync === 1500, activeSync);
 check('E10 ハートビートの完了を待たない（await せずに追撃する）',
@@ -451,9 +456,9 @@ check('F6 単独モード（シャード未設定）は従来どおりローカ�
   /if \(!urls\.length\) return local;/.test(framesBody));
 
 // =============================================================================
-// G. 出荷物 v1.6.11（固定仕様の維持）
+// G. 出荷物 v1.6.12（固定仕様の維持）
 // =============================================================================
-console.log('===== G. v1.6.11 出荷物と固定仕様 =====');
+console.log('===== G. v1.6.12 出荷物と固定仕様 =====');
 
 function zipEntry(zipPath, entry) {
   return execSync(
@@ -471,7 +476,7 @@ function zipNames(zipPath) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('G1 extension/manifest.json の version は 1.6.11', manifest.version === '1.6.11', manifest.version);
+check('G1 extension/manifest.json の version は 1.6.12', manifest.version === '1.6.12', manifest.version);
 check('G2 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
 const perms = (manifest.permissions || []).slice().sort().join(',');
 check('G3 権限は既存のまま（新規権限の追加なし＝再同意プロンプトを出さない）',
@@ -479,15 +484,15 @@ check('G3 権限は既存のまま（新規権限の追加なし＝再同意プ�
 check("G4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 
 const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-check('G5 dist/store.zip の manifest.version は 1.6.11', sm.version === '1.6.11', sm.version);
+check('G5 dist/store.zip の manifest.version は 1.6.12', sm.version === '1.6.12', sm.version);
 check('G6 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
 const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-check('G7 dist/direct.zip の manifest.version も 1.6.11', dm.version === '1.6.11', dm.version);
+check('G7 dist/direct.zip の manifest.version も 1.6.12', dm.version === '1.6.12', dm.version);
 check('G8 dist/direct.zip は検証用（popup.html 同梱）',
   !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
 const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-check("G9 dist/update.xml の version は 1.6.11", /version='1\.6\.11'/.test(xml),
+check("G9 dist/update.xml の version は 1.6.12", /version='1\.6\.12'/.test(xml),
   (xml.match(/version='[^']+'/) || [])[0]);
 
 const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'dist/managed_policy.json'), 'utf8'));

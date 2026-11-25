@@ -357,7 +357,7 @@ ok('E6 getShardMergedDevices は applyMonitorVisibility を通す',
 // =====================================================================
 console.log('--- F. 固定仕様の不変条件 ---');
 
-ok('F1 manifest の version は 1.6.11', manifest.version === '1.6.11');
+ok('F1 manifest の version は 1.6.12', manifest.version === '1.6.12');
 ok('F1 manifest に default_popup が無い',
   !(manifest.action && manifest.action.default_popup) &&
   !(manifest.browser_action && manifest.browser_action.default_popup));

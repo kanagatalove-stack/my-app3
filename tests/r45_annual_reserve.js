@@ -1141,7 +1141,7 @@ console.log('--- H. ガード/フォールバック/不変条件 ---');
     html.indexOf('id="annualReserveTeacherPreview"') >= 0, 'preview');
 
   // 製品全体の不変条件（既存仕様を壊していないこと）
-  ok('H-55 拡張機能は v1.6.11', manifest.version === '1.6.11', manifest.version);
+  ok('H-55 拡張機能は v1.6.12', manifest.version === '1.6.12', manifest.version);
   ok('H-56 default_popup を持たない',
     !(manifest.action && manifest.action.default_popup) &&
     !(manifest.browser_action && manifest.browser_action.default_popup), 'no-popup');

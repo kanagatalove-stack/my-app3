@@ -489,9 +489,9 @@ check('H2 14校（東粟倉小は廃校のため含めない）',
   !/東粟倉/.test(src));
 check('H3 shardFetchMany は無変更（UrlFetchApp.fetchAll・個別操作でも同じ送信器）',
   /function shardFetchMany\(/.test(src) && /UrlFetchApp\.fetchAll\(/.test(extract('shardFetchMany')));
-check('H4 拡張機能の manifest は v1.6.11 のまま',
+check('H4 拡張機能の manifest は v1.6.12 のまま',
   JSON.parse(fs.readFileSync('/home/user/webapp/extension/manifest.json', 'utf8'))
-    .version === '1.6.11');
+    .version === '1.6.12');
 check('H5 拡張機能の DEFAULT_GAS_URL は空文字のまま',
   /const DEFAULT_GAS_URL = '';/.test(
     fs.readFileSync('/home/user/webapp/extension/background.js', 'utf8')));
