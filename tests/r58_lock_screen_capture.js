@@ -81,13 +81,17 @@ const CONSTS = [
   // 【R59】独立ループの周期（applyLiveWatchFlag が参照する）
   'LIVE_WATCH_LOOP_MS',
   // 【R58】状態フレーム（ロック中・規制中の代替画像）
-  'RESTRICTION_FRAME_WIDTHS', 'RESTRICTION_FRAME_QUALITIES', 'RESTRICTION_FRAME_STATIC'
+  'RESTRICTION_FRAME_WIDTHS', 'RESTRICTION_FRAME_QUALITIES', 'RESTRICTION_FRAME_STATIC',
+  // 【R60】新しいタブ（Google トップ画面）の仮想プレビュー
+  'NEW_TAB_PAGE_PREFIXES', 'NEW_TAB_FRAME_WIDTHS', 'NEW_TAB_FRAME_QUALITIES'
 ];
 
 const FNS = [
   // 【R58】状態フレーム生成
   'truncateFrameText_', 'bufferToBase64_', 'buildRestrictionFrameMeta_',
   'drawRestrictionFrame_', 'renderRestrictionStateFrame_', 'restrictionStateForTab_',
+  // 【R60】新しいタブ判定（restrictionStateForTab_ が参照する）
+  'isNewTabPageUrl_',
   // 既存の判定・縮小
   'evaluateUrlRestriction', 'downscaleForLiveWatch', 'downscaleForSheet',
   'captureLightweightLiveFrame_', 'applyLiveWatchFlag',
@@ -432,7 +436,7 @@ check('D3 ロック中の撮影例外は screenshot_blocked ではなく状態�
 // D4: chrome:// ＋規制中 → 状態フレームを screenshot として送る
 const envD4 = makeEnv({
   storageData: Object.assign({}, LIVE_BASE, { filter_mode: 'BLACKLIST', blacklist_urls: ['game.example.com'] }),
-  tab: { windowId: 13, url: 'chrome://newtab/' },
+  tab: { windowId: 13, url: 'chrome://settings/' },
   OffscreenCanvas: canvasStub(0.05)
 });
 await call(envD4, 'captureAndUploadScreenshot');
@@ -456,7 +460,7 @@ check('D5 通常時の撮影例外は従来どおり screenshot_blocked を通�
 // D6: 通常時＋chrome:// → 従来どおり chrome_protected
 const envD6 = makeEnv({
   storageData: Object.assign({}, LIVE_BASE, { screen_lock: false, filter_mode: 'OFF' }),
-  tab: { windowId: 15, url: 'chrome://newtab/' },
+  tab: { windowId: 15, url: 'chrome://settings/' },
   OffscreenCanvas: canvasStub(0.05)
 });
 await call(envD6, 'captureAndUploadScreenshot');
@@ -480,9 +484,9 @@ check('D7 ロック中に縮小できなくても状態フレームで送信す�
   envD7.fetched.length ? envD7.fetched[0].body.action : null);
 
 // ============================================================================
-// E. 出荷物と固定仕様（v1.6.10）
+// E. 出荷物と固定仕様（v1.6.11）
 // ============================================================================
-console.log('\n===== E. v1.6.10 出荷物と固定仕様 =====');
+console.log('\n===== E. v1.6.11 出荷物と固定仕様 =====');
 
 function zipEntry(zipPath, entry) {
   return execSync(
@@ -500,7 +504,7 @@ function zipNames(zipPath) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('E1 extension/manifest.json の version は 1.6.10', manifest.version === '1.6.10', manifest.version);
+check('E1 extension/manifest.json の version は 1.6.11', manifest.version === '1.6.11', manifest.version);
 check('E2 default_popup を持たない（児童のアイコン操作は無反応）',
   !manifest.action || !manifest.action.default_popup);
 const perms = (manifest.permissions || []).slice().sort().join(',');
@@ -510,16 +514,16 @@ check("E4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(
 check('E5 ACTIVE_SYNC_MS（1.5 秒）は維持', /const ACTIVE_SYNC_MS = 1500;/.test(bgSrc));
 
 const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-check('E6 dist/store.zip の manifest.version は 1.6.10', sm.version === '1.6.10', sm.version);
+check('E6 dist/store.zip の manifest.version は 1.6.11', sm.version === '1.6.11', sm.version);
 check('E7 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
 
 const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-check('E8 dist/direct.zip の manifest.version も 1.6.10', dm.version === '1.6.10', dm.version);
+check('E8 dist/direct.zip の manifest.version も 1.6.11', dm.version === '1.6.11', dm.version);
 check('E9 dist/direct.zip は検証用（popup.html 同梱）',
   !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
 const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-check("E10 dist/update.xml の version は 1.6.10", /version='1\.6\.10'/.test(xml),
+check("E10 dist/update.xml の version は 1.6.11", /version='1\.6\.11'/.test(xml),
   (xml.match(/version='[^']+'/) || [])[0]);
 
 // 【R59】ロック画面・規制画面の上部ステータス帯は撤去し、R57 以前の構成へ戻した。

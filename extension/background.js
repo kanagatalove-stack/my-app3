@@ -1908,35 +1908,44 @@ async function downscaleForSheet(dataUrl) {
 //
 //   固定仕様:
 //     ・撮影は chrome.tabs.captureVisibleTab（JPEG・低品質）のみ。
-//     ・OffscreenCanvas で横幅 420〜480px に縮小し、Base64 30,000 文字以内に収める。
+//     ・OffscreenCanvas で横幅 360px に縮小し、Base64 30,000 文字以内に収める。
 //     ・liveWatchInFlight による排他制御で多重送信しない。
 //     ・live_watch === false になった瞬間に停止する（撮影もしない）。
 //     ・新規権限は不要（tabs / host_permissions は既存のまま）。
 //
 //   【R59】画像の切り替わりを約 6 秒 → 1.5〜2.5 秒へ短縮する。
 //     ・live_watch が false → true に変わった瞬間に 1 枚目を撮る（1.5 秒待たない）。
-//     ・以後はハートビートの完了を待たない独立ループ（1.2 秒）で撮影・送信する。
+//     ・以後はハートビートの完了を待たない独立ループで撮影・送信する。
 //       同期通信が遅い時間帯でも、画像の更新ペースは独立して保たれる。
-//     ・1 枚あたり 12〜18KB（横幅 420〜480px・品質 30〜35%）へ軽量化し、
-//       転送と管理画面のデコードを短くする。
+//     ・1 枚あたり 12〜18KB へ軽量化し、転送と管理画面のデコードを短くする。
+//
+//   【R60】起動・切り替わりをさらに詰める。
+//     ・独立ループの周期を 1.2 秒 → 0.8 秒へ短縮する。
+//     ・タブ切り替え（chrome.tabs.onActivated / onUpdated）を検知したら、
+//       デバウンス 250ms で即座に 1 枚撮って送る（次の 0.8 秒を待たない）。
+//     ・1 枚あたり 5〜10KB（横幅 360px・品質 28%）へ超軽量化する。
 //     ・ACTIVE_SYNC_MS（1.5 秒）と LIVE_WATCH_MAX_B64（30,000）は維持する。
 // ============================================================================
 const LIVE_WATCH_MAX_B64 = 30000;          // 送信する Base64 の上限（要件: 30,000 文字以内）
-const LIVE_WATCH_TARGET_MAX_B64 = 18000;   // 【R59】目標サイズの上限（12〜18KB）
-const LIVE_WATCH_TARGET_MIN_B64 = 12000;   // 【R59】目標サイズの下限（12KB を下回るなら画質を上げる）
-const LIVE_WATCH_TARGET_WIDTH = 480;       // 目標の横幅（要件: 420〜480px）
-const LIVE_WATCH_MIN_WIDTH = 240;          // 縮小の下限（これ以上は落とさない）
-// 【R59】品質は 30〜35% を起点にする（従来 50% 起点）。1 枚あたり 12〜18KB に収まり、
-//   子GAS への転送と管理画面のデコードが軽くなり、画像の切り替わりが速くなる。
-const LIVE_WATCH_QUALITIES = [0.35, 0.32, 0.30, 0.26, 0.22, 0.16];
-const LIVE_WATCH_CAPTURE_QUALITY = 35;     // captureVisibleTab の品質（30〜35%）
-// 【R59】ライブ視聴専用ループの周期（1.0〜1.5 秒）。ハートビート（1.5 秒）とは
+const LIVE_WATCH_TARGET_MAX_B64 = 10000;   // 【R60】目標サイズの上限（5〜10KB / 約7〜8KB）
+const LIVE_WATCH_TARGET_MIN_B64 = 5000;    // 【R60】目標サイズの下限（5KB を下回るなら画質を上げる）
+const LIVE_WATCH_TARGET_WIDTH = 360;       // 【R60】目標の横幅（360px へ軽量化）
+const LIVE_WATCH_MIN_WIDTH = 200;          // 縮小の下限（これ以上は落とさない）
+// 【R60】品質は 28% を起点にする。1 枚あたり 5〜10KB（約7〜8KB）に収まり、
+//   子GAS への転送・管理画面のデコード・シリアライズが最短になる。
+const LIVE_WATCH_QUALITIES = [0.28, 0.26, 0.24, 0.20, 0.16, 0.12];
+const LIVE_WATCH_CAPTURE_QUALITY = 28;     // captureVisibleTab の品質（28%）
+// 【R60】ライブ視聴専用ループの周期（0.8 秒）。ハートビート（1.5 秒）とは
 //   独立して回すため、同期通信が遅い時間帯でも画像の更新ペースを保てる。
-const LIVE_WATCH_LOOP_MS = 1200;
+const LIVE_WATCH_LOOP_MS = 800;
+// 【R60】タブ切り替え（onActivated / onUpdated）で「即座に 1 枚」撮るためのデバウンス。
+//   連続したイベント（複数タブの一斉復元など）で撮影が乱発しないよう 250ms 待つ。
+const LIVE_WATCH_TAB_HOOK_DEBOUNCE_MS = 250;
 let liveWatchActive = false;               // ハートビート応答 live_watch の写し
 let liveWatchInFlight = false;             // 送信の多重実行ガード（in-flight 排他）
 let liveWatchLastSentMs = 0;               // 直近の送信時刻（診断用）
 let liveWatchLoopTimer = null;             // 【R59】独立ループのタイマー（常に1本）
+let liveWatchTabHookTimer = null;          // 【R60】タブ切り替えフックのデバウンスタイマー
 
 /** ArrayBuffer → Base64（Service Worker には btoa がある）。 */
 function bufferToBase64_(buf) {
@@ -1950,20 +1959,21 @@ function bufferToBase64_(buf) {
 }
 
 /**
- * ライブ視聴用の縮小。横幅 420〜480px を起点に、Base64 が 12〜18KB に収まる
+ * ライブ視聴用の縮小。横幅 360px を起点に、Base64 が 5〜10KB に収まる
  * 幅と品質を選ぶ。30,000 文字（上限）は「超えてはいけない線」として別に守る。
  *
  * 【R59】従来は「30,000 文字に収まればよい」だったため 1 枚が 25〜30KB になり、
- *   子GAS への転送と管理画面のデコードに時間がかかっていた。12〜18KB を目標に
- *   することで、画質は実用のまま切り替わりが速くなる。
- *   ・目標上限（18,000）以内に収まった最初の候補を採用する。
+ *   子GAS への転送と管理画面のデコードに時間がかかっていた。
+ * 【R60】さらに 5〜10KB（約7〜8KB）まで軽量化する。転送・シリアライズ・デコードが
+ *   すべて短くなり、画像の切り替わりが体感で速くなる。
+ *   ・目標レンジ（5,000〜10,000）に収まった最初の候補を採用する。
  *   ・最後まで収まらなければ、上限（30,000）以内で最も小さい候補を返す。
  *   ・どれも上限を超えるなら null（壊れたデータは送らない）。
  */
 async function downscaleForLiveWatch(dataUrl) {
   const raw = String(dataUrl || '');
   const originalB64 = raw.replace(/^data:image\/[a-z]+;base64,/i, '');
-  // 目標サイズ（18KB）に既に収まっていればそのまま送る（無駄な再エンコードをしない）
+  // 目標サイズ（10KB）に既に収まっていればそのまま送る（無駄な再エンコードをしない）
   if (originalB64.length <= LIVE_WATCH_TARGET_MAX_B64) return raw;
   if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') {
     // 縮小できない環境: 上限（30,000）以内なら原寸のまま送る
@@ -1994,7 +2004,7 @@ async function downscaleForLiveWatch(dataUrl) {
         const b64 = bufferToBase64_(await blob.arrayBuffer());
         if (b64.length > LIVE_WATCH_MAX_B64) continue;   // 上限超過は使わない
         const out = 'data:image/jpeg;base64,' + b64;
-        // 目標レンジ（12〜18KB）に収まったら即採用（品質優先で最初に見つかったもの）
+        // 目標レンジ（5〜10KB）に収まったら即採用（品質優先で最初に見つかったもの）
         if (b64.length >= LIVE_WATCH_TARGET_MIN_B64 && b64.length <= LIVE_WATCH_TARGET_MAX_B64) return out;
         // 上限内だが目標より小さい/大きい → 保険として保持し、次候補を試す
         if (!best || b64.length < best.length) best = out;
@@ -2226,22 +2236,227 @@ async function renderRestrictionStateFrame_(state, maxLen) {
   return RESTRICTION_FRAME_STATIC;   // 956 文字。どの上限にも収まる
 }
 
+
+// ============================================================================
+// 【R60】新しいタブ（Google トップ画面）の仮想プレビュー
+//
+//   児童端末が「新しいタブ」（chrome://newtab/ 等）を表示しているとき、
+//   captureVisibleTab は Chrome の仕様で必ず失敗する。R59 まではこれを
+//   「撮影できない特権ページ」として扱い、URL規制が有効だと
+//   「🚫 アクセス制限中（chrome://newtab/）」の状態フレームを送っていた。
+//   しかし実態は規制ではなく「Google のトップ画面を開いている」だけであり、
+//   教員には誤解を与える（規制が誤作動しているように見える）。
+//
+//   R60 では新しいタブを「規制」ではなく「Google 検索トップ画面」として扱い、
+//   OffscreenCanvas で仮想のプレビュー画像を描いて送る。
+//     ・ライブ視聴（live_frame）と画面一覧（screenshot）の両方で同じ画像を使う。
+//     ・URL規制リストが有効でも、新しいタブは規制フォールバックにしない。
+//     ・実際の https://www.google.com/ を開いている場合は従来どおり
+//       captureVisibleTab で実画面を撮る（この仮想画像は使わない）。
+//   新規権限は不要（既存の tabs / host_permissions のみ）。
+// ============================================================================
+
+// 新しいタブとみなす URL の前方一致（Chrome / ChromeOS / 検索バー経由）
+const NEW_TAB_PAGE_PREFIXES = [
+  'chrome://newtab',
+  'chrome://new-tab-page',
+  'chrome-search://local-ntp',
+  'chrome-search://ntp',
+  'chrome://ntp'
+];
+
+// 仮想プレビューの描画候補（広い順）と JPEG 品質候補
+const NEW_TAB_FRAME_WIDTHS = [800, 640, 512, 420, 360];
+const NEW_TAB_FRAME_QUALITIES = [0.5, 0.42, 0.35, 0.28, 0.2];
+
+/** その URL が Chrome の「新しいタブ」かどうか。 */
+function isNewTabPageUrl_(url) {
+  const u = String(url === undefined || url === null ? '' : url).trim().toLowerCase();
+  if (!u) return false;
+  for (let i = 0; i < NEW_TAB_PAGE_PREFIXES.length; i++) {
+    if (u.startsWith(NEW_TAB_PAGE_PREFIXES[i])) return true;
+  }
+  return false;
+}
+
+/** 角丸長方形のパスを作る（古い実装でも動くよう自前で描く）。 */
+function roundRectPath_(ctx, x, y, w, h, r) {
+  const rr = Math.max(0, Math.min(Math.round(r), Math.floor(Math.min(w, h) / 2)));
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr);
+  ctx.arcTo(x, y, x + rr, y, rr);
+  ctx.closePath();
+}
+
+/** 仮想プレビューに描く現在時刻（右下の注記用）。 */
+function newTabFrameTimeText_() {
+  try {
+    const d = new Date();
+    const p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+    return d.getFullYear() + '/' + p2(d.getMonth() + 1) + '/' + p2(d.getDate()) +
+      ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * 指定の横幅で「Google 検索トップ画面」風の仮想プレビューを描き、JPEG の data URL を返す。
+ *   OffscreenCanvas が使えない／描画に失敗した場合は null（呼び出し側で代替）。
+ */
+async function drawNewTabPreviewFrame_(width) {
+  if (typeof OffscreenCanvas !== 'function') return null;
+  const W = Math.max(320, Math.round(Number(width) || NEW_TAB_FRAME_WIDTHS[0]));
+  const H = Math.round(W * 0.5625);   // 16:9（Chromebook の画面比に近づける）
+  try {
+    const canvas = new OffscreenCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    // ① 白背景＋上部のごく薄い帯（ブラウザのタブ領域に見えるアクセント）
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#f8fafc';
+    ctx.fillRect(0, 0, W, Math.round(H * 0.09));
+
+    const cx = Math.round(W / 2);
+    ctx.textBaseline = 'middle';
+
+    // ② 「Google」ロゴ風の文字（各文字をブランドカラーで描く）
+    const letters = [
+      { t: 'G', c: '#4285f4' },
+      { t: 'o', c: '#ea4335' },
+      { t: 'o', c: '#fbbc05' },
+      { t: 'g', c: '#4285f4' },
+      { t: 'l', c: '#34a853' },
+      { t: 'e', c: '#ea4335' }
+    ];
+    ctx.font = 'bold ' + Math.round(W * 0.14) + 'px sans-serif';
+    ctx.textAlign = 'left';
+    const ws = [];
+    let total = 0;
+    for (let i = 0; i < letters.length; i++) {
+      const lw = ctx.measureText(letters[i].t).width;
+      ws.push(lw);
+      total += lw;
+    }
+    let x = cx - Math.round(total / 2);
+    const logoY = Math.round(H * 0.34);
+    for (let i = 0; i < letters.length; i++) {
+      ctx.fillStyle = letters[i].c;
+      ctx.fillText(letters[i].t, x, logoY);
+      x += ws[i];
+    }
+
+    // ③ 角丸の検索バー（虫めがね＋プレースホルダ）
+    const barW = Math.round(W * 0.64);
+    const barH = Math.round(H * 0.118);
+    const barX = Math.round(cx - barW / 2);
+    const barY = Math.round(H * 0.50);
+    const barR = Math.round(barH / 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = '#dadce0';
+    ctx.lineWidth = Math.max(1, Math.round(W * 0.0045));
+    roundRectPath_(ctx, barX, barY, barW, barH, barR);
+    ctx.fill();
+    ctx.stroke();
+
+    // 虫めがね（円＋柄）
+    const magR = Math.round(barH * 0.20);
+    const magX = barX + Math.round(barH * 0.55);
+    const magY = barY + Math.round(barH * 0.5);
+    ctx.strokeStyle = '#9aa0a6';
+    ctx.lineWidth = Math.max(1, Math.round(W * 0.0055));
+    ctx.beginPath();
+    ctx.arc(magX, magY, magR, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(magX + Math.round(magR * 0.7), magY + Math.round(magR * 0.7));
+    ctx.lineTo(magX + Math.round(magR * 1.5), magY + Math.round(magR * 1.5));
+    ctx.stroke();
+
+    // プレースホルダ文字（検索窓の中）
+    ctx.fillStyle = '#9aa0a6';
+    ctx.textAlign = 'left';
+    ctx.font = Math.round(barH * 0.42) + 'px sans-serif';
+    ctx.fillText('検索または URL を入力', magX + Math.round(magR * 2.2), barY + Math.round(barH * 0.5));
+
+    // ④ 下部の注記「新しいタブ（Google トップ画面）」＋現在時刻
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#5f6368';
+    ctx.font = Math.round(W * 0.030) + 'px sans-serif';
+    ctx.fillText('新しいタブ（Google トップ画面）', cx, Math.round(H * 0.755));
+    ctx.fillStyle = '#9aa0a6';
+    ctx.font = Math.round(W * 0.024) + 'px monospace';
+    ctx.fillText(String(newTabFrameTimeText_() || ''), cx, Math.round(H * 0.83));
+
+    // ⑤ 上限に収まる品質を探す（最初に収まったものを採用）
+    for (let i = 0; i < NEW_TAB_FRAME_QUALITIES.length; i++) {
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: NEW_TAB_FRAME_QUALITIES[i] });
+      const b64 = bufferToBase64_(await blob.arrayBuffer());
+      if (b64.length <= LIVE_WATCH_MAX_B64) return 'data:image/jpeg;base64,' + b64;
+    }
+    const last = await canvas.convertToBlob({ type: 'image/jpeg', quality: NEW_TAB_FRAME_QUALITIES[0] });
+    return 'data:image/jpeg;base64,' + bufferToBase64_(await last.arrayBuffer());
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 新しいタブ用の仮想プレビュー 1 枚を生成する。
+ *   maxLen は呼び出し側の上限（ライブ視聴=10,000 / 画面一覧=42,000）。
+ *   どの横幅でも上限に収まらなければ、必ず上限内に収まる静的プレースホルダを返す。
+ */
+async function renderNewTabPreviewFrame_(maxLen) {
+  const limit = Number(maxLen) > 0 ? Number(maxLen) : LIVE_WATCH_MAX_B64;
+  for (let i = 0; i < NEW_TAB_FRAME_WIDTHS.length; i++) {
+    const out = await drawNewTabPreviewFrame_(NEW_TAB_FRAME_WIDTHS[i]);
+    if (!out) continue;
+    const len = String(out).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+    if (len <= limit) return out;
+  }
+  return RESTRICTION_FRAME_STATIC;   // 956 文字。どの上限にも収まる
+}
+
 /**
  * アクティブタブが「画面ロック中／URL規制中」かどうかを判定する。
  *   ・自拡張の lock.html / blocked.html を表示中なら、その画面自体を根拠にする
  *     （URL パラメータに元URL・規制モードが保持されている）。
  *   ・加えてストレージのポリシー（screen_lock / filter_mode）からも判定する
  *     （＝全タブがロック画面へ差し替わる直前の一瞬の隙間も拾う）。
- *   戻り値: { active, kind: 'lock'|'block'|'', url, mode }
+ *   戻り値: { active, kind: 'lock'|'block'|'', url, mode, newtab? }
  */
 function restrictionStateForTab_(data, tabUrl) {
   const url = String(tabUrl || '');
+
+  // ⓪ 【R60】新しいタブ（Google トップ画面）は「規制」ではない。
+  //   このページは captureVisibleTab で撮れないため、R59 までは ⑤ の
+  //   「撮影できない特権ページ＝規制中」に落ちて「🚫 アクセス制限中」を送っていた。
+  //   実態は Google のトップ画面を開いているだけなので、規制フォールバックにせず
+  //   newtab:true を立てて呼び出し側が仮想プレビューを描く。
+  //   ※ ストレージのロック指示（画面ロック中）は規制より優先されるため、
+  //     ロック中はここで return せず ③ のロック判定へ進める。
   let selfBase = '';
   try {
     if (chrome && chrome.runtime && typeof chrome.runtime.getURL === 'function') {
       selfBase = chrome.runtime.getURL('');
     }
   } catch (e) { selfBase = ''; }
+
+  // ⓪-2 【R60】新しいタブの判定。ロック指示が出ていないときだけ「Google トップ」扱い。
+  const __d0 = data || {};
+  const __locked0 = (__d0.screen_lock === true) || (__d0.screen_locked === true);
+  if (!__locked0 && isNewTabPageUrl_(url)) {
+    return { active: false, kind: '', url: url, mode: '', newtab: true };
+  }
 
   // ① 自拡張のロック画面を表示中
   if (selfBase && url.startsWith(selfBase + 'lock.html')) {
@@ -2310,6 +2525,7 @@ async function applyLiveWatchFlag(flag) {
     // 以後の新しい撮影は liveWatchActive を見て開始しない（即時停止）。
     liveWatchLastSentMs = 0;
     stopLiveWatchLoop();
+    stopLiveWatchTabHook();   // 【R60】タブ切り替えフックも止める
   }
   try {
     await chrome.storage.local.set({ live_watch_active: next });
@@ -2355,6 +2571,41 @@ function scheduleLiveWatchLoop() {
 function startLiveWatchLoop() {
   if (!liveWatchActive) return;
   scheduleLiveWatchLoop();
+}
+
+/**
+ * 【R60】タブ切り替えの即時フック（イベント駆動）。
+ *
+ *   0.8 秒ループだけだと「児童がタブを切り替えた瞬間」は最大 0.8 秒待たされる。
+ *   教員が「今どのタブを見ているか」を素早く知りたい場面では、その待ちが
+ *   「切り替わりが遅い」と感じる直接の原因になる。
+ *   そこで chrome.tabs.onActivated / onUpdated（遷移完了）を検知し、
+ *   デバウンス 250ms で即座に 1 枚撮って送る。
+ *    ・連続イベント（複数タブの一斉復元など）はデバウンスで 1 回にまとめる。
+ *    ・liveWatchInFlight により、ループ側と同時に走っても二重送信しない。
+ *    ・live_watch=false のときは何もしない（常時撮影はしない）。
+ *   新規権限は不要（tabs 権限は既存）。
+ */
+function stopLiveWatchTabHook() {
+  if (liveWatchTabHookTimer) {
+    try { clearTimeout(liveWatchTabHookTimer); } catch (e) {}
+    liveWatchTabHookTimer = null;
+  }
+}
+
+function scheduleLiveWatchTabHook() {
+  if (!liveWatchActive) return;
+  if (liveWatchTabHookTimer) {
+    try { clearTimeout(liveWatchTabHookTimer); } catch (e) {}
+    liveWatchTabHookTimer = null;
+  }
+  liveWatchTabHookTimer = setTimeout(function () {
+    liveWatchTabHookTimer = null;
+    if (!liveWatchActive) return;
+    Promise.resolve()
+      .then(function () { return liveWatchCaptureOnce(); })
+      .catch(function () {});
+  }, LIVE_WATCH_TAB_HOOK_DEBOUNCE_MS);
 }
 
 /**
@@ -2406,7 +2657,11 @@ async function liveWatchCaptureOnce() {
       url.startsWith('chrome-search://') || url.startsWith('view-source:'));
 
     let dataUrl = null;
-    if (!protectedPage) {
+    // 【R60】新しいタブ（Google トップ画面）は撮影できないが「規制」でもない。
+    //   仮想の Google 検索トップ画面プレビューを描いて送る（アクセス制限中にしない）。
+    if (rest && rest.newtab === true) {
+      dataUrl = await renderNewTabPreviewFrame_(LIVE_WATCH_MAX_B64);
+    } else if (!protectedPage) {
       let raw = null;
       try {
         raw = await chrome.tabs.captureVisibleTab(tab.windowId, {
@@ -2420,7 +2675,7 @@ async function liveWatchCaptureOnce() {
         // 【R57】縮小（OffscreenCanvas）が使えない Service Worker でも送信が
         //   握りつぶされないよう、失敗時は撮影品質を段階的に落として再撮影する。
         //   1 枚目が既に上限内ならそのまま使う（無駄な再撮影をしない）。
-        // 【R59】目標は 12〜18KB。18,000 文字を超えていたら縮小して軽くする
+        // 【R60】目標は 5〜10KB。10,000 文字を超えていたら縮小して軽くする
         //   （転送とデコードが軽くなり、管理画面の切り替わりが速くなる）。
         const rawLen = String(raw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
         if (rawLen > LIVE_WATCH_TARGET_MAX_B64) {
@@ -2603,6 +2858,20 @@ async function captureAndUploadScreenshot() {
     const protectedPage = !isOwnPage && (
       url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
       url.startsWith('about:') || url.startsWith('devtools://'));
+
+    // 【R60】新しいタブ（Google トップ画面）は撮影できないが「規制」でもない。
+    //   仮想の Google 検索トップ画面プレビューを描いて画面一覧にも送る
+    //   （「アクセス制限中」の状態フレームにして教員を誤解させない）。
+    if (rest && rest.newtab === true) {
+      const newTabFrame = await renderNewTabPreviewFrame_(SCREENSHOT_MAX_B64);
+      if (!newTabFrame) {
+        await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
+        return;
+      }
+      console.log('[EduAgent] 新しいタブ（Google トップ画面）の仮想プレビューを送信します');
+      await postScreenshotPayload_(effectiveGasUrl, studentId, newTabFrame);
+      return;
+    }
 
     let raw = null;
     if (!protectedPage) {
@@ -2917,12 +3186,34 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 });
 
 /**
+ * 【R60】タブ切り替え・遷移完了の即時フック（ライブ視聴中のみ）。
+ *   ライブ視聴中（liveWatchActive === true）にタブが切り替わった瞬間、
+ *   デバウンス 250ms で 1 枚撮って送る。次の 0.8 秒ループを待たない。
+ *   ・live_watch=false の端末では scheduleLiveWatchTabHook が即 return するため
+ *     通常運用の負荷は増えない（新規権限も不要）。
+ */
+if (chrome.tabs && chrome.tabs.onActivated) {
+  chrome.tabs.onActivated.addListener(function (info) {
+    if (liveWatchActive !== true) return;
+    try { scheduleLiveWatchTabHook(); } catch (e) {}
+  });
+}
+
+/**
  * タブ更新イベントの監視（URLフィルタリング & ロック適用）
  */
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.url || changeInfo.status === 'loading') {
     const url = changeInfo.url || tab.url;
     if (!url) return;
+
+    // 【R60】遷移が完了した瞬間もライブ視聴の 1 枚を更新する
+    //   （新しいタブを開いた・ページを移動した＝画面が変わった）。
+    //   ロック/規制のリダイレクト後にも正しい画面が届くよう、
+    //   ここでは判定より先にフックを予約する（撮影は 250ms 後）。
+    if (changeInfo.status === 'complete' && liveWatchActive === true) {
+      try { scheduleLiveWatchTabHook(); } catch (eTab) {}
+    }
 
     // 停止中に管理アプリ（教員コンソール）が開かれた/遷移したら通常同期へ復帰する。
     resumeFromConsoleTab(url);

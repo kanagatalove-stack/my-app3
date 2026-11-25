@@ -21,7 +21,7 @@
 //    D. 拡張機能は live_watch の false → true 遷移で即座に 1 枚目を撮る
 //    E. 拡張機能は独立ループ（1.0〜1.5 秒）で撮影し、1 枚 12〜18KB に収める
 //    F. 親GAS は毎回 子GAS から最新フレームを並列取得する（古い画像を溜めない）
-//    G. 出荷物は v1.6.10（固定仕様は維持）
+//    G. 出荷物は v1.6.11（固定仕様は維持）
 // =============================================================================
 'use strict';
 
@@ -97,7 +97,8 @@ check('A9 サーバーの明示的な拒否も退避しない（noFallback=true�
 check('A10 非認証の失敗時だけ google.script.run へ退避する',
   /catch \(eLf\) \{[\s\S]{0,300}?if \(\(eLf && eLf\.noFallback\) \|\| !__hasRunner2\) throw eLf;/.test(apiBody));
 check('A11 直送が続けて失敗する環境では一定時間だけ従来経路を優先（毎回のタイムアウト待ちを避ける）',
-  /liveFramesDirectCooldownUntil = Date\.now\(\) \+ LIVE_FRAME_DIRECT_COOLDOWN_MS;/.test(apiBody) &&
+  /liveFramesDirectCooldownUntil = Date\.now\(\) \+ __cd;/.test(apiBody) &&
+  /LIVE_FRAME_DIRECT_COOLDOWN_ONCE_MS/.test(html) &&
   /Date\.now\(\) >= liveFramesDirectCooldownUntil/.test(apiBody));
 check('A12 直送が成功したらクールダウンを解除する',
   /liveFramesDirectCooldownUntil = 0;/.test(apiBody));
@@ -109,21 +110,23 @@ check('A13 退避先（google.script.run）に live_watch_frames の分岐が残
 // =============================================================================
 console.log('===== B. ポーリング周期の短縮 =====');
 
-const pollMs = constNum(html, 'LIVE_WATCH_POLL_MS');
-const bootMs = constNum(html, 'LIVE_WATCH_BOOT_POLL_MS');
+// 【R60】固定周期（R59）は「応答完了直後に次を投げる」連続パイプラインへ置換した。
+const gapMs = constNum(html, 'LIVE_WATCH_PIPELINE_GAP_MS');
+const bootGapMs = constNum(html, 'LIVE_WATCH_BOOT_GAP_MS');
 const bootWindowMs = constNum(html, 'LIVE_WATCH_BOOT_MS');
 
-check('B1 通常周期は 1.2〜1.5 秒（1200〜1500ms）', pollMs >= 1200 && pollMs <= 1500, pollMs);
-check('B2 開始直後の周期は 0.8〜1.0 秒（800〜1000ms）', bootMs >= 800 && bootMs <= 1000, bootMs);
+check('B1 応答後の待ちは 150〜250ms（連続パイプライン）', gapMs >= 150 && gapMs <= 250, gapMs);
+check('B2 開始直後の待ちは 150ms 以上（0.8〜1.0 秒周期の廃止）', bootGapMs >= 150 && bootGapMs <= 250, bootGapMs);
 check('B3 「開始直後」は 6 秒間', bootWindowMs === 6000, bootWindowMs);
-check('B4 開始直後は短い周期を返す（getLiveWatchPollMs）',
-  /function getLiveWatchPollMs\(\)/.test(html) &&
+check('B4 開始直後は短い待ちを返す（getLiveWatchPipelineGapMs）',
+  /function getLiveWatchPipelineGapMs\(\)/.test(html) &&
   /\(Date\.now\(\) - liveWatchStartedAt\) < LIVE_WATCH_BOOT_MS/.test(html));
-check('B5 6 秒経過後は自動で通常周期へ切り替わる（tick 内で見直す）',
-  /async function liveWatchPollTick\(\)[\s\S]{0,700}?resetLiveWatchPollTimer\(\);/.test(html));
-check('B6 周期は「同じなら張り直さない」＝タイマーを増殖させない',
-  /if \(liveWatchPollTimer === ms\) return;/.test(html));
-check('B7 ポーリングは 1 本だけ（開始時に前のタイマーを必ず破棄する）',
+check('B5 応答完了直後に次を張る（scheduleLiveWatchPipeline の再帰 setTimeout）',
+  /function scheduleLiveWatchPipeline\(delay\)/.test(html) &&
+  /liveWatchPollTick\(\)[\s\S]{0,400}?scheduleLiveWatchPipeline\(\)/.test(html));
+check('B6 タイマーは常に 1 本（張り直す前に必ず破棄する）',
+  /if \(liveWatchPollTimer\) \{ clearTimeout\(liveWatchPollTimer\); liveWatchPollTimer = null; \}/.test(html));
+check('B7 開始時に前のタイマーを必ず破棄する',
   /function startLiveWatchPolling\(\)[\s\S]{0,900}?stopLiveWatchPolling\(\);/.test(html));
 
 // =============================================================================
@@ -230,7 +233,7 @@ const run = (expr) => vm.runInContext(expr, ctx);
 
 check('C6 前提: ライブ視聴の関数群が vm 上に読み込まれている',
   typeof ctx.liveWatchPollTick === 'function' &&
-  typeof ctx.getLiveWatchPollMs === 'function' &&
+  typeof ctx.getLiveWatchPipelineGapMs === 'function' &&
   typeof ctx.updateLiveWatchImages === 'function');
 
 // 取得を「保留」できる apiRequest に差し替える
@@ -278,11 +281,11 @@ check('C9 周回遅れの応答（通し番号が古い）は画面へ反映し�
 intervals.length = 0;
 clock.now = 5000000;
 run('liveWatchStartedAt = ' + clock.now + '; liveWatchPollTimer = null;');
-check('C10 開始直後の周期は 0.8〜1.0 秒',
-  ctx.getLiveWatchPollMs() >= 800 && ctx.getLiveWatchPollMs() <= 1000, ctx.getLiveWatchPollMs());
+check('C10 開始直後の待ちは 150〜250ms',
+  ctx.getLiveWatchPipelineGapMs() >= 150 && ctx.getLiveWatchPipelineGapMs() <= 250, ctx.getLiveWatchPipelineGapMs());
 clock.now = 5000000 + 6000;
-check('C11 6 秒経過後は 1.2〜1.5 秒へ戻る',
-  ctx.getLiveWatchPollMs() >= 1200 && ctx.getLiveWatchPollMs() <= 1500, ctx.getLiveWatchPollMs());
+check('C11 6 秒経過後も 150〜250ms を保つ（空き時間を作らない）',
+  ctx.getLiveWatchPipelineGapMs() >= 150 && ctx.getLiveWatchPipelineGapMs() <= 250, ctx.getLiveWatchPipelineGapMs());
 run('liveWatchStartedAt = 0;');
 
 // =============================================================================
@@ -315,6 +318,7 @@ bgBundle += 'let liveWatchActive = false;\n';
 bgBundle += 'let liveWatchInFlight = false;\n';
 bgBundle += 'let liveWatchLastSentMs = 0;\n';
 bgBundle += 'let liveWatchLoopTimer = null;\n';
+bgBundle += 'let liveWatchTabHookTimer = null;\n';
 bgBundle += extractConstBg('LIVE_WATCH_LOOP_MS') + '\n';
 bgBundle += extractConstBg('LIVE_WATCH_TARGET_MAX_B64') + '\n';
 bgBundle += extractConstBg('LIVE_WATCH_TARGET_MIN_B64') + '\n';
@@ -324,7 +328,9 @@ bgBundle += extractConstBg('LIVE_WATCH_QUALITIES') + '\n';
 bgBundle += extractConstBg('LIVE_WATCH_CAPTURE_QUALITY') + '\n';
 bgBundle += extractConstBg('LIVE_WATCH_MAX_B64') + '\n';
 bgBundle += extractConstBg('ACTIVE_SYNC_MS') + '\n';
-['applyLiveWatchFlag', 'stopLiveWatchLoop', 'scheduleLiveWatchLoop', 'startLiveWatchLoop']
+bgBundle += extractConstBg('LIVE_WATCH_TAB_HOOK_DEBOUNCE_MS') + '\n';
+['applyLiveWatchFlag', 'stopLiveWatchLoop', 'scheduleLiveWatchLoop', 'startLiveWatchLoop',
+ 'stopLiveWatchTabHook', 'scheduleLiveWatchTabHook']
   .forEach(function (n) { bgBundle += extract(bgSrc, n) + '\n'; });
 
 function makeBgEnv() {
@@ -398,14 +404,14 @@ const qualities = (function () {
   return m[1].split(',').map(function (s) { return Number(s.trim()); });
 })();
 
-check('E1 独立ループの周期は 1.0〜1.5 秒（1000〜1500ms）', loopMs >= 1000 && loopMs <= 1500, loopMs);
-check('E2 目標サイズの上限は 18,000 文字（約18KB）', targetMax === 18000, targetMax);
-check('E3 目標サイズの下限は 12,000 文字（約12KB）', targetMin === 12000, targetMin);
+check('E1 独立ループの周期は 800ms（R60 で短縮）', loopMs === 800, loopMs);
+check('E2 目標サイズの上限は 10,000 文字（約7〜8KB）', targetMax === 10000, targetMax);
+check('E3 目標サイズの下限は 5,000 文字', targetMin === 5000, targetMin);
 check('E4 目標より小さい画像は「目標レンジ内」として採用する',
   /b64\.length >= LIVE_WATCH_TARGET_MIN_B64 && b64\.length <= LIVE_WATCH_TARGET_MAX_B64/.test(bgSrc));
-check('E5 縮小の目標横幅は 420〜480px', targetWidth >= 420 && targetWidth <= 480, targetWidth);
-check('E6 撮影品質は 30〜35%', captureQuality >= 30 && captureQuality <= 35, captureQuality);
-check('E7 縮小品質の起点は 30〜35%', qualities[0] >= 0.30 && qualities[0] <= 0.35, qualities[0]);
+check('E5 縮小の目標横幅は 360px', targetWidth === 360, targetWidth);
+check('E6 撮影品質は 28%', captureQuality === 28, captureQuality);
+check('E7 縮小品質の起点は 28%', Math.abs(qualities[0] - 0.28) < 0.001, qualities[0]);
 check('E8 送信の上限 30,000 文字は維持（固定仕様）', maxB64 === 30000, maxB64);
 check('E9 ACTIVE_SYNC_MS（1.5 秒）は維持（固定仕様）', activeSync === 1500, activeSync);
 check('E10 ハートビートの完了を待たない（await せずに追撃する）',
@@ -445,9 +451,9 @@ check('F6 単独モード（シャード未設定）は従来どおりローカ�
   /if \(!urls\.length\) return local;/.test(framesBody));
 
 // =============================================================================
-// G. 出荷物 v1.6.10（固定仕様の維持）
+// G. 出荷物 v1.6.11（固定仕様の維持）
 // =============================================================================
-console.log('===== G. v1.6.10 出荷物と固定仕様 =====');
+console.log('===== G. v1.6.11 出荷物と固定仕様 =====');
 
 function zipEntry(zipPath, entry) {
   return execSync(
@@ -465,7 +471,7 @@ function zipNames(zipPath) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('G1 extension/manifest.json の version は 1.6.10', manifest.version === '1.6.10', manifest.version);
+check('G1 extension/manifest.json の version は 1.6.11', manifest.version === '1.6.11', manifest.version);
 check('G2 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
 const perms = (manifest.permissions || []).slice().sort().join(',');
 check('G3 権限は既存のまま（新規権限の追加なし＝再同意プロンプトを出さない）',
@@ -473,15 +479,15 @@ check('G3 権限は既存のまま（新規権限の追加なし＝再同意プ�
 check("G4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 
 const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-check('G5 dist/store.zip の manifest.version は 1.6.10', sm.version === '1.6.10', sm.version);
+check('G5 dist/store.zip の manifest.version は 1.6.11', sm.version === '1.6.11', sm.version);
 check('G6 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
 const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-check('G7 dist/direct.zip の manifest.version も 1.6.10', dm.version === '1.6.10', dm.version);
+check('G7 dist/direct.zip の manifest.version も 1.6.11', dm.version === '1.6.11', dm.version);
 check('G8 dist/direct.zip は検証用（popup.html 同梱）',
   !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
 const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-check("G9 dist/update.xml の version は 1.6.10", /version='1\.6\.10'/.test(xml),
+check("G9 dist/update.xml の version は 1.6.11", /version='1\.6\.11'/.test(xml),
   (xml.match(/version='[^']+'/) || [])[0]);
 
 const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'dist/managed_policy.json'), 'utf8'));

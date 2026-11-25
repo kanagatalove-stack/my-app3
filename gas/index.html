@@ -2217,8 +2217,13 @@
     //     一定時間だけ従来経路を優先する（クールダウン）。
     // ==================================================================
     const LIVE_FRAME_FETCH_TIMEOUT_MS = 9000;   // フレーム取得の上限（画像 1〜数枚）
-    const LIVE_FRAME_DIRECT_COOLDOWN_MS = 10000;
+    // 【R60】直送が使えない環境で「タイムアウト 9 秒待ち」を繰り返さないよう、
+    //   2 回連続で失敗したらクールダウンを 60 秒へ延ばす（1 回目は 10 秒）。
+    //   これで無駄な fetch タイムアウト待ちが完全に消え、画像更新のリズムが崩れない。
+    const LIVE_FRAME_DIRECT_COOLDOWN_MS = 60000;
+    const LIVE_FRAME_DIRECT_COOLDOWN_ONCE_MS = 10000;
     let liveFramesDirectCooldownUntil = 0;
+    let liveFramesDirectFailCount = 0;
 
     async function apiRequestDirectLiveFrames(payload) {
       const apiUrl = getApiUrl();
@@ -3252,12 +3257,18 @@
         try {
           const __lf = await apiRequestDirectLiveFrames(payload);
           liveFramesDirectCooldownUntil = 0;
+          liveFramesDirectFailCount = 0;   // 【R60】成功したら連続失敗カウントを戻す
           return __lf;
         } catch (eLf) {
           const __hasRunner2 = (typeof google !== 'undefined' && google.script && google.script.run);
           if ((eLf && eLf.noFallback) || !__hasRunner2) throw eLf;
-          // 非認証の失敗のみ退避する。次回以降は一定時間だけ従来経路を優先する。
-          liveFramesDirectCooldownUntil = Date.now() + LIVE_FRAME_DIRECT_COOLDOWN_MS;
+          // 非認証の失敗のみ退避する。
+          // 【R60】2 回連続で失敗したら 60 秒、1 回目は 10 秒だけ従来経路を優先する。
+          liveFramesDirectFailCount += 1;
+          const __cd = liveFramesDirectFailCount >= 2
+            ? LIVE_FRAME_DIRECT_COOLDOWN_MS
+            : LIVE_FRAME_DIRECT_COOLDOWN_ONCE_MS;
+          liveFramesDirectCooldownUntil = Date.now() + __cd;
           // ここから下の従来経路へ落ちる（退避）
         }
       }
@@ -3778,15 +3789,20 @@
     //      1 枚目が届くまでの待ち時間を縮める。
     //   ④ in-flight 排他は維持し、古い応答（周回遅れ）は破棄する。
     //      → 速くしても画像が巻き戻ってちらつくことがない。
-    const LIVE_WATCH_POLL_MS = 1300;               // 通常時の画像更新周期（1.2〜1.5秒）
-    const LIVE_WATCH_BOOT_POLL_MS = 900;           // 開始直後（最初の6秒）の周期（0.8〜1秒）
+    // 【R60】「前の応答が終わった直後に次を投げる」連続パイプライン方式へ変更する。
+    //   固定周期（setInterval）だと「応答が返ってから次の周期が来るまで」が必ず
+    //   空き時間になり、その分だけ画像が止まって見える。
+    //   応答完了 → 最短 150〜250ms 後に次を発行する再帰 setTimeout にすることで、
+    //   通信の空き時間をゼロに近づける（google.script.run 経路でも同様）。
+    const LIVE_WATCH_PIPELINE_GAP_MS = 200;        // 通常時の待ち（150〜250ms）
+    const LIVE_WATCH_BOOT_GAP_MS = 150;            // 開始直後（最初の6秒）の待ち
     const LIVE_WATCH_BOOT_MS = 6000;               // 「開始直後」とみなす時間
     const LIVE_WATCH_EXTEND_MS = 10000;            // 延長ハートビート（TTL 25 秒より短い）
     const LIVE_WATCH_FALLBACK_TIMEOUT_SEC = 180;   // 管理設定が取れないときの既定
     const LIVE_WATCH_TILE_LIMIT_FALLBACK = 3;      // 管理設定が取れないときの上限
 
-    let liveWatchSlots = [];          // [{ studentId, name, openedAt }]
-    let liveWatchPollTimer = null;
+    let liveWatchSlots = [];          // [{ studentId, name, openedAt, pending? }]
+    let liveWatchPollTimer = null;    // 【R60】連続パイプラインの setTimeout ハンドル（常に1本）
     let liveWatchLastExtendAt = 0;
     let liveWatchFramesFetching = false;
     let liveWatchStatusInfo = null;
@@ -3926,13 +3942,54 @@
           '  </div>',
           '  <div class="relative bg-black" style="aspect-ratio:16/9">',
           '    <img id="liveFrameImg' + i + '" alt="' + name + ' の現在画面" class="absolute inset-0 w-full h-full object-contain hidden">',
-          '    <div id="liveFrameEmpty' + i + '" class="absolute inset-0 flex items-center justify-center text-[11px] text-slate-400">端末の送信を待っています...</div>',
+          '    <div id="liveFrameEmpty' + i + '" class="absolute inset-0 flex items-center justify-center text-[11px] text-slate-400">' +
+            (slot.pending ? '<span class="animate-pulse">枠を確保しています...</span>' : '端末の送信を待っています...') + '</div>',
           '  </div>',
           '  <div id="liveFrameMeta' + i + '" class="px-3 py-1.5 text-[10px] text-slate-400 font-mono">-</div>',
           '</div>'
         ].join('\n'));
       });
       grid.innerHTML = tiles.join('\n');
+    }
+
+    /**
+     * 【R60】「ライブ視聴を開始」のオプティミスティック UI。
+     *   教員が押した瞬間（0ms）に待機タイルを描き、サーバー応答は裏で待つ。
+     *   応答が来るまで「枠を確保しています...」を出すことで、
+     *   「押したのに何も起きない」空白（実測 GAS 往復 1〜3 秒）を体感から消す。
+     *   戻り値は追加した枠の studentId 配列（失敗時にそのままロールバックする）。
+     */
+    function renderLiveWatchPendingTiles(ids) {
+      const added = [];
+      (Array.isArray(ids) ? ids : []).forEach(function (id) {
+        const sid = String(id);
+        const dev = (devicesData || []).find(function (d) { return d && d.student_id === sid; });
+        liveWatchSlots.push({
+          studentId: sid,
+          name: (dev && dev.student_name) ? dev.student_name : sid,
+          openedAt: Date.now(),
+          pending: true   // サーバー応答待ち（画像はまだ来ていない）
+        });
+        added.push(sid);
+      });
+      if (added.length) {
+        bindLiveWatchVisibility();
+        renderLiveWatchGrid();
+      }
+      return added;
+    }
+
+    /** 【R60】開始 API が失敗したときに、先行描画した待機タイルを元へ戻す。 */
+    function rollbackLiveWatchPendingTiles(ids) {
+      const drop = {};
+      (Array.isArray(ids) ? ids : []).forEach(function (id) { drop[String(id)] = true; });
+      const before = liveWatchSlots.length;
+      liveWatchSlots = liveWatchSlots.filter(function (s) {
+        return !(s && s.pending === true && drop[String(s.studentId)]);
+      });
+      if (liveWatchSlots.length !== before) renderLiveWatchGrid();
+      if (liveWatchSlots.length === 0) stopLiveWatchPolling();
+      return before - liveWatchSlots.length;
     }
 
     /** 取得した画像を枠へ反映する（枠の並びは renderLiveWatchGrid が決めた順）。 */
@@ -4035,10 +4092,17 @@
         await stopLiveWatchList(victims, 'replace');
       }
 
+      // 【R60】オプティミスティック UI: 押した瞬間（0ms）に待機タイルを描く。
+      //   サーバー応答（GAS 往復 1〜3 秒）を待ってから描くと「押したのに無反応」に
+      //   見えるため、先に枠を出して裏で live_watch_start を送る。
+      //   失敗したときだけ、先行描画した枠をロールバックしてトーストで知らせる。
+      const pendingIds = renderLiveWatchPendingTiles(ids);
+
       let startRes = null;
       try {
         startRes = await apiRequest({ action: 'live_watch_start', student_ids: ids });
       } catch (err) {
+        rollbackLiveWatchPendingTiles(pendingIds);   // 失敗時は元へ戻す
         showToast('ライブ視聴の開始に失敗しました: ' + err.message, 'error');
         return;
       }
@@ -4062,15 +4126,16 @@
         }
       });
 
+      // 【R60】先行描画した枠のうち、サーバーが受け付けたものだけ pending を解除する。
+      //   受け付けられなかった枠（満枠・上限・制限）はロールバックして残さない。
+      const okSet = {};
+      okIds.forEach(function (id) { okSet[String(id)] = true; });
+      const rejected = pendingIds.filter(function (id) { return !okSet[String(id)]; });
+      liveWatchSlots.forEach(function (slot) {
+        if (slot && okSet[String(slot.studentId)]) slot.pending = false;
+      });
+      if (rejected.length) rollbackLiveWatchPendingTiles(rejected);
       if (okIds.length) {
-        okIds.forEach(function (id) {
-          const dev = (devicesData || []).find(function (d) { return d && d.student_id === id; });
-          liveWatchSlots.push({
-            studentId: id,
-            name: (dev && dev.student_name) ? dev.student_name : id,
-            openedAt: Date.now()
-          });
-        });
         bindLiveWatchVisibility();
         renderLiveWatchGrid();
         liveWatchLastExtendAt = 0;
@@ -4145,59 +4210,78 @@
     }
 
     /**
-     * ポーリング周期を決める（【R59】開始直後の 6 秒間だけ速くする）。
-     *   ・「ライブ視聴を開始」直後の 6 秒 … 900ms（1 枚目を素早く出す）
-     *   ・それ以降                     … 1300ms（1.2〜1.5 秒の範囲）
+     * 【R60】次の取得までの待ち時間を決める。
+     *   ・「ライブ視聴を開始」直後の 6 秒 … 150ms（1 枚目・2 枚目を素早く出す）
+     *   ・それ以降                     … 200ms（150〜250ms の範囲）
+     * 固定周期ではなく「応答が返った直後の待ち」として使う。
      */
-    function getLiveWatchPollMs() {
+    function getLiveWatchPipelineGapMs() {
       if (liveWatchStartedAt > 0 && (Date.now() - liveWatchStartedAt) < LIVE_WATCH_BOOT_MS) {
-        return LIVE_WATCH_BOOT_POLL_MS;
+        return LIVE_WATCH_BOOT_GAP_MS;
       }
-      return LIVE_WATCH_POLL_MS;
+      return LIVE_WATCH_PIPELINE_GAP_MS;
     }
 
     function startLiveWatchPolling() {
       stopLiveWatchPolling();
-      // 【R59】開始直後は短い周期で 1 枚目を取りに行く。6 秒経過後は
-      //   liveWatchPollTick が自分で周期を見直す（resetLiveWatchPollTimer）。
       liveWatchStartedAt = Date.now();
       liveWatchFramesSeq = 0;
       liveWatchFramesAppliedSeq = 0;
       liveWatchFrameAtById = {};
-      resetLiveWatchPollTimer();
+      // 最初の 1 枚は待たずに取りに行く（0ms）
+      scheduleLiveWatchPipeline(0);
     }
 
-    /** 現在の周期でタイマーを張り直す（周期が変わるときだけ呼ぶ）。 */
+    /**
+     * 【R60】連続パイプラインのタイマーを張る（常に 1 本だけ）。
+     *   delay を省略すると getLiveWatchPipelineGapMs()（150〜200ms）を使う。
+     */
+    function scheduleLiveWatchPipeline(delay) {
+      if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
+      if (liveWatchPollTimer) { clearTimeout(liveWatchPollTimer); liveWatchPollTimer = null; }
+      const ms = (typeof delay === 'number' && delay >= 0) ? delay : getLiveWatchPipelineGapMs();
+      liveWatchPollTimer = setTimeout(function () {
+        liveWatchPollTimer = null;
+        // 1 周走ったら（成功・失敗どちらでも）応答直後に次を投げる
+        Promise.resolve()
+          .then(function () { return liveWatchPollTick(); })
+          .catch(function () {})
+          .then(function () {
+            if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
+            if (document.hidden === true) return;   // 非表示中は眠る（復帰時に再開）
+            scheduleLiveWatchPipeline();
+          });
+      }, ms);
+    }
+
+    /** 【R59 互換】周期の見直しは不要になったが、外部呼び出しを壊さないための別名。 */
     function resetLiveWatchPollTimer() {
-      const ms = getLiveWatchPollMs();
-      if (liveWatchPollTimer === ms) return;   // 既に同じ周期で張ってある
-      if (liveWatchPollTimer) { clearInterval(liveWatchPollTimer); liveWatchPollTimer = null; }
-      liveWatchPollTimer = setInterval(liveWatchPollTick, ms);
+      if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
+      scheduleLiveWatchPipeline();
     }
 
     function stopLiveWatchPolling() {
-      if (liveWatchPollTimer) { clearInterval(liveWatchPollTimer); liveWatchPollTimer = null; }
+      if (liveWatchPollTimer) { clearTimeout(liveWatchPollTimer); liveWatchPollTimer = null; }
       liveWatchLastExtendAt = 0;
       liveWatchStartedAt = 0;
     }
 
     /**
-     * ポーリング 1 周期分。
+     * 取得 1 周分。
      *   ① 管理設定の自動タイムアウト満了した枠を停止する
      *   ② 10 秒ごとに延長ハートビートを送る（TTL を切らさない）
-     *   ③ 画像を取得して枠へ反映する（in-flight 排他で多重送信しない）
+     *   ③ 画像を取得して枠へ反映する
      *
-     * 【R59】③ は次の 2 点で「速いのにちらつかない」を担保する。
+     * 【R59】③ は「速いのにちらつかない」を担保する。
      *   ・in-flight 排他: 前の取得が返る前に次を投げない（多重送信しない）。
      *   ・古い応答の破棄: 通し番号が古い応答は画面へ反映しない（巻き戻り防止）。
      *   ・児童ごとの撮影時刻: 直近に反映したものより古い画像は捨てる。
+     * 【R60】周期そのものは scheduleLiveWatchPipeline が「応答完了直後」に張るため、
+     *   ここでは待たずに取りに行く（通信の空き時間を作らない）。
      */
     async function liveWatchPollTick() {
       if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
       if (document.hidden === true) return; // 非表示中は送らない（復帰時に再開）
-
-      // 開始直後の速い周期から通常周期へ切り替える（6 秒経過で 1 回だけ）
-      resetLiveWatchPollTimer();
 
       // ① 自動タイムアウト
       const timeoutMs = getLiveWatchTimeoutSec() * 1000;
@@ -4230,7 +4314,7 @@
             renderLiveWatchGrid();
             if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
           }
-        } catch (eExt) { /* 延長失敗は次周期で再試行（TTL 25 秒あるため猶予あり） */ }
+        } catch (eExt) { /* 延長失敗は次周で再試行（TTL 25 秒あるため猶予あり） */ }
       }
 
       // ③ 画像取得（in-flight 排他＋古い応答の破棄）
@@ -4248,7 +4332,7 @@
         liveWatchFramesAppliedSeq = mySeq;
         if (res && Array.isArray(res.data)) updateLiveWatchImages(res.data);
       } catch (eF) {
-        // 画像 1 枚の失敗で枠を閉じない（次の周期で取り直す）
+        // 画像 1 枚の失敗で枠を閉じない（次の周で取り直す）
       } finally {
         liveWatchFramesFetching = false;
       }

@@ -885,7 +885,7 @@ console.log('===== H. 画面側の実装契約 =====');
 // ============================================================================
 console.log('===== I. 設計不変条件 =====');
 {
-  check('I-1 manifest version は 1.6.10 のまま', manifest.version === '1.6.10', manifest.version);
+  check('I-1 manifest version は 1.6.11 のまま', manifest.version === '1.6.11', manifest.version);
   check('I-2 default_popup を持たない', !('default_popup' in (manifest.action || {})));
 
   const bgSrc = fs.readFileSync(path.join(ROOT, 'extension/background.js'), 'utf8');

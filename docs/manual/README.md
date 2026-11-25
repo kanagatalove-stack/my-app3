@@ -2,7 +2,7 @@
 
 **美作市教育委員会 ／ 14小中学校**
 
-**拡張機能 v1.6.10 対応 ／ 2026年11月改訂**
+**拡張機能 v1.6.11 対応 ／ 2026年11月改訂**
 
 はじめてこのシステムを使う先生向けの説明書です。
 「このボタンを押すと、児童の画面はこうなる」という**操作例**を中心にまとめました。
@@ -1061,7 +1061,7 @@
   <rect x="548" y="52" width="148" height="76" rx="9" fill="#0284c7"/>
   <text x="622" y="80" fill="#fff" font-size="11" font-weight="bold" text-anchor="middle">児童端末</text>
   <text x="622" y="98" fill="#bae6fd" font-size="8" text-anchor="middle">Chromebook</text>
-  <text x="622" y="114" fill="#bae6fd" font-size="8" text-anchor="middle">拡張機能 v1.6.10</text>
+  <text x="622" y="114" fill="#bae6fd" font-size="8" text-anchor="middle">拡張機能 v1.6.11</text>
 
   <path d="M174 90 L282 90" stroke="#94a3b8" stroke-width="2" marker-end="url(#e1)"/>
   <text x="228" y="82" fill="#64748b" font-size="8" text-anchor="middle">指示を振り分け</text>
@@ -1498,7 +1498,7 @@ Apps Script のエディタで次の関数を実行すると、設定内容が�
 
 | 確認すること | 対処 |
 |---|---|
-| 拡張機能が 1.6.10 未満 | ストアから 1.6.10 を配布し直す |
+| 拡張機能が 1.6.11 未満 | ストアから 1.6.11 を配布し直す |
 | GAS を再デプロイしていない | 鉛筆アイコンから新バージョンでデプロイ |
 | ポリシーのキー名が違う | `school_name` になっているか確認 |
 | 学校名の綴りが違う | `CONFIG.SCHOOL_LIST` と完全に一致させる（「英田小」などの略称は不可） |
