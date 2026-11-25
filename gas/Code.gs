@@ -1015,6 +1015,15 @@ function doPost(e) {
       return jsonResponse(res);
     }
 
+    // A2-c. 【v1.6.8】ライブ視聴の軽量フレーム（端末 → GAS）。
+    //     ハートビート応答の live_watch が true の端末だけが送ってくる
+    //     （JPEG・横幅480px前後・Base64 30,000文字以内）。
+    //     screenshot と同じく認証不要の経路。画像は CacheService にだけ置き、
+    //     スプレッドシートへの書き込みは行わない（書き込み負荷ゼロ）。
+    if (action === 'live_frame' || action === 'live_watch_frame') {
+      return jsonResponse(liveWatchPutFrame(payload.student_id, payload.image_data || payload.data_url));
+    }
+
     // A3. 教員コンソールの稼働通知（ログイン中は 15 秒ごとに touch、ログアウト/タブ閉じで release）。
     //     児童端末はハートビート応答の ka_active を見て同期周期を切り替える。
     //     session_id を付けることで、複数アカウントのうち 1 つが終了しても他が稼働中なら維持される。
@@ -1156,6 +1165,30 @@ function doPost(e) {
     if (action === 'save_monitor_settings') {
       const saved = saveMonitoringSettings(currentTeacher, payload.settings || {});
       return jsonResponse({ success: true, message: '監視設定を保存しました', settings: saved });
+    }
+
+    // D1-3. 【v1.6.8】ライブ視聴の使用枠状況（読み取りは全教員可）
+    if (action === 'live_watch_status') {
+      return jsonResponse(liveWatchStatus(currentTeacher));
+    }
+    // D1-4. 【v1.6.8】ライブ視聴の開始（相乗りは満枠でも許可／新規は24台まで）
+    if (action === 'live_watch_start') {
+      return jsonResponse(liveWatchApplyBatch(currentTeacher, payload.student_ids, 'start'));
+    }
+    // D1-5. 【v1.6.8】視聴枠の延長ハートビート（管理画面が開いている間だけ）
+    if (action === 'live_watch_extend') {
+      return jsonResponse(liveWatchApplyBatch(currentTeacher, payload.student_ids, 'extend'));
+    }
+    // D1-6. 【v1.6.8】視聴枠の解放（枠を閉じた／タブ非表示／タイムアウト）
+    if (action === 'live_watch_stop') {
+      return jsonResponse(liveWatchApplyBatch(currentTeacher, payload.student_ids, 'stop'));
+    }
+    // D1-7. 【v1.6.8】最新ライブ画像の取得（管理画面が 1.5〜2 秒間隔で叩く）
+    if (action === 'live_watch_frames') {
+      const ids = Array.isArray(payload.student_ids) ? payload.student_ids : [];
+      const scoped = scopeStudentIdsForTeacher(ids, currentTeacher);
+      const frames = liveWatchGetFrames(scoped.ids);
+      return jsonResponse({ success: true, data: frames, ids: scoped.ids });
     }
 
     // D2. 画面情報取得要求（押下時のみ）：対象児童に要求IDを書き込む
@@ -2598,6 +2631,9 @@ function getMonitoringSettings() {
     enabled: false,
     learning_domains: MONITOR_DEFAULT_LEARNING_DOMAINS.slice(),
     blocked_domains: MONITOR_DEFAULT_BLOCKED_DOMAINS.slice(),
+    // 【v1.6.8】ライブ視聴の管理設定（管理者のみ変更可）。ここが既定値の正。
+    live_watch_per_teacher_limit: LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT,
+    live_watch_timeout_sec: LIVE_WATCH_DEFAULT_TIMEOUT_SEC,
     updated_at: '',
     updated_by: ''
   };
@@ -2615,6 +2651,13 @@ function getMonitoringSettings() {
       blocked_domains: Array.isArray(o.blocked_domains)
         ? o.blocked_domains.map(function (v) { return String(v); })
         : defaults.blocked_domains,
+      // 【v1.6.8】未保存（旧データ）のときは既定値へ落とす＝挙動を変えない。
+      live_watch_per_teacher_limit: (o.live_watch_per_teacher_limit !== undefined)
+        ? normalizeLiveWatchPerTeacherLimit(o.live_watch_per_teacher_limit)
+        : defaults.live_watch_per_teacher_limit,
+      live_watch_timeout_sec: (o.live_watch_timeout_sec !== undefined)
+        ? normalizeLiveWatchTimeoutSec(o.live_watch_timeout_sec)
+        : defaults.live_watch_timeout_sec,
       updated_at: String(o.updated_at || ''),
       updated_by: String(o.updated_by || '')
     };
@@ -2660,6 +2703,14 @@ function saveMonitoringSettings(teacher, incoming) {
     blocked_domains: Array.isArray(src.blocked_domains)
       ? sanitizeMonitorDomainList(src.blocked_domains)
       : cur.blocked_domains,
+    // 【v1.6.8】ライブ視聴の管理設定。管理者のみ変更できる（この関数の冒頭で拒否）。
+    //   未指定なら現在値を維持する（部分更新で意図せず既定へ戻さない）。
+    live_watch_per_teacher_limit: (src.live_watch_per_teacher_limit !== undefined)
+      ? normalizeLiveWatchPerTeacherLimit(src.live_watch_per_teacher_limit)
+      : cur.live_watch_per_teacher_limit,
+    live_watch_timeout_sec: (src.live_watch_timeout_sec !== undefined)
+      ? normalizeLiveWatchTimeoutSec(src.live_watch_timeout_sec)
+      : cur.live_watch_timeout_sec,
     updated_at: Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
     updated_by: String((teacher && teacher.email) || '')
   };
@@ -2690,6 +2741,14 @@ function shardChildApplyMonitorSettings(incoming) {
       enabled: incoming.enabled === true,
       learning_domains: sanitizeMonitorDomainList(incoming.learning_domains || []),
       blocked_domains: sanitizeMonitorDomainList(incoming.blocked_domains || []),
+      // 【v1.6.8】ライブ視聴の管理設定も親から配られる（R41: 子の PropertiesService は独立）。
+      //   未指定なら既定値（＝旧形式の shard_apply でも壊れない）。
+      live_watch_per_teacher_limit: (incoming.live_watch_per_teacher_limit !== undefined)
+        ? normalizeLiveWatchPerTeacherLimit(incoming.live_watch_per_teacher_limit)
+        : LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT,
+      live_watch_timeout_sec: (incoming.live_watch_timeout_sec !== undefined)
+        ? normalizeLiveWatchTimeoutSec(incoming.live_watch_timeout_sec)
+        : LIVE_WATCH_DEFAULT_TIMEOUT_SEC,
       updated_at: String(incoming.updated_at || ''),
       updated_by: String(incoming.updated_by || '')
     };
@@ -2744,6 +2803,654 @@ function shardPropagateMonitorSettings(settings) {
   } catch (e) {
     return { error: String(e) };
   }
+}
+
+// ============================================================================
+// 準リアルタイム画面視聴（ライブ視聴 / v1.6.8）
+//
+// 【設計（R41 前提を維持）】
+//   1 校 = 1 独立 Spreadsheet/GAS 環境のため、ライブ視聴の同時視聴枠は
+//   「各 GAS 環境の CacheService」で管理する（親子で独立してカウントされる）。
+//   1 つの GAS 環境あたりの同時ライブ監視対象は最大 MAX_LIVE_WATCH_DEVICES 台。
+//
+//   ▼ 全体プール制（ユニーク端末数で数える）
+//     ・プールは「児童ID」を単位に数える（教員数ではない）。
+//     ・すでに他の教員が見ている児童に別の教員が相乗りした場合は、
+//       同一のキャッシュ画像を共有し、ユニーク台数を増やさない。
+//       つまり 24/24 満枠でも「相乗り」は許可される（児童端末への
+//       キャプチャ要求も 1 ストリームのまま＝端末の負荷は増えない）。
+//     ・新規の児童を追加して 24 を超える場合だけ LIVE_WATCH_POOL_FULL を返す。
+//
+//   ▼ 短い TTL ＋ 延長ハートビート（ブラウザ強制終了時の自動解放）
+//     ・視聴セッションの TTL は LIVE_WATCH_TTL_SEC（25秒）。
+//     ・管理画面は枠が開いている間だけ LIVE_WATCH_EXTEND_SEC 間隔で
+//       延長（extend）を送る。
+//     ・ブラウザが落ちると延長が止まり、25 秒で自動的に枠が空く。
+//     ・さらに管理設定 live_watch_timeout_sec（既定 180 秒）を超えたら
+//       延長が来ていても自動解放する（＝見忘れによる占有を防ぐ）。
+//
+//   ▼ 設定は PropertiesService のみ（MONITOR_SETTINGS_V1 を拡張）
+//     ・live_watch_per_teacher_limit … 0=無効 / 1〜25 / -1（無限）。既定 3。
+//     ・live_watch_timeout_sec       … 自動タイムアウト秒。既定 180。
+//     ・R41 では子GASの PropertiesService が独立しているため、親の設定は
+//       既存の shard_apply 同梱経路（shardPropagateMonitorSettings）で配る。
+//
+//   ▼ 端末側（extension v1.6.8）
+//     ・ハートビート応答の live_watch が true の端末だけが軽量キャプチャを送る。
+//     ・送信先は action='live_frame'（認証不要・screenshot と同じ経路）。
+// ============================================================================
+
+/** 1 GAS 環境あたりの同時ライブ監視対象の上限（ユニーク端末数） */
+const MAX_LIVE_WATCH_DEVICES = 24;
+
+/** 視聴セッションの TTL（秒）。ブラウザ強制終了時の自動解放はこの長さで決まる。 */
+const LIVE_WATCH_TTL_SEC = 25;
+
+/** 管理画面が延長を送る間隔（秒）。TTL より十分短くして切れ目を作らない。 */
+const LIVE_WATCH_EXTEND_SEC = 10;
+
+/** ライブ画像（1枚）のキャッシュ保持時間（秒）。 */
+const LIVE_WATCH_FRAME_TTL_SEC = 20;
+
+/** プール台帳そのもののキャッシュ保持時間（秒）。内容は自前で期限判定する。 */
+const LIVE_WATCH_POOL_CACHE_SEC = 300;
+
+/** プール台帳のキャッシュキー（GAS 環境ごとに独立） */
+const LIVE_WATCH_POOL_KEY = 'live_watch_pool_v1';
+
+/** ライブ画像のキャッシュキー接頭辞 */
+const LIVE_WATCH_FRAME_PREFIX = 'live_watch_frame_';
+
+/** 端末から受け取る 1 枚あたりの Base64 上限（文字数）。約 15〜22KB を想定。 */
+const LIVE_WATCH_MAX_FRAME_CHARS = 30000;
+
+/** 管理設定 live_watch_per_teacher_limit の既定値（台） */
+const LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT = 3;
+
+/** 管理設定 live_watch_per_teacher_limit の上限（台） */
+const LIVE_WATCH_MAX_PER_TEACHER_LIMIT = 25;
+
+/** 管理設定 live_watch_timeout_sec の既定値（秒） */
+const LIVE_WATCH_DEFAULT_TIMEOUT_SEC = 180;
+
+/** 管理設定 live_watch_timeout_sec の許容範囲（秒） */
+const LIVE_WATCH_MIN_TIMEOUT_SEC = 30;
+const LIVE_WATCH_MAX_TIMEOUT_SEC = 3600;
+
+/** 「無限」を表す内部値（live_watch_per_teacher_limit） */
+const LIVE_WATCH_UNLIMITED = -1;
+
+/** 現在時刻（ms）。GAS の他の実装と揃えて Date 経由で取る。 */
+function liveWatchNowMs_() {
+  return new Date().getTime();
+}
+
+/**
+ * 1教員あたりの同時ライブ視聴上限を正規化する。
+ *   ・-1 / 'unlimited' / '∞' / '無限' … 無限（内部値 -1）
+ *   ・0                              … 機能無効
+ *   ・1〜25                          … その台数
+ *   ・それ以外（未設定・異常値）      … 既定 3
+ */
+function normalizeLiveWatchPerTeacherLimit(value) {
+  if (value === true) return LIVE_WATCH_UNLIMITED;
+  if (typeof value === 'string') {
+    const s = value.trim().toLowerCase();
+    if (!s) return LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT;
+    if (s === 'unlimited' || s === 'inf' || s === 'infinity' || s === '∞' ||
+        s === '無限' || s === '無制限' || s === '-1') {
+      return LIVE_WATCH_UNLIMITED;
+    }
+  }
+  const n = Number(value);
+  if (!isFinite(n)) return LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT;
+  const i = Math.floor(n);
+  if (i < 0) return LIVE_WATCH_UNLIMITED;
+  if (i === 0) return 0;
+  if (i > LIVE_WATCH_MAX_PER_TEACHER_LIMIT) return LIVE_WATCH_MAX_PER_TEACHER_LIMIT;
+  return i;
+}
+
+/**
+ * ライブ視聴の自動タイムアウト（秒）を正規化する。
+ *   未設定・非数値・0以下は既定 180 秒。範囲は 30〜3600 秒に丸める。
+ */
+function normalizeLiveWatchTimeoutSec(value) {
+  if (value === undefined || value === null || value === '') return LIVE_WATCH_DEFAULT_TIMEOUT_SEC;
+  const n = Number(value);
+  if (!isFinite(n) || n <= 0) return LIVE_WATCH_DEFAULT_TIMEOUT_SEC;
+  const i = Math.round(n);
+  if (i < LIVE_WATCH_MIN_TIMEOUT_SEC) return LIVE_WATCH_MIN_TIMEOUT_SEC;
+  if (i > LIVE_WATCH_MAX_TIMEOUT_SEC) return LIVE_WATCH_MAX_TIMEOUT_SEC;
+  return i;
+}
+
+/** 教員をプール台帳のキー（メールアドレス小文字）へ寄せる。 */
+function liveWatchTeacherKey_(teacher) {
+  if (teacher && typeof teacher === 'object') {
+    return String(teacher.email || teacher.teacher_email || '').trim().toLowerCase();
+  }
+  return String(teacher === undefined || teacher === null ? '' : teacher).trim().toLowerCase();
+}
+
+/** ライブ視聴関連のキャッシュ（使えない環境では null）。 */
+function liveWatchCache_() {
+  try {
+    if (typeof CacheService === 'undefined') return null;
+    return CacheService.getScriptCache();
+  } catch (e) {
+    return null;
+  }
+}
+
+/** ライブ視聴の管理設定（MONITOR_SETTINGS_V1 由来）を解決する。 */
+function liveWatchSettings_() {
+  let s = null;
+  try { s = getMonitoringSettings(); } catch (e) { s = null; }
+  const limit = (s && s.live_watch_per_teacher_limit !== undefined)
+    ? normalizeLiveWatchPerTeacherLimit(s.live_watch_per_teacher_limit)
+    : LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT;
+  const tmo = (s && s.live_watch_timeout_sec !== undefined)
+    ? normalizeLiveWatchTimeoutSec(s.live_watch_timeout_sec)
+    : LIVE_WATCH_DEFAULT_TIMEOUT_SEC;
+  return {
+    per_teacher_limit: limit,
+    timeout_sec: tmo,
+    unlimited: limit === LIVE_WATCH_UNLIMITED,
+    disabled: limit === 0
+  };
+}
+
+/** プール台帳を読む（無ければ空）。壊れていても例外にしない（監視を止めない）。 */
+function liveWatchReadPool_() {
+  const empty = { v: 1, students: {} };
+  const cache = liveWatchCache_();
+  if (!cache) return empty;
+  let raw = null;
+  try { raw = cache.get(LIVE_WATCH_POOL_KEY); } catch (e) { raw = null; }
+  if (!raw) return empty;
+  let o = null;
+  try { o = JSON.parse(raw); } catch (e) { o = null; }
+  if (!o || typeof o !== 'object' || !o.students || typeof o.students !== 'object') return empty;
+  const out = { v: 1, students: {} };
+  const ids = Object.keys(o.students);
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] || '').trim();
+    const e = o.students[ids[i]];
+    if (!sid || !e || typeof e !== 'object') continue;
+    out.students[sid] = {
+      stream_opened_at: Number(e.stream_opened_at) || 0,
+      teachers: (e.teachers && typeof e.teachers === 'object') ? e.teachers : {}
+    };
+  }
+  return out;
+}
+
+/** プール台帳を書く（TTL は LIVE_WATCH_POOL_CACHE_SEC）。 */
+function liveWatchWritePool_(reg) {
+  const cache = liveWatchCache_();
+  if (!cache) return false;
+  try {
+    cache.put(LIVE_WATCH_POOL_KEY, JSON.stringify(reg || { v: 1, students: {} }),
+      LIVE_WATCH_POOL_CACHE_SEC);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * 教員1名の視聴セッションが「いま有効」か。
+ *   ① TTL（expires_at）を過ぎていない
+ *   ② 開いてから timeout_sec を超えていない（管理設定の自動タイムアウト）
+ */
+function liveWatchSessionActive_(teachers, key, nowMs, timeoutSec) {
+  if (!teachers || typeof teachers !== 'object') return false;
+  const s = teachers[key];
+  if (!s || typeof s !== 'object') return false;
+  const exp = Number(s.expires_at) || 0;
+  if (!exp || nowMs >= exp) return false;
+  const opened = Number(s.opened_at) || 0;
+  if (opened > 0) {
+    const capMs = Math.max(0, Number(timeoutSec) || 0) * 1000;
+    if (capMs > 0 && (nowMs - opened) >= capMs) return false;
+  }
+  return true;
+}
+
+/**
+ * プール台帳から期限切れ（TTL 切れ・自動タイムアウト満了）を取り除く。
+ * changed は「書き戻しが必要か」を表す。
+ */
+function liveWatchPrune_(reg, nowMs, timeoutSec) {
+  const src = (reg && reg.students) ? reg.students : {};
+  const ids = Object.keys(src);
+  const out = { v: 1, students: {} };
+  let changed = false;
+  for (let i = 0; i < ids.length; i++) {
+    const sid = ids[i];
+    const e = src[sid] || {};
+    const tsrc = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+    const keys = Object.keys(tsrc);
+    const keep = {};
+    let kept = 0;
+    for (let j = 0; j < keys.length; j++) {
+      if (liveWatchSessionActive_(tsrc, keys[j], nowMs, timeoutSec)) {
+        keep[keys[j]] = tsrc[keys[j]];
+        kept++;
+      } else {
+        changed = true;
+      }
+    }
+    if (kept > 0) {
+      out.students[sid] = {
+        stream_opened_at: Number(e.stream_opened_at) || 0,
+        teachers: keep
+      };
+    } else if (keys.length) {
+      changed = true;
+    }
+  }
+  if (ids.length !== Object.keys(out.students).length) changed = true;
+  return { reg: out, changed: changed };
+}
+
+/** ユニーク端末数（＝有効な視聴セッションを持つ児童の数）。 */
+function liveWatchUniqueCount_(reg, nowMs, timeoutSec) {
+  const src = (reg && reg.students) ? reg.students : {};
+  const ids = Object.keys(src);
+  let n = 0;
+  for (let i = 0; i < ids.length; i++) {
+    const e = src[ids[i]] || {};
+    const tsrc = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+    const keys = Object.keys(tsrc);
+    for (let j = 0; j < keys.length; j++) {
+      if (liveWatchSessionActive_(tsrc, keys[j], nowMs, timeoutSec)) { n++; break; }
+    }
+  }
+  return n;
+}
+
+/** 指定教員がいま見ている児童の数（教員ごとの上限判定に使う）。 */
+function liveWatchTeacherCount_(reg, teacherKey, nowMs, timeoutSec) {
+  const src = (reg && reg.students) ? reg.students : {};
+  const ids = Object.keys(src);
+  let n = 0;
+  for (let i = 0; i < ids.length; i++) {
+    const e = src[ids[i]] || {};
+    const tsrc = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+    if (liveWatchSessionActive_(tsrc, teacherKey, nowMs, timeoutSec)) n++;
+  }
+  return n;
+}
+
+/**
+ * ハートビート応答用: この児童がいまライブ視聴の対象か。
+ *   端末はこの値が true のときだけ軽量キャプチャを送る。
+ */
+function liveWatchIsWatched_(studentId) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return false;
+  try {
+    const st = liveWatchSettings_();
+    const p = liveWatchPrune_(liveWatchReadPool_(), liveWatchNowMs_(), st.timeout_sec);
+    return !!p.reg.students[sid];
+  } catch (e) {
+    // ライブ視聴は補助機能。判定に失敗してもハートビートは止めない。
+    return false;
+  }
+}
+
+/** 現在のプール使用状況（教員画面のインジケーターが使う）。 */
+function liveWatchStatus(teacher) {
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  if (p.changed) liveWatchWritePool_(p.reg);
+  const email = liveWatchTeacherKey_(teacher);
+  const used = liveWatchUniqueCount_(p.reg, now, st.timeout_sec);
+  const mine = email ? liveWatchTeacherCount_(p.reg, email, now, st.timeout_sec) : 0;
+  return {
+    success: true,
+    used: used,
+    max: MAX_LIVE_WATCH_DEVICES,
+    remaining: Math.max(0, MAX_LIVE_WATCH_DEVICES - used),
+    full: used >= MAX_LIVE_WATCH_DEVICES,
+    teacher_used: mine,
+    teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited,
+    disabled: st.disabled,
+    timeout_sec: st.timeout_sec,
+    ttl_sec: LIVE_WATCH_TTL_SEC,
+    extend_sec: LIVE_WATCH_EXTEND_SEC,
+    students: Object.keys(p.reg.students)
+  };
+}
+
+/** liveWatchStart の戻り値で共通に返す使用状況。 */
+function liveWatchUsageBits_(reg, teacherKey, nowMs, st) {
+  const used = liveWatchUniqueCount_(reg, nowMs, st.timeout_sec);
+  return {
+    used: used,
+    max: MAX_LIVE_WATCH_DEVICES,
+    remaining: Math.max(0, MAX_LIVE_WATCH_DEVICES - used),
+    full: used >= MAX_LIVE_WATCH_DEVICES,
+    usage: used + '/' + MAX_LIVE_WATCH_DEVICES,
+    teacher_used: teacherKey ? liveWatchTeacherCount_(reg, teacherKey, nowMs, st.timeout_sec) : 0,
+    teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited,
+    timeout_sec: st.timeout_sec
+  };
+}
+
+/**
+ * ライブ視聴の開始。
+ *   ・すでに誰かが見ている児童 → 相乗り（ユニーク台数を増やさない・満枠でも許可）
+ *   ・新規の児童で 24 を超える → LIVE_WATCH_POOL_FULL（現在の使用数を併せて返す）
+ *   ・管理設定が 0 → LIVE_WATCH_DISABLED
+ *   ・教員ごとの上限に達している → LIVE_WATCH_TEACHER_LIMIT
+ */
+function liveWatchStart(teacher, studentId) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return { success: false, error: 'student_id is required', live_watch: false };
+  const email = liveWatchTeacherKey_(teacher);
+  if (!email) return { success: false, error: 'teacher is required', live_watch: false };
+
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  const reg = p.reg;
+  const usage = liveWatchUsageBits_(reg, email, now, st);
+
+  // 管理設定 0（機能無効）: 一般教員の新規開始はブロックする。
+  if (st.disabled) {
+    return {
+      success: false, live_watch: false, student_id: sid,
+      code: 'LIVE_WATCH_DISABLED',
+      error: '現在管理者によりライブ視聴が制限されています',
+      used: usage.used, max: usage.max, usage: usage.usage,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  const existing = reg.students[sid];
+  if (existing) {
+    // 相乗り: 同じキャッシュ画像を共有する。ユニーク台数・端末への要求は増やさない。
+    existing.teachers[email] = { opened_at: now, expires_at: now + LIVE_WATCH_TTL_SEC * 1000 };
+    if (!existing.stream_opened_at) existing.stream_opened_at = now;
+    reg.students[sid] = existing;
+    liveWatchWritePool_(reg);
+    return {
+      success: true, live_watch: true, student_id: sid, shared: true,
+      used: usage.used, max: usage.max, usage: usage.usage, remaining: usage.remaining,
+      full: usage.full, teacher_used: usage.teacher_used,
+      teacher_limit: st.per_teacher_limit, teacher_unlimited: st.unlimited,
+      timeout_sec: st.timeout_sec, ttl_sec: LIVE_WATCH_TTL_SEC,
+      extend_sec: LIVE_WATCH_EXTEND_SEC
+    };
+  }
+
+  // 新規の児童: ここでだけ「24 を超えるか」を判定する。
+  if (usage.used >= MAX_LIVE_WATCH_DEVICES) {
+    return {
+      success: false, live_watch: false, student_id: sid, shared: false,
+      code: 'LIVE_WATCH_POOL_FULL',
+      error: '全体のライブ視聴枠が満杯です（' + usage.usage + '・相乗り視聴のみ可能）',
+      used: usage.used, max: usage.max, usage: usage.usage, remaining: 0, full: true,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  // 教員ごとの上限（無限 = -1 のときは判定しない）。
+  if (!st.unlimited && st.per_teacher_limit > 0 &&
+      usage.teacher_used >= st.per_teacher_limit) {
+    return {
+      success: false, live_watch: false, student_id: sid, shared: false,
+      code: 'LIVE_WATCH_TEACHER_LIMIT',
+      error: '1人あたりの同時ライブ視聴上限（' + st.per_teacher_limit + '台）に達しています',
+      used: usage.used, max: usage.max, usage: usage.usage,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  const teachers = {};
+  teachers[email] = { opened_at: now, expires_at: now + LIVE_WATCH_TTL_SEC * 1000 };
+  reg.students[sid] = { stream_opened_at: now, teachers: teachers };
+  liveWatchWritePool_(reg);
+  return {
+    success: true, live_watch: true, student_id: sid, shared: false,
+    used: usage.used + 1, max: usage.max, usage: (usage.used + 1) + '/' + usage.max,
+    remaining: Math.max(0, usage.max - (usage.used + 1)),
+    full: (usage.used + 1) >= usage.max,
+    teacher_used: usage.teacher_used + 1,
+    teacher_limit: st.per_teacher_limit, teacher_unlimited: st.unlimited,
+    timeout_sec: st.timeout_sec, ttl_sec: LIVE_WATCH_TTL_SEC,
+    extend_sec: LIVE_WATCH_EXTEND_SEC
+  };
+}
+
+/**
+ * 視聴セッションの延長（管理画面が開いている間だけ送るハートビート）。
+ *   ・タイムアウトの起点（opened_at）は変えない＝見忘れによる占有を防ぐ。
+ *   ・期限切れ／タイムアウト満了なら SESSION_EXPIRED を返し、端末へ false を配る。
+ */
+function liveWatchExtend(teacher, studentId) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return { success: false, error: 'student_id is required', live_watch: false };
+  const email = liveWatchTeacherKey_(teacher);
+  if (!email) return { success: false, error: 'teacher is required', live_watch: false };
+
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  const reg = p.reg;
+  const usage = liveWatchUsageBits_(reg, email, now, st);
+
+  if (st.disabled) {
+    if (p.changed) liveWatchWritePool_(reg);
+    return {
+      success: false, live_watch: false, student_id: sid,
+      code: 'LIVE_WATCH_DISABLED',
+      error: '現在管理者によりライブ視聴が制限されています',
+      used: usage.used, max: usage.max, usage: usage.usage,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  const entry = reg.students[sid];
+  if (!entry) {
+    if (p.changed) liveWatchWritePool_(reg);
+    return {
+      success: false, live_watch: false, student_id: sid, released: true,
+      code: 'LIVE_WATCH_SESSION_EXPIRED',
+      error: 'ライブ視聴の枠が解放されました（自動タイムアウトまたは期限切れ）',
+      used: usage.used, max: usage.max, usage: usage.usage,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  const cur = entry.teachers[email];
+  if (cur && typeof cur === 'object') {
+    cur.expires_at = now + LIVE_WATCH_TTL_SEC * 1000;
+  } else {
+    entry.teachers[email] = { opened_at: now, expires_at: now + LIVE_WATCH_TTL_SEC * 1000 };
+  }
+  reg.students[sid] = entry;
+  liveWatchWritePool_(reg);
+  const after = liveWatchUsageBits_(reg, email, now, st);
+  return {
+    success: true, live_watch: true, student_id: sid,
+    used: after.used, max: after.max, usage: after.usage, remaining: after.remaining,
+    teacher_used: after.teacher_used, teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited, timeout_sec: st.timeout_sec,
+    ttl_sec: LIVE_WATCH_TTL_SEC, extend_sec: LIVE_WATCH_EXTEND_SEC
+  };
+}
+
+/**
+ * ライブ視聴の停止（枠の解放）。
+ *   ・その教員のセッションだけを消す。
+ *   ・他の教員がまだ見ていれば、児童（＝キャプチャ端末）は止めない（live_watch: true）。
+ */
+function liveWatchStop(teacher, studentId) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return { success: false, error: 'student_id is required', live_watch: false };
+  const email = liveWatchTeacherKey_(teacher);
+  if (!email) return { success: false, error: 'teacher is required', live_watch: false };
+
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  const reg = p.reg;
+
+  const entry = reg.students[sid];
+  if (entry && entry.teachers && entry.teachers[email]) {
+    delete entry.teachers[email];
+  }
+  let stillWatched = false;
+  if (entry) {
+    const keys = Object.keys(entry.teachers || {});
+    if (keys.length) {
+      stillWatched = true;
+      reg.students[sid] = entry;
+    } else {
+      delete reg.students[sid];
+      liveWatchClearFrame_(sid);
+    }
+  }
+  const usage = liveWatchUsageBits_(reg, email, now, st);
+  liveWatchWritePool_(reg);
+  return {
+    success: true, student_id: sid, released: true,
+    live_watch: stillWatched,
+    used: usage.used, max: usage.max, usage: usage.usage, remaining: usage.remaining,
+    teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited, timeout_sec: st.timeout_sec
+  };
+}
+
+/** ライブ画像を1枚だけ消す（枠が空いたときの後始末）。 */
+function liveWatchClearFrame_(studentId) {
+  const cache = liveWatchCache_();
+  if (!cache) return false;
+  try { cache.remove(LIVE_WATCH_FRAME_PREFIX + String(studentId || '').trim()); return true; }
+  catch (e) { return false; }
+}
+
+/**
+ * 端末から届いたライブ画像を保存する（action='live_frame'）。
+ *   ・視聴対象でなければ保存しない（＝全端末が送ってしまう事故を防ぐ）。
+ *   ・Base64 は LIVE_WATCH_MAX_FRAME_CHARS 以内のみ受け付ける。
+ */
+function liveWatchPutFrame(studentId, imageData) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return { success: false, live_watch: false, error: 'student_id is required' };
+  if (!liveWatchIsWatched_(sid)) {
+    return { success: false, live_watch: false, error: 'not_watching', student_id: sid };
+  }
+  const raw = String(imageData || '');
+  const b64 = raw.replace(/^data:image\/[a-z]+;base64,/i, '').replace(/\s+/g, '');
+  if (!b64) return { success: false, live_watch: true, error: 'empty image', student_id: sid };
+  if (b64.length > LIVE_WATCH_MAX_FRAME_CHARS) {
+    return {
+      success: false, live_watch: true, error: 'frame too large', student_id: sid,
+      chars: b64.length, limit: LIVE_WATCH_MAX_FRAME_CHARS
+    };
+  }
+  const cache = liveWatchCache_();
+  if (!cache) return { success: false, live_watch: true, error: 'cache unavailable', student_id: sid };
+  const payload = JSON.stringify({
+    at: liveWatchNowMs_(),
+    at_text: Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
+    data_url: 'data:image/jpeg;base64,' + b64
+  });
+  try {
+    cache.put(LIVE_WATCH_FRAME_PREFIX + sid, payload, LIVE_WATCH_FRAME_TTL_SEC);
+  } catch (e) {
+    return { success: false, live_watch: true, error: 'cache put failed', student_id: sid };
+  }
+  return { success: true, live_watch: true, student_id: sid, chars: b64.length };
+}
+
+/** 指定児童の最新ライブ画像を返す（管理画面の 1.5〜2 秒更新）。 */
+function liveWatchGetFrames(studentIds) {
+  const ids = Array.isArray(studentIds) ? studentIds : [];
+  const cache = liveWatchCache_();
+  const out = [];
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] === undefined || ids[i] === null ? '' : ids[i]).trim();
+    if (!sid) continue;
+    let at = 0, atText = '', dataUrl = '';
+    if (cache) {
+      let raw = null;
+      try { raw = cache.get(LIVE_WATCH_FRAME_PREFIX + sid); } catch (e) { raw = null; }
+      if (raw) {
+        try {
+          const o = JSON.parse(raw);
+          if (o && typeof o === 'object') {
+            at = Number(o.at) || 0;
+            atText = String(o.at_text || '');
+            dataUrl = String(o.data_url || '');
+          }
+        } catch (e) { /* 壊れた画像は無視する */ }
+      }
+    }
+    out.push({
+      student_id: sid,
+      live_watch: liveWatchIsWatched_(sid),
+      at: at,
+      at_text: atText,
+      data_url: dataUrl,
+      has_image: !!dataUrl
+    });
+  }
+  return out;
+}
+
+/**
+ * 複数児童への視聴開始・停止・延長をまとめて行う（管理画面のバッチ用）。
+ * 返り値は 1 件ずつの結果配列＋全体の集計。
+ */
+function liveWatchApplyBatch(teacher, studentIds, op) {
+  const ids = Array.isArray(studentIds) ? studentIds : [];
+  const results = [];
+  let failCode = '';
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] === undefined || ids[i] === null ? '' : ids[i]).trim();
+    if (!sid) continue;
+    let r;
+    if (op === 'stop') r = liveWatchStop(teacher, sid);
+    else if (op === 'extend') r = liveWatchExtend(teacher, sid);
+    else r = liveWatchStart(teacher, sid);
+    if (!r || typeof r !== 'object') r = { success: false, student_id: sid };
+    r.student_id = sid;
+    if (r.success !== true && !failCode) failCode = String(r.code || '');
+    results.push(r);
+  }
+  let okAll = results.length > 0;
+  for (let i = 0; i < results.length; i++) { if (results[i].success !== true) okAll = false; }
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  const email = liveWatchTeacherKey_(teacher);
+  const usage = liveWatchUsageBits_(p.reg, email, now, st);
+  return {
+    success: okAll,
+    op: op,
+    code: failCode,
+    error: okAll ? '' : (results[0] && results[0].error) || '',
+    results: results,
+    used: usage.used, max: usage.max, usage: usage.usage, remaining: usage.remaining,
+    full: usage.full, teacher_used: usage.teacher_used,
+    teacher_limit: st.per_teacher_limit, teacher_unlimited: st.unlimited,
+    disabled: st.disabled, timeout_sec: st.timeout_sec,
+    ttl_sec: LIVE_WATCH_TTL_SEC, extend_sec: LIVE_WATCH_EXTEND_SEC
+  };
 }
 
 /**
@@ -3423,6 +4130,16 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
   // 【負荷保護】過負荷時のみ sync_interval_sec を緩和する（負荷が下がれば即 1.5 へ戻る）
   var effSyncSec = hbThrottleIntervalSec_(kaInfo ? kaInfo.sync_interval_sec : 0, serverTimeMs);
 
+  // 【v1.6.8】ライブ視聴の対象か（教員がこの児童のライブ枠を開いているか）。
+  //   端末はこの値が true のあいだだけ軽量キャプチャを送る。
+  //   ライブ視聴は補助機能なので、判定に失敗してもハートビートは止めない。
+  var liveWatchFlag = false;
+  try {
+    if (typeof liveWatchIsWatched_ === 'function') {
+      liveWatchFlag = liveWatchIsWatched_(studentId) === true;
+    }
+  } catch (eLW) { liveWatchFlag = false; }
+
   return {
     student_id: studentId,
     school_name: String(row[headerMap['学校名'] - 1] || ''),
@@ -3444,6 +4161,8 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
     // 【負荷保護】通常は 1.5 秒のまま。過負荷のときだけ一時的に緩和（4秒）する。
     sync_interval_sec: effSyncSec,
     idle_drift_until: kaInfo.idle_drift_until,
+    // 【v1.6.8】ライブ視聴の対象なら true（端末はこのときだけ画面を送る）
+    live_watch: liveWatchFlag,
     server_time: now,
     // 【フェーズ3】端末の時計補正とスケジュール判定のための配信契約。
     //   server_time_ms … server_time と同じ瞬間の epoch ms（端末はこれで時計を補正）
@@ -8375,6 +9094,65 @@ function api_saveMonitorSettings(token, settings) {
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
     const saved = saveMonitoringSettings(currentTeacher, settings || {});
     return { success: true, message: '監視設定を保存しました', settings: saved };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+// ---- ライブ視聴 API (google.script.run 用 / v1.6.8) ----
+
+function api_liveWatchStatus(token) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    return liveWatchStatus(currentTeacher);
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_liveWatchStart(token, studentIds) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
+    return liveWatchApplyBatch(currentTeacher, scoped.ids, 'start');
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_liveWatchExtend(token, studentIds) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    return liveWatchApplyBatch(currentTeacher, studentIds, 'extend');
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_liveWatchStop(token, studentIds) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    return liveWatchApplyBatch(currentTeacher, studentIds, 'stop');
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_liveWatchFrames(token, studentIds) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
+    return { success: true, data: liveWatchGetFrames(scoped.ids), ids: scoped.ids };
   } catch (err) {
     return { success: false, error: err.toString() };
   }

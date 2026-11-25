@@ -748,7 +748,7 @@ function mkVmG(sheet) {
 // =====================================================================
 console.log('--- H. 固定仕様の不変条件 ---');
 
-ok('H1 manifest の version は 1.6.7', manifest.version === '1.6.7');
+ok('H1 manifest の version は 1.6.8', manifest.version === '1.6.8');
 ok('H1 manifest に default_popup が無い',
   !(manifest.action && manifest.action.default_popup) &&
   !(manifest.browser_action && manifest.browser_action.default_popup));

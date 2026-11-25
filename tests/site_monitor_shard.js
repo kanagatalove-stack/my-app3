@@ -70,9 +70,15 @@ function check(n, c, e) {
 // 監視系の関数・定数を1つの VM に読み込むための前処理（monitor.js と同じ方針）。
 const MON_FNS = ['normalizeMonitorHost', 'hostMatchesAnyDomain', 'getMonitoringSettings',
   'sanitizeMonitorDomainList', 'isWebUrlForMonitoring', 'evaluateUrlForMonitoring',
-  'applyMonitorVisibility'];
+  'applyMonitorVisibility',
+  // 【v1.6.8】shardChildApplyMonitorSettings が参照するライブ視聴設定の正規化
+  'normalizeLiveWatchPerTeacherLimit', 'normalizeLiveWatchTimeoutSec'];
 const MON_CONSTS = ['MONITOR_PROP_KEY', 'MONITOR_MAX_DOMAINS',
-  'MONITOR_DEFAULT_LEARNING_DOMAINS', 'MONITOR_DEFAULT_BLOCKED_DOMAINS'];
+  'MONITOR_DEFAULT_LEARNING_DOMAINS', 'MONITOR_DEFAULT_BLOCKED_DOMAINS',
+  // 【v1.6.8】ライブ視聴設定の既定値・上限
+  'LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT', 'LIVE_WATCH_DEFAULT_TIMEOUT_SEC',
+  'LIVE_WATCH_MAX_PER_TEACHER_LIMIT', 'LIVE_WATCH_UNLIMITED',
+  'LIVE_WATCH_MIN_TIMEOUT_SEC', 'LIVE_WATCH_MAX_TIMEOUT_SEC'];
 
 function mkMonitorPrelude() {
   let code = '';
@@ -488,7 +494,7 @@ check('API アクション名（save_monitor_settings）も維持',
 // =====================================================================
 console.log('\n===== [H] 不変条件 =====');
 
-check('拡張機能の版数は 1.6.7', manifest.version === '1.6.7', manifest.version);
+check('拡張機能の版数は 1.6.8', manifest.version === '1.6.8', manifest.version);
 check('manifest に default_popup を追加していない',
   !JSON.stringify(manifest).includes('default_popup'));
 check('子スプレッドシートへのテレメトリ書き戻しをしていない（親シートへの転記なし）',

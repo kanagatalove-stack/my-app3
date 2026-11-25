@@ -169,11 +169,11 @@ const distPolicy = path.join(ROOT, 'dist/managed_policy.json');
   ok('A-14 direct.zip にもエンジン関数10個が全て実在する',
     !!directBg && missDirect.length === 0, missDirect);
 
-  // 版数（出荷物の manifest が 1.6.7 であること）
+  // 版数（出荷物の manifest が 1.6.8 であること）
   const storeManifest = dStore ? readIf(path.join(dStore, 'manifest.json')) : null;
   let sm = null;
   try { sm = JSON.parse(storeManifest); } catch (e) { sm = null; }
-  ok('A-15 store.zip の manifest.version は 1.6.7', !!sm && sm.version === '1.6.7',
+  ok('A-15 store.zip の manifest.version は 1.6.8', !!sm && sm.version === '1.6.8',
     sm && sm.version);
   ok('A-16 store.zip の manifest に default_popup が無い',
     !!sm && !((sm.action || {}).default_popup));
@@ -184,12 +184,12 @@ const distPolicy = path.join(ROOT, 'dist/managed_policy.json');
   try { dm = JSON.parse(directManifest); } catch (e) { dm = null; }
   ok('A-17 direct.zip は検証用ビルド（default_popup: popup.html）',
     !!dm && (dm.action || {}).default_popup === 'popup.html');
-  ok('A-18 direct.zip の manifest.version も 1.6.7', !!dm && dm.version === '1.6.7',
+  ok('A-18 direct.zip の manifest.version も 1.6.8', !!dm && dm.version === '1.6.8',
     dm && dm.version);
 
   // update.xml の版数が manifest と一致（自動反映の確認）
   const xml = readIf(distXml) || '';
-  ok('A-19 update.xml の version は 1.6.7', /version='1\.6\.7'/.test(xml));
+  ok('A-19 update.xml の version は 1.6.8', /version='1\.6\.8'/.test(xml));
 
   // 管理ポリシー配布 JSON（14校・廃校を含まない・student_id は ${USER_EMAIL}）
   let pol = null;
@@ -754,8 +754,8 @@ function sectionE() {
 // ---------------------------------------------------------------- F. 不変条件
 function sectionF() {
   console.log('--- F. 不変条件（版数・権限・配布物の作られ方） ---');
-  ok('F-1 manifest.version は 1.6.7（ストア再提出用の版上げ）',
-    manifest.version === '1.6.7', manifest.version);
+  ok('F-1 manifest.version は 1.6.8（ストア再提出用の版上げ）',
+    manifest.version === '1.6.8', manifest.version);
   ok('F-2 default_popup を持たない（児童がアイコンを押しても無反応）',
     !manifest.action || !manifest.action.default_popup);
   ok('F-3 permissions は storage/alarms/idle/tabs/identity/identity.email の6つ',

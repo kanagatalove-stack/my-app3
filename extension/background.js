@@ -1321,6 +1321,13 @@ async function syncWithGas() {
     wakeRetryBudget = 0;   // 成功したら短い再試行の予算は使い切る
     clearWakeRetry();
 
+    // 【v1.6.8】準リアルタイム画面視聴: 送信は既存の 1.5 秒ポーリングに同期させる。
+    //   live_watch === true の端末だけが撮影し、in-flight 排他で多重送信しない。
+    //   同期の成功処理を済ませた後に実行するため、失敗しても状態更新へ影響しない。
+    try {
+      if (liveWatchActive === true) await liveWatchCaptureOnce();
+    } catch (eLWC) {}
+
   } catch (err) {
     console.error('[EduAgent] 通信エラー:', err);
     try {
@@ -1820,6 +1827,14 @@ async function applyPolicies(newPolicy, oldStorage) {
     await chrome.storage.local.set({ last_screen_request: newScreenReq });
     captureAndUploadScreenshot();
   }
+
+  // 6. 【v1.6.8】準リアルタイム画面視聴のフラグ反映
+  //    ハートビート応答の live_watch が true の端末だけが、以後の 1.5 秒ポーリングで
+  //    軽量キャプチャを送る。false（または未指定）になった瞬間に停止する。
+  //    ここでは状態の反映のみ行い、撮影は syncWithGas の末尾（1.5秒周期）で行う。
+  try {
+    await applyLiveWatchFlag(newPolicy.live_watch === true);
+  } catch (eLW) {}
 }
 
 /**
@@ -1878,6 +1893,187 @@ async function downscaleForSheet(dataUrl) {
     try { bitmap.close(); } catch (e) {}
   }
   return null; // どの組み合わせでも上限に収まらなかった
+}
+
+// ============================================================================
+// 【v1.6.8】準リアルタイム画面視聴（指定端末のみの軽量キャプチャ送信）
+//
+//   教員コンソールで「ライブ視聴」を開始した児童端末だけが、ハートビート応答の
+//   live_watch === true を受け取る。その端末だけが 1.5 秒ポーリングのたびに
+//   アクティブタブを撮影し、教員が見やすい軽量JPEGに縮小して子GASへ送る。
+//
+//   固定仕様:
+//     ・撮影は chrome.tabs.captureVisibleTab（JPEG・低品質）のみ。
+//     ・OffscreenCanvas で横幅 480px 前後に縮小し、Base64 30,000 文字以内に収める。
+//     ・送信は既存の 1.5 秒ポーリング周期に同期（独立タイマーは増やさない）。
+//     ・liveWatchInFlight による排他制御で多重送信しない。
+//     ・live_watch === false になった瞬間に停止する（撮影もしない）。
+//     ・新規権限は不要（tabs / host_permissions は既存のまま）。
+// ============================================================================
+const LIVE_WATCH_MAX_B64 = 30000;          // 送信する Base64 の上限（要件: 30,000 文字以内）
+const LIVE_WATCH_TARGET_WIDTH = 480;       // 目標の横幅（要件: 480px 前後）
+const LIVE_WATCH_MIN_WIDTH = 240;          // 縮小の下限（これ以上は落とさない）
+const LIVE_WATCH_QUALITIES = [0.5, 0.42, 0.34, 0.28, 0.22, 0.16];
+const LIVE_WATCH_CAPTURE_QUALITY = 40;     // captureVisibleTab の品質（低品質設定）
+let liveWatchActive = false;               // ハートビート応答 live_watch の写し
+let liveWatchInFlight = false;             // 送信の多重実行ガード（in-flight 排他）
+let liveWatchLastSentMs = 0;               // 直近の送信時刻（診断用）
+
+/** ArrayBuffer → Base64（Service Worker には btoa がある）。 */
+function bufferToBase64_(buf) {
+  let bin = '';
+  const bytes = new Uint8Array(buf);
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  }
+  return btoa(bin);
+}
+
+/**
+ * ライブ視聴用の縮小。横幅 480px 前後を起点に、Base64 が上限に収まるまで
+ * 幅と品質を段階的に落とす。収まらなければ null（壊れたデータは送らない）。
+ */
+async function downscaleForLiveWatch(dataUrl) {
+  const raw = String(dataUrl || '');
+  const originalB64 = raw.replace(/^data:image\/[a-z]+;base64,/i, '');
+  if (originalB64.length <= LIVE_WATCH_MAX_B64) return raw;
+  if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') return null;
+
+  let bitmap;
+  try {
+    const blob = await (await fetch(raw)).blob();
+    bitmap = await createImageBitmap(blob);
+  } catch (e) {
+    return null;
+  }
+
+  try {
+    let w = Math.min(LIVE_WATCH_TARGET_WIDTH, bitmap.width);
+    while (w >= LIVE_WATCH_MIN_WIDTH) {
+      const h = Math.max(1, Math.round((bitmap.height * w) / bitmap.width));
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'medium';
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      for (let qi = 0; qi < LIVE_WATCH_QUALITIES.length; qi++) {
+        const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: LIVE_WATCH_QUALITIES[qi] });
+        const b64 = bufferToBase64_(await blob.arrayBuffer());
+        if (b64.length <= LIVE_WATCH_MAX_B64) return 'data:image/jpeg;base64,' + b64;
+      }
+      // 画質を落としきっても収まらないときは幅を縮める
+      w = Math.round(w * 0.8);
+    }
+  } catch (e) {
+    return null;
+  } finally {
+    try { bitmap.close(); } catch (e) {}
+  }
+  return null;
+}
+
+/**
+ * live_watch フラグの反映（毎ハートビートで呼ばれる）。
+ *   true  … 以後のポーリングで撮影・送信を開始する
+ *   false … 即座に停止する（以降の撮影もしない）
+ */
+async function applyLiveWatchFlag(flag) {
+  const next = flag === true;
+  if (liveWatchActive === next) return liveWatchActive;
+  liveWatchActive = next;
+  if (!next) {
+    // 停止指示が来た瞬間にフラグを落とす。実行中の送信は完了させ、
+    // 以後の新しい撮影は liveWatchActive を見て開始しない（即時停止）。
+    liveWatchLastSentMs = 0;
+  }
+  try {
+    await chrome.storage.local.set({ live_watch_active: next });
+  } catch (e) {}
+  console.log('[EduAgent] ライブ視聴:', next ? '開始（指定端末として撮影を送信します）' : '停止（撮影を止めました）');
+  return liveWatchActive;
+}
+
+/**
+ * ライブ視聴の1回分の撮影・送信。
+ *  ・live_watch === true の端末だけが実行する（呼び出し側も確認している）。
+ *  ・1.5 秒ポーリングのたびに 1 回だけ走らせ、in-flight 中は必ず捨てる。
+ *  ・失敗はログのみ（他の同期処理へ影響させない＝画面ロック等を止めない）。
+ */
+async function liveWatchCaptureOnce() {
+  if (!liveWatchActive) return false;   // 停止指示後は一切撮影しない（即時停止）
+  if (liveWatchInFlight) return false;  // 多重送信しない
+  liveWatchInFlight = true;
+  try {
+    const data = await chrome.storage.local.get(null);
+    if (!liveWatchActive) return false; // 読み込み中に停止された場合も撮らない
+    const studentId = data.student_id;
+    const gasUrl = resolveGasUrl(data);
+    if (!studentId || !gasUrl) return false;
+
+    let tab = null;
+    try {
+      const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      tab = tabs && tabs[0] ? tabs[0] : null;
+    } catch (e) {}
+    if (!tab) return false;
+    if (!tab.windowId) return false;
+
+    // 保護ページは captureVisibleTab では撮影できない（Chrome の仕様）。
+    // ライブ視聴は連続送信のため、画面一覧のような「撮れない通知」は送らない。
+    const url = tab.url || '';
+    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
+        url.startsWith('about:') || url.startsWith('devtools://') ||
+        url.startsWith('chrome-search://') || url.startsWith('view-source:')) {
+      return false;
+    }
+
+    let raw = null;
+    try {
+      raw = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: 'jpeg',
+        quality: LIVE_WATCH_CAPTURE_QUALITY
+      });
+    } catch (eCap) {
+      return false;
+    }
+    if (!raw || !/^data:image\//.test(raw)) return false;
+
+    const dataUrl = await downscaleForLiveWatch(raw);
+    if (!dataUrl) return false;
+    if (!liveWatchActive) return false; // 縮小中に停止されたら送らない
+
+    let response = null;
+    try {
+      response = await fetch(gasUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'live_frame',
+          student_id: studentId,
+          image_data: dataUrl,
+          mime_type: 'image/jpeg'
+        }),
+        redirect: 'follow'
+      });
+    } catch (eNet) {
+      return false;
+    }
+    liveWatchLastSentMs = Date.now();
+    if (!response || !response.ok) return false;
+
+    let body = null;
+    try { body = await response.json(); } catch (eJson) { body = null; }
+    // 枠が解放されていた（TTL 切れ・停止・上限）場合は、次のハートビートで
+    // live_watch=false が届くまでの間、無駄な撮影を続けないよう記録だけ残す。
+    if (body && body.accepted === false) return false;
+    return true;
+  } catch (err) {
+    return false;
+  } finally {
+    liveWatchInFlight = false;
+  }
 }
 
 /**

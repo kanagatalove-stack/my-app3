@@ -29,7 +29,7 @@
 //   B. 通信中（in-flight）の重複呼び出しを抑止する
 //   C. document.hidden 中はポーリングせず、復帰した瞬間に 1 回取得する
 //   D. 周期は 3〜5 秒。失敗が続いたときだけ自動緩和し、成功で既定へ戻る
-//   E. 固定仕様の不変条件（拡張機能 v1.6.7 / 1.5 秒 / shardFetchMany / 14 校）
+//   E. 固定仕様の不変条件（拡張機能 v1.6.8 / 1.5 秒 / shardFetchMany / 14 校）
 // =============================================================================
 const fs = require('fs'), vm = require('vm');
 const ROOT = require('path').join(__dirname, '..');
@@ -397,7 +397,7 @@ console.log('===== B. in-flight ガード（多重リクエストの抑止） ==
   console.log('===== E. 固定仕様の不変条件 =====');
 
   const manifest = JSON.parse(fs.readFileSync(ROOT + '/extension/manifest.json', 'utf8'));
-  check('E1 拡張機能は v1.6.7 を維持', manifest.version === '1.6.7', manifest.version);
+  check('E1 拡張機能は v1.6.8 を維持', manifest.version === '1.6.8', manifest.version);
   check('E2 default_popup を持たない', manifest.action && manifest.action.default_popup === undefined,
     manifest.action);
   check('E3 DEFAULT_GAS_URL は空のまま（既定値を埋めない）',

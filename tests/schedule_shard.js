@@ -802,7 +802,7 @@ console.log('===== I. 不変条件 =====');
 
   // manifest 不変
   const mf = JSON.parse(fs.readFileSync('/home/user/webapp/extension/manifest.json', 'utf8'));
-  check('拡張のバージョンは v1.6.7', mf.version === '1.6.7', mf.version);
+  check('拡張のバージョンは v1.6.8', mf.version === '1.6.8', mf.version);
   check('alarms 権限を保持', (mf.permissions || []).indexOf('alarms') !== -1);
   check('default_popup を持たない（児童端末で何も出ない）', !mf.action || !mf.action.default_popup);
 

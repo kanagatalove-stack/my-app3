@@ -226,6 +226,21 @@
             <span class="font-medium text-indigo-100 text-[11px]">自動更新(任意)</span>
           </label>
 
+          <!-- ===== ライブ視聴の使用枠インジケーター（常時表示 / v1.6.8） =====
+               教員がひと目で「今どれだけ枠を使っているか」を把握できるようにする。
+               値は live_watch_status（1.5〜2秒ごとの更新に同乗）で更新する。 -->
+          <div id="liveWatchBadges" class="flex items-center space-x-1.5 flex-wrap gap-y-1">
+            <span id="liveWatchPoolBadge" title="このGAS環境で同時にライブ視聴している端末数（相乗りは1台と数えます）"
+                  class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-indigo-900/90 border border-indigo-600 text-indigo-100">
+              <svg class="w-3.5 h-3.5 mr-1 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+              全体ライブ枠: <span id="liveWatchPoolUsed" class="mx-0.5">0</span> / <span id="liveWatchPoolMax">24</span>台（残り <span id="liveWatchPoolLeft">24</span>枠）
+            </span>
+            <span id="liveWatchMineBadge" title="あなたが同時にライブ視聴している台数（管理設定の上限）"
+                  class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-indigo-900/70 border border-indigo-500 text-indigo-200">
+              あなたの視聴枠: <span id="liveWatchMineText">0 / 3台</span>
+            </span>
+          </div>
+
           <!-- 更新ボタン -->
           <button id="refreshBtn" onclick="refreshDevicesManual()" class="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-indigo-400">
             <svg id="refreshSpinner" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -526,6 +541,46 @@
         </div>
 
         <div id="screenStatusBar" class="text-xs text-slate-500 px-1"></div>
+
+        <!-- ===== ライブ視聴パネル（準リアルタイム / v1.6.8） =====
+             管理設定の上限まで同時に枠を並べ、約1.5〜2秒間隔で画像を更新する。
+             枠を閉じた／タブが非表示になった／自動タイムアウト満了で即座に枠を解放する。 -->
+        <div id="liveWatchPanel" class="bg-white p-4 rounded-xl shadow-sm border border-sky-200">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div class="flex items-start space-x-3">
+              <div class="p-2.5 bg-sky-100 text-sky-700 rounded-xl shrink-0">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+              </div>
+              <div>
+                <h2 class="text-sm font-bold text-slate-800">ライブ視聴（準リアルタイム）</h2>
+                <p class="text-[11px] text-slate-500 leading-relaxed">
+                  対象の児童端末が数秒おきに画面を送信します。全体 <b>24台</b> まで、あなたは管理設定の上限まで同時に表示できます。
+                </p>
+                <div id="liveWatchPanelStatus" class="text-[11px] text-slate-500 mt-1"></div>
+              </div>
+            </div>
+            <div class="flex items-center space-x-2 flex-wrap gap-y-2">
+              <button id="liveWatchStartBtn" onclick="startLiveWatchFromSelection()" class="flex items-center space-x-1.5 bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold px-3.5 py-2 rounded-lg shadow-sm transition">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                <span>ライブ視聴を開始</span>
+              </button>
+              <button id="liveWatchStopAllBtn" onclick="stopAllLiveWatch()" class="hidden flex items-center space-x-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3.5 py-2 rounded-lg shadow-sm transition">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                <span>すべて停止</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="liveWatchGrid" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 mt-4">
+            <div class="col-span-full text-center py-8 text-slate-400">
+              <div class="flex flex-col items-center justify-center space-y-2">
+                <svg class="w-9 h-9 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="text-sm font-semibold text-slate-600">「ライブ視聴を開始」を押すと、対象児童の画面を準リアルタイムで表示します</span>
+                <span class="text-xs text-slate-400">常時送信は行いません（枠を開いている間だけ送信します）</span>
+              </div>
+            </div>
+          </div>
+        </div>
 
         <!-- 画面一覧グリッド -->
         <div id="screenGrid" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -1513,6 +1568,70 @@
             placeholder="google.com&#10;nhk.or.jp&#10;scratch.mit.edu"></textarea>
         </div>
 
+        <!-- ===== ライブ視聴の管理設定（v1.6.8・管理者のみ） =====
+             システム全体に効くため、一般教員には表示しない（openMonitoringModal が弾く）。
+             保存は既存の MONITOR_SETTINGS_V1（PropertiesService）に相乗りし、
+             R41 では shard_apply 同梱経路で子GASへも配られる。 -->
+        <div class="border border-sky-200 bg-sky-50 rounded-xl p-4 space-y-3">
+          <div class="flex items-start space-x-2">
+            <span class="p-1.5 bg-sky-100 text-sky-700 rounded-lg shrink-0">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+            </span>
+            <div>
+              <span class="block text-sm font-bold text-sky-900">ライブ視聴の制限（準リアルタイム画面視聴）</span>
+              <span class="block text-[11px] text-sky-700 mt-1 leading-relaxed">
+                児童端末が<b>数秒おき</b>に現在の画面を送る「ライブ視聴」の同時枠を制限します。<br>
+                全体の上限は <b>24台</b>（相乗り視聴は満枠でも可）です。
+              </span>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label for="liveWatchPerTeacherLimit" class="block text-[11px] font-bold text-slate-700 mb-1">1教員あたりの同時ライブ視聴上限</label>
+              <select id="liveWatchPerTeacherLimit"
+                      class="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-2 text-xs focus:ring-sky-500 focus:border-sky-500">
+                <option value="0">0台（機能を停止）</option>
+                <option value="1">1台</option>
+                <option value="2">2台</option>
+                <option value="3" selected>3台（初期値）</option>
+                <option value="4">4台</option>
+                <option value="6">6台</option>
+                <option value="9">9台</option>
+                <option value="12">12台</option>
+                <option value="16">16台</option>
+                <option value="24">24台</option>
+                <option value="-1">無限（全体24台まで）</option>
+              </select>
+              <div class="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                0にすると一般教員の新規ライブ視聴は「現在管理者によりライブ視聴が制限されています」で止まります。
+              </div>
+            </div>
+            <div>
+              <label for="liveWatchTimeoutSec" class="block text-[11px] font-bold text-slate-700 mb-1">自動タイムアウト時間</label>
+              <select id="liveWatchTimeoutSec" onchange="syncLiveWatchTimeoutCustom()"
+                      class="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-2 text-xs focus:ring-sky-500 focus:border-sky-500">
+                <option value="60">60秒（1分）</option>
+                <option value="180" selected>180秒（3分・初期値）</option>
+                <option value="300">300秒（5分）</option>
+                <option value="600">600秒（10分）</option>
+                <option value="900">900秒（15分）</option>
+                <option value="custom">任意の秒数を指定</option>
+              </select>
+              <div class="flex items-center space-x-1.5 mt-1.5">
+                <input type="number" id="liveWatchTimeoutCustom" min="30" max="3600" step="10" placeholder="30〜3600"
+                       class="hidden w-24 bg-white border border-slate-300 rounded-lg px-2 py-1.5 text-xs">
+                <span id="liveWatchTimeoutCustomUnit" class="hidden text-[11px] text-slate-500">秒</span>
+              </div>
+              <div class="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                この時間を超えると自動で枠が解放されます（見忘れによる占有を防ぐ）。
+              </div>
+            </div>
+          </div>
+
+          <div id="liveWatchSettingsInfo" class="text-[10px] text-sky-700 leading-relaxed"></div>
+        </div>
+
         <div id="monitorUpdatedInfo" class="text-[11px] text-slate-400"></div>
 
         <div class="bg-slate-50 border border-slate-200 rounded-lg p-3 text-[11px] text-slate-600 leading-relaxed">
@@ -1934,6 +2053,10 @@
 
       loadDevices();
       setupAutoRefresh();
+      // 【R56】全体ライブ枠／自分の視聴枠のインジケーターをログイン直後に最新化する。
+      //   ここでは読み取り1回のみ（setInterval は作らない）。ポーリングは
+      //   ライブ視聴パネルで枠を開いたときだけ startLiveWatchPolling() が開始する。
+      try { refreshLiveWatchStatus(true); } catch (eLW0) {}
       // ログイン中は拡張機能のキープアライブを有効化（児童端末の同期を数秒以内に反映）
       startExtensionKeepalive();
     }
@@ -3151,6 +3274,17 @@
             runner.api_getMonitorSettings(authToken);
           } else if (act === 'save_monitor_settings') {
             runner.api_saveMonitorSettings(authToken, payload.settings || {});
+          } else if (act === 'live_watch_status') {
+            // 【R56】全体系のライブ枠使用数・自分の枠数を取得（読み取りのみ）。
+            runner.api_liveWatchStatus(authToken);
+          } else if (act === 'live_watch_start') {
+            runner.api_liveWatchStart(authToken, payload.student_ids);
+          } else if (act === 'live_watch_extend') {
+            runner.api_liveWatchExtend(authToken, payload.student_ids);
+          } else if (act === 'live_watch_stop') {
+            runner.api_liveWatchStop(authToken, payload.student_ids);
+          } else if (act === 'live_watch_frames') {
+            runner.api_liveWatchFrames(authToken, payload.student_ids);
           } else if (act === 'list_schedules') {
             runner.api_listSchedules(authToken, payload.school_name);
           } else if (act === 'save_schedule') {
@@ -3556,6 +3690,509 @@
         try { noteRefreshResult(__ok); } catch (eN) {}
         if (!isSilent && spinner) spinner.classList.remove('animate-spin');
       }
+    }
+
+    // ==================== ライブ視聴（準リアルタイム / v1.6.8） ====================
+    //
+    // 【設計】
+    //   ・GAS 側のプール（全体 24 台）と管理設定（1教員あたり上限／自動タイムアウト）に従う。
+    //   ・画像は約 1.8 秒間隔で取得する（1.5〜2 秒要件）。取得は /exec 直送で行い、
+    //     google.script.run の callback ポーリング往復（実測 3.6〜7.1 秒）を避ける。
+    //   ・枠が開いている間だけ 10 秒ごとに延長を送る。GAS 側の TTL は 25 秒なので、
+    //     ブラウザが強制終了しても 25 秒で自動解放される。
+    //   ・枠を閉じた／タブが非表示／自動タイムアウト満了 → 即座に停止 API を呼ぶ。
+    const LIVE_WATCH_POLL_MS = 1800;               // 画像更新の周期（1.5〜2秒）
+    const LIVE_WATCH_EXTEND_MS = 10000;            // 延長ハートビート（TTL 25 秒より短い）
+    const LIVE_WATCH_FALLBACK_TIMEOUT_SEC = 180;   // 管理設定が取れないときの既定
+    const LIVE_WATCH_TILE_LIMIT_FALLBACK = 3;      // 管理設定が取れないときの上限
+
+    let liveWatchSlots = [];          // [{ studentId, name, openedAt }]
+    let liveWatchPollTimer = null;
+    let liveWatchLastExtendAt = 0;
+    let liveWatchFramesFetching = false;
+    let liveWatchStatusInfo = null;
+    let liveWatchVisibilityBound = false;
+
+    /** 管理設定の自動タイムアウト（秒）。取れないときは既定 180 秒。 */
+    function getLiveWatchTimeoutSec() {
+      const s = liveWatchStatusInfo || {};
+      const n = Number(s.timeout_sec);
+      return (isFinite(n) && n > 0) ? n : LIVE_WATCH_FALLBACK_TIMEOUT_SEC;
+    }
+
+    /** 1教員あたりの同時表示上限（無限は全体上限 24 を返す）。 */
+    function getLiveWatchTileLimit() {
+      const s = liveWatchStatusInfo || {};
+      if (s.teacher_unlimited === true) return 24;
+      const n = Number(s.teacher_limit);
+      if (!isFinite(n) || n < 0) return LIVE_WATCH_TILE_LIMIT_FALLBACK;
+      return n;
+    }
+
+    /**
+     * 常時表示インジケーターを更新する。
+     *   全体プール使用状況: 「全体ライブ枠: X / 24台（残り Y枠）」
+     *   自分の使用状況    : 「あなたの視聴枠: A / B台」／「A台（上限なし）」／「停止中（0台）」
+     *   満枠時はバッジを警告色にし、「相乗り視聴のみ可能」を併記する。
+     */
+    function updateLiveWatchIndicators(status) {
+      const s = status || liveWatchStatusInfo || {};
+      const used = Number(s.used) || 0;
+      const max = Number(s.max) || 24;
+      const left = (typeof s.remaining === 'number') ? s.remaining : Math.max(0, max - used);
+      const full = (s.full === true) || used >= max;
+
+      const usedEl = document.getElementById('liveWatchPoolUsed');
+      const maxEl = document.getElementById('liveWatchPoolMax');
+      const leftEl = document.getElementById('liveWatchPoolLeft');
+      if (usedEl) usedEl.textContent = String(used);
+      if (maxEl) maxEl.textContent = String(max);
+      if (leftEl) leftEl.textContent = String(left);
+
+      const poolBadge = document.getElementById('liveWatchPoolBadge');
+      if (poolBadge) {
+        // 満枠は警告色（rose）、通常は indigo。状態が一目で分かるようにする。
+        poolBadge.className = full
+          ? 'inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-rose-600 border border-rose-300 text-white'
+          : 'inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-indigo-900/90 border border-indigo-600 text-indigo-100';
+        poolBadge.title = full
+          ? '全体のライブ枠が満杯です（新規追加はできません。相乗り視聴のみ可能）'
+          : 'このGAS環境で同時にライブ視聴している端末数（相乗りは1台と数えます）';
+      }
+
+      const mineText = document.getElementById('liveWatchMineText');
+      if (mineText) {
+        const mine = Number(s.teacher_used) || 0;
+        if (s.disabled === true) {
+          mineText.textContent = '停止中（0台）';
+        } else if (s.teacher_unlimited === true) {
+          mineText.textContent = mine + '台（上限なし）';
+        } else {
+          const lim = (typeof s.teacher_limit === 'number') ? s.teacher_limit : LIVE_WATCH_TILE_LIMIT_FALLBACK;
+          mineText.textContent = mine + ' / ' + lim + '台';
+        }
+      }
+
+      const panelStatus = document.getElementById('liveWatchPanelStatus');
+      if (panelStatus) {
+        const bits = [];
+        if (s.disabled === true) {
+          bits.push('現在管理者によりライブ視聴が制限されています');
+        } else {
+          bits.push('全体 ' + used + '/' + max + '台（残り ' + left + '枠）');
+          if (full) bits.push('相乗り視聴のみ可能');
+          if (s.teacher_unlimited === true) bits.push('あなたは上限なし');
+          else if (typeof s.teacher_limit === 'number') bits.push('あなたは ' + s.teacher_limit + '台まで');
+          if (typeof s.timeout_sec === 'number') bits.push('自動終了 ' + s.timeout_sec + '秒');
+        }
+        panelStatus.textContent = bits.join(' ／ ');
+      }
+
+      const startBtn = document.getElementById('liveWatchStartBtn');
+      if (startBtn) startBtn.disabled = (s.disabled === true);
+    }
+
+    /** 使用枠の最新値を取り直してインジケーターを更新する（読み取りのみ）。 */
+    async function refreshLiveWatchStatus(silent) {
+      try {
+        const res = await apiRequest({ action: 'live_watch_status' });
+        if (res && res.success !== false) {
+          liveWatchStatusInfo = res;
+          updateLiveWatchIndicators(res);
+        }
+        return res;
+      } catch (e) {
+        if (!silent) console.warn('live_watch_status 取得失敗:', e && e.message ? e.message : e);
+        return null;
+      }
+    }
+
+    /** ライブ枠の一覧を描画する（枠の増減時にだけ呼ぶ＝画像更新は img.src の差し替えのみ）。 */
+    function renderLiveWatchGrid() {
+      const grid = document.getElementById('liveWatchGrid');
+      const stopAllBtn = document.getElementById('liveWatchStopAllBtn');
+      if (stopAllBtn) stopAllBtn.classList.toggle('hidden', liveWatchSlots.length === 0);
+      if (!grid) return;
+
+      if (liveWatchSlots.length === 0) {
+        grid.innerHTML = [
+          '<div class="col-span-full text-center py-8 text-slate-400">',
+          '  <div class="flex flex-col items-center justify-center space-y-2">',
+          '    <span class="text-sm font-semibold text-slate-600">「ライブ視聴を開始」を押すと、対象児童の画面を準リアルタイムで表示します</span>',
+          '    <span class="text-xs text-slate-400">常時送信は行いません（枠を開いている間だけ送信します）</span>',
+          '  </div>',
+          '</div>'
+        ].join('');
+        return;
+      }
+
+      const tiles = [];
+      liveWatchSlots.forEach(function (slot, i) {
+        const name = escapeHtml(slot.name || slot.studentId);
+        tiles.push([
+          '<div class="border border-slate-200 rounded-xl overflow-hidden bg-slate-900 shadow-sm">',
+          '  <div class="flex items-center justify-between px-3 py-2 bg-slate-800">',
+          '    <div class="flex items-center space-x-1.5 min-w-0">',
+          '      <span class="w-2 h-2 rounded-full bg-rose-500 animate-pulse shrink-0"></span>',
+          '      <span class="text-[11px] font-bold text-slate-100 truncate" title="' + name + '">' + name + '</span>',
+          '    </div>',
+          '    <button onclick="stopLiveWatch(\'' + escapeHtml(slot.studentId) + '\', \'close\')" title="この枠を閉じる（枠を解放します）"',
+          '            class="p-1 text-slate-300 hover:text-white hover:bg-slate-700 rounded transition shrink-0">',
+          '      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>',
+          '    </button>',
+          '  </div>',
+          '  <div class="relative bg-black" style="aspect-ratio:16/9">',
+          '    <img id="liveFrameImg' + i + '" alt="' + name + ' の現在画面" class="absolute inset-0 w-full h-full object-contain hidden">',
+          '    <div id="liveFrameEmpty' + i + '" class="absolute inset-0 flex items-center justify-center text-[11px] text-slate-400">端末の送信を待っています...</div>',
+          '  </div>',
+          '  <div id="liveFrameMeta' + i + '" class="px-3 py-1.5 text-[10px] text-slate-400 font-mono">-</div>',
+          '</div>'
+        ].join('\n'));
+      });
+      grid.innerHTML = tiles.join('\n');
+    }
+
+    /** 取得した画像を枠へ反映する（枠の並びは renderLiveWatchGrid が決めた順）。 */
+    function updateLiveWatchImages(frames) {
+      const byId = {};
+      (frames || []).forEach(function (f) { if (f && f.student_id) byId[String(f.student_id)] = f; });
+      liveWatchSlots.forEach(function (slot, i) {
+        const f = byId[String(slot.studentId)] || null;
+        const img = document.getElementById('liveFrameImg' + i);
+        const empty = document.getElementById('liveFrameEmpty' + i);
+        const meta = document.getElementById('liveFrameMeta' + i);
+        if (f && f.data_url) {
+          if (img) {
+            // src の差し替えだけにする（DOM を作り直さない＝ちらつきを防ぐ）
+            if (img.getAttribute('src') !== f.data_url) img.setAttribute('src', f.data_url);
+            img.classList.remove('hidden');
+          }
+          if (empty) empty.classList.add('hidden');
+          if (meta) meta.textContent = '更新: ' + String(f.at_text || '-');
+        } else if (meta && f) {
+          meta.textContent = f.live_watch === false ? '枠が解放されました' : '端末の送信を待っています...';
+        }
+      });
+    }
+
+    /** タブ非表示・ウィンドウ離脱で即座に枠を解放する（見忘れの占有を防ぐ）。 */
+    function bindLiveWatchVisibility() {
+      if (liveWatchVisibilityBound) return;
+      liveWatchVisibilityBound = true;
+      try {
+        document.addEventListener('visibilitychange', function () {
+          if (document.hidden === true) {
+            stopAllLiveWatch('hidden');
+          } else if (liveWatchSlots.length > 0) {
+            liveWatchLastExtendAt = 0;
+            liveWatchPollTick();
+          }
+        });
+      } catch (e) {}
+      try {
+        window.addEventListener('pagehide', function () { stopAllLiveWatch('pagehide'); });
+      } catch (e2) {}
+    }
+
+    /** 選択中（未選択なら表示中）の児童でライブ視聴を開始する。 */
+    async function startLiveWatchFromSelection() {
+      const res = resolveBulkTargetIds();
+      let ids = (res && res.ids) ? res.ids.slice() : [];
+      if (!ids.length) {
+        showToast('対象の児童がいません。表示中の児童を確認してください。', 'error');
+        return;
+      }
+
+      const info = await refreshLiveWatchStatus(true);
+      if (info && info.disabled === true) {
+        showAlertModal('ライブ視聴は制限されています',
+          '現在管理者によりライブ視聴が制限されています。', 'warning');
+        return;
+      }
+
+      // すでに開いている枠は二重に開かない
+      const opened = {};
+      liveWatchSlots.forEach(function (s) { opened[String(s.studentId)] = true; });
+      ids = ids.filter(function (id) { return !opened[String(id)]; });
+      if (!ids.length) {
+        showToast('選択した児童はすでに表示中です。', 'info');
+        return;
+      }
+
+      // 上限（管理設定）を超える場合は最も古い枠との入れ替えを確認する
+      const limit = getLiveWatchTileLimit();
+      const over = (liveWatchSlots.length + ids.length) - limit;
+      if (limit > 0 && over > 0) {
+        const victims = liveWatchSlots.slice(0, over).map(function (s) { return s.studentId; });
+        const victimNames = liveWatchSlots.slice(0, over)
+          .map(function (s) { return s.name || s.studentId; }).join('、');
+        const ok = (typeof window !== 'undefined' && window.confirm)
+          ? window.confirm('同時ライブ視聴は ' + limit + ' 台までです。\n最も古い枠（' + victimNames +
+              '）を閉じて入れ替えますか？')
+          : true;
+        if (!ok) {
+          showAlertModal('ライブ視聴の上限',
+            '同時にライブ視聴できるのは ' + limit + ' 台までです。先に表示中の枠を閉じてください。', 'info');
+          return;
+        }
+        await stopLiveWatchList(victims, 'replace');
+      }
+
+      let startRes = null;
+      try {
+        startRes = await apiRequest({ action: 'live_watch_start', student_ids: ids });
+      } catch (err) {
+        showToast('ライブ視聴の開始に失敗しました: ' + err.message, 'error');
+        return;
+      }
+
+      // 1件ずつ結果を確認する（満枠の児童だけ弾く）
+      const results = (startRes && Array.isArray(startRes.results)) ? startRes.results : [];
+      const okIds = [];
+      let fullMessage = '';
+      let limitMessage = '';
+      let blockMessage = '';
+      results.forEach(function (r) {
+        if (!r) return;
+        if (r.success === true) { okIds.push(String(r.student_id)); return; }
+        if (r.code === 'LIVE_WATCH_POOL_FULL') {
+          fullMessage = '全体のライブ枠が満杯です（' + (r.usage || (r.used + '/' + r.max)) +
+            '）。新規の追加はできません（相乗り視聴のみ可能）。';
+        } else if (r.code === 'LIVE_WATCH_TEACHER_LIMIT') {
+          limitMessage = r.error || '1人あたりの同時ライブ視聴上限に達しています';
+        } else if (r.code === 'LIVE_WATCH_DISABLED') {
+          blockMessage = '現在管理者によりライブ視聴が制限されています';
+        }
+      });
+
+      if (okIds.length) {
+        okIds.forEach(function (id) {
+          const dev = (devicesData || []).find(function (d) { return d && d.student_id === id; });
+          liveWatchSlots.push({
+            studentId: id,
+            name: (dev && dev.student_name) ? dev.student_name : id,
+            openedAt: Date.now()
+          });
+        });
+        bindLiveWatchVisibility();
+        renderLiveWatchGrid();
+        liveWatchLastExtendAt = 0;
+        startLiveWatchPolling();
+        showToast(okIds.length + ' 台のライブ視聴を開始しました', 'success');
+      }
+      if (blockMessage) {
+        showAlertModal('ライブ視聴は制限されています', blockMessage, 'warning');
+      } else if (fullMessage) {
+        showAlertModal('全体のライブ枠が満杯です', fullMessage, 'warning');
+      } else if (limitMessage && !okIds.length) {
+        showAlertModal('ライブ視聴の上限', limitMessage, 'info');
+      }
+
+      if (startRes) {
+        liveWatchStatusInfo = Object.assign({}, liveWatchStatusInfo || {}, {
+          used: startRes.used, max: startRes.max, remaining: startRes.remaining,
+          full: startRes.full, teacher_used: startRes.teacher_used,
+          teacher_limit: startRes.teacher_limit, teacher_unlimited: startRes.teacher_unlimited,
+          timeout_sec: startRes.timeout_sec, disabled: startRes.disabled === true
+            ? true : (liveWatchStatusInfo ? liveWatchStatusInfo.disabled === true : false)
+        });
+        updateLiveWatchIndicators(liveWatchStatusInfo);
+      }
+    }
+
+    /** 1枠を停止する（枠を閉じた・タブ非表示・自動タイムアウト）。 */
+    async function stopLiveWatch(studentId, reason) {
+      await stopLiveWatchList([studentId], reason);
+    }
+
+    /** まとめて停止し、GAS 側の枠を解放する。 */
+    async function stopLiveWatchList(studentIds, reason) {
+      const ids = (Array.isArray(studentIds) ? studentIds : []).map(String).filter(Boolean);
+      if (!ids.length) return;
+      // 先に手元の枠を閉じる（通信を待たずに即座に UI を解放する）
+      const drop = {};
+      ids.forEach(function (id) { drop[id] = true; });
+      liveWatchSlots = liveWatchSlots.filter(function (s) { return !drop[String(s.studentId)]; });
+      renderLiveWatchGrid();
+      if (liveWatchSlots.length === 0) stopLiveWatchPolling();
+
+      try {
+        const res = await apiRequest({ action: 'live_watch_stop', student_ids: ids });
+        if (res && typeof res.used === 'number') {
+          liveWatchStatusInfo = Object.assign({}, liveWatchStatusInfo || {}, {
+            used: res.used, max: res.max, remaining: res.remaining,
+            teacher_used: res.teacher_used, teacher_limit: res.teacher_limit,
+            teacher_unlimited: res.teacher_unlimited
+          });
+          updateLiveWatchIndicators(liveWatchStatusInfo);
+        }
+      } catch (e) {
+        // 停止要求が届かなくても TTL（25秒）で自動解放されるため、UI は閉じたままにする。
+        console.warn('live_watch_stop 送信失敗（TTLで自動解放されます）:', e && e.message ? e.message : e);
+      }
+      if (reason === 'hidden') {
+        showToast('タブが非表示になったためライブ視聴を停止しました', 'info');
+      } else if (reason === 'timeout') {
+        showToast('自動タイムアウトのためライブ視聴を停止しました', 'info');
+      }
+    }
+
+    /** すべてのライブ枠を停止する。 */
+    async function stopAllLiveWatch(reason) {
+      const ids = liveWatchSlots.map(function (s) { return s.studentId; });
+      if (!ids.length) {
+        stopLiveWatchPolling();
+        return;
+      }
+      await stopLiveWatchList(ids, reason || 'all');
+    }
+
+    function startLiveWatchPolling() {
+      stopLiveWatchPolling();
+      liveWatchPollTimer = setInterval(liveWatchPollTick, LIVE_WATCH_POLL_MS);
+    }
+
+    function stopLiveWatchPolling() {
+      if (liveWatchPollTimer) { clearInterval(liveWatchPollTimer); liveWatchPollTimer = null; }
+      liveWatchLastExtendAt = 0;
+    }
+
+    /**
+     * ポーリング 1 周期分。
+     *   ① 管理設定の自動タイムアウト満了した枠を停止する
+     *   ② 10 秒ごとに延長ハートビートを送る（TTL を切らさない）
+     *   ③ 画像を取得して枠へ反映する（in-flight 排他で多重送信しない）
+     */
+    async function liveWatchPollTick() {
+      if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
+      if (document.hidden === true) return; // 非表示中は送らない（復帰時に再開）
+
+      // ① 自動タイムアウト
+      const timeoutMs = getLiveWatchTimeoutSec() * 1000;
+      const now = Date.now();
+      const expired = liveWatchSlots.filter(function (s) {
+        return timeoutMs > 0 && s.openedAt > 0 && (now - s.openedAt) >= timeoutMs;
+      }).map(function (s) { return s.studentId; });
+      if (expired.length) {
+        await stopLiveWatchList(expired, 'timeout');
+        if (liveWatchSlots.length === 0) return;
+      }
+
+      const ids = liveWatchSlots.map(function (s) { return s.studentId; });
+
+      // ② 延長（10 秒ごと）
+      if (!liveWatchLastExtendAt || (now - liveWatchLastExtendAt) >= LIVE_WATCH_EXTEND_MS) {
+        liveWatchLastExtendAt = now;
+        try {
+          const ext = await apiRequest({ action: 'live_watch_extend', student_ids: ids });
+          const results = (ext && Array.isArray(ext.results)) ? ext.results : [];
+          const dead = results.filter(function (r) {
+            return r && r.success !== true &&
+              (r.code === 'LIVE_WATCH_SESSION_EXPIRED' || r.code === 'LIVE_WATCH_DISABLED');
+          }).map(function (r) { return r.student_id; });
+          if (dead.length) {
+            // GAS 側で枠が消えている（タイムアウト／管理者が無効化）→ 手元も閉じる
+            const drop = {};
+            dead.forEach(function (id) { drop[String(id)] = true; });
+            liveWatchSlots = liveWatchSlots.filter(function (s) { return !drop[String(s.studentId)]; });
+            renderLiveWatchGrid();
+            if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
+          }
+        } catch (eExt) { /* 延長失敗は次周期で再試行（TTL 25 秒あるため猶予あり） */ }
+      }
+
+      // ③ 画像取得（in-flight 排他）
+      if (liveWatchFramesFetching) return;
+      const wantIds = liveWatchSlots.map(function (s) { return s.studentId; });
+      if (!wantIds.length) return;
+      liveWatchFramesFetching = true;
+      try {
+        const res = await apiRequest({ action: 'live_watch_frames', student_ids: wantIds });
+        if (res && Array.isArray(res.data)) updateLiveWatchImages(res.data);
+      } catch (eF) {
+        // 画像 1 枚の失敗で枠を閉じない（次の周期で取り直す）
+      } finally {
+        liveWatchFramesFetching = false;
+      }
+    }
+
+    // ---- 管理設定（ライブ視聴）: 監視モーダル内の入力補助 ----
+
+    /** 「任意の秒数」を選んだときだけ数値入力を表示する。 */
+    function syncLiveWatchTimeoutCustom() {
+      const sel = document.getElementById('liveWatchTimeoutSec');
+      const inp = document.getElementById('liveWatchTimeoutCustom');
+      const unit = document.getElementById('liveWatchTimeoutCustomUnit');
+      const custom = !!(sel && sel.value === 'custom');
+      if (inp) inp.classList.toggle('hidden', !custom);
+      if (unit) unit.classList.toggle('hidden', !custom);
+    }
+
+    /** 保存済みの設定値をモーダルへ反映する（openMonitoringModal から呼ぶ）。 */
+    function applyLiveWatchSettingsToModal(s) {
+      const src = s || {};
+      const sel = document.getElementById('liveWatchPerTeacherLimit');
+      if (sel) {
+        const v = (src.live_watch_per_teacher_limit === undefined || src.live_watch_per_teacher_limit === null)
+          ? '3' : String(src.live_watch_per_teacher_limit);
+        const exists = Array.prototype.some.call(sel.options || [], function (o) { return o.value === v; });
+        sel.value = exists ? v : '3';
+      }
+
+      const tsel = document.getElementById('liveWatchTimeoutSec');
+      const tinp = document.getElementById('liveWatchTimeoutCustom');
+      const t = Number(src.live_watch_timeout_sec);
+      const presets = ['60', '180', '300', '600', '900'];
+      if (tsel) {
+        if (isFinite(t) && t > 0 && presets.indexOf(String(t)) >= 0) {
+          tsel.value = String(t);
+          if (tinp) tinp.value = '';
+        } else if (isFinite(t) && t > 0) {
+          tsel.value = 'custom';
+          if (tinp) tinp.value = String(t);
+        } else {
+          tsel.value = '180';
+        }
+      }
+      syncLiveWatchTimeoutCustom();
+
+      const infoEl = document.getElementById('liveWatchSettingsInfo');
+      if (infoEl) {
+        const lim = (src.live_watch_per_teacher_limit !== undefined)
+          ? src.live_watch_per_teacher_limit : 3;
+        const tmo = (src.live_watch_timeout_sec !== undefined) ? src.live_watch_timeout_sec : 180;
+        infoEl.textContent = '現在の設定: 1教員あたり ' +
+          (String(lim) === '-1' ? '無限' : (String(lim) + '台')) +
+          ' ／ 自動タイムアウト ' + String(tmo) + '秒';
+      }
+    }
+
+    /** モーダルの入力値から保存用の2項目を組み立てる。 */
+    function readLiveWatchSettingsFromModal() {
+      const sel = document.getElementById('liveWatchPerTeacherLimit');
+      const tsel = document.getElementById('liveWatchTimeoutSec');
+      const tinp = document.getElementById('liveWatchTimeoutCustom');
+
+      let limit = 3;
+      if (sel && sel.value !== '') {
+        const n = Number(sel.value);
+        limit = isFinite(n) ? n : 3;
+      }
+
+      let timeout = 180;
+      if (tsel) {
+        if (tsel.value === 'custom') {
+          const n = Number(tinp ? tinp.value : '');
+          if (isFinite(n) && n > 0) timeout = Math.round(n);
+        } else {
+          const n = Number(tsel.value);
+          if (isFinite(n) && n > 0) timeout = Math.round(n);
+        }
+      }
+      return {
+        live_watch_per_teacher_limit: limit,
+        live_watch_timeout_sec: timeout
+      };
     }
 
     // ==================== 画面一覧（押下時のみ取得） ====================
@@ -6409,6 +7046,9 @@
         if (blockedEl) blockedEl.value = (Array.isArray(s.blocked_domains) ? s.blocked_domains : []).join('\n');
         if (learningEl) learningEl.value = (Array.isArray(s.learning_domains) ? s.learning_domains : []).join('\n');
 
+        // 【R56】管理アカウント専用のライブ視聴設定（上限・自動タイムアウト）を反映する。
+        applyLiveWatchSettingsToModal(s);
+
         if (infoEl) {
           infoEl.textContent = s.updated_at
             ? `最終更新: ${s.updated_at}${s.updated_by ? '（' + s.updated_by + '）' : ''}`
@@ -6440,6 +7080,10 @@
         return;
       }
 
+      // 【R56】ライブ視聴の2項目（1教員あたり上限・自動タイムアウト秒）を同時に保存する。
+      //   保存先は PropertiesService（MONITOR_SETTINGS_V1）のみ。子GAS へも shard_apply で伝播する。
+      const liveWatchSettings = readLiveWatchSettingsFromModal();
+
       try {
         showToast('監視設定を保存中...', 'info');
         await apiRequest({
@@ -6447,7 +7091,9 @@
           settings: {
             enabled: enabled,
             blocked_domains: blocked,
-            learning_domains: learning
+            learning_domains: learning,
+            live_watch_per_teacher_limit: liveWatchSettings.live_watch_per_teacher_limit,
+            live_watch_timeout_sec: liveWatchSettings.live_watch_timeout_sec
           }
         });
         showToast(enabled ? 'サイト監視を有効にしました' : 'サイト監視を無効にしました', 'success');
@@ -6455,6 +7101,8 @@
         // 注意マークの表示／非表示を即座に反映する
         refreshSuppressedUntil = 0;
         await loadDevices();
+        // 【R56】上限・タイムアウトの変更を教員画面のインジケーターへ即時反映する。
+        try { await refreshLiveWatchStatus(true); } catch (eLW) {}
       } catch (err) {
         showToast('監視設定の保存に失敗しました: ' + err.message, 'error');
       }

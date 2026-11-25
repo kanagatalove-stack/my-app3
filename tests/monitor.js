@@ -61,12 +61,21 @@ let bundle = '';
 [
   'normalizeMonitorHost', 'hostMatchesAnyDomain', 'isWebUrlForMonitoring', 'getMonitoringSettings',
   'sanitizeMonitorDomainList', 'saveMonitoringSettings', 'evaluateUrlForMonitoring',
-  'applyMonitorVisibility', 'parseUrlList', 'parseBoolean', 'isAdminTeacher'
+  'applyMonitorVisibility', 'parseUrlList', 'parseBoolean', 'isAdminTeacher',
+  // 【v1.6.8】getMonitoringSettings / saveMonitoringSettings が参照するライブ視聴設定の正規化
+  'normalizeLiveWatchPerTeacherLimit', 'normalizeLiveWatchTimeoutSec'
 ].forEach(n => { bundle += extract(n) + '\n'; });
 bundle += extractConst('MONITOR_PROP_KEY') + '\n';
 bundle += extractConst('MONITOR_MAX_DOMAINS') + '\n';
 bundle += extractConst('MONITOR_DEFAULT_LEARNING_DOMAINS') + '\n';
 bundle += extractConst('MONITOR_DEFAULT_BLOCKED_DOMAINS') + '\n';
+// 【v1.6.8】ライブ視聴設定の既定値・上限（getMonitoringSettings の既定値が参照する）
+bundle += extractConst('LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT') + '\n';
+bundle += extractConst('LIVE_WATCH_DEFAULT_TIMEOUT_SEC') + '\n';
+bundle += extractConst('LIVE_WATCH_MAX_PER_TEACHER_LIMIT') + '\n';
+bundle += extractConst('LIVE_WATCH_UNLIMITED') + '\n';
+bundle += extractConst('LIVE_WATCH_MIN_TIMEOUT_SEC') + '\n';
+bundle += extractConst('LIVE_WATCH_MAX_TIMEOUT_SEC') + '\n';
 
 vm.createContext(ctx);
 vm.runInContext(bundle, ctx);
