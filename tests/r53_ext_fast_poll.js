@@ -1,5 +1,5 @@
 // ============================================================================
-// r53_ext_fast_poll.js — 拡張機能の稼働中高精度ポーリング（r53 で追加 / v1.6.9 時点の版数で検証）
+// r53_ext_fast_poll.js — 拡張機能の稼働中高精度ポーリング（r53 で追加 / v1.6.10 時点の版数で検証）
 //
 //  実機症状（GAS 側の高速化 8e11e53 / 5af5e0e 完了後）
 //    GAS は最速 2〜4 秒で反映するようになったが、拡張機能 (MV3) の
@@ -360,18 +360,18 @@ check('F6 教員コンソール以外からの稼働通知は拒否したまま�
   /script\\\.google\\\.com/.test(contentSrc));
 
 // ============================================================================
-// 8. 版数と固定仕様（v1.6.9 / default_popup なし / DEFAULT_GAS_URL ''）
+// 8. 版数と固定仕様（v1.6.10 / default_popup なし / DEFAULT_GAS_URL ''）
 // ============================================================================
 console.log('\n===== G. 版数と固定仕様 =====');
 
-check('G1 manifest.version は 1.6.9', manifest.version === '1.6.9', manifest.version);
+check('G1 manifest.version は 1.6.10', manifest.version === '1.6.10', manifest.version);
 check('G2 default_popup を設けていない（児童のアイコン操作は無反応）',
   !((manifest.action || {}).default_popup));
 check('G3 DEFAULT_GAS_URL は空文字のまま',
   /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 check('G4 manifest_version は 3 のまま', manifest.manifest_version === 3);
 
-// 出荷物（dist）が 1.6.9 であること
+// 出荷物（dist）が 1.6.10 であること
 function zipManifest(file) {
   try {
     const out = execSync('unzip -p ' + JSON.stringify(path.join(ROOT, 'dist', file)) + ' manifest.json',
@@ -383,13 +383,13 @@ const sm = zipManifest('store.zip');
 const dm = zipManifest('direct.zip');
 let xml = '';
 try { xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8'); } catch (e) { xml = ''; }
-check('G5 dist/store.zip の manifest.version は 1.6.9', !!sm && sm.version === '1.6.9',
+check('G5 dist/store.zip の manifest.version は 1.6.10', !!sm && sm.version === '1.6.10',
   sm && sm.version);
 check('G6 dist/store.zip に default_popup が無い',
   !!sm && !((sm.action || {}).default_popup));
-check('G7 dist/direct.zip の manifest.version も 1.6.9', !!dm && dm.version === '1.6.9',
+check('G7 dist/direct.zip の manifest.version も 1.6.10', !!dm && dm.version === '1.6.10',
   dm && dm.version);
-check('G8 dist/update.xml の version は 1.6.9', /version='1\.6\.9'/.test(xml));
+check('G8 dist/update.xml の version は 1.6.10', /version='1\.6\.10'/.test(xml));
 check('G9 ストア版 background.js は extension/background.js と一致（旧版混入なし）',
   (function () {
     try {

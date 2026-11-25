@@ -3738,6 +3738,15 @@ function liveWatchApplyBatchSharded(teacher, studentIds, op) {
  * 親GAS側: 子GASから最新フレームを並列取得し、ローカルの分とマージする。
  *   同一児童が複数の GAS に存在し得るため「新しい at（撮影時刻）を優先」する。
  *   live_watch は OR（どこかで視聴中なら true）。
+ *
+ * 【R59】フレーム取得は絶対にキャッシュしない。
+ *   管理画面は 1.3 秒周期で叩くため、ここで 1 秒でも古い画像を返すと
+ *   「切り替わりが遅い」という症状に直結する。よって
+ *     ・local（親のキャッシュ）は常に読み直す（CacheService の値をそのまま使う）
+ *     ・子GASへは毎回 shardFetchMany で並列に取りに行く（結果を保持しない）
+ *   とする。古いフレームを溜める余地を作らないことが、速度の前提になる。
+ *   ※ liveWatchStatusSharded 側の短時間キャッシュ（2 秒）は「使用枠の集計」だけを
+ *     対象にしており、画像には一切使っていない（status が 2 秒古くても画像は最新）。
  */
 function liveWatchGetFramesSharded(studentIds, teacher) {
   const ids = Array.isArray(studentIds) ? studentIds : [];
@@ -3749,6 +3758,7 @@ function liveWatchGetFramesSharded(studentIds, teacher) {
   try { secret = String(shardConfigCached().sec || ''); } catch (e) { secret = ''; }
   let parsed = [];
   try {
+    // 【R59】毎回その場で子GASへ並列取得する（キャッシュを持たない）
     parsed = liveWatchShardPost_(urls, {
       action: LIVE_WATCH_SHARD_FRAMES,
       shard_secret: secret,

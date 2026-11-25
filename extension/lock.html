@@ -22,8 +22,7 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      /* 【v1.6.9 / R58】上部の状態帯と重ならないよう上側だけ余白を広げる */
-      padding: 104px 24px 24px;
+      padding: 24px;
       min-height: 100vh;
     }
     .lock-card {
@@ -50,35 +49,6 @@
       animation: lockPulse 2s ease-in-out infinite;
     }
     .lock-icon-wrap svg { width: 42px; height: 42px; stroke: #ef4444; }
-    /* 【v1.6.9 / R58】横幅480px前後のサムネイルでも「ロック中」と一目で分かる
-       上部の帯。ライブ視聴・画面一覧に写ったときの視認性を最優先する。 */
-    .lock-status-bar {
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 12px;
-      padding: 18px 20px;
-      background: linear-gradient(90deg, #b91c1c 0%, #ef4444 50%, #b91c1c 100%);
-      color: #ffffff;
-      font-size: 26px;
-      font-weight: 800;
-      letter-spacing: 0.04em;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-      z-index: 10;
-    }
-    .lock-status-emoji { font-size: 30px; line-height: 1; }
-    .lock-status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #ffffff;
-      opacity: 0.9;
-      animation: lockPing 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
-    }
     .lock-title {
       font-size: 32px;
       font-weight: 800;
@@ -158,15 +128,6 @@
   </style>
 </head>
 <body>
-  <!-- 【v1.6.9 / R58】ライブ視聴・画面一覧に写ったときに「ロック中」と
-       一目で分かる状態帯。縮小サムネイル（480px前後）でも判別できる。 -->
-  <div class="lock-status-bar">
-    <span class="lock-status-emoji" aria-hidden="true">🔒</span>
-    <span>画面ロック中</span>
-    <span class="lock-status-dot" aria-hidden="true"></span>
-    <span style="font-size:16px;font-weight:700;opacity:0.92;">端末は規制されています</span>
-  </div>
-
   <div class="lock-card">
     <div class="lock-icon-wrap">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

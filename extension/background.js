@@ -1321,11 +1321,15 @@ async function syncWithGas() {
     wakeRetryBudget = 0;   // 成功したら短い再試行の予算は使い切る
     clearWakeRetry();
 
-    // 【v1.6.8】準リアルタイム画面視聴: 送信は既存の 1.5 秒ポーリングに同期させる。
-    //   live_watch === true の端末だけが撮影し、in-flight 排他で多重送信しない。
-    //   同期の成功処理を済ませた後に実行するため、失敗しても状態更新へ影響しない。
+    // 【v1.6.8】準リアルタイム画面視聴: live_watch === true の端末だけが撮影し、
+    //   in-flight 排他で多重送信しない。
+    // 【R59】1 枚目は applyLiveWatchFlag（false→true の遷移）が即座に撮る。
+    //   ここでは「SW が再起動して独立ループが消えた場合の張り直し」を兼ねて、
+    //   追撃の 1 回とループの再開だけを行う（await しない＝ハートビートを遅らせない。
+    //   実際の撮影間隔は独立ループが 1.2 秒で刻む）。
     try {
-      if (liveWatchActive === true) await liveWatchCaptureOnce();
+      if (liveWatchActive === true) liveWatchCaptureOnce();
+      startLiveWatchLoop();
     } catch (eLWC) {}
 
   } catch (err) {
@@ -1899,25 +1903,40 @@ async function downscaleForSheet(dataUrl) {
 // 【v1.6.8】準リアルタイム画面視聴（指定端末のみの軽量キャプチャ送信）
 //
 //   教員コンソールで「ライブ視聴」を開始した児童端末だけが、ハートビート応答の
-//   live_watch === true を受け取る。その端末だけが 1.5 秒ポーリングのたびに
-//   アクティブタブを撮影し、教員が見やすい軽量JPEGに縮小して子GASへ送る。
+//   live_watch === true を受け取る。その端末だけがアクティブタブを撮影し、
+//   教員が見やすい軽量JPEGに縮小して子GASへ送る。
 //
 //   固定仕様:
 //     ・撮影は chrome.tabs.captureVisibleTab（JPEG・低品質）のみ。
-//     ・OffscreenCanvas で横幅 480px 前後に縮小し、Base64 30,000 文字以内に収める。
-//     ・送信は既存の 1.5 秒ポーリング周期に同期（独立タイマーは増やさない）。
+//     ・OffscreenCanvas で横幅 420〜480px に縮小し、Base64 30,000 文字以内に収める。
 //     ・liveWatchInFlight による排他制御で多重送信しない。
 //     ・live_watch === false になった瞬間に停止する（撮影もしない）。
 //     ・新規権限は不要（tabs / host_permissions は既存のまま）。
+//
+//   【R59】画像の切り替わりを約 6 秒 → 1.5〜2.5 秒へ短縮する。
+//     ・live_watch が false → true に変わった瞬間に 1 枚目を撮る（1.5 秒待たない）。
+//     ・以後はハートビートの完了を待たない独立ループ（1.2 秒）で撮影・送信する。
+//       同期通信が遅い時間帯でも、画像の更新ペースは独立して保たれる。
+//     ・1 枚あたり 12〜18KB（横幅 420〜480px・品質 30〜35%）へ軽量化し、
+//       転送と管理画面のデコードを短くする。
+//     ・ACTIVE_SYNC_MS（1.5 秒）と LIVE_WATCH_MAX_B64（30,000）は維持する。
 // ============================================================================
 const LIVE_WATCH_MAX_B64 = 30000;          // 送信する Base64 の上限（要件: 30,000 文字以内）
-const LIVE_WATCH_TARGET_WIDTH = 480;       // 目標の横幅（要件: 480px 前後）
+const LIVE_WATCH_TARGET_MAX_B64 = 18000;   // 【R59】目標サイズの上限（12〜18KB）
+const LIVE_WATCH_TARGET_MIN_B64 = 12000;   // 【R59】目標サイズの下限（12KB を下回るなら画質を上げる）
+const LIVE_WATCH_TARGET_WIDTH = 480;       // 目標の横幅（要件: 420〜480px）
 const LIVE_WATCH_MIN_WIDTH = 240;          // 縮小の下限（これ以上は落とさない）
-const LIVE_WATCH_QUALITIES = [0.5, 0.42, 0.34, 0.28, 0.22, 0.16];
-const LIVE_WATCH_CAPTURE_QUALITY = 40;     // captureVisibleTab の品質（低品質設定）
+// 【R59】品質は 30〜35% を起点にする（従来 50% 起点）。1 枚あたり 12〜18KB に収まり、
+//   子GAS への転送と管理画面のデコードが軽くなり、画像の切り替わりが速くなる。
+const LIVE_WATCH_QUALITIES = [0.35, 0.32, 0.30, 0.26, 0.22, 0.16];
+const LIVE_WATCH_CAPTURE_QUALITY = 35;     // captureVisibleTab の品質（30〜35%）
+// 【R59】ライブ視聴専用ループの周期（1.0〜1.5 秒）。ハートビート（1.5 秒）とは
+//   独立して回すため、同期通信が遅い時間帯でも画像の更新ペースを保てる。
+const LIVE_WATCH_LOOP_MS = 1200;
 let liveWatchActive = false;               // ハートビート応答 live_watch の写し
 let liveWatchInFlight = false;             // 送信の多重実行ガード（in-flight 排他）
 let liveWatchLastSentMs = 0;               // 直近の送信時刻（診断用）
+let liveWatchLoopTimer = null;             // 【R59】独立ループのタイマー（常に1本）
 
 /** ArrayBuffer → Base64（Service Worker には btoa がある）。 */
 function bufferToBase64_(buf) {
@@ -1931,14 +1950,25 @@ function bufferToBase64_(buf) {
 }
 
 /**
- * ライブ視聴用の縮小。横幅 480px 前後を起点に、Base64 が上限に収まるまで
- * 幅と品質を段階的に落とす。収まらなければ null（壊れたデータは送らない）。
+ * ライブ視聴用の縮小。横幅 420〜480px を起点に、Base64 が 12〜18KB に収まる
+ * 幅と品質を選ぶ。30,000 文字（上限）は「超えてはいけない線」として別に守る。
+ *
+ * 【R59】従来は「30,000 文字に収まればよい」だったため 1 枚が 25〜30KB になり、
+ *   子GAS への転送と管理画面のデコードに時間がかかっていた。12〜18KB を目標に
+ *   することで、画質は実用のまま切り替わりが速くなる。
+ *   ・目標上限（18,000）以内に収まった最初の候補を採用する。
+ *   ・最後まで収まらなければ、上限（30,000）以内で最も小さい候補を返す。
+ *   ・どれも上限を超えるなら null（壊れたデータは送らない）。
  */
 async function downscaleForLiveWatch(dataUrl) {
   const raw = String(dataUrl || '');
   const originalB64 = raw.replace(/^data:image\/[a-z]+;base64,/i, '');
-  if (originalB64.length <= LIVE_WATCH_MAX_B64) return raw;
-  if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') return null;
+  // 目標サイズ（18KB）に既に収まっていればそのまま送る（無駄な再エンコードをしない）
+  if (originalB64.length <= LIVE_WATCH_TARGET_MAX_B64) return raw;
+  if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') {
+    // 縮小できない環境: 上限（30,000）以内なら原寸のまま送る
+    return originalB64.length <= LIVE_WATCH_MAX_B64 ? raw : null;
+  }
 
   let bitmap;
   try {
@@ -1948,6 +1978,7 @@ async function downscaleForLiveWatch(dataUrl) {
     return null;
   }
 
+  let best = null;         // 上限内での最良候補（目標に届かないときの保険）
   try {
     let w = Math.min(LIVE_WATCH_TARGET_WIDTH, bitmap.width);
     while (w >= LIVE_WATCH_MIN_WIDTH) {
@@ -1961,17 +1992,27 @@ async function downscaleForLiveWatch(dataUrl) {
       for (let qi = 0; qi < LIVE_WATCH_QUALITIES.length; qi++) {
         const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: LIVE_WATCH_QUALITIES[qi] });
         const b64 = bufferToBase64_(await blob.arrayBuffer());
-        if (b64.length <= LIVE_WATCH_MAX_B64) return 'data:image/jpeg;base64,' + b64;
+        if (b64.length > LIVE_WATCH_MAX_B64) continue;   // 上限超過は使わない
+        const out = 'data:image/jpeg;base64,' + b64;
+        // 目標レンジ（12〜18KB）に収まったら即採用（品質優先で最初に見つかったもの）
+        if (b64.length >= LIVE_WATCH_TARGET_MIN_B64 && b64.length <= LIVE_WATCH_TARGET_MAX_B64) return out;
+        // 上限内だが目標より小さい/大きい → 保険として保持し、次候補を試す
+        if (!best || b64.length < best.length) best = out;
+        if (b64.length <= LIVE_WATCH_TARGET_MAX_B64) {
+          // 目標上限には収まっている → これ以上幅を縮める必要はない
+          break;
+        }
       }
-      // 画質を落としきっても収まらないときは幅を縮める
+      if (best && best.replace(/^data:image\/[a-z]+;base64,/i, '').length <= LIVE_WATCH_TARGET_MAX_B64) break;
+      // 画質を落としきっても目標に収まらないときは幅を縮める
       w = Math.round(w * 0.8);
     }
   } catch (e) {
-    return null;
+    return best;
   } finally {
     try { bitmap.close(); } catch (e) {}
   }
-  return null;
+  return best;   // 目標に届かなくても上限内なら送る（送信ゼロにしない）
 }
 
 // 【v1.6.8 / R57】Service Worker 環境では OffscreenCanvas / createImageBitmap が
@@ -2251,8 +2292,14 @@ function restrictionStateForTab_(data, tabUrl) {
 
 /**
  * live_watch フラグの反映（毎ハートビートで呼ばれる）。
- *   true  … 以後のポーリングで撮影・送信を開始する
- *   false … 即座に停止する（以降の撮影もしない）
+ *   true  … 即座に 1 枚目を撮影・送信し、以後 1.2 秒周期の独立ループを回す
+ *   false … 即座に停止する（以降の撮影もしない・ループも止める）
+ *
+ * 【R59】従来は「次の 1.5 秒ポーリングを待ってから」1 枚目を撮っていたため、
+ *   教員が「ライブ視聴を開始」してから最初の画像が出るまで最大 1.5 秒＋往復待ち
+ *   かかっていた。false → true の遷移を検知した瞬間に撮ることで待ちを無くす。
+ *   また、撮影・送信はハートビートの完了を待たずに独立ループで回すため、
+ *   ハートビートが遅い時間帯でも画像の更新は 1.2 秒周期を保てる。
  */
 async function applyLiveWatchFlag(flag) {
   const next = flag === true;
@@ -2262,12 +2309,52 @@ async function applyLiveWatchFlag(flag) {
     // 停止指示が来た瞬間にフラグを落とす。実行中の送信は完了させ、
     // 以後の新しい撮影は liveWatchActive を見て開始しない（即時停止）。
     liveWatchLastSentMs = 0;
+    stopLiveWatchLoop();
   }
   try {
     await chrome.storage.local.set({ live_watch_active: next });
   } catch (e) {}
   console.log('[EduAgent] ライブ視聴:', next ? '開始（指定端末として撮影を送信します）' : '停止（撮影を止めました）');
+  if (next) {
+    // 【R59】遷移した瞬間に 1 枚目を撮る（await しない＝ハートビートを遅らせない）。
+    try { liveWatchCaptureOnce(); } catch (eNow) {}
+    startLiveWatchLoop();
+  }
   return liveWatchActive;
+}
+
+/**
+ * 【R59】ライブ視聴専用の独立ループ（1.2 秒周期）。
+ *   ・ハートビート（syncWithGas）の完了を待たない。待つと通信が遅い時間帯に
+ *     画像の更新まで一緒に遅れてしまう。
+ *   ・多重起動しないようタイマーは常に 1 本だけ保持する（setTimeout チェーン）。
+ *   ・liveWatchInFlight により、前回の送信が終わる前に次を投げない。
+ *   ・live_watch が false になった瞬間に止まる（無駄な撮影を続けない）。
+ *   ・新規権限は不要（既存の tabs / host_permissions のみ）。
+ */
+function stopLiveWatchLoop() {
+  if (liveWatchLoopTimer) {
+    try { clearTimeout(liveWatchLoopTimer); } catch (e) {}
+    liveWatchLoopTimer = null;
+  }
+}
+
+function scheduleLiveWatchLoop() {
+  if (!liveWatchActive) { stopLiveWatchLoop(); return; }
+  if (liveWatchLoopTimer) return;   // 常に 1 本だけ（多重起動しない）
+  liveWatchLoopTimer = setTimeout(function () {
+    liveWatchLoopTimer = null;
+    if (!liveWatchActive) { stopLiveWatchLoop(); return; }
+    Promise.resolve()
+      .then(function () { return liveWatchCaptureOnce(); })
+      .catch(function () {})
+      .then(function () { scheduleLiveWatchLoop(); });
+  }, LIVE_WATCH_LOOP_MS);
+}
+
+function startLiveWatchLoop() {
+  if (!liveWatchActive) return;
+  scheduleLiveWatchLoop();
 }
 
 /**
@@ -2333,10 +2420,17 @@ async function liveWatchCaptureOnce() {
         // 【R57】縮小（OffscreenCanvas）が使えない Service Worker でも送信が
         //   握りつぶされないよう、失敗時は撮影品質を段階的に落として再撮影する。
         //   1 枚目が既に上限内ならそのまま使う（無駄な再撮影をしない）。
+        // 【R59】目標は 12〜18KB。18,000 文字を超えていたら縮小して軽くする
+        //   （転送とデコードが軽くなり、管理画面の切り替わりが速くなる）。
         const rawLen = String(raw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
-        dataUrl = rawLen > LIVE_WATCH_MAX_B64
-          ? await captureLightweightLiveFrame_(tab.windowId)
-          : raw;
+        if (rawLen > LIVE_WATCH_TARGET_MAX_B64) {
+          const scaled = await downscaleForLiveWatch(raw);
+          dataUrl = scaled || (rawLen > LIVE_WATCH_MAX_B64
+            ? await captureLightweightLiveFrame_(tab.windowId)
+            : raw);
+        } else {
+          dataUrl = raw;
+        }
       }
     }
 

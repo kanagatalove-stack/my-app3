@@ -2201,6 +2201,55 @@
       return data;
     }
 
+    // ==================================================================
+    // 【R59】ライブ視聴フレーム（live_watch_frames）の /exec 直送
+    //
+    //   実機ではライブ視聴の画像が切り替わるまで約 6 秒かかっていた。
+    //   拡張機能は 1.5 秒で撮影・送信しているのに、管理画面側の取得が
+    //   google.script.run の callback?nocache_id= ポーリング（実測 3.6〜7.1 秒）
+    //   を通っていたため、往復待ちがそのまま「切り替わりの遅さ」になっていた。
+    //   R55 の get_all と同じく /exec へ直送し、往復を 1 回分にする。
+    //
+    //   ・失敗（URL未設定・ネットワーク断・タイムアウト）だけ google.script.run
+    //     へ退避する（環境差で画像が取れなくなることはない）。
+    //   ・認証切れ（need_auth）は退避しない（再ログイン導線を二重に走らせない）。
+    //   ・直送が続けて失敗する環境では、毎回タイムアウトを待つと遅くなるため
+    //     一定時間だけ従来経路を優先する（クールダウン）。
+    // ==================================================================
+    const LIVE_FRAME_FETCH_TIMEOUT_MS = 9000;   // フレーム取得の上限（画像 1〜数枚）
+    const LIVE_FRAME_DIRECT_COOLDOWN_MS = 10000;
+    let liveFramesDirectCooldownUntil = 0;
+
+    async function apiRequestDirectLiveFrames(payload) {
+      const apiUrl = getApiUrl();
+      if (!apiUrl) {
+        const e = new Error('GAS APIエンドポイントが取得できません。');
+        e.noFallback = false;
+        throw e;
+      }
+      const body = Object.assign({}, payload);
+      if (authToken) body.token = authToken;
+      const res = await eduFetchWithTimeout(apiUrl, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        redirect: 'follow'
+      }, LIVE_FRAME_FETCH_TIMEOUT_MS);
+      const data = await res.json();
+      if (data && data.need_auth) {
+        logout();
+        const e = new Error('セッションの有効期限が切れました。再ログインしてください。');
+        e.noFallback = true;
+        throw e;
+      }
+      if (data && data.success === false) {
+        const e = new Error(data.error || 'リクエスト処理に失敗しました');
+        e.noFallback = true;   // サーバーが明示的に拒否＝退避しても同じ結果
+        throw e;
+      }
+      return data;
+    }
+
     // fetch に上限時間を付ける。AbortController が無い環境では素の fetch。
     //   ※ テスト環境などで setTimeout が同期実行される場合に備え、
     //     settled フラグで「解決済みなら abort しない」ようにする。
@@ -3192,6 +3241,26 @@
           // ここから下の従来経路へ落ちる（退避）
         }
       }
+      // 【R59】ライブ視聴フレーム（live_watch_frames）も /exec 直送を優先する。
+      //   画像の切り替わりが約 6 秒かかっていたのは、この取得だけが
+      //   google.script.run の callback ポーリング往復（実測 3.6〜7.1 秒）を
+      //   通っていたため。R55 の get_all と同じ扱いに揃える。
+      //   直送が続けて失敗する環境では、クールダウン中だけ従来経路を優先して
+      //   毎回タイムアウトを待つ遅さを避ける（画像は必ず取れる）。
+      const __liveFramesAction = !!(payload && payload.action === 'live_watch_frames');
+      if (__liveFramesAction && Date.now() >= liveFramesDirectCooldownUntil) {
+        try {
+          const __lf = await apiRequestDirectLiveFrames(payload);
+          liveFramesDirectCooldownUntil = 0;
+          return __lf;
+        } catch (eLf) {
+          const __hasRunner2 = (typeof google !== 'undefined' && google.script && google.script.run);
+          if ((eLf && eLf.noFallback) || !__hasRunner2) throw eLf;
+          // 非認証の失敗のみ退避する。次回以降は一定時間だけ従来経路を優先する。
+          liveFramesDirectCooldownUntil = Date.now() + LIVE_FRAME_DIRECT_COOLDOWN_MS;
+          // ここから下の従来経路へ落ちる（退避）
+        }
+      }
       if (__directFetch) {
         // 【R37】応答を待たず、送信と「完全同時（0ms）」に子GASビーコンを撃つ。
         //   親シートの書き込みと子シートの書き込みを時間軸で重ねるため。
@@ -3696,12 +3765,22 @@
     //
     // 【設計】
     //   ・GAS 側のプール（全体 24 台）と管理設定（1教員あたり上限／自動タイムアウト）に従う。
-    //   ・画像は約 1.8 秒間隔で取得する（1.5〜2 秒要件）。取得は /exec 直送で行い、
+    //   ・画像は 1.3 秒間隔で取得する（1.2〜1.5 秒要件）。取得は /exec 直送で行い、
     //     google.script.run の callback ポーリング往復（実測 3.6〜7.1 秒）を避ける。
     //   ・枠が開いている間だけ 10 秒ごとに延長を送る。GAS 側の TTL は 25 秒なので、
     //     ブラウザが強制終了しても 25 秒で自動解放される。
     //   ・枠を閉じた／タブが非表示／自動タイムアウト満了 → 即座に停止 API を呼ぶ。
-    const LIVE_WATCH_POLL_MS = 1800;               // 画像更新の周期（1.5〜2秒）
+    //
+    // 【R59】画像の切り替わりを約 6 秒 → 1.5〜2.5 秒へ短縮する。
+    //   ① 取得経路を /exec 直送にする（上の apiRequestDirectLiveFrames）。
+    //   ② ポーリング周期を 1800ms → 1300ms（1.2〜1.5 秒の範囲）へ短縮する。
+    //   ③ 「ライブ視聴を開始」直後の 6 秒間だけ 900ms 周期で取得し、
+    //      1 枚目が届くまでの待ち時間を縮める。
+    //   ④ in-flight 排他は維持し、古い応答（周回遅れ）は破棄する。
+    //      → 速くしても画像が巻き戻ってちらつくことがない。
+    const LIVE_WATCH_POLL_MS = 1300;               // 通常時の画像更新周期（1.2〜1.5秒）
+    const LIVE_WATCH_BOOT_POLL_MS = 900;           // 開始直後（最初の6秒）の周期（0.8〜1秒）
+    const LIVE_WATCH_BOOT_MS = 6000;               // 「開始直後」とみなす時間
     const LIVE_WATCH_EXTEND_MS = 10000;            // 延長ハートビート（TTL 25 秒より短い）
     const LIVE_WATCH_FALLBACK_TIMEOUT_SEC = 180;   // 管理設定が取れないときの既定
     const LIVE_WATCH_TILE_LIMIT_FALLBACK = 3;      // 管理設定が取れないときの上限
@@ -3712,6 +3791,10 @@
     let liveWatchFramesFetching = false;
     let liveWatchStatusInfo = null;
     let liveWatchVisibilityBound = false;
+    let liveWatchStartedAt = 0;       // 【R59】開始時刻（最初の6秒を判定する）
+    let liveWatchFramesSeq = 0;       // 【R59】取得要求の通し番号（古い応答の破棄用）
+    let liveWatchFramesAppliedSeq = 0;// 【R59】最後に画面へ反映した通し番号
+    let liveWatchFrameAtById = {};    // 【R59】児童ごとの最終反映「撮影時刻」（巻き戻り防止）
 
     /** 管理設定の自動タイムアウト（秒）。取れないときは既定 180 秒。 */
     function getLiveWatchTimeoutSec() {
@@ -3853,6 +3936,14 @@
     }
 
     /** 取得した画像を枠へ反映する（枠の並びは renderLiveWatchGrid が決めた順）。 */
+    /**
+     * 取得した画像を枠へ反映する（枠の並びは renderLiveWatchGrid が決めた順）。
+     *
+     * 【R59】取得周期を 1.3 秒へ縮めたため、応答の到着順が前後することがある。
+     *   児童ごとに「最後に反映した撮影時刻（at）」を覚えておき、それより古い
+     *   フレームは捨てる（＝画像が一瞬前の状態へ巻き戻るのを防ぐ）。
+     *   at が同じ／新しいものだけを反映するので、体感は「速いのに滑らか」になる。
+     */
     function updateLiveWatchImages(frames) {
       const byId = {};
       (frames || []).forEach(function (f) { if (f && f.student_id) byId[String(f.student_id)] = f; });
@@ -3862,6 +3953,12 @@
         const empty = document.getElementById('liveFrameEmpty' + i);
         const meta = document.getElementById('liveFrameMeta' + i);
         if (f && f.data_url) {
+          const sid = String(slot.studentId);
+          const at = Number(f.at) || 0;
+          const seen = Number(liveWatchFrameAtById[sid]) || 0;
+          // 直近に反映したものより古い撮影時刻のフレームは捨てる（巻き戻り防止）
+          if (at > 0 && seen > 0 && at < seen) return;
+          if (at > 0) liveWatchFrameAtById[sid] = at;
           if (img) {
             // src の差し替えだけにする（DOM を作り直さない＝ちらつきを防ぐ）
             if (img.getAttribute('src') !== f.data_url) img.setAttribute('src', f.data_url);
@@ -4047,14 +4144,41 @@
       await stopLiveWatchList(ids, reason || 'all');
     }
 
+    /**
+     * ポーリング周期を決める（【R59】開始直後の 6 秒間だけ速くする）。
+     *   ・「ライブ視聴を開始」直後の 6 秒 … 900ms（1 枚目を素早く出す）
+     *   ・それ以降                     … 1300ms（1.2〜1.5 秒の範囲）
+     */
+    function getLiveWatchPollMs() {
+      if (liveWatchStartedAt > 0 && (Date.now() - liveWatchStartedAt) < LIVE_WATCH_BOOT_MS) {
+        return LIVE_WATCH_BOOT_POLL_MS;
+      }
+      return LIVE_WATCH_POLL_MS;
+    }
+
     function startLiveWatchPolling() {
       stopLiveWatchPolling();
-      liveWatchPollTimer = setInterval(liveWatchPollTick, LIVE_WATCH_POLL_MS);
+      // 【R59】開始直後は短い周期で 1 枚目を取りに行く。6 秒経過後は
+      //   liveWatchPollTick が自分で周期を見直す（resetLiveWatchPollTimer）。
+      liveWatchStartedAt = Date.now();
+      liveWatchFramesSeq = 0;
+      liveWatchFramesAppliedSeq = 0;
+      liveWatchFrameAtById = {};
+      resetLiveWatchPollTimer();
+    }
+
+    /** 現在の周期でタイマーを張り直す（周期が変わるときだけ呼ぶ）。 */
+    function resetLiveWatchPollTimer() {
+      const ms = getLiveWatchPollMs();
+      if (liveWatchPollTimer === ms) return;   // 既に同じ周期で張ってある
+      if (liveWatchPollTimer) { clearInterval(liveWatchPollTimer); liveWatchPollTimer = null; }
+      liveWatchPollTimer = setInterval(liveWatchPollTick, ms);
     }
 
     function stopLiveWatchPolling() {
       if (liveWatchPollTimer) { clearInterval(liveWatchPollTimer); liveWatchPollTimer = null; }
       liveWatchLastExtendAt = 0;
+      liveWatchStartedAt = 0;
     }
 
     /**
@@ -4062,10 +4186,18 @@
      *   ① 管理設定の自動タイムアウト満了した枠を停止する
      *   ② 10 秒ごとに延長ハートビートを送る（TTL を切らさない）
      *   ③ 画像を取得して枠へ反映する（in-flight 排他で多重送信しない）
+     *
+     * 【R59】③ は次の 2 点で「速いのにちらつかない」を担保する。
+     *   ・in-flight 排他: 前の取得が返る前に次を投げない（多重送信しない）。
+     *   ・古い応答の破棄: 通し番号が古い応答は画面へ反映しない（巻き戻り防止）。
+     *   ・児童ごとの撮影時刻: 直近に反映したものより古い画像は捨てる。
      */
     async function liveWatchPollTick() {
       if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
       if (document.hidden === true) return; // 非表示中は送らない（復帰時に再開）
+
+      // 開始直後の速い周期から通常周期へ切り替える（6 秒経過で 1 回だけ）
+      resetLiveWatchPollTimer();
 
       // ① 自動タイムアウト
       const timeoutMs = getLiveWatchTimeoutSec() * 1000;
@@ -4101,13 +4233,19 @@
         } catch (eExt) { /* 延長失敗は次周期で再試行（TTL 25 秒あるため猶予あり） */ }
       }
 
-      // ③ 画像取得（in-flight 排他）
+      // ③ 画像取得（in-flight 排他＋古い応答の破棄）
       if (liveWatchFramesFetching) return;
       const wantIds = liveWatchSlots.map(function (s) { return s.studentId; });
       if (!wantIds.length) return;
       liveWatchFramesFetching = true;
+      liveWatchFramesSeq += 1;
+      const mySeq = liveWatchFramesSeq;
       try {
         const res = await apiRequest({ action: 'live_watch_frames', student_ids: wantIds });
+        // 【R59】自分より新しい要求が既に走っている／走っていたなら、
+        //   この応答は周回遅れ。画面へ反映すると画像が巻き戻るので捨てる。
+        if (mySeq < liveWatchFramesAppliedSeq) return;
+        liveWatchFramesAppliedSeq = mySeq;
         if (res && Array.isArray(res.data)) updateLiveWatchImages(res.data);
       } catch (eF) {
         // 画像 1 枚の失敗で枠を閉じない（次の周期で取り直す）

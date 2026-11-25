@@ -75,8 +75,11 @@ const CONSTS = [
   // 画面一覧（スクリーンショット）
   'SCREENSHOT_MAX_B64', 'SCREENSHOT_WIDTHS', 'SCREENSHOT_QUALITIES',
   // ライブ視聴（軽量キャプチャ）
-  'LIVE_WATCH_MAX_B64', 'LIVE_WATCH_TARGET_WIDTH', 'LIVE_WATCH_MIN_WIDTH',
+  'LIVE_WATCH_MAX_B64', 'LIVE_WATCH_TARGET_MAX_B64', 'LIVE_WATCH_TARGET_MIN_B64',
+  'LIVE_WATCH_TARGET_WIDTH', 'LIVE_WATCH_MIN_WIDTH',
   'LIVE_WATCH_QUALITIES', 'LIVE_WATCH_CAPTURE_QUALITY', 'LIVE_WATCH_FALLBACK_QUALITIES',
+  // 【R59】独立ループの周期（applyLiveWatchFlag が参照する）
+  'LIVE_WATCH_LOOP_MS',
   // 【R58】状態フレーム（ロック中・規制中の代替画像）
   'RESTRICTION_FRAME_WIDTHS', 'RESTRICTION_FRAME_QUALITIES', 'RESTRICTION_FRAME_STATIC'
 ];
@@ -477,9 +480,9 @@ check('D7 ロック中に縮小できなくても状態フレームで送信す�
   envD7.fetched.length ? envD7.fetched[0].body.action : null);
 
 // ============================================================================
-// E. 出荷物と固定仕様（v1.6.9）
+// E. 出荷物と固定仕様（v1.6.10）
 // ============================================================================
-console.log('\n===== E. v1.6.9 出荷物と固定仕様 =====');
+console.log('\n===== E. v1.6.10 出荷物と固定仕様 =====');
 
 function zipEntry(zipPath, entry) {
   return execSync(
@@ -497,7 +500,7 @@ function zipNames(zipPath) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('E1 extension/manifest.json の version は 1.6.9', manifest.version === '1.6.9', manifest.version);
+check('E1 extension/manifest.json の version は 1.6.10', manifest.version === '1.6.10', manifest.version);
 check('E2 default_popup を持たない（児童のアイコン操作は無反応）',
   !manifest.action || !manifest.action.default_popup);
 const perms = (manifest.permissions || []).slice().sort().join(',');
@@ -507,27 +510,52 @@ check("E4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(
 check('E5 ACTIVE_SYNC_MS（1.5 秒）は維持', /const ACTIVE_SYNC_MS = 1500;/.test(bgSrc));
 
 const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-check('E6 dist/store.zip の manifest.version は 1.6.9', sm.version === '1.6.9', sm.version);
+check('E6 dist/store.zip の manifest.version は 1.6.10', sm.version === '1.6.10', sm.version);
 check('E7 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
 
 const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-check('E8 dist/direct.zip の manifest.version も 1.6.9', dm.version === '1.6.9', dm.version);
+check('E8 dist/direct.zip の manifest.version も 1.6.10', dm.version === '1.6.10', dm.version);
 check('E9 dist/direct.zip は検証用（popup.html 同梱）',
   !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
 const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-check("E10 dist/update.xml の version は 1.6.9", /version='1\.6\.9'/.test(xml),
+check("E10 dist/update.xml の version は 1.6.10", /version='1\.6\.10'/.test(xml),
   (xml.match(/version='[^']+'/) || [])[0]);
 
-// ロック画面・規制画面の視認性（480px 前後のサムネイルでも判別できる）
+// 【R59】ロック画面・規制画面の上部ステータス帯は撤去し、R57 以前の構成へ戻した。
+//   状態は「生の画面」ではなく、撮影できない場合の状態フレーム（B/C 節）で伝える。
 const lockHtml = fs.readFileSync(path.join(ROOT, 'extension/lock.html'), 'utf8');
 const blockedHtml = fs.readFileSync(path.join(ROOT, 'extension/blocked.html'), 'utf8');
-check('E11 lock.html に 🔒 と「画面ロック中」の大きな状態表示がある',
-  lockHtml.indexOf('🔒') >= 0 && /画面ロック中/.test(lockHtml) && /lock-status-bar/.test(lockHtml));
-check('E12 blocked.html に 🚫 と「アクセス制限中」の大きな状態表示がある',
-  blockedHtml.indexOf('🚫') >= 0 && /アクセス制限中/.test(blockedHtml) && /lock-status-bar/.test(blockedHtml));
-check('E13 状態帯は縮小サムネイルでも読める大きさ（26px）で描画される',
-  /font-size:\s*26px/.test(lockHtml) && /font-size:\s*26px/.test(blockedHtml));
+check('E11 lock.html から上部ステータス帯を撤去した（.lock-status-bar も CSS も残さない）',
+  lockHtml.indexOf('lock-status-bar') === -1 &&
+  lockHtml.indexOf('lock-status-emoji') === -1 &&
+  lockHtml.indexOf('lock-status-dot') === -1 &&
+  !/font-size:\s*26px/.test(lockHtml));
+check('E12 blocked.html から上部ステータス帯を撤去した（.lock-status-bar も CSS も残さない）',
+  blockedHtml.indexOf('lock-status-bar') === -1 &&
+  blockedHtml.indexOf('lock-status-emoji') === -1 &&
+  blockedHtml.indexOf('lock-status-dot') === -1 &&
+  !/font-size:\s*26px/.test(blockedHtml));
+check('E13 両画面の body 余白は状態帯のぶんを確保しない（padding: 24px へ戻した）',
+  /padding:\s*24px;/.test(lockHtml) && /padding:\s*24px;/.test(blockedHtml) &&
+  lockHtml.indexOf('104px') === -1 && blockedHtml.indexOf('104px') === -1);
+check('E13b blocked.html は「アクセスが制限されています」より下の要素を全部削除した',
+  blockedHtml.indexOf('lock-subtitle') === -1 &&
+  blockedHtml.indexOf('lock-notice') === -1 &&
+  blockedHtml.indexOf('lock-detail') === -1 &&
+  blockedHtml.indexOf('blockedUrl') === -1 &&
+  blockedHtml.indexOf('filterMode') === -1 &&
+  blockedHtml.indexOf('accountLabel') === -1 &&
+  blockedHtml.indexOf('先生の指示に従って作業を進めましょう') === -1 &&
+  blockedHtml.indexOf('ブロック対象URL') === -1);
+check('E13c blocked.html のカードは「アイコン＋見出し」だけで閉じている',
+  /<h1 class="lock-title">アクセスが制限されています<\/h1>\s*\n\s*<\/div>/.test(blockedHtml) &&
+  /<div class="lock-icon-wrap">/.test(blockedHtml));
+check('E13d lock.html のカード内容は元のまま（画面ロック中／先生の話をよく聞きましょう／先生からの指示）',
+  /<h1 class="lock-title">画面ロック中<\/h1>/.test(lockHtml) &&
+  /先生の話をよく聞きましょう/.test(lockHtml) &&
+  /先生からの指示/.test(lockHtml) &&
+  /<div class="lock-instructions">/.test(lockHtml));
 check('E14 ロック画面・規制画面は外部CDNを使わない（オリジナルSVG＋自己完結CSS）',
   !/https?:\/\/(cdn|fonts|ajax)\./i.test(lockHtml) && !/https?:\/\/(cdn|fonts|ajax)\./i.test(blockedHtml));
 
