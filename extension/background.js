@@ -6,6 +6,14 @@
  * ・ロック解除の全タブ高速反映
  */
 
+// 【ブートストラップ用】親GASの Web アプリ URL（/exec）。
+//   Managed Storage ポリシー（gas_url / gas_url_map）が未配布の端末でも、
+//   ここに親の /exec を入れておけば初回同期が成立し、親が assigned_gas_url を
+//   返して以降は子GASへ直接つながる（1校240台を子GASへ分散する R41 構成の入口）。
+//   ※ 空のままなら端末は通信できない。その事実は sync_diag とコンソールへ
+//     必ず出す（無言で停止させない）。
+const DEFAULT_GAS_URL = '';
+
 // デフォルト設定
 const DEFAULT_CONFIG = {
   student_id: '',
@@ -47,6 +55,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   } else if (alarm.name === 'wakeAlarm') {
     // 非稼働中でも「先生が復帰したか」だけを軽く確認する（シート非接触の短い応答）。
     probeWake();
+  } else if (alarm.name === 'schedulePoll') {
+    // 【低速ポーリング】教員コンソールが閉じられたままでも、予約を保持している端末は
+    //   5 分ごとに起床して親／子GASへハートビートを送り、新規予約を取りこぼさない。
+    //   （時間制限タイマーが実機で発動しない問題の対策。未割り当て・予約ゼロの端末は
+    //      maybeSync 側が同期せずアラームも解除するため、通信負荷は増えない）
+    maybeSync();
   } else if (alarm.name === 'scheduleEdge' || alarm.name === 'scheduleTick') {
     // 【フェーズ3】スケジュール（タイマー）の境界発動。
     //   scheduleEdge … 開始/終了時刻ちょうどに1回だけ起こす（本命）
@@ -73,6 +87,27 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 let keepaliveActive = false; // GAS のハートビート応答 ka_active を反映
 let activeIntervalMs = 1500; // 稼働中の同期周期（GAS の sync_interval_sec で上書きされる）
 let idleDriftUntil = 0;      // 非稼働時、この時刻までは低頻度で再確認する（0=猶予なし）
+// 【v1.6.6】稼働中（ka_active=true）の高精度ポーリング用の状態。
+//   chrome.alarms は最短 30 秒でしか鳴らず、Chrome のスロットリングで更に遅れる。
+//   そこで Service Worker 内の setTimeout チェーンを主軸にし、alarms はフェイルセーフとして併存させる。
+let fastChainTimer = null;      // 稼働中の setTimeout チェーン（1本だけ保持）
+const FAST_MIN_GAP_RATIO = 0.8; // 重複抑止しきい値（sync_interval_sec × 0.8 秒未満は再送しない）
+let lastHeartbeatStartMs = 0;   // 直近ハートビートの「送信開始」時刻（重複排除用）
+
+// 【v1.6.7】スリープ復帰（蓋を開けた／画面ロック解除／ウィンドウ復帰）の即時ハートビート。
+//   課題: 蓋を閉じてスリープ → 開けて Wi-Fi が繋がっても、次の setTimeout／chrome.alarms まで
+//         待たされるため、管理画面の「オンライン状態」へ戻るのに時間がかかっていた。
+//   方針: 復帰イベントの瞬間に 1 回だけ即時送信する。ただし通常のウィンドウ切替で毎回
+//         通信しないよう「前回の【成功】から 5 秒」のクールダウンと syncInFlight を併用する。
+const WAKE_RESUME_COOLDOWN_MS = 5000; // 前回の成功送信からこの時間未満の復帰通知は捨てる
+const WAKE_RETRY_DELAY_MS = 2000;     // 復帰直後の通信失敗は短い間隔（2 秒）で再試行する
+const WAKE_RETRY_MAX = 2;             // 短い再試行の上限（長いエラーバックオフへは入らない）
+const WAKE_RESUME_MIN_GAP_MS = 1000;  // 復帰イベント自体の連続発火をまとめる最小間隔
+let lastHeartbeatOkMs = 0;            // 直近ハートビートが「成功」した時刻（クールダウン判定用）
+let lastWakeResumeMs = 0;             // 直近の復帰通知で即時送信した時刻（連打防止）
+let lastWakeResumeReason = '';        // 直近の復帰理由（診断用: idle / focus / online）
+let wakeRetryBudget = 0;              // 復帰直後に許す短い再試行の残数
+let wakeRetryTimer = null;            // 短い再試行のタイマー（1 本だけ保持）
 
 // GAS の応答（ka_active / sync_interval_sec / idle_drift_until）を storage と同期ループへ反映する。
 // 旧形式（真偽値のみ）でも受け付ける（後方互換）。
@@ -126,41 +161,128 @@ function applyRemoteKeepalive(payload) {
     // 稼働中のバックストップ（30 秒アラーム）を確保し、猶予用アラームは不要なので止める。
     if (activeChanged) {
       lastSyncMs = 0;          // 稼働へ切替時は次回 ping で即同期し、素早く反映する
-      ensureSyncLoop();        // 稼働中のみアラームを登録（状態遷移時だけ）
+      ensureSyncLoop();        // 稼働中のみアラーム＋setTimeout チェーンを登録
       clearIdleDriftAlarm();
+      // 稼働中は通常同期が走るため、低速ポーリングは不要（二重起床を防ぐ）。
+      clearSlowPoll();
+    } else if (intervalChanged) {
+      // 【v1.6.6】GAS が sync_interval_sec を変えた（過負荷バックオフ 4 秒など）とき、
+      //   setTimeout チェーンの周期を即座に張り替える（GAS の負荷保護を損なわない）。
+      scheduleFastChain();
     }
     // 稼働中は起こしプローブ不要（通常同期が走っているため）。止めて通信を増やさない。
     clearWakeProbe();
-  } else if (activeChanged || driftChanged) {
-    // 非稼働: 30 秒アラームを止めて無駄な起床を止める。猶予期間だけ再開を確認する。
-    stopSyncLoop();
-    scheduleIdleDrift();
-    // 猶予が尽きた後も「先生が復帰したか」だけは拾えるようにする。
-    // 間隔は時間帯で切り替える（平日日中=1分固定／夜間・土日祝=10分）。
-    ensureWakeProbe();
+  } else {
+    // 【v1.6.6】非稼働（ka_active=false）を受けた瞬間に高頻度チェーンを即時停止し、
+    //   従来の長周期 chrome.alarms スリープへ戻す（放課後・夜間の無駄な通信をゼロに）。
+    clearFastChain();
+    if (activeChanged || driftChanged) {
+      // 非稼働: 30 秒アラームを止めて無駄な起床を止める。猶予期間だけ再開を確認する。
+      stopSyncLoop();
+      scheduleIdleDrift();
+      // 猶予が尽きた後も「先生が復帰したか」だけは拾えるようにする。
+      // 間隔は時間帯で切り替える（平日日中=1分固定／夜間・土日祝=10分）。
+      ensureWakeProbe();
+      // 【低速ポーリング】予約を保持している／子GASへ割り当て済みの端末だけは、
+      //   猶予が尽きた後も 5 分周期で起床させる。これが無いと「教員が管理画面を閉じた
+      //   まま新しい予約を作る」ケースで端末が永久に眠り、時間制限タイマーが発動しない。
+      if (scheduleInterestActive()) ensureSlowPoll();
+      else clearSlowPoll();
+    }
   }
 }
 
 // ==================== 同期のレート制御 ====================
-//  ・稼働中（管理アプリが稼働中）      : 1.5 秒 … 指示を 3 秒以内に反映
-//  ・非稼働・猶予期間内               : 1 秒上限の低頻度で再確認（管理アプリの再起動を拾う）
-//  ・非稼働・猶予期間外               : 同期しない（doPost を出さない＝通信負荷ゼロ）
+//  ・稼働中（管理アプリが稼働中）        : 1.5 秒 … 指示を 3 秒以内に反映
+//  ・非稼働・猶予期間内                 : 1 秒上限の低頻度で再確認（管理アプリの再起動を拾う）
+//  ・非稼働・猶予期間外＋予約/子GASあり : 5 分周期の低速ポーリング（予約の取りこぼし防止）
+//  ・非稼働・猶予期間外＋予約も子GASも無: 同期しない（doPost を出さない＝通信負荷ゼロ）
 const ACTIVE_SYNC_MS = 1500;
-const IDLE_SYNC_MS = 0;         // 非稼働時は定期ポーリングをしない（0＝常にスキップ）
+const IDLE_SYNC_MS = 0;         // 非稼働時は 1.5 秒の速いポーリングをしない（0＝常にスキップ）
 const IDLE_DRIFT_MS = 1000;     // 猶予期間中の再確認レート上限（1 秒）
 const IDLE_DRIFT_ALARM_MIN = 5 / 60; // 猶予期間中の再確認アラーム周期（5 秒）
+// 【低速ポーリング】v1.6.4 修正
+//   教員コンソールを閉じたまま新しい予約が作られると、従来は端末が完全に眠ってしまい
+//   予約が永久に届かなかった（＝時間制限タイマーが実機で発動しない本命の原因）。
+//   そこで「予約を保持している端末」と「子GASへ割り当て済みの端末」に限り、
+//   非稼働・猶予終了後も 5 分周期で起床して予約の到着を確認する。
+//   未割り当てかつ予約ゼロの端末は従来どおり「通信ゼロ」を維持する（無駄な doPost を出さない）。
+const SLOW_POLL_MS = 5 * 60 * 1000;
+const SLOW_POLL_ALARM = 'schedulePoll';
+const SLOW_POLL_ALARM_MIN = 5;
 let lastSyncMs = 0;
+// 【初回ブートストラップの番人】この Service Worker の生存期間で
+//   「一度でも送信を試みたか」。false の間は稼働判定をバイパスして必ず1回送る。
+let hasSyncedOnce = false;
+
+/**
+ * 「予約を取りこぼせない端末か」を判定する（低速ポーリングの可否）。
+ *   教員コンソールを閉じたまま新規予約が作成されても、端末が完全に眠っていると
+ *   予約が永久に届かず、時間制限タイマーが実機で発動しない。
+ *   そこで次のいずれかに該当する端末だけ、非稼働・猶予終了後も 5 分周期で起床する。
+ *     ① 子GASへ割り当て済み（＝親から配られた予約を子GASが保持している）
+ *     ② 予約キャッシュ（active / upcoming）を 1 件以上保持している
+ *   未割り当てかつ予約ゼロの端末は、従来どおり「通信ゼロ」を維持する。
+ *   ※ 単体検証（VM へ関数だけを切り出した環境）では宣言が無い場合があるため typeof で守る。
+ */
+function scheduleInterestActive() {
+  if (typeof shardAssignedCache !== 'undefined' && shardAssignedCache) return true;
+  if (typeof scheduleCache !== 'undefined' && scheduleCache && scheduleCache.schedules) {
+    const s = scheduleCache.schedules;
+    const a = Array.isArray(s.active) ? s.active.length : 0;
+    const u = Array.isArray(s.upcoming) ? s.upcoming.length : 0;
+    if ((a + u) > 0) return true;
+  }
+  return false;
+}
 
 function maybeSync() {
   const now = Date.now();
-  let interval;
+
+  // 【初回ブートストラップ】未同期の端末は keepaliveActive / idleDrift の判定より
+  //   先に「必ず1回」送る。教員コンソールを閉じていても、ここで親GASから
+  //   assigned_gas_url を取得しないと、以後の子GASへのハートビートが永久に
+  //   始まらない（実機で「子GASの実行数がゼロ」になった正体）。
+  if (!hasSyncedOnce) {
+    hasSyncedOnce = true;
+    lastSyncMs = now;
+    syncWithGas();
+    return;
+  }
+
+  // 【v1.6.6】多重トリガーの重複排除。
+  //   setTimeout チェーン / chrome.alarms / content.js の KEEPALIVE_PING が
+  //   同時に叩いても、通信中の二重送信はここで必ず捨てる（通信量を増やさない）。
+  if (syncInFlight) return;
+
   if (keepaliveActive) {
-    interval = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
-  } else if (idleDriftUntil && now < idleDriftUntil) {
+    // 稼働中: setTimeout チェーンを主軸に sync_interval_sec（1.5 秒／バックオフ 4 秒）へ
+    //   厳密追従する。前回「送信開始」から sync_interval_sec × 0.8 秒未満の再トリガーは
+    //   重複とみなす（タイマーの 1〜2ms の揺らぎで周期が 2 倍へ落ちるのを防ぐ下限緩和）。
+    const fastInterval = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
+    const minGap = Math.max(0, Math.round(fastInterval * FAST_MIN_GAP_RATIO));
+    if (lastHeartbeatStartMs > 0) {
+      const since = lastHeartbeatStartMs > now ? -1 : (now - lastHeartbeatStartMs);
+      if (since >= 0 && since < minGap) return;
+    }
+    lastSyncMs = now;
+    syncWithGas();
+    return;
+  }
+
+  let interval;
+  if (idleDriftUntil && now < idleDriftUntil) {
     interval = IDLE_DRIFT_MS; // 猶予期間のみ低頻度で再確認する
+  } else if (scheduleInterestActive()) {
+    // 【低速ポーリング】非稼働・猶予終了でも、予約保持または子GAS割り当て済みなら
+    //   5 分周期で起床して予約の到着を確認する（時間制限タイマーの取りこぼし防止）。
+    interval = SLOW_POLL_MS;
+    ensureSlowPoll();
   } else {
-    // 非稼働かつ猶予終了 → 同期しない。猶予用アラームが残っていれば止める。
+    // 非稼働・猶予終了・予約も子GASも無し → 同期しない（doPost を出さない＝通信負荷ゼロ）。
+    //   猶予用／低速ポーリング用アラームが残っていれば止める。
     clearIdleDriftAlarm();
+    clearSlowPoll();
     return;
   }
   if (now - lastSyncMs < interval) return;
@@ -175,13 +297,42 @@ function maybeSync() {
  */
 function ensureSyncLoop() {
   try {
-    chrome.alarms.create('syncAlarm', { periodInMinutes: 0.5 }); // 30秒（MV3の最小値）
+    // 30秒（MV3の最小値）。SW が 30 秒アイドルで停止しても復旧できるフェイルセーフ。
+    chrome.alarms.create('syncAlarm', { periodInMinutes: 0.5 });
   } catch (e) {}
+  // 【v1.6.6】稼働中は setTimeout チェーンを主軸にする（alarms は 30 秒＋間引きで遅い）。
+  scheduleFastChain();
 }
 
-/** 稼働が終わったらバックストップ（30 秒アラーム）を止める。 */
+/**
+ * 稼働中の高精度 setTimeout チェーンを（再）スケジュールする。
+ *   sync_interval_sec（通常 1.5 秒／過負荷バックオフ時 4 秒）に厳密追従する。
+ *   チェーンは常に 1 本だけ保持し、再設定時は前のタイマーを必ず破棄する。
+ */
+function scheduleFastChain() {
+  clearFastChain();
+  if (!keepaliveActive) return;
+  const ms = activeIntervalMs > 0 ? activeIntervalMs : ACTIVE_SYNC_MS;
+  fastChainTimer = setTimeout(function () {
+    fastChainTimer = null;
+    if (!keepaliveActive) return; // 稼働が終わっていたら再武装しない
+    maybeSync();
+    scheduleFastChain();
+  }, ms);
+}
+
+/** 高精度チェーンを停止する（非稼働へ戻った瞬間に呼ぶ）。 */
+function clearFastChain() {
+  if (fastChainTimer) {
+    try { clearTimeout(fastChainTimer); } catch (e) {}
+    fastChainTimer = null;
+  }
+}
+
+/** 稼働が終わったらバックストップ（30 秒アラーム）と高頻度チェーンを止める。 */
 function stopSyncLoop() {
   try { chrome.alarms.clear('syncAlarm'); } catch (e) {}
+  clearFastChain();
 }
 
 /**
@@ -203,6 +354,24 @@ function scheduleIdleDrift() {
 /** 猶予期間用の再確認アラームを止める。 */
 function clearIdleDriftAlarm() {
   try { chrome.alarms.clear('idleDriftAlarm'); } catch (e) {}
+}
+
+/**
+ * 低速ポーリング用アラーム（5 分周期）を登録する。
+ *   教員コンソールが閉じられていても、予約を持つ端末は 5 分ごとに起床して
+ *   親／子GASへハートビートを送り、新規予約を受け取る。
+ *   MV3 の Service Worker は 30 秒で停止するため、アラームが唯一の継続手段になる。
+ *   ※ 既に登録済みでも chrome.alarms.create は同名を上書きするため冪等。
+ */
+function ensureSlowPoll() {
+  try {
+    chrome.alarms.create(SLOW_POLL_ALARM, { periodInMinutes: SLOW_POLL_ALARM_MIN });
+  } catch (e) {}
+}
+
+/** 低速ポーリング用アラームを止める（予約も子GAS割り当ても無くなったとき）。 */
+function clearSlowPoll() {
+  try { chrome.alarms.clear(SLOW_POLL_ALARM); } catch (e) {}
 }
 
 // ==================== 非稼働時の「起こしプローブ」 ====================
@@ -430,26 +599,105 @@ async function probeWake() {
   } catch (e) {}
 }
 
+/**
+ * 【v1.6.7】復帰通知の短い再試行タイマーを止める。
+ */
+function clearWakeRetry() {
+  if (wakeRetryTimer) {
+    try { clearTimeout(wakeRetryTimer); } catch (e) {}
+    wakeRetryTimer = null;
+  }
+}
+
+/**
+ * 【v1.6.7】Wi-Fi 再接続待ちのための「短い再試行」を 1 回だけ予約する。
+ *   蓋を開けた直後は Wi-Fi の再接続に 1〜2 秒かかるため、初回通信が
+ *   `Failed to fetch` 等で落ちる。ここで長いエラーバックオフ（30 秒〜数分）へ
+ *   入ってしまうと「オンライン復帰が遅い」実害になるので、2 秒後に短く再試行する。
+ *   予算（wakeRetryBudget）は復帰通知のたびに WAKE_RETRY_MAX へ戻し、
+ *   通常のエラー時は 0 のままなので無駄な通信は増えない。
+ *   戻り値: 予約したら true / 予算切れ・通信中なら false
+ */
+function scheduleWakeRetry() {
+  if (wakeRetryBudget <= 0) return false;
+  wakeRetryBudget--;
+  clearWakeRetry();
+  wakeRetryTimer = setTimeout(function () {
+    wakeRetryTimer = null;
+    if (syncInFlight) return; // 別の同期が走っているなら次周期に任せる（二重送信しない）
+    lastSyncMs = 0;
+    syncWithGas();
+  }, WAKE_RETRY_DELAY_MS);
+  return true;
+}
+
+/**
+ * 【v1.6.7】スリープ復帰（蓋を開けた／画面ロック解除／ネットワーク復帰）の即時ハートビート。
+ *   ・トリガー: chrome.idle.onStateChanged('active') / chrome.windows.onFocusChanged /
+ *               Service Worker の online イベント
+ *   ・クールダウン: 「前回の【成功】送信から 5 秒」未満なら捨てる。
+ *     これにより稼働中の通常のウィンドウ切替（1.5 秒ごとに成功している状態）では
+ *     一切追加の通信が発生しない。
+ *   ・既存の syncInFlight 排他制御と併用し、通信中の復帰通知も捨てる。
+ *   戻り値: 実際に即時送信を発火したら true
+ */
+function handleWakeResume(reason) {
+  const now = Date.now();
+  if (syncInFlight) return false; // 通信中は捨てる（多重送信しない）
+  // 短時間の連続発火（フォーカス往復・イベントの重複配送）をまとめて捨てる。
+  if (lastWakeResumeMs > 0 && (now - lastWakeResumeMs) < WAKE_RESUME_MIN_GAP_MS) return false;
+  // クールダウン: 前回の「成功」から一定時間経っていないなら即時送信しない。
+  if (lastHeartbeatOkMs > 0 && (now - lastHeartbeatOkMs) < WAKE_RESUME_COOLDOWN_MS) return false;
+  lastWakeResumeMs = now;
+  clearWakeRetry();                 // 予約済みの再試行は今回の送信に吸収する
+  wakeRetryBudget = WAKE_RETRY_MAX; // 復帰直後だけ短い再試行を許可する
+  lastSyncMs = 0;                   // レート制限を無視して必ず 1 回同期する
+  syncWithGas();
+  if (reason) lastWakeResumeReason = String(reason);
+  return true;
+}
+
 // ① イベント起床: 蓋を開けた／スリープから復帰して操作を再開した瞬間に 1 回だけ同期する。
 //    アラームと違い「実際に人が端末を使ったとき」しか動かないため、通信は増えない。
 //    （これが無いと、蓋の開閉だけでは SW が起きず復帰できなかった）
+//    v1.6.7: クールダウン（成功から 5 秒）付きの handleWakeResume に一本化した。
 try {
   if (chrome.idle && chrome.idle.onStateChanged) {
     chrome.idle.setDetectionInterval(60);
     chrome.idle.onStateChanged.addListener((state) => {
       if (state !== 'active') return;
-      lastSyncMs = 0;      // レート制限を無視して必ず 1 回同期する
-      syncWithGas();
+      handleWakeResume('idle');
     });
+  }
+} catch (e) {}
+
+// ② 【v1.6.7】ネットワーク復帰（Wi-Fi 再接続）の瞬間も即時同期する。
+//    Chromebook の蓋を開けた直後は Wi-Fi がまだ繋がっておらず、少し遅れて online になる。
+//    その瞬間に送れば「数秒でオンライン復帰」が成立する（クールダウンは共通）。
+try {
+  if (typeof self !== 'undefined' && self && self.addEventListener) {
+    self.addEventListener('online', function () { handleWakeResume('online'); });
   }
 } catch (e) {}
 
 // SW が停止状態から復帰したとき（端末が眠ったまま SW だけ再起動した場合）に備え、
 // 非稼働なら起こしプローブを張り直す。これが無いとアラームが失われたまま復帰できない。
 try {
-  chrome.storage.local.get(['keepalive_active'], (d) => {
+  chrome.storage.local.get(['keepalive_active', 'keepalive_interval_sec'], (d) => {
     if (chrome.runtime.lastError) return;
-    if (!(d && d.keepalive_active)) ensureWakeProbe();
+    if (d && d.keepalive_active) {
+      // 【v1.6.6】SW が 30 秒アイドルで停止した直後の復帰。
+      //   稼働中だったなら setTimeout チェーンとフェイルセーフ alarm を即座に張り直す
+      //   （これが無いと alarms の 30 秒待ちまで遅延が残る）。
+      keepaliveActive = true;
+      const sec = Number(d.keepalive_interval_sec);
+      if (isFinite(sec) && sec > 0) activeIntervalMs = Math.round(sec * 1000);
+      hasSyncedOnce = true;
+      lastSyncMs = 0;
+      ensureSyncLoop();
+    } else {
+      ensureWakeProbe();
+    }
   });
 } catch (e) {}
 
@@ -582,7 +830,18 @@ async function initializeClient() {
 
     // GAS URLが設定されていれば即座に自動同期を実行！
     if (initialGasUrl) {
+      hasSyncedOnce = true; // 初回同期を実行済み（maybeSync の二重発火を防ぐ）
       await syncWithGas();
+    } else {
+      // 【無言停止の根絶】URL が無い＝端末は1件も送信できない。
+      //   旧実装はここで何も出さずに終わっていたため、
+      //   「実行数ゼロ・エラーも出ない」という最悪の切り分け不能状態になった。
+      console.warn('[EduAgent] GAS WebアプリURLが未設定のため同期できません。'
+        + ' 管理ポリシーの gas_url / gas_url_map を配布するか、'
+        + ' background.js の DEFAULT_GAS_URL に親GASの /exec を設定してください。');
+      await recordSyncDiag(false, 'no_gas_url',
+        'GAS WebアプリURLが未設定です（管理ポリシーの gas_url / gas_url_map、'
+        + ' または background.js の DEFAULT_GAS_URL を設定してください）');
     }
 
     // 【フェーズ3】保存済みの予約から制限状態と境界アラームを復元する。
@@ -695,7 +954,13 @@ function resolveGasUrl(data) {
       }
     }
   }
-  return direct;
+  // 4) 最後の砦: 埋め込みの既定（親GASの /exec）。
+  //   Managed Storage ポリシー未配布の端末はここが唯一の通信先になる。
+  //   これが空だと端末は1件も送信できないため、呼び出し側で必ず診断を残す。
+  //   typeof ガードは、この関数だけを単体で切り出して検証するテスト環境
+  //   （DEFAULT_GAS_URL を注入しない sandbox）でも ReferenceError にしないため。
+  const embedded = (typeof DEFAULT_GAS_URL === 'string') ? DEFAULT_GAS_URL.trim() : '';
+  return direct || embedded;
 }
 
 // ==================== 子GAS分散（SHARD_MODE）: 動的ルーティング ====================
@@ -718,6 +983,16 @@ const SHARD_COOLDOWN_MS = 30 * 60 * 1000;    // 切り戻し後30分は再割り
 //   これにより 1.5 秒ごとの判定で余分なストレージ読み取りを行わない。
 let shardAssignedCache = '';
 let shardFailCount = 0;
+
+// 【バトンタッチ（即時ハートビート）】v1.6.4 修正
+//   親GASから新しい assigned_gas_url（子GAS）を受け取った直後は、端末の通信先が
+//   親→子へ切り替わった第1報で終わってしまい、子GAS側には「端末が存在する」ことも
+//   「予約を配るべき相手」であることも一切伝わっていなかった（実機で子GASの実行数ゼロ）。
+//   そこで「割り当てが確定した」ことをこのフラグで1回だけ持ち越し、syncWithGas() の
+//   finally（＝syncInFlight のガード解放直後）で消費して子GAS宛てに2回目の同期を発火する。
+//   ※ フラグは必ず消費時に false へ戻すため、子GASが assigned_gas_url を返さないことも
+//     相まって無限再入にはならない（1割り当てにつき1回限りのバトンタッチ）。
+let shardHandoffPending = false;
 
 function shardAssignedUrl(data) {
   return String((data && data.assigned_gas_url) || '').trim();
@@ -771,6 +1046,13 @@ async function applyShardAssignment(resJson, data, usedUrl, talkingToParent) {
     try { await chrome.storage.local.set(patch); } catch (e) {}
     shardAssignedCache = String(patch.assigned_gas_url || '');
     shardFailCount = 0;
+
+    // 【バトンタッチ】新しい子GAS URL を保存した瞬間に「2通目を送る」意図を立てる。
+    //   ここで直接 syncWithGas() を呼ぶと、呼び出し元の syncWithGas() がまだ
+    //   syncInFlight=true のためガードに弾かれて**無言で捨てられる**（実機で子GASの
+    //   実行数がゼロだった原因そのもの）。フラグに留め、ガード解放後に発火させる。
+    //   ※ 空文字（＝親へ切り戻し）では立てない。子GASへ送る意味がないため。
+    if (patch.assigned_gas_url) shardHandoffPending = true;
   }
 }
 
@@ -969,6 +1251,8 @@ async function syncWithGas() {
     // 【フェーズ3】送信時刻を控える。応答受信時に往復の中央時刻を求めて
     //   サーバ時刻との差（時計補正）を NTP 風に算出するために使う。
     lastHeartbeatSentMs = Date.now();
+    // 【v1.6.6】稼働中の重複トリガー抑止用に「送信開始」時刻も控える。
+    lastHeartbeatStartMs = lastHeartbeatSentMs;
     const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     let timer = null;
     if (controller) {
@@ -1031,6 +1315,23 @@ async function syncWithGas() {
 
     await recordSyncDiag(true, 'ok', '');
 
+    // 【v1.6.7】成功時刻を控える。復帰通知（handleWakeResume）のクールダウン判定は
+    //   「前回の成功から 5 秒」なので、ここでしか更新しない（送信開始では更新しない）。
+    lastHeartbeatOkMs = Date.now();
+    wakeRetryBudget = 0;   // 成功したら短い再試行の予算は使い切る
+    clearWakeRetry();
+
+    // 【v1.6.8】準リアルタイム画面視聴: live_watch === true の端末だけが撮影し、
+    //   in-flight 排他で多重送信しない。
+    // 【R59】1 枚目は applyLiveWatchFlag（false→true の遷移）が即座に撮る。
+    //   ここでは「SW が再起動して独立ループが消えた場合の張り直し」を兼ねて、
+    //   追撃の 1 回とループの再開だけを行う（await しない＝ハートビートを遅らせない。
+    //   実際の撮影間隔は独立ループが 1.2 秒で刻む）。
+    try {
+      if (liveWatchActive === true) liveWatchCaptureOnce();
+      startLiveWatchLoop();
+    } catch (eLWC) {}
+
   } catch (err) {
     console.error('[EduAgent] 通信エラー:', err);
     try {
@@ -1038,8 +1339,28 @@ async function syncWithGas() {
       await recordSyncDiag(false, 'network',
         'GASへ到達できません（URL・ネットワーク・公開範囲を確認）: ' + detail);
     } catch (e2) {}
+    // 【v1.6.7】復帰直後（蓋を開けた／Wi-Fi 再接続中）の失敗は長いバックオフに入れない。
+    //   予算（wakeRetryBudget）は復帰通知の瞬間だけ立つ。通常運用の失敗時は 0 なので
+    //   従来どおり何もせず、GAS 側の sync_interval_sec（過負荷時 4 秒）に任せる。
+    try { scheduleWakeRetry(); } catch (e3) {}
   } finally {
     syncInFlight = false;
+
+    // 【バトンタッチ＝即時ハートビート】v1.6.4 修正
+    //   親から新しい assigned_gas_url（子GAS）を受けた回は、この finally で
+    //   ガードが下りた「まさにこの一点」でのみ、子GAS宛ての2回目の同期を1回発火する。
+    //   ・applyShardAssignment() の中から呼ぶと syncInFlight=true のままなので
+    //     先頭のガードに弾かれ、子GASへは一歩も届かない（実機の実行数ゼロの正体）。
+    //   ・フラグは消費時に必ず false に戻すため、1割り当てにつき1回限り。
+    //     子GASは assigned_gas_url を返さないため、次回以降フラグは立たない。
+    //   ・setTimeout(0) で現在のマイクロタスク列を抜けてから再入する
+    //     （finally の中で await せず、呼び出し元の完了を待たせない）。
+    if (shardHandoffPending) {
+      shardHandoffPending = false;
+      try {
+        setTimeout(function () { syncWithGas(); }, 0);
+      } catch (e) {}
+    }
   }
 }
 
@@ -1510,6 +1831,14 @@ async function applyPolicies(newPolicy, oldStorage) {
     await chrome.storage.local.set({ last_screen_request: newScreenReq });
     captureAndUploadScreenshot();
   }
+
+  // 6. 【v1.6.8】準リアルタイム画面視聴のフラグ反映
+  //    ハートビート応答の live_watch が true の端末だけが、以後の 1.5 秒ポーリングで
+  //    軽量キャプチャを送る。false（または未指定）になった瞬間に停止する。
+  //    ここでは状態の反映のみ行い、撮影は syncWithGas の末尾（1.5秒周期）で行う。
+  try {
+    await applyLiveWatchFlag(newPolicy.live_watch === true);
+  } catch (eLW) {}
 }
 
 /**
@@ -1570,6 +1899,583 @@ async function downscaleForSheet(dataUrl) {
   return null; // どの組み合わせでも上限に収まらなかった
 }
 
+// ============================================================================
+// 【v1.6.8】準リアルタイム画面視聴（指定端末のみの軽量キャプチャ送信）
+//
+//   教員コンソールで「ライブ視聴」を開始した児童端末だけが、ハートビート応答の
+//   live_watch === true を受け取る。その端末だけがアクティブタブを撮影し、
+//   教員が見やすい軽量JPEGに縮小して子GASへ送る。
+//
+//   固定仕様:
+//     ・撮影は chrome.tabs.captureVisibleTab（JPEG・低品質）のみ。
+//     ・OffscreenCanvas で横幅 420〜480px に縮小し、Base64 30,000 文字以内に収める。
+//     ・liveWatchInFlight による排他制御で多重送信しない。
+//     ・live_watch === false になった瞬間に停止する（撮影もしない）。
+//     ・新規権限は不要（tabs / host_permissions は既存のまま）。
+//
+//   【R59】画像の切り替わりを約 6 秒 → 1.5〜2.5 秒へ短縮する。
+//     ・live_watch が false → true に変わった瞬間に 1 枚目を撮る（1.5 秒待たない）。
+//     ・以後はハートビートの完了を待たない独立ループ（1.2 秒）で撮影・送信する。
+//       同期通信が遅い時間帯でも、画像の更新ペースは独立して保たれる。
+//     ・1 枚あたり 12〜18KB（横幅 420〜480px・品質 30〜35%）へ軽量化し、
+//       転送と管理画面のデコードを短くする。
+//     ・ACTIVE_SYNC_MS（1.5 秒）と LIVE_WATCH_MAX_B64（30,000）は維持する。
+// ============================================================================
+const LIVE_WATCH_MAX_B64 = 30000;          // 送信する Base64 の上限（要件: 30,000 文字以内）
+const LIVE_WATCH_TARGET_MAX_B64 = 18000;   // 【R59】目標サイズの上限（12〜18KB）
+const LIVE_WATCH_TARGET_MIN_B64 = 12000;   // 【R59】目標サイズの下限（12KB を下回るなら画質を上げる）
+const LIVE_WATCH_TARGET_WIDTH = 480;       // 目標の横幅（要件: 420〜480px）
+const LIVE_WATCH_MIN_WIDTH = 240;          // 縮小の下限（これ以上は落とさない）
+// 【R59】品質は 30〜35% を起点にする（従来 50% 起点）。1 枚あたり 12〜18KB に収まり、
+//   子GAS への転送と管理画面のデコードが軽くなり、画像の切り替わりが速くなる。
+const LIVE_WATCH_QUALITIES = [0.35, 0.32, 0.30, 0.26, 0.22, 0.16];
+const LIVE_WATCH_CAPTURE_QUALITY = 35;     // captureVisibleTab の品質（30〜35%）
+// 【R59】ライブ視聴専用ループの周期（1.0〜1.5 秒）。ハートビート（1.5 秒）とは
+//   独立して回すため、同期通信が遅い時間帯でも画像の更新ペースを保てる。
+const LIVE_WATCH_LOOP_MS = 1200;
+let liveWatchActive = false;               // ハートビート応答 live_watch の写し
+let liveWatchInFlight = false;             // 送信の多重実行ガード（in-flight 排他）
+let liveWatchLastSentMs = 0;               // 直近の送信時刻（診断用）
+let liveWatchLoopTimer = null;             // 【R59】独立ループのタイマー（常に1本）
+
+/** ArrayBuffer → Base64（Service Worker には btoa がある）。 */
+function bufferToBase64_(buf) {
+  let bin = '';
+  const bytes = new Uint8Array(buf);
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  }
+  return btoa(bin);
+}
+
+/**
+ * ライブ視聴用の縮小。横幅 420〜480px を起点に、Base64 が 12〜18KB に収まる
+ * 幅と品質を選ぶ。30,000 文字（上限）は「超えてはいけない線」として別に守る。
+ *
+ * 【R59】従来は「30,000 文字に収まればよい」だったため 1 枚が 25〜30KB になり、
+ *   子GAS への転送と管理画面のデコードに時間がかかっていた。12〜18KB を目標に
+ *   することで、画質は実用のまま切り替わりが速くなる。
+ *   ・目標上限（18,000）以内に収まった最初の候補を採用する。
+ *   ・最後まで収まらなければ、上限（30,000）以内で最も小さい候補を返す。
+ *   ・どれも上限を超えるなら null（壊れたデータは送らない）。
+ */
+async function downscaleForLiveWatch(dataUrl) {
+  const raw = String(dataUrl || '');
+  const originalB64 = raw.replace(/^data:image\/[a-z]+;base64,/i, '');
+  // 目標サイズ（18KB）に既に収まっていればそのまま送る（無駄な再エンコードをしない）
+  if (originalB64.length <= LIVE_WATCH_TARGET_MAX_B64) return raw;
+  if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') {
+    // 縮小できない環境: 上限（30,000）以内なら原寸のまま送る
+    return originalB64.length <= LIVE_WATCH_MAX_B64 ? raw : null;
+  }
+
+  let bitmap;
+  try {
+    const blob = await (await fetch(raw)).blob();
+    bitmap = await createImageBitmap(blob);
+  } catch (e) {
+    return null;
+  }
+
+  let best = null;         // 上限内での最良候補（目標に届かないときの保険）
+  try {
+    let w = Math.min(LIVE_WATCH_TARGET_WIDTH, bitmap.width);
+    while (w >= LIVE_WATCH_MIN_WIDTH) {
+      const h = Math.max(1, Math.round((bitmap.height * w) / bitmap.width));
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'medium';
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      for (let qi = 0; qi < LIVE_WATCH_QUALITIES.length; qi++) {
+        const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: LIVE_WATCH_QUALITIES[qi] });
+        const b64 = bufferToBase64_(await blob.arrayBuffer());
+        if (b64.length > LIVE_WATCH_MAX_B64) continue;   // 上限超過は使わない
+        const out = 'data:image/jpeg;base64,' + b64;
+        // 目標レンジ（12〜18KB）に収まったら即採用（品質優先で最初に見つかったもの）
+        if (b64.length >= LIVE_WATCH_TARGET_MIN_B64 && b64.length <= LIVE_WATCH_TARGET_MAX_B64) return out;
+        // 上限内だが目標より小さい/大きい → 保険として保持し、次候補を試す
+        if (!best || b64.length < best.length) best = out;
+        if (b64.length <= LIVE_WATCH_TARGET_MAX_B64) {
+          // 目標上限には収まっている → これ以上幅を縮める必要はない
+          break;
+        }
+      }
+      if (best && best.replace(/^data:image\/[a-z]+;base64,/i, '').length <= LIVE_WATCH_TARGET_MAX_B64) break;
+      // 画質を落としきっても目標に収まらないときは幅を縮める
+      w = Math.round(w * 0.8);
+    }
+  } catch (e) {
+    return best;
+  } finally {
+    try { bitmap.close(); } catch (e) {}
+  }
+  return best;   // 目標に届かなくても上限内なら送る（送信ゼロにしない）
+}
+
+// 【v1.6.8 / R57】Service Worker 環境では OffscreenCanvas / createImageBitmap が
+//   使えない（または convertToBlob が失敗する）ことがある。その場合に縮小処理で
+//   null を返して「送信ゼロ」になり、管理画面が「端末の送信を待っています…」のまま
+//   固まるのを避けるため、撮影品質を段階的に落として再撮影するフォールバックを持つ。
+//   それでも上限に収まらないときだけ送信を見送る（壊れたデータは送らない）。
+const LIVE_WATCH_FALLBACK_QUALITIES = [40, 28, 18, 10];
+
+/**
+ * 軽量フレームを1枚取得する（撮影 → 縮小 → 収まらなければ品質を落として再撮影）。
+ *   戻り値: data URL(JPEG) or null
+ *   ・1 回目の captureVisibleTab は従来どおり quality 40。
+ *   ・OffscreenCanvas が使えるなら 480px へ縮小する。
+ *   ・使えない／失敗した場合は、captureVisibleTab の品質だけを下げて再撮影する。
+ */
+async function captureLightweightLiveFrame_(windowId) {
+  let lastRaw = null;
+  for (let i = 0; i < LIVE_WATCH_FALLBACK_QUALITIES.length; i++) {
+    let raw = null;
+    try {
+      raw = await chrome.tabs.captureVisibleTab(windowId, {
+        format: 'jpeg',
+        quality: LIVE_WATCH_FALLBACK_QUALITIES[i]
+      });
+    } catch (eCap) {
+      return null; // 撮影自体ができない（保護ページ等）
+    }
+    if (!raw || !/^data:image\//.test(raw)) return null;
+    lastRaw = raw;
+
+    // ① まず縮小を試す（成功すれば 480px 前後の軽量画像）
+    const scaled = await downscaleForLiveWatch(raw);
+    if (scaled) return scaled;
+
+    // ② 縮小できなかった場合は、原寸のまま上限に収まっているか確認する
+    const b64len = String(raw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+    if (b64len <= LIVE_WATCH_MAX_B64) return raw;
+
+    // ③ どちらも不可 → 次の（より低い）品質で再撮影する
+  }
+  // 最後の手段: 最高圧縮の撮影結果が上限内なら送る
+  if (lastRaw) {
+    const b64len = String(lastRaw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+    if (b64len <= LIVE_WATCH_MAX_B64) return lastRaw;
+  }
+  return null;
+}
+
+// ============================================================================
+// 【v1.6.9 / R58】画面ロック中・URL規制中の「効いている」ことの可視化
+//
+//   R57 までは、ロック画面（lock.html）・規制画面（blocked.html）を表示中は
+//   自拡張のページ（chrome-extension://）であることを理由にキャプチャを
+//   スキップしていた。また chrome:// 等の保護ページでは captureVisibleTab が
+//   失敗し、管理画面は「端末の送信を待っています…」のまま放置されていた。
+//   そのため教員は「ロック・規制が本当に効いているか」を画面上で確認できなかった。
+//
+//   R58 では次の 2 点を担保する。
+//     ① ロック中・規制中も撮影をスキップしない
+//        自拡張のロック画面／規制画面は captureVisibleTab で撮影できるため、
+//        そのまま撮って送る（教員がロック画面そのものを目視できる）。
+//     ② 撮影できない場合の状態フレーム送信
+//        chrome:// 等で captureVisibleTab が失敗しても、ロック／規制が有効なら
+//        「🔒 画面ロック中」「🚫 アクセス制限中」＋対象URL＋現在時刻を描いた
+//        JPEG を OffscreenCanvas で生成して送る（黒画面のまま放置しない）。
+//        ※ ロック中・規制中でない通常の失敗は従来どおり（ダミーは作らない）。
+//   新規権限は不要。送信経路（live_frame / screenshot）も従来のまま。
+// ============================================================================
+
+// 状態フレームの描画設定（480px 前後のサムネイルでも判別できる大きさで描く）
+const RESTRICTION_FRAME_WIDTHS = [640, 512, 400];
+const RESTRICTION_FRAME_QUALITIES = [0.55, 0.45, 0.35, 0.26];
+
+// OffscreenCanvas すら使えない環境の最終手段（32x18 の暗色プレースホルダ）。
+// 「画像が永久に来ない」よりは「規制中であることが分かる画像」を送る方が有益。
+const RESTRICTION_FRAME_STATIC =
+  'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABIMDRANCxIQDhAUExIVGywdGxgYGzYnKSAsQDlEQz85Pj1HUGZXR0thTT0+WXlaYWltcnNyRVV9hnxvhWZwcm7/2wBDARMUFBsXGzQdHTRuST5Jbm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm7/wAARCAASACADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDkKuWtrmBriSNpVBwsa5+Y+uR2qnXQaV/yD4vx/maKsuVG+EpqpOz7GXdWuIBcRxtEpOGjbPyn1ye1U66DVf8AkHy/h/MVz9FKXMgxdNU52XYKKKK1OUKKKKAP/9k=';
+
+/** 状態フレーム用のテキスト切り詰め（はみ出し防止）。 */
+function truncateFrameText_(text, max) {
+  const s = String(text === undefined || text === null ? '' : text);
+  const n = Number(max) || 0;
+  if (n <= 0 || s.length <= n) return s;
+  return s.slice(0, Math.max(0, n - 1)) + '…';
+}
+
+/**
+ * 状態フレームに描く内容（見出し・色・対象URL・現在時刻）を組み立てる。
+ *   サムネイル（横幅480px前後）でも一目で判別できるよう、短い日本語にする。
+ */
+function buildRestrictionFrameMeta_(state) {
+  const st = state || {};
+  const isBlock = st.kind === 'block';
+  let timeText = '';
+  try {
+    const d = new Date();
+    const p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+    timeText = d.getFullYear() + '/' + p2(d.getMonth() + 1) + '/' + p2(d.getDate()) +
+      ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+  } catch (e) { timeText = ''; }
+  const modeText = String(st.mode || '');
+  let modeLabel = '';
+  if (isBlock) {
+    if (modeText === 'WHITELIST') modeLabel = '規制モード: 許可リスト（指定外を制限）';
+    else if (modeText === 'BLACKLIST') modeLabel = '規制モード: 禁止リスト（指定先を制限）';
+    else modeLabel = modeText ? ('規制モード: ' + modeText) : '規制モード: URL規制中';
+  }
+  return {
+    isBlock: isBlock,
+    glyph: isBlock ? '\u{1F6AB}' : '\u{1F512}',              // 🚫 / 🔒
+    title: isBlock ? 'アクセス制限中' : '画面ロック中',
+    subtitle: isBlock
+      ? '先生の指示により、このWebサイトは規制されています'
+      : '先生の指示があるまで、端末の操作はできません',
+    accent: isBlock ? '#f59e0b' : '#ef4444',
+    urlText: truncateFrameText_(st.url || '', 58),
+    modeLabel: modeLabel,
+    modeText: modeText,
+    timeText: timeText
+  };
+}
+
+/**
+ * 指定の横幅で状態フレームを描画し JPEG の data URL を返す。
+ *   OffscreenCanvas が使えない／描画に失敗した場合は null（呼び出し側で代替）。
+ */
+async function drawRestrictionFrame_(meta, width) {
+  if (typeof OffscreenCanvas !== 'function') return null;
+  const m = meta || {};
+  const W = Math.max(240, Math.round(Number(width) || RESTRICTION_FRAME_WIDTHS[0]));
+  const H = Math.round(W * 0.5625);   // 16:9
+  try {
+    const canvas = new OffscreenCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    // 背景（濃紺）＋左のアクセントバー（ロック=赤／規制=橙）
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = m.accent || '#ef4444';
+    ctx.fillRect(0, 0, Math.max(8, Math.round(W * 0.022)), H);
+
+    const cx = Math.round(W / 2);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // ① アイコン（絵文字。描けない環境では四角にフォールバックするだけ）
+    ctx.fillStyle = '#ffffff';
+    ctx.font = Math.round(W * 0.15) + 'px sans-serif';
+    ctx.fillText(String(m.glyph || ''), cx, Math.round(H * 0.24));
+
+    // ② タイトル（サムネイルでも読める大きさ）
+    ctx.font = 'bold ' + Math.round(W * 0.098) + 'px sans-serif';
+    ctx.fillText(String(m.title || ''), cx, Math.round(H * 0.46));
+
+    // ③ サブタイトル
+    ctx.font = Math.round(W * 0.038) + 'px sans-serif';
+    ctx.fillStyle = '#cbd5e1';
+    ctx.fillText(truncateFrameText_(m.subtitle || '', 44), cx, Math.round(H * 0.58));
+
+    // ④ 対象URL と 規制モード（左寄せ）
+    ctx.textAlign = 'left';
+    const padX = Math.round(W * 0.06);
+    ctx.font = Math.round(W * 0.032) + 'px monospace';
+    ctx.fillStyle = '#94a3b8';
+    if (m.isBlock) {
+      ctx.fillText('対象URL: ' + (m.urlText || '(不明)'), padX, Math.round(H * 0.71));
+      ctx.font = Math.round(W * 0.03) + 'px sans-serif';
+      ctx.fillText(truncateFrameText_(m.modeLabel || '', 46), padX, Math.round(H * 0.80));
+    } else {
+      ctx.fillText('元の画面: ' + (m.urlText || '(不明)'), padX, Math.round(H * 0.71));
+      ctx.font = Math.round(W * 0.03) + 'px sans-serif';
+      ctx.fillText('ロックは教員の解除操作で自動的に終了します', padX, Math.round(H * 0.80));
+    }
+
+    // ⑤ 現在時刻（右下）— 「いつ時点の状態か」を教員が判断できるようにする
+    ctx.textAlign = 'right';
+    ctx.font = Math.round(W * 0.028) + 'px monospace';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText(String(m.timeText || ''), Math.round(W * 0.95), Math.round(H * 0.92));
+
+    // ⑥ 上限に収まる品質を探す
+    for (let i = 0; i < RESTRICTION_FRAME_QUALITIES.length; i++) {
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: RESTRICTION_FRAME_QUALITIES[i] });
+      const b64 = bufferToBase64_(await blob.arrayBuffer());
+      if (b64.length <= LIVE_WATCH_MAX_B64) return 'data:image/jpeg;base64,' + b64;
+    }
+    // ライブ視聴の上限には収まらないが、画像自体は生成できた（呼び出し側が再判定）
+    const last = await canvas.convertToBlob({ type: 'image/jpeg', quality: RESTRICTION_FRAME_QUALITIES[0] });
+    return 'data:image/jpeg;base64,' + bufferToBase64_(await last.arrayBuffer());
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * ロック中／規制中を示す 1 枚の JPEG を生成する（撮影できないときの代替）。
+ *   maxLen は呼び出し側の上限（ライブ視聴=30,000 / 画面一覧=42,000）。
+ *   どの横幅でも上限に収まらなければ、必ず上限内に収まる静的プレースホルダを返す。
+ */
+async function renderRestrictionStateFrame_(state, maxLen) {
+  const limit = Number(maxLen) > 0 ? Number(maxLen) : LIVE_WATCH_MAX_B64;
+  const meta = buildRestrictionFrameMeta_(state);
+  for (let i = 0; i < RESTRICTION_FRAME_WIDTHS.length; i++) {
+    const out = await drawRestrictionFrame_(meta, RESTRICTION_FRAME_WIDTHS[i]);
+    if (!out) continue;
+    const len = String(out).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+    if (len <= limit) return out;
+  }
+  return RESTRICTION_FRAME_STATIC;   // 956 文字。どの上限にも収まる
+}
+
+/**
+ * アクティブタブが「画面ロック中／URL規制中」かどうかを判定する。
+ *   ・自拡張の lock.html / blocked.html を表示中なら、その画面自体を根拠にする
+ *     （URL パラメータに元URL・規制モードが保持されている）。
+ *   ・加えてストレージのポリシー（screen_lock / filter_mode）からも判定する
+ *     （＝全タブがロック画面へ差し替わる直前の一瞬の隙間も拾う）。
+ *   戻り値: { active, kind: 'lock'|'block'|'', url, mode }
+ */
+function restrictionStateForTab_(data, tabUrl) {
+  const url = String(tabUrl || '');
+  let selfBase = '';
+  try {
+    if (chrome && chrome.runtime && typeof chrome.runtime.getURL === 'function') {
+      selfBase = chrome.runtime.getURL('');
+    }
+  } catch (e) { selfBase = ''; }
+
+  // ① 自拡張のロック画面を表示中
+  if (selfBase && url.startsWith(selfBase + 'lock.html')) {
+    let original = '';
+    try { original = new URL(url).searchParams.get('url') || ''; } catch (e) { original = ''; }
+    return { active: true, kind: 'lock', url: original, mode: '' };
+  }
+  // ② 自拡張の規制画面を表示中
+  if (selfBase && url.startsWith(selfBase + 'blocked.html')) {
+    let original = '', mode = '';
+    try {
+      const q = new URL(url).searchParams;
+      original = q.get('url') || '';
+      mode = String(q.get('mode') || '').toUpperCase();
+    } catch (e) { original = ''; mode = ''; }
+    return { active: true, kind: 'block', url: original, mode: mode };
+  }
+  // ③ ストレージのポリシー（ロック指示が出ている）
+  const d = data || {};
+  const locked = (d.screen_lock === true) || (d.screen_locked === true);
+  if (locked) return { active: true, kind: 'lock', url: url, mode: '' };
+  // ④ ストレージのポリシー（URL規制に該当している）
+  const mode = String(d.filter_mode || 'OFF').toUpperCase();
+  if (mode && mode !== 'OFF' && url) {
+    let blocked = false;
+    try {
+      blocked = evaluateUrlRestriction(url, mode, d.whitelist_urls || [], d.blacklist_urls || []);
+    } catch (e) { blocked = false; }
+    if (blocked) return { active: true, kind: 'block', url: url, mode: mode };
+  }
+  // ⑤ 撮影できないページ（chrome:// 等の特権ページ）で URL 規制が有効な場合
+  //    ・evaluateUrlRestriction は chrome:// を素通しする（＝規制対象にしない）ため
+  //      「そのページ自身がブロックされた」とは判定できない。
+  //    ・しかし規制そのものは有効なので、撮影できない状況では黒画面のまま放置せず
+  //      「🚫 規制中」の状態フレームを送る（教員が規制の効力を確認できる）。
+  //    ※ 通常の Web ページ（https 等）では従来どおりの判定に任せる（挙動不変）。
+  if (mode && mode !== 'OFF') {
+    const uncapturable = !url ||
+      url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
+      url.startsWith('about:') || url.startsWith('devtools://') ||
+      url.startsWith('chrome-search://') || url.startsWith('view-source:');
+    if (uncapturable) {
+      return { active: true, kind: 'block', url: url, mode: mode, restricted_page: true };
+    }
+  }
+  return { active: false, kind: '', url: url, mode: '' };
+}
+
+/**
+ * live_watch フラグの反映（毎ハートビートで呼ばれる）。
+ *   true  … 即座に 1 枚目を撮影・送信し、以後 1.2 秒周期の独立ループを回す
+ *   false … 即座に停止する（以降の撮影もしない・ループも止める）
+ *
+ * 【R59】従来は「次の 1.5 秒ポーリングを待ってから」1 枚目を撮っていたため、
+ *   教員が「ライブ視聴を開始」してから最初の画像が出るまで最大 1.5 秒＋往復待ち
+ *   かかっていた。false → true の遷移を検知した瞬間に撮ることで待ちを無くす。
+ *   また、撮影・送信はハートビートの完了を待たずに独立ループで回すため、
+ *   ハートビートが遅い時間帯でも画像の更新は 1.2 秒周期を保てる。
+ */
+async function applyLiveWatchFlag(flag) {
+  const next = flag === true;
+  if (liveWatchActive === next) return liveWatchActive;
+  liveWatchActive = next;
+  if (!next) {
+    // 停止指示が来た瞬間にフラグを落とす。実行中の送信は完了させ、
+    // 以後の新しい撮影は liveWatchActive を見て開始しない（即時停止）。
+    liveWatchLastSentMs = 0;
+    stopLiveWatchLoop();
+  }
+  try {
+    await chrome.storage.local.set({ live_watch_active: next });
+  } catch (e) {}
+  console.log('[EduAgent] ライブ視聴:', next ? '開始（指定端末として撮影を送信します）' : '停止（撮影を止めました）');
+  if (next) {
+    // 【R59】遷移した瞬間に 1 枚目を撮る（await しない＝ハートビートを遅らせない）。
+    try { liveWatchCaptureOnce(); } catch (eNow) {}
+    startLiveWatchLoop();
+  }
+  return liveWatchActive;
+}
+
+/**
+ * 【R59】ライブ視聴専用の独立ループ（1.2 秒周期）。
+ *   ・ハートビート（syncWithGas）の完了を待たない。待つと通信が遅い時間帯に
+ *     画像の更新まで一緒に遅れてしまう。
+ *   ・多重起動しないようタイマーは常に 1 本だけ保持する（setTimeout チェーン）。
+ *   ・liveWatchInFlight により、前回の送信が終わる前に次を投げない。
+ *   ・live_watch が false になった瞬間に止まる（無駄な撮影を続けない）。
+ *   ・新規権限は不要（既存の tabs / host_permissions のみ）。
+ */
+function stopLiveWatchLoop() {
+  if (liveWatchLoopTimer) {
+    try { clearTimeout(liveWatchLoopTimer); } catch (e) {}
+    liveWatchLoopTimer = null;
+  }
+}
+
+function scheduleLiveWatchLoop() {
+  if (!liveWatchActive) { stopLiveWatchLoop(); return; }
+  if (liveWatchLoopTimer) return;   // 常に 1 本だけ（多重起動しない）
+  liveWatchLoopTimer = setTimeout(function () {
+    liveWatchLoopTimer = null;
+    if (!liveWatchActive) { stopLiveWatchLoop(); return; }
+    Promise.resolve()
+      .then(function () { return liveWatchCaptureOnce(); })
+      .catch(function () {})
+      .then(function () { scheduleLiveWatchLoop(); });
+  }, LIVE_WATCH_LOOP_MS);
+}
+
+function startLiveWatchLoop() {
+  if (!liveWatchActive) return;
+  scheduleLiveWatchLoop();
+}
+
+/**
+ * ライブ視聴の1回分の撮影・送信。
+ *  ・live_watch === true の端末だけが実行する（呼び出し側も確認している）。
+ *  ・1.5 秒ポーリングのたびに 1 回だけ走らせ、in-flight 中は必ず捨てる。
+ *  ・失敗はログのみ（他の同期処理へ影響させない＝画面ロック等を止めない）。
+ */
+async function liveWatchCaptureOnce() {
+  if (!liveWatchActive) return false;   // 停止指示後は一切撮影しない（即時停止）
+  if (liveWatchInFlight) return false;  // 多重送信しない
+  liveWatchInFlight = true;
+  try {
+    const data = await chrome.storage.local.get(null);
+    if (!liveWatchActive) return false; // 読み込み中に停止された場合も撮らない
+    const studentId = data.student_id;
+    const gasUrl = resolveGasUrl(data);
+    if (!studentId || !gasUrl) return false;
+
+    let tab = null;
+    try {
+      const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      tab = tabs && tabs[0] ? tabs[0] : null;
+    } catch (e) {}
+    if (!tab) return false;
+    if (!tab.windowId) return false;
+
+    const url = tab.url || '';
+
+    // 【R58】ロック中・規制中かを先に判定する。
+    //   撮影に失敗したとき「状態フレーム」を描くかどうかの判断に使う。
+    let rest = { active: false, kind: '', url: url, mode: '' };
+    try {
+      rest = restrictionStateForTab_(data, url);
+    } catch (eRest) {
+      rest = { active: false, kind: '', url: url, mode: '' };
+    }
+
+    // 【R58】自拡張のロック画面（lock.html）・規制画面（blocked.html）は
+    //   chrome-extension:// ではあるが captureVisibleTab で撮影できるため、
+    //   「ロック・規制が効いていること」を教員に見せる最重要画面として撮影対象にする。
+    let selfBase = '';
+    try { selfBase = chrome.runtime.getURL(''); } catch (eSelf) { selfBase = ''; }
+    const isOwnPage = !!selfBase && url.startsWith(selfBase);
+    // Chrome の仕様で撮影できない特権ページ（自拡張ページは除く）
+    const protectedPage = !isOwnPage && (
+      url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
+      url.startsWith('about:') || url.startsWith('devtools://') ||
+      url.startsWith('chrome-search://') || url.startsWith('view-source:'));
+
+    let dataUrl = null;
+    if (!protectedPage) {
+      let raw = null;
+      try {
+        raw = await chrome.tabs.captureVisibleTab(tab.windowId, {
+          format: 'jpeg',
+          quality: LIVE_WATCH_CAPTURE_QUALITY
+        });
+      } catch (eCap) {
+        raw = null;
+      }
+      if (raw && /^data:image\//.test(raw)) {
+        // 【R57】縮小（OffscreenCanvas）が使えない Service Worker でも送信が
+        //   握りつぶされないよう、失敗時は撮影品質を段階的に落として再撮影する。
+        //   1 枚目が既に上限内ならそのまま使う（無駄な再撮影をしない）。
+        // 【R59】目標は 12〜18KB。18,000 文字を超えていたら縮小して軽くする
+        //   （転送とデコードが軽くなり、管理画面の切り替わりが速くなる）。
+        const rawLen = String(raw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+        if (rawLen > LIVE_WATCH_TARGET_MAX_B64) {
+          const scaled = await downscaleForLiveWatch(raw);
+          dataUrl = scaled || (rawLen > LIVE_WATCH_MAX_B64
+            ? await captureLightweightLiveFrame_(tab.windowId)
+            : raw);
+        } else {
+          dataUrl = raw;
+        }
+      }
+    }
+
+    // 【R58】撮れなかった場合でも、ロック中・規制中なら「その状態」を描いた
+    //   フレームを送る（管理画面を『端末の送信を待っています…』のまま放置しない）。
+    //   ※ ロック中・規制中でない通常時の失敗は、従来どおり送らない（ダミーを作らない）。
+    if (!dataUrl) {
+      if (!rest.active) return false;
+      dataUrl = await renderRestrictionStateFrame_(rest, LIVE_WATCH_MAX_B64);
+    }
+    if (!dataUrl) return false;
+    if (!liveWatchActive) return false; // 縮小中に停止されたら送らない
+
+    let response = null;
+    try {
+      response = await fetch(gasUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'live_frame',
+          student_id: studentId,
+          image_data: dataUrl,
+          mime_type: 'image/jpeg'
+        }),
+        redirect: 'follow'
+      });
+    } catch (eNet) {
+      return false;
+    }
+    liveWatchLastSentMs = Date.now();
+    if (!response || !response.ok) return false;
+
+    let body = null;
+    try { body = await response.json(); } catch (eJson) { body = null; }
+    // 枠が解放されていた（TTL 切れ・停止・上限）場合は、次のハートビートで
+    // live_watch=false が届くまでの間、無駄な撮影を続けないよう記録だけ残す。
+    if (body && body.accepted === false) return false;
+    return true;
+  } catch (err) {
+    return false;
+  } finally {
+    liveWatchInFlight = false;
+  }
+}
+
 /**
  * 【R43.3】「撮影できなかった」ことを子GASへ通知する（画像を含まない軽量POST）。
  *
@@ -1612,6 +2518,46 @@ async function notifyScreenshotBlocked(gasUrl, studentId, reason) {
   }
 }
 
+/**
+ * 【R58】画面情報（スクリーンショット）を子GASへ送る共通処理。
+ *   通常の撮影結果と「ロック中・規制中の状態フレーム」の両方から使う。
+ *   送信結果の検証（HTTP ステータス・success フラグ）は従来と同じ扱い。
+ */
+async function postScreenshotPayload_(gasUrl, studentId, dataUrl) {
+  let response = null;
+  try {
+    response = await fetch(gasUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'screenshot',
+        student_id: studentId,
+        image_data: dataUrl,
+        mime_type: 'image/jpeg'
+      }),
+      redirect: 'follow'
+    });
+  } catch (eNet) {
+    console.warn('[EduAgent] 画面情報の送信に失敗（通信）:',
+      eNet && eNet.message ? eNet.message : eNet, '(base64 ' + String(dataUrl).length + ' 文字)');
+    return false;
+  }
+  if (!response || !response.ok) {
+    console.warn('[EduAgent] 画面情報の送信が拒否されました: HTTP ' +
+      (response ? response.status : 0) + '（base64 ' + String(dataUrl).length + ' 文字）');
+    return false;
+  }
+  let body = null;
+  try { body = await response.json(); } catch (eJson) { body = null; }
+  if (body && body.success === false) {
+    console.warn('[EduAgent] 画面情報の保存に失敗:',
+      body.error_code || '', body.error || '', '(base64 ' + String(dataUrl).length + ' 文字)');
+    return false;
+  }
+  console.log('[EduAgent] 画面情報（スクリーンショット）を送信しました', String(dataUrl).length);
+  return true;
+}
+
 async function captureAndUploadScreenshot() {
   try {
     const data = await chrome.storage.local.get(null);
@@ -1633,6 +2579,15 @@ async function captureAndUploadScreenshot() {
     }
     if (!tab || !tab.windowId) return;
 
+    // 【R58】ロック中・規制中かを先に判定する（撮影失敗時の状態フレーム生成に使う）。
+    const url = tab.url || '';
+    let rest = { active: false, kind: '', url: url, mode: '' };
+    try {
+      rest = restrictionStateForTab_(data, url);
+    } catch (eRest) {
+      rest = { active: false, kind: '', url: url, mode: '' };
+    }
+
     // 【R43.2】キャプチャ不可のページ（内部ページ・拡張機能ページ）は
     //   黙って return せず、理由を必ずログに残す（原因究明のため）。
     //   画面一覧は補助機能のため、通知できなくても他の同期処理には影響させない。
@@ -1640,30 +2595,46 @@ async function captureAndUploadScreenshot() {
     //   chrome://newtab/（ログイン状態の新しいタブ）は Chrome の仕様上
     //   captureVisibleTab で撮影できず、待っても永久に画像は来ない。
     //   通知しないと教員画面の「更新待ち」が解除されないまま残る。
-    const url = tab.url || '';
-    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
-        url.startsWith('about:') || url.startsWith('devtools://')) {
-      console.warn('[EduAgent] 画面キャプチャ不可（保護されたページ）のため送信しません:', url);
-      // 画面一覧の補助機能なので、通知の成否で他の同期処理を止めない。
-      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'chrome_protected');
-      return;
+    // 【R58】ただしロック中・規制中のときは「撮れなかった」で終わらせず、
+    //   その状態を描いた画像を送る（教員が規制の効力を画面で確認できるようにする）。
+    let selfBase = '';
+    try { selfBase = chrome.runtime.getURL(''); } catch (eSelf) { selfBase = ''; }
+    const isOwnPage = !!selfBase && url.startsWith(selfBase);
+    const protectedPage = !isOwnPage && (
+      url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
+      url.startsWith('about:') || url.startsWith('devtools://'));
+
+    let raw = null;
+    if (!protectedPage) {
+      // 【R43.2】captureVisibleTab の失敗を握り潰さない。
+      //   URL 判定をすり抜ける保護ページや非アクティブウィンドウでも例外になる。
+      try {
+        raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
+      } catch (eCap) {
+        console.warn('[EduAgent] 画面キャプチャに失敗（送信しません）:',
+          eCap && eCap.message ? eCap.message : eCap);
+        raw = null;
+      }
+      if (raw && !/^data:image\//.test(raw)) raw = null;
     }
 
-    // 【R43.2】captureVisibleTab の失敗を握り潰さない。
-    //   URL 判定をすり抜ける保護ページや非アクティブウィンドウでも例外になる。
-    // 【R43.3】失敗も「撮れなかった」として通知する（理由: capture_error）。
-    let raw = null;
-    try {
-      raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 });
-    } catch (eCap) {
-      console.warn('[EduAgent] 画面キャプチャに失敗（送信しません）:',
-        eCap && eCap.message ? eCap.message : eCap);
-      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
-      return;
-    }
-    if (!raw || !/^data:image\//.test(raw)) {
-      console.warn('[EduAgent] 画面キャプチャ結果が画像ではありません（送信しません）');
-      await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
+    // 【R58】撮れなかった（保護ページ／撮影例外）ときの分岐。
+    //   ・ロック中・規制中 → 状態フレームを生成して送る（黒画面のまま放置しない）
+    //   ・通常時          → 従来どおり「撮れなかった」を通知して終了
+    if (!raw) {
+      if (!rest.active) {
+        const reason = protectedPage ? 'chrome_protected' : 'capture_error';
+        console.warn('[EduAgent] 画面キャプチャ不可（保護されたページ）のため送信しません:', url);
+        await notifyScreenshotBlocked(effectiveGasUrl, studentId, reason);
+        return;
+      }
+      const stateFrame = await renderRestrictionStateFrame_(rest, SCREENSHOT_MAX_B64);
+      if (!stateFrame) {
+        await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'capture_error');
+        return;
+      }
+      console.log('[EduAgent] ロック中・規制中のため状態フレームを送信します:', rest.kind);
+      await postScreenshotPayload_(effectiveGasUrl, studentId, stateFrame);
       return;
     }
 
@@ -1672,6 +2643,14 @@ async function captureAndUploadScreenshot() {
     //   通知しないと「端末の送信待ち」のまま残り、教員が原因を知れない。
     const dataUrl = await downscaleForSheet(raw);
     if (!dataUrl) {
+      // 【R58】ロック中・規制中なら、縮小できなくても状態フレームで代替する。
+      if (rest.active) {
+        const stateFrame = await renderRestrictionStateFrame_(rest, SCREENSHOT_MAX_B64);
+        if (stateFrame) {
+          await postScreenshotPayload_(effectiveGasUrl, studentId, stateFrame);
+          return;
+        }
+      }
       console.warn('[EduAgent] 画面情報を上限サイズまで縮小できませんでした');
       await notifyScreenshotBlocked(effectiveGasUrl, studentId, 'image_too_large');
       return;
@@ -1680,41 +2659,8 @@ async function captureAndUploadScreenshot() {
     // 【R43.2】レスポンスを検証する。
     //   R43.1 までは response.ok を見ておらず、GAS が 500 を返しても
     //   「送信しました」と出力していた（実機で原因究明を遅らせた誤ログ）。
-    let response = null;
-    try {
-      response = await fetch(effectiveGasUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'screenshot',
-          student_id: studentId,
-          image_data: dataUrl,
-          mime_type: 'image/jpeg'
-        }),
-        redirect: 'follow'
-      });
-    } catch (eNet) {
-      console.warn('[EduAgent] 画面情報の送信に失敗（通信）:',
-        eNet && eNet.message ? eNet.message : eNet, '(base64 ' + dataUrl.length + ' 文字)');
-      return;
-    }
-
-    if (!response || !response.ok) {
-      console.warn('[EduAgent] 画面情報の送信が拒否されました: HTTP ' +
-        (response ? response.status : 0) + '（base64 ' + dataUrl.length + ' 文字）');
-      return;
-    }
-
-    // GAS は 200 でも {"success":false,...} を返すことがある。成功と誤認しない。
-    let body = null;
-    try { body = await response.json(); } catch (eJson) { body = null; }
-    if (body && body.success === false) {
-      console.warn('[EduAgent] 画面情報の保存に失敗:',
-        body.error_code || '', body.error || '', '(base64 ' + dataUrl.length + ' 文字)');
-      return;
-    }
-
-    console.log('[EduAgent] 画面情報（スクリーンショット）を送信しました', dataUrl.length);
+    // 【R58】送信処理は postScreenshotPayload_ へ集約した（状態フレームと共通）。
+    await postScreenshotPayload_(effectiveGasUrl, studentId, dataUrl);
   } catch (err) {
     // captureVisibleTab はマニフェスト権限が無い/対象外ページで失敗する。
     // 画面一覧は補助機能のため、失敗しても他の同期処理には影響させない。
@@ -1825,6 +2771,52 @@ let broadcastGuardUntil = 0;
 let broadcastTabId = null;
 // 同一配信IDの二重オープン防止
 let lastBroadcastOpenedId = '';
+// 【要件2】同一URLの二重オープン防止（時間窓）。
+//   GAS側で broadcast_id を統一しても、経路（親/子直送/保留キューflush）の
+//   重複やID再発番が起きると同じページが2枚開く。ここは最後の安全網として
+//   「直近30秒以内に同じURLを自動オープン済みなら、IDが違っても開かない」を担う。
+const BROADCAST_DEDUP_WINDOW_MS = 30000;
+let lastBroadcastUrls = [];   // [{ url: string, at: number }]
+
+// URLの比較用正規化（末尾スラッシュ・大文字小文字・既定ポート差を吸収）
+function normalizeBroadcastUrl(u) {
+  let v = String(u || '').trim();
+  if (!v) return '';
+  if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+  try {
+    const parsed = new URL(v);
+    let host = parsed.hostname.toLowerCase();
+    let port = parsed.port;
+    if ((parsed.protocol === 'https:' && port === '443') ||
+        (parsed.protocol === 'http:' && port === '80')) port = '';
+    let path = parsed.pathname || '/';
+    if (path.length > 1 && path.charAt(path.length - 1) === '/') path = path.slice(0, -1);
+    return parsed.protocol.toLowerCase() + '//' + host + (port ? ':' + port : '') +
+      path + (parsed.search || '');
+  } catch (e) {
+    return v.replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+// 直近に同じURLを自動オープンしたか（時間窓内）。判定と記録を同時に行う。
+//   true  = 開いてよい（記録した）
+//   false = 窓内で同一URLを既に開いている（抑止）
+//   空URL（配信の解除）は対象外＝常に true。
+function claimBroadcastUrlOnce(url, nowMs) {
+  const now = (typeof nowMs === 'number') ? nowMs : Date.now();
+  const key = normalizeBroadcastUrl(url);
+  if (!key) return true;
+  const win = (typeof BROADCAST_DEDUP_WINDOW_MS === 'number' && BROADCAST_DEDUP_WINDOW_MS > 0)
+    ? BROADCAST_DEDUP_WINDOW_MS : 30000;
+  lastBroadcastUrls = (Array.isArray(lastBroadcastUrls) ? lastBroadcastUrls : []).filter(function (e) {
+    return e && typeof e.at === 'number' && (now - e.at) < win;
+  });
+  for (let i = 0; i < lastBroadcastUrls.length; i++) {
+    if (lastBroadcastUrls[i].url === key) return false;   // 窓内で同一URL → 抑止
+  }
+  lastBroadcastUrls.push({ url: key, at: now });
+  return true;
+}
 
 /**
  * 一斉配信直後に保護すべきタブかどうかを判定する。
@@ -1850,6 +2842,15 @@ async function openBroadcastUrl(url, broadcastId) {
     let validUrl = url;
     if (!validUrl.startsWith('http://') && !validUrl.startsWith('https://')) {
       validUrl = 'https://' + validUrl;
+    }
+    // 【要件2】IDが違っても、直近30秒以内に同じURLを開いていれば開かない。
+    //   これが無いと、経路の重複やID再発番で同じページが2枚開く（実機症状）。
+    //   空URL（配信の解除）は対象外。
+    //   抑止した場合も「処理済みID」だけは記録し、以降の再送も弾けるようにする。
+    if (!claimBroadcastUrlOnce(validUrl)) {
+      if (broadcastId) lastBroadcastOpenedId = broadcastId;
+      console.log('[EduAgent] 同一URLの二重オープンを抑止:', validUrl);
+      return;
     }
     if (broadcastId) lastBroadcastOpenedId = broadcastId;
 
@@ -1955,9 +2956,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
  * タブ作成/更新イベントが拾えないことがある。ウィンドウのフォーカス変化（＝人が端末を操作した）
  * で SW が起きるため、ここでアクティブタブを確認して復帰判定する。
  * ※ 稼働中は resumeFromConsoleTab が即 return するため負荷はない。停止中の起床も操作時のみ。
+ * 【v1.6.7】ウィンドウ復帰（別ウィンドウから戻った／蓋を開けた）の瞬間にも即時ハートビートを
+ *   打つ。ただし handleWakeResume 側のクールダウン（成功から 5 秒）で、通常のウィンドウ切替では
+ *   追加の通信が起きない（稼働中は 1.5 秒ごとに成功しているため常にクールダウン内）。
  */
 if (chrome.windows && chrome.windows.onFocusChanged) {
-  chrome.windows.onFocusChanged.addListener(async () => {
+  chrome.windows.onFocusChanged.addListener(async (winId) => {
+    // フォーカスが「どのウィンドウにも無い」（デスクトップ・スリープ移行）は復帰ではない。
+    const NONE = (chrome.windows && chrome.windows.WINDOW_ID_NONE !== undefined)
+      ? chrome.windows.WINDOW_ID_NONE : -1;
+    if (winId !== undefined && winId === NONE) return;
+    try { handleWakeResume('focus'); } catch (e) {}
     try {
       const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       const tab = tabs && tabs[0];

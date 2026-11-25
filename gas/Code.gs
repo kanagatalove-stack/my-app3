@@ -83,7 +83,7 @@ const CONFIG = {
     // スクリーンショットを撮影・アップロードする（結果は 画面情報 シートに保存）。
     '画面情報要求日時',
     '画面情報更新日時',
-    // AI監視（学習に関係のないサイトの検知）用の列。
+    // サイト監視（学習に関係のないサイトの検知）用の列。
     // システム全体のON/OFF が管理者により切り替えられる。OFF のときは
     // getAllDevices 側で「要注意=false」に伏せて返すため、管理画面の注意マークは消える。
     // ※ 既存シートには ensureDeviceHeaders が末尾へ自動追加する（後方互換）。
@@ -120,7 +120,10 @@ const CONFIG = {
     '登録URL情報',
     '個別ホワイトリスト',
     '個別ブラックリスト',
-    '最終ログイン日時'
+    '最終ログイン日時',
+    // 【Request K】教員ごとのGoogleアカウントSSO可否（末尾に追加。既存1〜10列の
+    //   インデックスは不変。ensureTeacherHeaders が既存シートへも自動補完する）
+    'Google SSO許可'
   ],
 
   // ==========================================================
@@ -884,6 +887,13 @@ function doGet(e) {
   try {
     const params = (e && e.parameter) || {};
     const api = params.api || '';
+    // 【可観測性】受け取った時点で必ずログを残す。
+    //   「端末が本当に届いているのか」を実行ログだけで100%判定できるようにする。
+    try {
+      Logger.log('[SHARD] heartbeat: received(GET) api=' + String(api || '(none)') +
+        ' student_id=' + String(params.student_id || '(none)') +
+        ' keys=' + Object.keys(params || {}).length);
+    } catch (eRcv) {}
 
     // 1. 児童拡張機能からのハートビート (GET対応)
     if (api === 'heartbeat' || api === 'get_settings') {
@@ -905,7 +915,14 @@ function doGet(e) {
       if (!auth.valid) {
         return jsonResponse({ success: false, error: '認証が必要です。ログインし直してください。', need_auth: true });
       }
-      const data = getAllDevices(params.school_name, auth.teacher, parseBoolean(params.include_unassigned));
+      // 【Request L】管理画面（api_getAllDevices）と同じ集約経路に統一する。
+      //   以前はここだけ getAllDevices を直接呼んでいたため、親GASモードでも
+      //   この経路（api=list）でだけ子GASの端末が見えなかった。
+      //   SHARD_MODE=false のときは getShardMergedDevices 内部で
+      //   getAllDevices をそのまま返す＝従来と完全同一の挙動。
+      const currentTeacher = resolveCurrentTeacher(auth.teacher);
+      const data = getShardMergedDevices(
+        params.school_name, currentTeacher, parseBoolean(params.include_unassigned));
       return jsonResponse({ success: true, data: data, teacher: auth.teacher });
     }
 
@@ -948,11 +965,25 @@ function doPost(e) {
 
     const action = payload.action || payload.api;
 
+    // 【可観測性】受け取った時点で必ずログを残す（本文形式・パラメータ形式を問わない）。
+    //   実機では「子GASの実行数が完全にゼロ」で原因を切り分けられなかったため、
+    //   到達の有無を1行で判別できるようにする。
+    try {
+      Logger.log('[SHARD] heartbeat: received(POST) action=' + String(action || '(none)') +
+        ' student_id=' + String(payload.student_id || '(none)') +
+        ' keys=' + Object.keys(payload || {}).length +
+        ' postData=' + !!(e && e.postData));
+    } catch (eRcvP) {}
+
     // A. 児童拡張機能からのハートビート (認証不要・student_id必須)
     if (action === 'heartbeat') {
       const studentId = payload.student_id;
       const currentUrl = payload.current_url || '';
-      if (!studentId) return jsonResponse({ success: false, error: 'student_id is required' });
+      if (!studentId) {
+        // 端末は届いているが ID が無い＝設定不良。無言で返さず理由を残す。
+        try { Logger.log('[SHARD] heartbeat: student_id 未設定のため配信できません（端末側の児童ID設定を確認）'); } catch (eNoId) {}
+        return jsonResponse({ success: false, error: 'student_id is required' });
+      }
       const hb = processHeartbeat(studentId, currentUrl, payload.school_name);
       // 子GAS分散（SHARD_MODE）: 親は端末のクラスから「子GAS URL」を解決して返す。
       // 親でない場合 resolveShardForHeartbeat は {} を返すため、応答は従来と完全に同一。
@@ -982,6 +1013,15 @@ function doPost(e) {
         payload.reason || payload.kind || 'chrome_protected'
       );
       return jsonResponse(res);
+    }
+
+    // A2-c. 【v1.6.8】ライブ視聴の軽量フレーム（端末 → GAS）。
+    //     ハートビート応答の live_watch が true の端末だけが送ってくる
+    //     （JPEG・横幅480px前後・Base64 30,000文字以内）。
+    //     screenshot と同じく認証不要の経路。画像は CacheService にだけ置き、
+    //     スプレッドシートへの書き込みは行わない（書き込み負荷ゼロ）。
+    if (action === 'live_frame' || action === 'live_watch_frame') {
+      return jsonResponse(liveWatchPutFrame(payload.student_id, payload.image_data || payload.data_url));
     }
 
     // A3. 教員コンソールの稼働通知（ログイン中は 15 秒ごとに touch、ログアウト/タブ閉じで release）。
@@ -1037,12 +1077,30 @@ function doPost(e) {
     if (action === 'shard_apply') {
       return jsonResponse(shardApplyFromParent(payload));
     }
+    // 【Request N】年次更新の専用クリーンアップ指令（子GASの前年度行を全削除）
+    if (action === 'shard_annual_clear') {
+      return jsonResponse(shardAnnualClearFromParent(payload));
+    }
     if (action === 'shard_push') {
       return jsonResponse(shardUpsertTelemetryFromChild(payload));
     }
     // 親が子の端末一覧を取りに来る（コンソールの1画面集約用）
     if (action === 'shard_list') {
       return jsonResponse(shardListForParent(payload));
+    }
+    // 【R57】ライブ視聴の親子ルーティング（子GAS側の受信口）。
+    //   親は「親の台帳」を更新したうえで、同じ操作をここへ並列転送してくる。
+    //   これが無いと子GASのハートビート応答が live_watch:false のままになり、
+    //   端末は撮影を開始しない（＝管理画面が永久に「送信を待っています」）。
+    //   認証は教員トークンではなく共有シークレット（1校独立運用のため自校のみ到達可能）。
+    if (action === LIVE_WATCH_SHARD_APPLY) {
+      return jsonResponse(liveWatchShardApplyFromParent(payload));
+    }
+    if (action === LIVE_WATCH_SHARD_FRAMES) {
+      return jsonResponse(liveWatchShardFramesFromParent(payload));
+    }
+    if (action === LIVE_WATCH_SHARD_STATUS) {
+      return jsonResponse(liveWatchShardStatusFromParent(payload));
     }
     // 子GASが「この児童は誰か（氏名・学校・クラス）」を親の名簿へ問い合わせる。
     // 子は名簿を持たないため、これが無いとクラス未取得の端末が永久に直らない。
@@ -1100,12 +1158,15 @@ function doPost(e) {
     if (action === 'get_all') {
       // 子GAS分散: 子の端末も同じ画面に並べる（教員は1画面のまま）。
       // 子GASへは並列（fetchAll）で問い合わせ、集約結果を数秒キャッシュする。
+      // 【R55】payload.fresh（または no_cache）が真なら読み取りキャッシュを迂回し、
+      //   子GASの最新 last_seen を取り直す（コンソールの自動更新・タブ復帰・操作直後）。
+      const __freshGetAll = parseBoolean(payload.fresh) || parseBoolean(payload.no_cache);
       const data = getShardMergedDevices(
-        payload.school_name, currentTeacher, Boolean(payload.include_unassigned));
+        payload.school_name, currentTeacher, Boolean(payload.include_unassigned), __freshGetAll);
       return jsonResponse({ success: true, data: data });
     }
 
-    // D1. AI監視設定の取得（読み取りは全教員可。変更可否の判断材料として is_admin を返す）
+    // D1. サイト監視設定の取得（読み取りは全教員可。変更可否の判断材料として is_admin を返す）
     if (action === 'get_monitor_settings') {
       return jsonResponse({
         success: true,
@@ -1114,10 +1175,39 @@ function doPost(e) {
       });
     }
 
-    // D1-2. AI監視設定の保存（システム全体・管理者のみ）
+    // D1-2. サイト監視設定の保存（システム全体・管理者のみ）
     if (action === 'save_monitor_settings') {
       const saved = saveMonitoringSettings(currentTeacher, payload.settings || {});
       return jsonResponse({ success: true, message: '監視設定を保存しました', settings: saved });
+    }
+
+    // D1-3. 【v1.6.8】ライブ視聴の使用枠状況（読み取りは全教員可）
+    //   【R57】R41分散時は子GASの台帳と和集合を取る（子の端末が実際に撮影しているため）。
+    if (action === 'live_watch_status') {
+      return jsonResponse(liveWatchStatusSharded(currentTeacher));
+    }
+    // D1-4. 【v1.6.8】ライブ視聴の開始（相乗りは満枠でも許可／新規は24台まで）
+    //   【R57】親の台帳を更新したうえで、対象スコープの子GASへも転送して
+    //   子の台帳に登録する（＝子のハートビート応答が live_watch:true になる）。
+    if (action === 'live_watch_start') {
+      return jsonResponse(liveWatchApplyBatchSharded(currentTeacher, payload.student_ids, 'start'));
+    }
+    // D1-5. 【v1.6.8】視聴枠の延長ハートビート（管理画面が開いている間だけ）
+    if (action === 'live_watch_extend') {
+      return jsonResponse(liveWatchApplyBatchSharded(currentTeacher, payload.student_ids, 'extend'));
+    }
+    // D1-6. 【v1.6.8】視聴枠の解放（枠を閉じた／タブ非表示／タイムアウト）
+    if (action === 'live_watch_stop') {
+      return jsonResponse(liveWatchApplyBatchSharded(currentTeacher, payload.student_ids, 'stop'));
+    }
+    // D1-7. 【v1.6.8】最新ライブ画像の取得（管理画面が 1.5〜2 秒間隔で叩く）
+    //   【R57】端末は子GASへ live_frame を送るため、子GASからも並列取得して
+    //   「新しい撮影時刻の画像」を優先してマージする。
+    if (action === 'live_watch_frames') {
+      const ids = Array.isArray(payload.student_ids) ? payload.student_ids : [];
+      const scoped = scopeStudentIdsForTeacher(ids, currentTeacher);
+      const frames = liveWatchGetFramesSharded(scoped.ids, currentTeacher);
+      return jsonResponse({ success: true, data: frames, ids: scoped.ids });
     }
 
     // D2. 画面情報取得要求（押下時のみ）：対象児童に要求IDを書き込む
@@ -1163,8 +1253,16 @@ function doPost(e) {
       if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
         return jsonResponse({ success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' });
       }
-      const broadcastId = bulkUpdateBroadcastUrl(scoped.ids, targetUrl, '');
-      const shardBc = shardPropagatePolicy(scoped.ids, { broadcast_url: targetUrl });
+      // 【要件1】配信IDは管理画面の押下時に1つだけ採番され、payload.broadcast_id で届く。
+      //   ここで採番し直すと子GAS直送（ブラウザ→子）と別IDになり、
+      //   端末が「新しい配信」と誤認して同じページを2枚開く（実機症状）。
+      //   届かなかった場合のみ bulkUpdateBroadcastUrl 側がフォールバック発番する。
+      const reqBcId = String((payload && payload.broadcast_id) || '').trim();
+      const broadcastId = bulkUpdateBroadcastUrl(scoped.ids, targetUrl, reqBcId);
+      const shardBc = shardPropagatePolicy(scoped.ids, {
+        broadcast_url: targetUrl,
+        broadcast_id: broadcastId
+      });
       return jsonResponse({ success: true, message: '一斉URLを配信しました', broadcast_id: broadcastId, shard: shardBc });
     }
 
@@ -1217,6 +1315,12 @@ function doPost(e) {
       return jsonResponse(handleOverrideSchedule_(payload, currentTeacher));
     }
 
+    // G6. 【Request P】予約の編集（schedule_id は維持し、既存行を書き換える）
+    //   有効/手動解除/手動解除日時（16/17/18）と 作成者/作成日時（19/20）には触れない。
+    if (action === 'update_schedule' || action === 'schedule_update') {
+      return jsonResponse(handleUpdateSchedule_(payload, currentTeacher));
+    }
+
     // H. 単一児童端末の更新（他校の児童は更新不可）
     if (action === 'update_single') {
       const targetStudent = getDeviceByStudentId(payload.student_id);
@@ -1226,18 +1330,21 @@ function doPost(e) {
       if (!isDeviceInTeacherScope(targetStudent.school_name, currentTeacher, targetStudent.class_name)) {
         return jsonResponse({ success: false, error: '対象外の児童は操作できません（学校・対象クラスの範囲外）' });
       }
-      updateSingleDevice(payload.student_id, payload.data || {});
       const single = payload.data || {};
       const shardPatch = {};
       if (single.screen_lock !== undefined) shardPatch.screen_lock = parseBoolean(single.screen_lock);
       if (single.filter_mode !== undefined) shardPatch.filter_mode = single.filter_mode;
       if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
       if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
-      if (single.broadcast_url !== undefined) shardPatch.broadcast_url = single.broadcast_url;
-      // 【R41】子GASへの反映はブラウザが直接・並列で行う（親は待たない）
-      const shardSingle = Object.keys(shardPatch).length
-        ? shardPropagatePolicy([payload.student_id], shardPatch) : { skipped: true };
-      return jsonResponse({ success: true, message: '設定を更新しました', shard: shardSingle });
+      if (single.broadcast_url !== undefined) {
+        shardPatch.broadcast_url = single.broadcast_url;
+        if (single.broadcast_id) shardPatch.broadcast_id = String(single.broadcast_id);
+      }
+      // 【個別操作の統一経路】① 親キャッシュ先行反映 → ② 子GASへ即時同期転送
+      //   （forceSync=true / deferred 禁止）→ ③ シート永続化 の順で必ず通す。
+      const singleRes = applySingleControl_(payload.student_id, shardPatch, single);
+      return jsonResponse({ success: true, message: '設定を更新しました',
+        shard: singleRes.shard, broadcast_id: singleRes.broadcast_id || '' });
     }
 
     // H2. 【R41】子GASの接続情報をブラウザへ配布する
@@ -1373,7 +1480,10 @@ function handleTeacherLogin(email, password) {
         target_class: String(data[i][headerMap['対象クラス'] - 1] || ''),
         urls: parseTeacherUrls(data[i][headerMap['登録URL情報'] - 1]),
         filter_whitelist: String(data[i][headerMap['個別ホワイトリスト'] - 1] || defaultWhitelist),
-        filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist)
+        filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist),
+        // 【Request K】SSO可否（列が無い環境でも安全に評価できるようガード）
+        sso_allowed: parseSsoAllowedFlag(
+          headerMap['Google SSO許可'] ? data[i][headerMap['Google SSO許可'] - 1] : undefined)
       };
 
       const token = generateToken(teacher);
@@ -1548,7 +1658,10 @@ function getTeacherSettings(email) {
         target_class: String(data[i][headerMap['対象クラス'] - 1] || ''),
         urls: parseTeacherUrls(data[i][headerMap['登録URL情報'] - 1]),
         filter_whitelist: String(data[i][headerMap['個別ホワイトリスト'] - 1] || defaultWhitelist),
-        filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist)
+        filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || defaultBlacklist),
+        // 【Request K】SSO可否（空欄＝既定ON。明示的な FALSE のみ拒否）
+        sso_allowed: parseSsoAllowedFlag(
+          headerMap['Google SSO許可'] ? data[i][headerMap['Google SSO許可'] - 1] : undefined)
       };
       if (__tCache && __tKey) {
         try { __tCache.put(__tKey, JSON.stringify(__found), 300); } catch (e) { /* 容量超過等は無視 */ }
@@ -1678,7 +1791,13 @@ function getAllTeachers(teacher) {
       school: String(data[i][headerMap['所属学校'] - 1] || ''),
       role: String(data[i][headerMap['権限'] - 1] || 'TEACHER'),
       target_class: String(data[i][headerMap['対象クラス'] - 1] || ''),
-      last_login: headerMap['最終ログイン日時'] ? String(data[i][headerMap['最終ログイン日時'] - 1] || '') : ''
+      last_login: headerMap['最終ログイン日時'] ? String(data[i][headerMap['最終ログイン日時'] - 1] || '') : '',
+      // 【Request K】編集モーダルで全項目を復元できるようにする
+      sso_allowed: parseSsoAllowedFlag(
+        headerMap['Google SSO許可'] ? data[i][headerMap['Google SSO許可'] - 1] : undefined),
+      urls: parseTeacherUrls(data[i][headerMap['登録URL情報'] - 1]),
+      filter_whitelist: String(data[i][headerMap['個別ホワイトリスト'] - 1] || ''),
+      filter_blacklist: String(data[i][headerMap['個別ブラックリスト'] - 1] || '')
     });
   }
   return results;
@@ -1695,8 +1814,17 @@ function addTeacher(teacher, payload) {
   const school = String((payload && payload.school) || '').trim();
   const role = String((payload && payload.role) || 'TEACHER').trim().toUpperCase();
   const targetClass = String((payload && payload.target_class) || '').trim();
+  // 【Request K】SSO許可・登録URL情報・個別ホワイト/ブラックリストも登録可能にする
+  const ssoAllowed = parseSsoAllowedFlag(
+    (payload && payload.sso_allowed !== undefined) ? payload.sso_allowed : true);
+  const urls = (payload && payload.urls) || [];
+  const whitelist = String((payload && payload.filter_whitelist) || '').trim();
+  const blacklist = String((payload && payload.filter_blacklist) || '').trim();
   if (!email) throw new Error('メールアドレスを入力してください');
-  if (!password) throw new Error('パスワードを入力してください');
+  // SSOが有効ならパスワード未設定でも登録できる（手動ログインを併用したい場合のみ設定）
+  if (!password && !ssoAllowed) {
+    throw new Error('パスワードを入力するか、Google SSO許可を有効にしてください');
+  }
   return withWriteLock(function () {
 
   const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
@@ -1716,6 +1844,13 @@ function addTeacher(teacher, payload) {
   newRow[headerMap['所属学校'] - 1] = school || '全校管理';
   newRow[headerMap['権限'] - 1] = role || 'TEACHER';
   newRow[headerMap['対象クラス'] - 1] = targetClass;
+  // 【Request K】URL情報・個別リスト・SSO可否（列が無い環境でも落ちないようガード）
+  if (headerMap['登録URL情報'] && Array.isArray(urls) && urls.length) {
+    newRow[headerMap['登録URL情報'] - 1] = serializeTeacherUrls(urls);
+  }
+  if (headerMap['個別ホワイトリスト'] && whitelist) newRow[headerMap['個別ホワイトリスト'] - 1] = whitelist;
+  if (headerMap['個別ブラックリスト'] && blacklist) newRow[headerMap['個別ブラックリスト'] - 1] = blacklist;
+  if (headerMap['Google SSO許可']) newRow[headerMap['Google SSO許可'] - 1] = ssoAllowed;
   sheet.appendRow(newRow);
   // 【R33】教員を追加したのでキャッシュを失効させる
   try { if (typeof invalidateTeacherCache === 'function') invalidateTeacherCache(); } catch (e) {}
@@ -1748,6 +1883,19 @@ function updateTeacherRecord(teacher, payload) {
   if (payload.school !== undefined && headerMap['所属学校']) sheet.getRange(targetRow, headerMap['所属学校']).setValue(String(payload.school).trim());
   if (payload.role !== undefined && headerMap['権限']) sheet.getRange(targetRow, headerMap['権限']).setValue(String(payload.role).trim().toUpperCase());
   if (payload.target_class !== undefined && headerMap['対象クラス']) sheet.getRange(targetRow, headerMap['対象クラス']).setValue(String(payload.target_class).trim());
+  // 【Request K】登録URL情報・個別ホワイト/ブラックリスト・SSO可否も更新できるようにする
+  if (payload.urls !== undefined && headerMap['登録URL情報']) {
+    sheet.getRange(targetRow, headerMap['登録URL情報']).setValue(serializeTeacherUrls(payload.urls || []));
+  }
+  if (payload.filter_whitelist !== undefined && headerMap['個別ホワイトリスト']) {
+    sheet.getRange(targetRow, headerMap['個別ホワイトリスト']).setValue(String(payload.filter_whitelist || '').trim());
+  }
+  if (payload.filter_blacklist !== undefined && headerMap['個別ブラックリスト']) {
+    sheet.getRange(targetRow, headerMap['個別ブラックリスト']).setValue(String(payload.filter_blacklist || '').trim());
+  }
+  if (payload.sso_allowed !== undefined && headerMap['Google SSO許可']) {
+    sheet.getRange(targetRow, headerMap['Google SSO許可']).setValue(parseSsoAllowedFlag(payload.sso_allowed));
+  }
   // 【R33】教員情報を更新したのでキャッシュを失効させる（所属校・権限の変更を即反映）
   try { if (typeof invalidateTeacherCache === 'function') invalidateTeacherCache(); } catch (e) {}
   return getTeacherSettings(email);
@@ -2400,7 +2548,7 @@ function canonicalizeIncomingSchool(raw) {
   return '';
 }
 
-// ==================== AI監視（学習に関係のないサイトの検知） ====================
+// ==================== サイト監視（学習に関係のないサイトの検知） ====================
 // 判定方式はハイブリッド:
 //   (a) あらかじめ用意したドメイン辞書（学習ドメイン / 非学習ドメイン）
 //   (b) 先生が登録するリスト（端末の「許可URLリスト」「規制URLリスト」）
@@ -2502,6 +2650,9 @@ function getMonitoringSettings() {
     enabled: false,
     learning_domains: MONITOR_DEFAULT_LEARNING_DOMAINS.slice(),
     blocked_domains: MONITOR_DEFAULT_BLOCKED_DOMAINS.slice(),
+    // 【v1.6.8】ライブ視聴の管理設定（管理者のみ変更可）。ここが既定値の正。
+    live_watch_per_teacher_limit: LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT,
+    live_watch_timeout_sec: LIVE_WATCH_DEFAULT_TIMEOUT_SEC,
     updated_at: '',
     updated_by: ''
   };
@@ -2519,6 +2670,13 @@ function getMonitoringSettings() {
       blocked_domains: Array.isArray(o.blocked_domains)
         ? o.blocked_domains.map(function (v) { return String(v); })
         : defaults.blocked_domains,
+      // 【v1.6.8】未保存（旧データ）のときは既定値へ落とす＝挙動を変えない。
+      live_watch_per_teacher_limit: (o.live_watch_per_teacher_limit !== undefined)
+        ? normalizeLiveWatchPerTeacherLimit(o.live_watch_per_teacher_limit)
+        : defaults.live_watch_per_teacher_limit,
+      live_watch_timeout_sec: (o.live_watch_timeout_sec !== undefined)
+        ? normalizeLiveWatchTimeoutSec(o.live_watch_timeout_sec)
+        : defaults.live_watch_timeout_sec,
       updated_at: String(o.updated_at || ''),
       updated_by: String(o.updated_by || '')
     };
@@ -2564,6 +2722,14 @@ function saveMonitoringSettings(teacher, incoming) {
     blocked_domains: Array.isArray(src.blocked_domains)
       ? sanitizeMonitorDomainList(src.blocked_domains)
       : cur.blocked_domains,
+    // 【v1.6.8】ライブ視聴の管理設定。管理者のみ変更できる（この関数の冒頭で拒否）。
+    //   未指定なら現在値を維持する（部分更新で意図せず既定へ戻さない）。
+    live_watch_per_teacher_limit: (src.live_watch_per_teacher_limit !== undefined)
+      ? normalizeLiveWatchPerTeacherLimit(src.live_watch_per_teacher_limit)
+      : cur.live_watch_per_teacher_limit,
+    live_watch_timeout_sec: (src.live_watch_timeout_sec !== undefined)
+      ? normalizeLiveWatchTimeoutSec(src.live_watch_timeout_sec)
+      : cur.live_watch_timeout_sec,
     updated_at: Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
     updated_by: String((teacher && teacher.email) || '')
   };
@@ -2571,7 +2737,1184 @@ function saveMonitoringSettings(teacher, incoming) {
   PropertiesService.getScriptProperties().setProperty(MONITOR_PROP_KEY, JSON.stringify(next));
   // 一覧の読み取りキャッシュを捨てて、次の取得で新しい設定を反映させる
   if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache();
+  // 【サイト監視】R41: 各校は独立したGAS環境のため、親の設定は子GASへも配らないと
+  //   子配下の児童を判定できない（子の getMonitoringSettings() が既定 false のままになる）。
+  //   既存の shard_apply 同梱経路（即時並列プッシュ＋保留キュー）を再利用する。
+  try {
+    if (typeof shardPropagateMonitorSettings === 'function') shardPropagateMonitorSettings(next);
+  } catch (eProp) { /* 伝播に失敗しても親の設定保存は成立させる */ }
   return next;
+}
+
+/**
+ * 【サイト監視】子GAS側: 親から届いた監視設定を PropertiesService に保存する。
+ *
+ * R41 では親子で PropertiesService が完全に独立しているため、親と同一キー
+ * （MONITOR_SETTINGS_V1）を使っても競合しない。同一キーにすることで
+ * 子GASでも既存の getMonitoringSettings() をそのまま使える。
+ */
+function shardChildApplyMonitorSettings(incoming) {
+  if (!incoming || typeof incoming !== 'object') return null;
+  try {
+    const next = {
+      enabled: incoming.enabled === true,
+      learning_domains: sanitizeMonitorDomainList(incoming.learning_domains || []),
+      blocked_domains: sanitizeMonitorDomainList(incoming.blocked_domains || []),
+      // 【v1.6.8】ライブ視聴の管理設定も親から配られる（R41: 子の PropertiesService は独立）。
+      //   未指定なら既定値（＝旧形式の shard_apply でも壊れない）。
+      live_watch_per_teacher_limit: (incoming.live_watch_per_teacher_limit !== undefined)
+        ? normalizeLiveWatchPerTeacherLimit(incoming.live_watch_per_teacher_limit)
+        : LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT,
+      live_watch_timeout_sec: (incoming.live_watch_timeout_sec !== undefined)
+        ? normalizeLiveWatchTimeoutSec(incoming.live_watch_timeout_sec)
+        : LIVE_WATCH_DEFAULT_TIMEOUT_SEC,
+      updated_at: String(incoming.updated_at || ''),
+      updated_by: String(incoming.updated_by || '')
+    };
+    // 辞書が空で届いた場合は既定辞書で補う（全サイト注意になる事故を防ぐ）
+    if (!next.learning_domains.length) next.learning_domains = MONITOR_DEFAULT_LEARNING_DOMAINS.slice();
+    if (!next.blocked_domains.length) next.blocked_domains = MONITOR_DEFAULT_BLOCKED_DOMAINS.slice();
+    PropertiesService.getScriptProperties().setProperty(MONITOR_PROP_KEY, JSON.stringify(next));
+    if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache();
+    return { saved: true, enabled: next.enabled };
+  } catch (e) {
+    return { saved: false, error: String((e && e.message) ? e.message : e) };
+  }
+}
+
+/**
+ * 【サイト監視】親GAS側: 監視設定を全子GASへ伝播する。
+ *
+ * 既存の shard_apply へ schedules を同封するのと同じ経路を使う。
+ * student_ids を空にした専用リクエストなので、子はポリシー変更を行わず
+ * 設定の保存だけを行う（shardApplyFromParent の早期 return 経路）。
+ * 応答は待たず保留キューへ積む（R41 の並列配信速度を落とさない）。
+ */
+function shardPropagateMonitorSettings(settings) {
+  if (!isShardParent()) return { skipped: true, reason: 'not_parent' };
+  try {
+    const cfg = shardConfigCached();
+    const urls = shardAllChildUrls(cfg);
+    if (!urls.length) return { skipped: true, reason: 'no_child' };
+
+    const s = settings || getMonitoringSettings();
+    const body = JSON.stringify({
+      action: 'shard_apply',
+      shard_secret: cfg.sec,
+      student_ids: [],
+      monitor_settings: s
+    });
+    const requests = [];
+    for (let i = 0; i < urls.length; i++) {
+      requests.push({
+        url: urls[i], method: 'post', contentType: 'application/json',
+        payload: body, muteHttpExceptions: true
+      });
+    }
+    try {
+      if (typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
+          typeof shardQueuePending === 'function' && shardQueuePending(requests)) {
+        return { sent: urls.length, deferred: true };
+      }
+    } catch (eq) { /* 保留が使えなければ同期送信へ */ }
+    shardFetchMany(requests);
+    return { sent: urls.length, deferred: false };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+// ============================================================================
+// 準リアルタイム画面視聴（ライブ視聴 / v1.6.8）
+//
+// 【設計（R41 前提を維持）】
+//   1 校 = 1 独立 Spreadsheet/GAS 環境のため、ライブ視聴の同時視聴枠は
+//   「各 GAS 環境の CacheService」で管理する（親子で独立してカウントされる）。
+//   1 つの GAS 環境あたりの同時ライブ監視対象は最大 MAX_LIVE_WATCH_DEVICES 台。
+//
+//   ▼ 全体プール制（ユニーク端末数で数える）
+//     ・プールは「児童ID」を単位に数える（教員数ではない）。
+//     ・すでに他の教員が見ている児童に別の教員が相乗りした場合は、
+//       同一のキャッシュ画像を共有し、ユニーク台数を増やさない。
+//       つまり 24/24 満枠でも「相乗り」は許可される（児童端末への
+//       キャプチャ要求も 1 ストリームのまま＝端末の負荷は増えない）。
+//     ・新規の児童を追加して 24 を超える場合だけ LIVE_WATCH_POOL_FULL を返す。
+//
+//   ▼ 短い TTL ＋ 延長ハートビート（ブラウザ強制終了時の自動解放）
+//     ・視聴セッションの TTL は LIVE_WATCH_TTL_SEC（25秒）。
+//     ・管理画面は枠が開いている間だけ LIVE_WATCH_EXTEND_SEC 間隔で
+//       延長（extend）を送る。
+//     ・ブラウザが落ちると延長が止まり、25 秒で自動的に枠が空く。
+//     ・さらに管理設定 live_watch_timeout_sec（既定 180 秒）を超えたら
+//       延長が来ていても自動解放する（＝見忘れによる占有を防ぐ）。
+//
+//   ▼ 設定は PropertiesService のみ（MONITOR_SETTINGS_V1 を拡張）
+//     ・live_watch_per_teacher_limit … 0=無効 / 1〜25 / -1（無限）。既定 3。
+//     ・live_watch_timeout_sec       … 自動タイムアウト秒。既定 180。
+//     ・R41 では子GASの PropertiesService が独立しているため、親の設定は
+//       既存の shard_apply 同梱経路（shardPropagateMonitorSettings）で配る。
+//
+//   ▼ 端末側（extension v1.6.8）
+//     ・ハートビート応答の live_watch が true の端末だけが軽量キャプチャを送る。
+//     ・送信先は action='live_frame'（認証不要・screenshot と同じ経路）。
+// ============================================================================
+
+/** 1 GAS 環境あたりの同時ライブ監視対象の上限（ユニーク端末数） */
+const MAX_LIVE_WATCH_DEVICES = 24;
+
+/** 視聴セッションの TTL（秒）。ブラウザ強制終了時の自動解放はこの長さで決まる。 */
+const LIVE_WATCH_TTL_SEC = 25;
+
+/** 管理画面が延長を送る間隔（秒）。TTL より十分短くして切れ目を作らない。 */
+const LIVE_WATCH_EXTEND_SEC = 10;
+
+/** ライブ画像（1枚）のキャッシュ保持時間（秒）。 */
+const LIVE_WATCH_FRAME_TTL_SEC = 20;
+
+/** プール台帳そのもののキャッシュ保持時間（秒）。内容は自前で期限判定する。 */
+const LIVE_WATCH_POOL_CACHE_SEC = 300;
+
+/** プール台帳のキャッシュキー（GAS 環境ごとに独立） */
+const LIVE_WATCH_POOL_KEY = 'live_watch_pool_v1';
+
+/** ライブ画像のキャッシュキー接頭辞 */
+const LIVE_WATCH_FRAME_PREFIX = 'live_watch_frame_';
+
+/** 端末から受け取る 1 枚あたりの Base64 上限（文字数）。約 15〜22KB を想定。 */
+const LIVE_WATCH_MAX_FRAME_CHARS = 30000;
+
+/** 管理設定 live_watch_per_teacher_limit の既定値（台） */
+const LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT = 3;
+
+/** 管理設定 live_watch_per_teacher_limit の上限（台） */
+const LIVE_WATCH_MAX_PER_TEACHER_LIMIT = 25;
+
+/** 管理設定 live_watch_timeout_sec の既定値（秒） */
+const LIVE_WATCH_DEFAULT_TIMEOUT_SEC = 180;
+
+/** 管理設定 live_watch_timeout_sec の許容範囲（秒） */
+const LIVE_WATCH_MIN_TIMEOUT_SEC = 30;
+const LIVE_WATCH_MAX_TIMEOUT_SEC = 3600;
+
+/** 「無限」を表す内部値（live_watch_per_teacher_limit） */
+const LIVE_WATCH_UNLIMITED = -1;
+
+/** 現在時刻（ms）。GAS の他の実装と揃えて Date 経由で取る。 */
+function liveWatchNowMs_() {
+  return new Date().getTime();
+}
+
+/**
+ * 1教員あたりの同時ライブ視聴上限を正規化する。
+ *   ・-1 / 'unlimited' / '∞' / '無限' … 無限（内部値 -1）
+ *   ・0                              … 機能無効
+ *   ・1〜25                          … その台数
+ *   ・それ以外（未設定・異常値）      … 既定 3
+ */
+function normalizeLiveWatchPerTeacherLimit(value) {
+  if (value === true) return LIVE_WATCH_UNLIMITED;
+  if (typeof value === 'string') {
+    const s = value.trim().toLowerCase();
+    if (!s) return LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT;
+    if (s === 'unlimited' || s === 'inf' || s === 'infinity' || s === '∞' ||
+        s === '無限' || s === '無制限' || s === '-1') {
+      return LIVE_WATCH_UNLIMITED;
+    }
+  }
+  const n = Number(value);
+  if (!isFinite(n)) return LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT;
+  const i = Math.floor(n);
+  if (i < 0) return LIVE_WATCH_UNLIMITED;
+  if (i === 0) return 0;
+  if (i > LIVE_WATCH_MAX_PER_TEACHER_LIMIT) return LIVE_WATCH_MAX_PER_TEACHER_LIMIT;
+  return i;
+}
+
+/**
+ * ライブ視聴の自動タイムアウト（秒）を正規化する。
+ *   未設定・非数値・0以下は既定 180 秒。範囲は 30〜3600 秒に丸める。
+ */
+function normalizeLiveWatchTimeoutSec(value) {
+  if (value === undefined || value === null || value === '') return LIVE_WATCH_DEFAULT_TIMEOUT_SEC;
+  const n = Number(value);
+  if (!isFinite(n) || n <= 0) return LIVE_WATCH_DEFAULT_TIMEOUT_SEC;
+  const i = Math.round(n);
+  if (i < LIVE_WATCH_MIN_TIMEOUT_SEC) return LIVE_WATCH_MIN_TIMEOUT_SEC;
+  if (i > LIVE_WATCH_MAX_TIMEOUT_SEC) return LIVE_WATCH_MAX_TIMEOUT_SEC;
+  return i;
+}
+
+/** 教員をプール台帳のキー（メールアドレス小文字）へ寄せる。 */
+function liveWatchTeacherKey_(teacher) {
+  if (teacher && typeof teacher === 'object') {
+    return String(teacher.email || teacher.teacher_email || '').trim().toLowerCase();
+  }
+  return String(teacher === undefined || teacher === null ? '' : teacher).trim().toLowerCase();
+}
+
+/** ライブ視聴関連のキャッシュ（使えない環境では null）。 */
+function liveWatchCache_() {
+  try {
+    if (typeof CacheService === 'undefined') return null;
+    return CacheService.getScriptCache();
+  } catch (e) {
+    return null;
+  }
+}
+
+/** ライブ視聴の管理設定（MONITOR_SETTINGS_V1 由来）を解決する。 */
+function liveWatchSettings_() {
+  let s = null;
+  try { s = getMonitoringSettings(); } catch (e) { s = null; }
+  const limit = (s && s.live_watch_per_teacher_limit !== undefined)
+    ? normalizeLiveWatchPerTeacherLimit(s.live_watch_per_teacher_limit)
+    : LIVE_WATCH_DEFAULT_PER_TEACHER_LIMIT;
+  const tmo = (s && s.live_watch_timeout_sec !== undefined)
+    ? normalizeLiveWatchTimeoutSec(s.live_watch_timeout_sec)
+    : LIVE_WATCH_DEFAULT_TIMEOUT_SEC;
+  return {
+    per_teacher_limit: limit,
+    timeout_sec: tmo,
+    unlimited: limit === LIVE_WATCH_UNLIMITED,
+    disabled: limit === 0
+  };
+}
+
+/** プール台帳を読む（無ければ空）。壊れていても例外にしない（監視を止めない）。 */
+function liveWatchReadPool_() {
+  const empty = { v: 1, students: {} };
+  const cache = liveWatchCache_();
+  if (!cache) return empty;
+  let raw = null;
+  try { raw = cache.get(LIVE_WATCH_POOL_KEY); } catch (e) { raw = null; }
+  if (!raw) return empty;
+  let o = null;
+  try { o = JSON.parse(raw); } catch (e) { o = null; }
+  if (!o || typeof o !== 'object' || !o.students || typeof o.students !== 'object') return empty;
+  const out = { v: 1, students: {} };
+  const ids = Object.keys(o.students);
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] || '').trim();
+    const e = o.students[ids[i]];
+    if (!sid || !e || typeof e !== 'object') continue;
+    out.students[sid] = {
+      stream_opened_at: Number(e.stream_opened_at) || 0,
+      teachers: (e.teachers && typeof e.teachers === 'object') ? e.teachers : {}
+    };
+  }
+  return out;
+}
+
+/** プール台帳を書く（TTL は LIVE_WATCH_POOL_CACHE_SEC）。 */
+function liveWatchWritePool_(reg) {
+  const cache = liveWatchCache_();
+  if (!cache) return false;
+  try {
+    cache.put(LIVE_WATCH_POOL_KEY, JSON.stringify(reg || { v: 1, students: {} }),
+      LIVE_WATCH_POOL_CACHE_SEC);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * 教員1名の視聴セッションが「いま有効」か。
+ *   ① TTL（expires_at）を過ぎていない
+ *   ② 開いてから timeout_sec を超えていない（管理設定の自動タイムアウト）
+ */
+function liveWatchSessionActive_(teachers, key, nowMs, timeoutSec) {
+  if (!teachers || typeof teachers !== 'object') return false;
+  const s = teachers[key];
+  if (!s || typeof s !== 'object') return false;
+  const exp = Number(s.expires_at) || 0;
+  if (!exp || nowMs >= exp) return false;
+  const opened = Number(s.opened_at) || 0;
+  if (opened > 0) {
+    const capMs = Math.max(0, Number(timeoutSec) || 0) * 1000;
+    if (capMs > 0 && (nowMs - opened) >= capMs) return false;
+  }
+  return true;
+}
+
+/**
+ * プール台帳から期限切れ（TTL 切れ・自動タイムアウト満了）を取り除く。
+ * changed は「書き戻しが必要か」を表す。
+ */
+function liveWatchPrune_(reg, nowMs, timeoutSec) {
+  const src = (reg && reg.students) ? reg.students : {};
+  const ids = Object.keys(src);
+  const out = { v: 1, students: {} };
+  let changed = false;
+  for (let i = 0; i < ids.length; i++) {
+    const sid = ids[i];
+    const e = src[sid] || {};
+    const tsrc = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+    const keys = Object.keys(tsrc);
+    const keep = {};
+    let kept = 0;
+    for (let j = 0; j < keys.length; j++) {
+      if (liveWatchSessionActive_(tsrc, keys[j], nowMs, timeoutSec)) {
+        keep[keys[j]] = tsrc[keys[j]];
+        kept++;
+      } else {
+        changed = true;
+      }
+    }
+    if (kept > 0) {
+      out.students[sid] = {
+        stream_opened_at: Number(e.stream_opened_at) || 0,
+        teachers: keep
+      };
+    } else if (keys.length) {
+      changed = true;
+    }
+  }
+  if (ids.length !== Object.keys(out.students).length) changed = true;
+  return { reg: out, changed: changed };
+}
+
+/** ユニーク端末数（＝有効な視聴セッションを持つ児童の数）。 */
+function liveWatchUniqueCount_(reg, nowMs, timeoutSec) {
+  const src = (reg && reg.students) ? reg.students : {};
+  const ids = Object.keys(src);
+  let n = 0;
+  for (let i = 0; i < ids.length; i++) {
+    const e = src[ids[i]] || {};
+    const tsrc = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+    const keys = Object.keys(tsrc);
+    for (let j = 0; j < keys.length; j++) {
+      if (liveWatchSessionActive_(tsrc, keys[j], nowMs, timeoutSec)) { n++; break; }
+    }
+  }
+  return n;
+}
+
+/** 指定教員がいま見ている児童の数（教員ごとの上限判定に使う）。 */
+function liveWatchTeacherCount_(reg, teacherKey, nowMs, timeoutSec) {
+  const src = (reg && reg.students) ? reg.students : {};
+  const ids = Object.keys(src);
+  let n = 0;
+  for (let i = 0; i < ids.length; i++) {
+    const e = src[ids[i]] || {};
+    const tsrc = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+    if (liveWatchSessionActive_(tsrc, teacherKey, nowMs, timeoutSec)) n++;
+  }
+  return n;
+}
+
+/**
+ * ハートビート応答用: この児童がいまライブ視聴の対象か。
+ *   端末はこの値が true のときだけ軽量キャプチャを送る。
+ */
+function liveWatchIsWatched_(studentId) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return false;
+  try {
+    const st = liveWatchSettings_();
+    const p = liveWatchPrune_(liveWatchReadPool_(), liveWatchNowMs_(), st.timeout_sec);
+    return !!p.reg.students[sid];
+  } catch (e) {
+    // ライブ視聴は補助機能。判定に失敗してもハートビートは止めない。
+    return false;
+  }
+}
+
+/** 現在のプール使用状況（教員画面のインジケーターが使う）。 */
+function liveWatchStatus(teacher) {
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  if (p.changed) liveWatchWritePool_(p.reg);
+  const email = liveWatchTeacherKey_(teacher);
+  const used = liveWatchUniqueCount_(p.reg, now, st.timeout_sec);
+  const mine = email ? liveWatchTeacherCount_(p.reg, email, now, st.timeout_sec) : 0;
+  return {
+    success: true,
+    used: used,
+    max: MAX_LIVE_WATCH_DEVICES,
+    remaining: Math.max(0, MAX_LIVE_WATCH_DEVICES - used),
+    full: used >= MAX_LIVE_WATCH_DEVICES,
+    teacher_used: mine,
+    teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited,
+    disabled: st.disabled,
+    timeout_sec: st.timeout_sec,
+    ttl_sec: LIVE_WATCH_TTL_SEC,
+    extend_sec: LIVE_WATCH_EXTEND_SEC,
+    students: Object.keys(p.reg.students)
+  };
+}
+
+/** liveWatchStart の戻り値で共通に返す使用状況。 */
+function liveWatchUsageBits_(reg, teacherKey, nowMs, st) {
+  const used = liveWatchUniqueCount_(reg, nowMs, st.timeout_sec);
+  return {
+    used: used,
+    max: MAX_LIVE_WATCH_DEVICES,
+    remaining: Math.max(0, MAX_LIVE_WATCH_DEVICES - used),
+    full: used >= MAX_LIVE_WATCH_DEVICES,
+    usage: used + '/' + MAX_LIVE_WATCH_DEVICES,
+    teacher_used: teacherKey ? liveWatchTeacherCount_(reg, teacherKey, nowMs, st.timeout_sec) : 0,
+    teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited,
+    timeout_sec: st.timeout_sec
+  };
+}
+
+/**
+ * ライブ視聴の開始。
+ *   ・すでに誰かが見ている児童 → 相乗り（ユニーク台数を増やさない・満枠でも許可）
+ *   ・新規の児童で 24 を超える → LIVE_WATCH_POOL_FULL（現在の使用数を併せて返す）
+ *   ・管理設定が 0 → LIVE_WATCH_DISABLED
+ *   ・教員ごとの上限に達している → LIVE_WATCH_TEACHER_LIMIT
+ */
+function liveWatchStart(teacher, studentId) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return { success: false, error: 'student_id is required', live_watch: false };
+  const email = liveWatchTeacherKey_(teacher);
+  if (!email) return { success: false, error: 'teacher is required', live_watch: false };
+
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  const reg = p.reg;
+  const usage = liveWatchUsageBits_(reg, email, now, st);
+
+  // 管理設定 0（機能無効）: 一般教員の新規開始はブロックする。
+  if (st.disabled) {
+    return {
+      success: false, live_watch: false, student_id: sid,
+      code: 'LIVE_WATCH_DISABLED',
+      error: '現在管理者によりライブ視聴が制限されています',
+      used: usage.used, max: usage.max, usage: usage.usage,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  const existing = reg.students[sid];
+  if (existing) {
+    // 相乗り: 同じキャッシュ画像を共有する。ユニーク台数・端末への要求は増やさない。
+    existing.teachers[email] = { opened_at: now, expires_at: now + LIVE_WATCH_TTL_SEC * 1000 };
+    if (!existing.stream_opened_at) existing.stream_opened_at = now;
+    reg.students[sid] = existing;
+    liveWatchWritePool_(reg);
+    return {
+      success: true, live_watch: true, student_id: sid, shared: true,
+      used: usage.used, max: usage.max, usage: usage.usage, remaining: usage.remaining,
+      full: usage.full, teacher_used: usage.teacher_used,
+      teacher_limit: st.per_teacher_limit, teacher_unlimited: st.unlimited,
+      timeout_sec: st.timeout_sec, ttl_sec: LIVE_WATCH_TTL_SEC,
+      extend_sec: LIVE_WATCH_EXTEND_SEC
+    };
+  }
+
+  // 新規の児童: ここでだけ「24 を超えるか」を判定する。
+  if (usage.used >= MAX_LIVE_WATCH_DEVICES) {
+    return {
+      success: false, live_watch: false, student_id: sid, shared: false,
+      code: 'LIVE_WATCH_POOL_FULL',
+      error: '全体のライブ視聴枠が満杯です（' + usage.usage + '・相乗り視聴のみ可能）',
+      used: usage.used, max: usage.max, usage: usage.usage, remaining: 0, full: true,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  // 教員ごとの上限（無限 = -1 のときは判定しない）。
+  if (!st.unlimited && st.per_teacher_limit > 0 &&
+      usage.teacher_used >= st.per_teacher_limit) {
+    return {
+      success: false, live_watch: false, student_id: sid, shared: false,
+      code: 'LIVE_WATCH_TEACHER_LIMIT',
+      error: '1人あたりの同時ライブ視聴上限（' + st.per_teacher_limit + '台）に達しています',
+      used: usage.used, max: usage.max, usage: usage.usage,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  const teachers = {};
+  teachers[email] = { opened_at: now, expires_at: now + LIVE_WATCH_TTL_SEC * 1000 };
+  reg.students[sid] = { stream_opened_at: now, teachers: teachers };
+  liveWatchWritePool_(reg);
+  return {
+    success: true, live_watch: true, student_id: sid, shared: false,
+    used: usage.used + 1, max: usage.max, usage: (usage.used + 1) + '/' + usage.max,
+    remaining: Math.max(0, usage.max - (usage.used + 1)),
+    full: (usage.used + 1) >= usage.max,
+    teacher_used: usage.teacher_used + 1,
+    teacher_limit: st.per_teacher_limit, teacher_unlimited: st.unlimited,
+    timeout_sec: st.timeout_sec, ttl_sec: LIVE_WATCH_TTL_SEC,
+    extend_sec: LIVE_WATCH_EXTEND_SEC
+  };
+}
+
+/**
+ * 視聴セッションの延長（管理画面が開いている間だけ送るハートビート）。
+ *   ・タイムアウトの起点（opened_at）は変えない＝見忘れによる占有を防ぐ。
+ *   ・期限切れ／タイムアウト満了なら SESSION_EXPIRED を返し、端末へ false を配る。
+ */
+function liveWatchExtend(teacher, studentId) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return { success: false, error: 'student_id is required', live_watch: false };
+  const email = liveWatchTeacherKey_(teacher);
+  if (!email) return { success: false, error: 'teacher is required', live_watch: false };
+
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  const reg = p.reg;
+  const usage = liveWatchUsageBits_(reg, email, now, st);
+
+  if (st.disabled) {
+    if (p.changed) liveWatchWritePool_(reg);
+    return {
+      success: false, live_watch: false, student_id: sid,
+      code: 'LIVE_WATCH_DISABLED',
+      error: '現在管理者によりライブ視聴が制限されています',
+      used: usage.used, max: usage.max, usage: usage.usage,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  const entry = reg.students[sid];
+  if (!entry) {
+    if (p.changed) liveWatchWritePool_(reg);
+    return {
+      success: false, live_watch: false, student_id: sid, released: true,
+      code: 'LIVE_WATCH_SESSION_EXPIRED',
+      error: 'ライブ視聴の枠が解放されました（自動タイムアウトまたは期限切れ）',
+      used: usage.used, max: usage.max, usage: usage.usage,
+      teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+      timeout_sec: st.timeout_sec
+    };
+  }
+
+  const cur = entry.teachers[email];
+  if (cur && typeof cur === 'object') {
+    cur.expires_at = now + LIVE_WATCH_TTL_SEC * 1000;
+  } else {
+    entry.teachers[email] = { opened_at: now, expires_at: now + LIVE_WATCH_TTL_SEC * 1000 };
+  }
+  reg.students[sid] = entry;
+  liveWatchWritePool_(reg);
+  const after = liveWatchUsageBits_(reg, email, now, st);
+  return {
+    success: true, live_watch: true, student_id: sid,
+    used: after.used, max: after.max, usage: after.usage, remaining: after.remaining,
+    teacher_used: after.teacher_used, teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited, timeout_sec: st.timeout_sec,
+    ttl_sec: LIVE_WATCH_TTL_SEC, extend_sec: LIVE_WATCH_EXTEND_SEC
+  };
+}
+
+/**
+ * ライブ視聴の停止（枠の解放）。
+ *   ・その教員のセッションだけを消す。
+ *   ・他の教員がまだ見ていれば、児童（＝キャプチャ端末）は止めない（live_watch: true）。
+ */
+function liveWatchStop(teacher, studentId) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return { success: false, error: 'student_id is required', live_watch: false };
+  const email = liveWatchTeacherKey_(teacher);
+  if (!email) return { success: false, error: 'teacher is required', live_watch: false };
+
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  const reg = p.reg;
+
+  const entry = reg.students[sid];
+  if (entry && entry.teachers && entry.teachers[email]) {
+    delete entry.teachers[email];
+  }
+  let stillWatched = false;
+  if (entry) {
+    const keys = Object.keys(entry.teachers || {});
+    if (keys.length) {
+      stillWatched = true;
+      reg.students[sid] = entry;
+    } else {
+      delete reg.students[sid];
+      liveWatchClearFrame_(sid);
+    }
+  }
+  const usage = liveWatchUsageBits_(reg, email, now, st);
+  liveWatchWritePool_(reg);
+  return {
+    success: true, student_id: sid, released: true,
+    live_watch: stillWatched,
+    used: usage.used, max: usage.max, usage: usage.usage, remaining: usage.remaining,
+    teacher_used: usage.teacher_used, teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited, timeout_sec: st.timeout_sec
+  };
+}
+
+/** ライブ画像を1枚だけ消す（枠が空いたときの後始末）。 */
+function liveWatchClearFrame_(studentId) {
+  const cache = liveWatchCache_();
+  if (!cache) return false;
+  try { cache.remove(LIVE_WATCH_FRAME_PREFIX + String(studentId || '').trim()); return true; }
+  catch (e) { return false; }
+}
+
+/**
+ * 端末から届いたライブ画像を保存する（action='live_frame'）。
+ *   ・視聴対象でなければ保存しない（＝全端末が送ってしまう事故を防ぐ）。
+ *   ・Base64 は LIVE_WATCH_MAX_FRAME_CHARS 以内のみ受け付ける。
+ */
+function liveWatchPutFrame(studentId, imageData) {
+  const sid = String(studentId === undefined || studentId === null ? '' : studentId).trim();
+  if (!sid) return { success: false, live_watch: false, error: 'student_id is required' };
+  if (!liveWatchIsWatched_(sid)) {
+    return { success: false, live_watch: false, error: 'not_watching', student_id: sid };
+  }
+  const raw = String(imageData || '');
+  const b64 = raw.replace(/^data:image\/[a-z]+;base64,/i, '').replace(/\s+/g, '');
+  if (!b64) return { success: false, live_watch: true, error: 'empty image', student_id: sid };
+  if (b64.length > LIVE_WATCH_MAX_FRAME_CHARS) {
+    return {
+      success: false, live_watch: true, error: 'frame too large', student_id: sid,
+      chars: b64.length, limit: LIVE_WATCH_MAX_FRAME_CHARS
+    };
+  }
+  const cache = liveWatchCache_();
+  if (!cache) return { success: false, live_watch: true, error: 'cache unavailable', student_id: sid };
+  const payload = JSON.stringify({
+    at: liveWatchNowMs_(),
+    at_text: Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
+    data_url: 'data:image/jpeg;base64,' + b64
+  });
+  try {
+    cache.put(LIVE_WATCH_FRAME_PREFIX + sid, payload, LIVE_WATCH_FRAME_TTL_SEC);
+  } catch (e) {
+    return { success: false, live_watch: true, error: 'cache put failed', student_id: sid };
+  }
+  return { success: true, live_watch: true, student_id: sid, chars: b64.length };
+}
+
+/** 指定児童の最新ライブ画像を返す（管理画面の 1.5〜2 秒更新）。 */
+function liveWatchGetFrames(studentIds) {
+  const ids = Array.isArray(studentIds) ? studentIds : [];
+  const cache = liveWatchCache_();
+  const out = [];
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] === undefined || ids[i] === null ? '' : ids[i]).trim();
+    if (!sid) continue;
+    let at = 0, atText = '', dataUrl = '';
+    if (cache) {
+      let raw = null;
+      try { raw = cache.get(LIVE_WATCH_FRAME_PREFIX + sid); } catch (e) { raw = null; }
+      if (raw) {
+        try {
+          const o = JSON.parse(raw);
+          if (o && typeof o === 'object') {
+            at = Number(o.at) || 0;
+            atText = String(o.at_text || '');
+            dataUrl = String(o.data_url || '');
+          }
+        } catch (e) { /* 壊れた画像は無視する */ }
+      }
+    }
+    out.push({
+      student_id: sid,
+      live_watch: liveWatchIsWatched_(sid),
+      at: at,
+      at_text: atText,
+      data_url: dataUrl,
+      has_image: !!dataUrl
+    });
+  }
+  return out;
+}
+
+/**
+ * 複数児童への視聴開始・停止・延長をまとめて行う（管理画面のバッチ用）。
+ * 返り値は 1 件ずつの結果配列＋全体の集計。
+ */
+function liveWatchApplyBatch(teacher, studentIds, op) {
+  const ids = Array.isArray(studentIds) ? studentIds : [];
+  const results = [];
+  let failCode = '';
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] === undefined || ids[i] === null ? '' : ids[i]).trim();
+    if (!sid) continue;
+    let r;
+    if (op === 'stop') r = liveWatchStop(teacher, sid);
+    else if (op === 'extend') r = liveWatchExtend(teacher, sid);
+    else r = liveWatchStart(teacher, sid);
+    if (!r || typeof r !== 'object') r = { success: false, student_id: sid };
+    r.student_id = sid;
+    if (r.success !== true && !failCode) failCode = String(r.code || '');
+    results.push(r);
+  }
+  let okAll = results.length > 0;
+  for (let i = 0; i < results.length; i++) { if (results[i].success !== true) okAll = false; }
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  const email = liveWatchTeacherKey_(teacher);
+  const usage = liveWatchUsageBits_(p.reg, email, now, st);
+  return {
+    success: okAll,
+    op: op,
+    code: failCode,
+    error: okAll ? '' : (results[0] && results[0].error) || '',
+    results: results,
+    used: usage.used, max: usage.max, usage: usage.usage, remaining: usage.remaining,
+    full: usage.full, teacher_used: usage.teacher_used,
+    teacher_limit: st.per_teacher_limit, teacher_unlimited: st.unlimited,
+    disabled: st.disabled, timeout_sec: st.timeout_sec,
+    ttl_sec: LIVE_WATCH_TTL_SEC, extend_sec: LIVE_WATCH_EXTEND_SEC
+  };
+}
+
+// ============================================================================
+// 【R57】R41分散構成におけるライブ視聴の親子ルーティング
+//
+//   【実機で確定した不具合】
+//     R56 までは、管理画面が親GASの api_liveWatch* を叩くと「親GASの
+//     CacheService（live_watch_pool_v1）」だけが更新されていた。ところが
+//     児童端末は R41 で子GASへ直接ハートビートし、live_frame も子GASへ送る。
+//     そのため次の 2 点が噛み合わず、管理画面は「端末の送信を待っています…」の
+//     まま画像が出なかった（拡張機能 v1.6.8・親子とも再デプロイ済みでも再現）。
+//       ① 子GASのハートビート応答が live_watch: false のまま
+//          → 端末は「撮影しない」ので、そもそも画像が発生しない
+//       ② 子GASのキャッシュに溜まったフレームを親が読めない
+//          → 画像が発生しても、管理画面（親）には届かない
+//
+//   【本ブロックの役割】双方向を接続する。
+//     ① 親 → 子（start / extend / stop）
+//        親の台帳（全体24枠プールの正）を更新したうえで、shardFetchMany で
+//        対象スコープの子GASへ並列転送し、子の台帳にも「同じ TTL・同じ
+//        自動タイムアウト起点」で登録／解除する。
+//    ② 子 → 親（frames / status）
+//        子GASから最新フレーム（および使用中の児童ID）を並列取得してマージし、
+//        管理画面へ 1 つの応答として返す。
+//
+//   【単独モード】SHARD_MODE 無効・子URL 0 件のときは子への転送を行わず、
+//     従来どおり親のローカルキャッシュだけで完結する（挙動不変）。
+//
+//   【通信量】extend は 10 秒に 1 回、frames は 1.8 秒に 1 回だが、転送先は
+//     教員のスコープ内の子GAS（一般教員は自校＝1〜2 校）に限定する。
+//     管理者（全校）でも 14 校 × 0.55 req/秒程度に収まる。
+// ============================================================================
+const LIVE_WATCH_SHARD_APPLY = 'live_watch_shard_apply';
+const LIVE_WATCH_SHARD_FRAMES = 'live_watch_shard_frames';
+const LIVE_WATCH_SHARD_STATUS = 'live_watch_shard_status';
+const LIVE_WATCH_SHARD_STATUS_TTL_SEC = 2;   // status 集約の短時間キャッシュ（連打を吸収）
+
+/**
+ * 親が転送すべき子GASのURL一覧。
+ *   単独モード（親でない／子URL 0 件）は [] を返す＝ローカル完結。
+ */
+function liveWatchShardTargetUrls_(teacher) {
+  try {
+    if (typeof isShardParent !== 'function' || !isShardParent()) return [];
+    const cfg = shardConfigCached();
+    return shardUrlsForTeacher(cfg, teacher);
+  } catch (e) {
+    return [];
+  }
+}
+
+/** URL 一覧から短いキャッシュキーを作る（14 校分でも 250 文字に収める）。 */
+function liveWatchShardKey_(urls, extra) {
+  const joined = (Array.isArray(urls) ? urls.join(',') : '') + '|' + String(extra || '');
+  let h = 5381;
+  for (let i = 0; i < joined.length; i++) {
+    h = ((h * 33) + joined.charCodeAt(i)) % 2147483647;
+  }
+  return 'lw_shard_' + h.toString(36);
+}
+
+/** 子GASへ 1 アクションを並列 POST し、解析済みの応答配列を返す。 */
+function liveWatchShardPost_(urls, bodyObj) {
+  const out = [];
+  if (!Array.isArray(urls) || !urls.length) return out;
+  let secret = '';
+  try { secret = String(shardConfigCached().sec || ''); } catch (e) { secret = ''; }
+  const body = JSON.stringify(bodyObj || {});
+  const requests = [];
+  for (let i = 0; i < urls.length; i++) {
+    requests.push({
+      url: urls[i], method: 'post', contentType: 'application/json',
+      payload: body, muteHttpExceptions: true
+    });
+  }
+  let responses = [];
+  try {
+    responses = shardFetchMany(requests) || [];
+  } catch (e) {
+    responses = [];
+  }
+  for (let i = 0; i < responses.length; i++) {
+    const res = responses[i];
+    if (!res) { out.push(null); continue; }
+    let code = 0;
+    try { code = res.getResponseCode(); } catch (e2) { code = 0; }
+    if (code !== 200) { out.push(null); continue; }
+    let txt = '';
+    try { txt = res.getContentText(); } catch (e3) { txt = ''; }
+    let json = null;
+    try { json = JSON.parse(txt); } catch (e4) { json = null; }
+    out.push(json);
+  }
+  return out;
+}
+
+/**
+ * 子GAS側: 親から転送された start / extend / stop を自分の台帳へ適用する。
+ *
+ * ・教員の権限（学校・クラス境界）と 1 教員あたり上限は **親が既に判定済み**。
+ *   子は「全児童の名簿を持たない」ため再判定できない。よって子では
+ *   上限・スコープ判定を行わず、台帳への登録／解除だけを行う（二重判定の回避）。
+ * ・ただし「管理者が機能停止（0）にした」ことは子にも伝播済みなので、
+ *   新規の start は その場合だけ拒否する。
+ * ・opened_at（自動タイムアウトの起点）は既存値を維持し、extend では延ばさない
+ *   （延ばすと自動タイムアウトが永久に来なくなる）。
+ */
+function liveWatchShardApplyFromParent(payload) {
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  const op = String((payload && payload.op) || 'start');
+  const ids = Array.isArray(payload && payload.student_ids) ? payload.student_ids : [];
+  const email = String((payload && payload.teacher_email) || '').trim().toLowerCase();
+  const timeoutSec = normalizeLiveWatchTimeoutSec(payload && payload.timeout_sec);
+  if (!email && op !== 'stop') {
+    return { success: false, error: 'teacher_email is required' };
+  }
+
+  let st = null;
+  try { st = liveWatchSettings_(); } catch (e) { st = null; }
+  if (op !== 'stop' && st && st.disabled) {
+    return {
+      success: false, code: 'LIVE_WATCH_DISABLED',
+      error: '現在管理者によりライブ視聴が制限されています',
+      results: [], timeout_sec: timeoutSec
+    };
+  }
+
+  const now = liveWatchNowMs_();
+  const reg = liveWatchReadPool_();
+  const results = [];
+  let cleared = 0;
+
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] === undefined || ids[i] === null ? '' : ids[i]).trim();
+    if (!sid) continue;
+
+    if (op === 'stop') {
+      const entry = reg.students[sid];
+      let still = false;
+      if (entry && entry.teachers && email && entry.teachers[email]) {
+        delete entry.teachers[email];
+      }
+      if (entry) {
+        const keys = Object.keys(entry.teachers || {});
+        if (keys.length) {
+          still = true;
+          reg.students[sid] = entry;
+        } else {
+          delete reg.students[sid];
+          try { liveWatchClearFrame_(sid); cleared++; } catch (eC) {}
+        }
+      }
+      results.push({ student_id: sid, success: true, live_watch: still });
+      continue;
+    }
+
+    // start / extend: 台帳へ登録（既存なら TTL だけ延長）
+    const entry = reg.students[sid] || { stream_opened_at: now, teachers: {} };
+    if (!entry.stream_opened_at) entry.stream_opened_at = now;
+    if (!entry.teachers || typeof entry.teachers !== 'object') entry.teachers = {};
+    const cur = entry.teachers[email];
+    if (cur && typeof cur === 'object') {
+      cur.expires_at = now + LIVE_WATCH_TTL_SEC * 1000;   // opened_at は変えない
+    } else {
+      entry.teachers[email] = { opened_at: now, expires_at: now + LIVE_WATCH_TTL_SEC * 1000 };
+    }
+    reg.students[sid] = entry;
+    results.push({ student_id: sid, success: true, live_watch: true });
+  }
+
+  liveWatchWritePool_(reg);
+  let usedNow = 0;
+  try { usedNow = liveWatchUniqueCount_(reg, now, timeoutSec); } catch (e6) { usedNow = 0; }
+  return {
+    success: true, op: op, saved: results.length, cleared_frames: cleared,
+    results: results, used: usedNow, max: MAX_LIVE_WATCH_DEVICES,
+    timeout_sec: timeoutSec, ttl_sec: LIVE_WATCH_TTL_SEC
+  };
+}
+
+/** 子GAS側: 親が画像を集約しに来たときの応答（自分のキャッシュにある分だけ返す）。 */
+function liveWatchShardFramesFromParent(payload) {
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  const ids = Array.isArray(payload && payload.student_ids) ? payload.student_ids : [];
+  return { success: true, data: liveWatchGetFrames(ids) };
+}
+
+/** 子GAS側: 親が使用枠を集約しに来たときの応答。 */
+function liveWatchShardStatusFromParent(payload) {
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  const email = String((payload && payload.teacher_email) || '').trim().toLowerCase();
+  let st = null;
+  try { st = liveWatchSettings_(); } catch (e) { st = null; }
+  const timeoutSec = (st && st.timeout_sec) ? st.timeout_sec
+    : normalizeLiveWatchTimeoutSec(payload && payload.timeout_sec);
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, timeoutSec);
+  if (p.changed) liveWatchWritePool_(p.reg);
+
+  const students = Object.keys(p.reg.students);
+  const mine = [];
+  if (email) {
+    for (let i = 0; i < students.length; i++) {
+      const e = p.reg.students[students[i]] || {};
+      const ts = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+      if (liveWatchSessionActive_(ts, email, now, timeoutSec)) mine.push(students[i]);
+    }
+  }
+  return {
+    success: true,
+    used: liveWatchUniqueCount_(p.reg, now, timeoutSec),
+    students: students,
+    teacher_students: mine,
+    timeout_sec: timeoutSec
+  };
+}
+
+/**
+ * 親GAS側: start / extend / stop を「親の台帳」＋「子の台帳」の両方へ適用する。
+ *   子への転送に失敗しても親の結果は必ず返す（管理画面の操作を止めない）。
+ */
+function liveWatchApplyBatchSharded(teacher, studentIds, op) {
+  const local = liveWatchApplyBatch(teacher, studentIds, op);
+  const urls = liveWatchShardTargetUrls_(teacher);
+  if (!urls.length) return local;   // 単独モード（従来どおり）
+
+  const ids = Array.isArray(studentIds) ? studentIds : [];
+  const email = liveWatchTeacherKey_(teacher);
+  let st = null;
+  try { st = liveWatchSettings_(); } catch (e) { st = null; }
+  const timeoutSec = (st && st.timeout_sec) ? st.timeout_sec : LIVE_WATCH_DEFAULT_TIMEOUT_SEC;
+
+  let parsed = [];
+  try {
+    parsed = liveWatchShardPost_(urls, {
+      action: LIVE_WATCH_SHARD_APPLY,
+      shard_secret: shardConfigCached().sec,
+      op: op,
+      student_ids: ids,
+      teacher_email: email,
+      timeout_sec: timeoutSec
+    });
+  } catch (eFwd) {
+    parsed = [];
+  }
+  let okCount = 0;
+  const failed = [];
+  for (let i = 0; i < parsed.length; i++) {
+    if (parsed[i] && parsed[i].success === true) okCount++;
+    else failed.push(urls[i] || '');
+  }
+  local.shard = {
+    op: op, sent: urls.length, ok: okCount, failed: failed,
+    single_mode: false
+  };
+  return local;
+}
+
+/**
+ * 親GAS側: 子GASから最新フレームを並列取得し、ローカルの分とマージする。
+ *   同一児童が複数の GAS に存在し得るため「新しい at（撮影時刻）を優先」する。
+ *   live_watch は OR（どこかで視聴中なら true）。
+ *
+ * 【R59】フレーム取得は絶対にキャッシュしない。
+ *   管理画面は 1.3 秒周期で叩くため、ここで 1 秒でも古い画像を返すと
+ *   「切り替わりが遅い」という症状に直結する。よって
+ *     ・local（親のキャッシュ）は常に読み直す（CacheService の値をそのまま使う）
+ *     ・子GASへは毎回 shardFetchMany で並列に取りに行く（結果を保持しない）
+ *   とする。古いフレームを溜める余地を作らないことが、速度の前提になる。
+ *   ※ liveWatchStatusSharded 側の短時間キャッシュ（2 秒）は「使用枠の集計」だけを
+ *     対象にしており、画像には一切使っていない（status が 2 秒古くても画像は最新）。
+ */
+function liveWatchGetFramesSharded(studentIds, teacher) {
+  const ids = Array.isArray(studentIds) ? studentIds : [];
+  const local = liveWatchGetFrames(ids);
+  const urls = liveWatchShardTargetUrls_(teacher);
+  if (!urls.length) return local;   // 単独モード（従来どおり）
+
+  let secret = '';
+  try { secret = String(shardConfigCached().sec || ''); } catch (e) { secret = ''; }
+  let parsed = [];
+  try {
+    // 【R59】毎回その場で子GASへ並列取得する（キャッシュを持たない）
+    parsed = liveWatchShardPost_(urls, {
+      action: LIVE_WATCH_SHARD_FRAMES,
+      shard_secret: secret,
+      student_ids: ids
+    });
+  } catch (eF) {
+    parsed = [];
+  }
+
+  const byId = {};
+  const order = [];
+  const take = function (f) {
+    if (!f || typeof f !== 'object') return;
+    const sid = String(f.student_id || '').trim();
+    if (!sid) return;
+    if (!byId[sid]) {
+      byId[sid] = {
+        student_id: sid, live_watch: false, at: 0, at_text: '',
+        data_url: '', has_image: false
+      };
+      order.push(sid);
+    }
+    const cur = byId[sid];
+    if (f.live_watch === true) cur.live_watch = true;
+    const at = Number(f.at) || 0;
+    const hasImg = (f.has_image === true) && !!f.data_url;
+    if (hasImg && (!cur.has_image || at > cur.at)) {
+      cur.at = at;
+      cur.at_text = String(f.at_text || '');
+      cur.data_url = String(f.data_url || '');
+      cur.has_image = true;
+    } else if (!hasImg && at > cur.at) {
+      cur.at = at;
+      cur.at_text = String(f.at_text || '');
+    }
+  };
+
+  // ローカル → 子の順に取り込む（子の方が新しい画像を持つ場合に上書きされる）
+  for (let i = 0; i < local.length; i++) take(local[i]);
+  for (let i = 0; i < parsed.length; i++) {
+    const body = parsed[i];
+    if (!body || body.success === false || !Array.isArray(body.data)) continue;
+    for (let j = 0; j < body.data.length; j++) take(body.data[j]);
+  }
+
+  const out = [];
+  for (let i = 0; i < order.length; i++) out.push(byId[order[i]]);
+  // 要求したが どこにも無い児童も従来どおり枠として返す（画面の「待機中」表示用）
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] === undefined || ids[i] === null ? '' : ids[i]).trim();
+    if (!sid || byId[sid]) continue;
+    out.push({ student_id: sid, live_watch: false, at: 0, at_text: '', data_url: '', has_image: false });
+  }
+  return out;
+}
+
+/**
+ * 親GAS側: 使用枠を「親の台帳」＋「子の台帳」の和集合で返す。
+ *   ・used              … ユニーク端末数（和集合）
+ *   ・teacher_used      … その教員が見ている端末数（和集合）
+ *   ・students          … 視聴中の児童ID（和集合。管理画面の整合確認用）
+ *   設定（上限・タイムアウト・停止中）は親の値が正（子へ伝播済み）なので親を使う。
+ */
+function liveWatchStatusSharded(teacher) {
+  const local = liveWatchStatus(teacher);
+  const urls = liveWatchShardTargetUrls_(teacher);
+  if (!urls.length) return local;   // 単独モード（従来どおり）
+
+  const email = liveWatchTeacherKey_(teacher);
+  const cacheKey = liveWatchShardKey_(urls, email);
+  let mine = [];
+  let childUsed = 0;
+
+  // 短時間キャッシュ（管理画面のポーリングで子GASを叩き過ぎない）
+  let cached = null;
+  try {
+    const c = liveWatchCache_();
+    if (c) {
+      const raw = c.get(cacheKey);
+      if (raw) {
+        const o = JSON.parse(raw);
+        if (o && typeof o === 'object') cached = o;
+      }
+    }
+  } catch (e) { cached = null; }
+
+  if (cached) {
+    mine = Array.isArray(cached.teacher_students) ? cached.teacher_students : [];
+    childUsed = Number(cached.used) || 0;
+  } else {
+    let secret = '';
+    try { secret = String(shardConfigCached().sec || ''); } catch (e) { secret = ''; }
+    let parsed = [];
+    try {
+      parsed = liveWatchShardPost_(urls, {
+        action: LIVE_WATCH_SHARD_STATUS,
+        shard_secret: secret,
+        teacher_email: email
+      });
+    } catch (eS) {
+      parsed = [];
+    }
+    for (let i = 0; i < parsed.length; i++) {
+      const b = parsed[i];
+      if (!b || b.success === false) continue;
+      childUsed = Math.max(childUsed, Number(b.used) || 0);
+      if (Array.isArray(b.teacher_students)) mine = mine.concat(b.teacher_students);
+    }
+    try {
+      const c = liveWatchCache_();
+      if (c) {
+        c.put(cacheKey, JSON.stringify({ used: childUsed, teacher_students: mine }),
+          LIVE_WATCH_SHARD_STATUS_TTL_SEC);
+      }
+    } catch (e) { /* キャッシュ不可でも結果は返す */ }
+  }
+
+  // 和集合（親・子で同じ児童が重複しても 1 台と数える）
+  const union = {};
+  const localStudents = Array.isArray(local.students) ? local.students : [];
+  for (let i = 0; i < localStudents.length; i++) {
+    const sid = String(localStudents[i] || '').trim();
+    if (sid) union[sid] = true;
+  }
+  const used = Math.max(Number(local.used) || 0, childUsed, Object.keys(union).length);
+  const teacherUnion = {};
+  const localMine = (function () {
+    // 親の台帳で その教員が見ている児童ID（返り値には無いので台帳から拾う）
+    try {
+      const st = liveWatchSettings_();
+      const now = liveWatchNowMs_();
+      const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+      const out = [];
+      const keys = Object.keys(p.reg.students);
+      for (let i = 0; i < keys.length; i++) {
+        const e = p.reg.students[keys[i]] || {};
+        const ts = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+        if (email && liveWatchSessionActive_(ts, email, now, st.timeout_sec)) out.push(keys[i]);
+      }
+      return out;
+    } catch (e) { return []; }
+  })();
+  for (let i = 0; i < localMine.length; i++) teacherUnion[localMine[i]] = true;
+  for (let i = 0; i < mine.length; i++) {
+    const sid = String(mine[i] || '').trim();
+    if (sid) teacherUnion[sid] = true;
+  }
+
+  const merged = local;
+  merged.used = Math.min(MAX_LIVE_WATCH_DEVICES, used);
+  merged.remaining = Math.max(0, MAX_LIVE_WATCH_DEVICES - merged.used);
+  merged.full = merged.used >= MAX_LIVE_WATCH_DEVICES;
+  merged.teacher_used = Object.keys(teacherUnion).length;
+  merged.students = Object.keys(union);
+  merged.shard = { children: urls.length, child_used: childUsed, single_mode: false };
+  return merged;
 }
 
 /**
@@ -2720,6 +4063,12 @@ function hbResolveRowByStudentId(sheet, headerMap, studentId) {
   let foundRowNum = -1;
   let foundRow = null;
   let foundRawId = '';
+  // 【表記ゆれの相互吸収】端末によっては student_id がメール全体で届くことも
+  //   ローカル部だけで届くこともある。完全一致を第一とし、見つからない
+  //   場合に限りローカル部一致の候補を1件だけ採用する。
+  //   候補が複数あるときは別児童の可能性があるため解決せず、
+  //   新規登録に回す（誤って別の児童の行へ書くより安全）。
+  const looseRowNums = [];
   for (let i = 1; i < total; i++) {
     const rawId = data[i] ? data[i][idColIdx] : '';
     const key = normalizeIdKey(rawId);
@@ -2731,7 +4080,19 @@ function hbResolveRowByStudentId(sheet, headerMap, studentId) {
       foundRowNum = i + 1;
       foundRow = data[i];
       foundRawId = rawId;
+      continue;
     }
+    if (idKeysMatch_(rawId, studentId)) looseRowNums.push(i + 1);
+  }
+  if (foundRowNum < 0 && looseRowNums.length === 1) {
+    const ln = looseRowNums[0];
+    foundRowNum = ln;
+    foundRow = data[ln - 1];
+    foundRawId = data[ln - 1] ? data[ln - 1][idColIdx] : '';
+    hbLog('resolve: ローカル部一致で解決 row=' + ln + ' id=' + String(foundRawId) +
+      ' 要求=' + studentId);
+  } else if (foundRowNum < 0 && looseRowNums.length > 1) {
+    hbLog('resolve: ローカル部一致が複数(' + looseRowNums.length + '件)のため解決しません id=' + studentId);
   }
 
   if (foundRowNum >= 0) {
@@ -2743,6 +4104,430 @@ function hbResolveRowByStudentId(sheet, headerMap, studentId) {
   hbLog('resolve: 不一致 id=' + studentId + ' (総行数=' + total +
     ', 空ID行の先頭=' + orphanRowNum + ')');
   return { rowNum: -1, row: null, total: total, orphanRowNum: orphanRowNum };
+}
+
+// ============================================================================
+// 一斉表示（ブロードキャスト）の TTL マスク
+//
+//  実機症状
+//    対象端末がログアウト／シャットダウンでオフラインになった後、再度ログイン・
+//    連携した「初回同期」だけ、過去に実行した一斉表示URLのサイトが新しいタブで
+//    1つ自動的に開いてしまう（2回目以降は発生しない）。
+//
+//  原因
+//    [1] シートの I列(一斉表示URL) / J列(一斉表示実行ID `bc_<ms>_<rand>`) に
+//        過去の指示値が残ったままになっている。
+//    [2] 端末(v1.6.5)の「実行済みID記憶」(storage.last_broadcast_id) は
+//        ログアウト／シャットダウンで揮発する。再連携の初回ハートビート応答で
+//        古い `bc_<ms>_<rand>` を受け取ると「新規の一斉表示指示」と判定して
+//        タブを開いてしまう。
+//
+//  対策（GAS側のみ・シート書き込み負荷ゼロ）
+//    端末へ返すポリシー応答を組み立てるこの1か所で、メモリ上のタイムスタンプ
+//    比較だけを行い、期限切れの一斉表示を空文字へマスクする。
+//    extension/ は v1.6.5 のまま一切変更しない。
+//
+//  有効期限(TTL)
+//    Math.max(120000, sync_interval_sec * 1000 * 3)
+//    ・最低 2 分（120,000ms）
+//    ・ポーリング間隔が長い現場では「間隔の3倍」まで許容し、
+//      正当な一斉表示が届く前にマスクされる事故を防ぐ。
+//
+//  安全側フォールバック
+//    `bc_<ms>_<rand>` から有効な数値が取れない古い／不正なIDは期限切れ扱い。
+//    ただし ID 自体が空のときは、そのまま空（何もしない）。
+// ============================================================================
+
+// 一斉表示の最低有効期限（2分）。ポーリング間隔が長い場合はこの3倍まで延ばす。
+var BROADCAST_TTL_MIN_MS = 120000;
+
+/**
+ * 一斉表示の有効期限(ms)を返す。
+ *   既定 120,000ms（2分）。sync_interval_sec が 40 秒を超える場合のみ
+ *   「間隔 × 3」の方が長くなるため、その値を使う。
+ */
+function broadcastTtlMs_(syncIntervalSec) {
+  var base = BROADCAST_TTL_MIN_MS;
+  var iv = Number(syncIntervalSec);
+  if (!isFinite(iv) || iv <= 0) return base;
+  var byInterval = iv * 1000 * 3;
+  return byInterval > base ? byInterval : base;
+}
+
+/**
+ * 実行ID `bc_<issuedMs>_<rand>` から発行時刻(epoch ms)を取り出す。
+ *   取り出せない（空・旧形式・数値でない）ときは 0 を返す＝呼び出し側で期限切れ扱い。
+ */
+function parseBroadcastIssuedMs_(broadcastId) {
+  var id = String(broadcastId || '').trim();
+  if (!id) return 0;
+  var m = /^bc_(\d{10,16})(?:_|$)/.exec(id);
+  if (!m) return 0;
+  var ms = Number(m[1]);
+  if (!isFinite(ms) || ms <= 0) return 0;
+  return ms;
+}
+
+/**
+ * 期限切れの一斉表示を空文字へマスクする（シートには一切書き込まない）。
+ *   戻り値は必ず { broadcast_url: string, broadcast_id: string }。
+ */
+function maskStaleBroadcast_(broadcastUrl, broadcastId, nowMs, syncIntervalSec) {
+  var url = String(broadcastUrl == null ? '' : broadcastUrl).trim();
+  var id = String(broadcastId == null ? '' : broadcastId).trim();
+
+  // ID が空＝そもそも一斉表示の指示が無い。何も返さない。
+  if (!id) return { broadcast_url: '', broadcast_id: '' };
+
+  var issuedMs = parseBroadcastIssuedMs_(id);
+  // 旧形式・不正なIDは、再起動時の誤爆を防ぐため安全側で期限切れ扱いにする。
+  if (!issuedMs) return { broadcast_url: '', broadcast_id: '' };
+
+  var now = Number(nowMs);
+  if (!isFinite(now) || now <= 0) return { broadcast_url: '', broadcast_id: '' };
+
+  // 未来方向のズレは期限切れとしない（端末時計ではなくサーバ時刻で比較するため
+  // 通常は起きないが、負の経過時間で誤ってマスクしないようガードする）。
+  var elapsed = now - issuedMs;
+  if (elapsed < 0) return { broadcast_url: url, broadcast_id: id };
+
+  var ttl = broadcastTtlMs_(syncIntervalSec);
+  if (elapsed > ttl) return { broadcast_url: '', broadcast_id: '' };
+
+  return { broadcast_url: url, broadcast_id: id };
+}
+
+// ============================================================================
+// 【高速化】制御状態のメモリ先行キャッシュ（CacheService）
+//
+//  背景（実機計測）
+//    端末起動・接続直後の1回目の操作だけ 26〜30 秒かかり、一度反映された後の
+//    2回目以降は 5〜6 秒で全端末揃う。原因は「ハートビート応答のたびに
+//    スプレッドシートを読み書きし、シートロック待ちで詰まる」こと。
+//
+//  方針
+//    教員の制御操作（ロック／解除／一斉表示／URL規制）を受けた時点で、
+//    その状態を CacheService に即時反映する。buildHeartbeatResponse は
+//    キャッシュがあればそれを最優先で使い、シートの読み書き完了を待たない。
+//    （シートへの永続化は従来どおり行う。キャッシュは「先に返す」ためだけ。）
+//
+//  安全側
+//    キャッシュが無い／壊れている／期限切れのときは従来どおりシート値を返す。
+//    つまりキャッシュは「高速化の上乗せ」であり、正しさの前提にはしない。
+// ============================================================================
+
+var HB_STATE_CACHE_PREFIX = 'hb_state:';
+var HB_STATE_CACHE_SEC = 600; // 10分（教員操作の間隔より十分長い）
+
+/** 端末1台ぶんの制御状態キャッシュキー。 */
+function hbStateCacheKey_(studentId) {
+  var id = String(studentId || '').trim();
+  if (!id) return '';
+  // 単体で切り出して実行するテストでは normalizeIdKey が無い場合がある（typeof ガード）。
+  var norm = (typeof normalizeIdKey === 'function') ? normalizeIdKey(id) : id.toLowerCase();
+  var pfx = (typeof HB_STATE_CACHE_PREFIX === 'string' && HB_STATE_CACHE_PREFIX)
+    ? HB_STATE_CACHE_PREFIX : 'hb_state:';
+  return pfx + norm;
+}
+
+/**
+ * 制御状態を CacheService へ即時反映する（シート書き込みと並行して呼ぶ）。
+ * 失敗しても本処理は止めない（キャッシュは高速化の上乗せ）。
+ */
+function hbWriteStateCache_(studentId, state) {
+  try {
+    var key = hbStateCacheKey_(studentId);
+    if (!key) return false;
+    var cur = {};
+    try {
+      var raw = CacheService.getScriptCache().get(key);
+      if (raw) cur = JSON.parse(raw) || {};
+    } catch (e0) { cur = {}; }
+    var next = {};
+    var k0 = Object.keys(cur);
+    for (var i = 0; i < k0.length; i++) next[k0[i]] = cur[k0[i]];
+    var ks = Object.keys(state || {});
+    for (var j = 0; j < ks.length; j++) {
+      if (state[ks[j]] === undefined) continue;
+      next[ks[j]] = state[ks[j]];
+    }
+    next.__at = new Date().getTime();
+    var sec = (typeof HB_STATE_CACHE_SEC === 'number' && HB_STATE_CACHE_SEC > 0)
+      ? HB_STATE_CACHE_SEC : 600;
+    CacheService.getScriptCache().put(key, JSON.stringify(next), sec);
+    return true;
+  } catch (e) { return false; }
+}
+
+/** 制御状態キャッシュを読む。無ければ null（＝シート値へフォールバック）。 */
+function hbReadStateCache_(studentId) {
+  try {
+    var key = hbStateCacheKey_(studentId);
+    if (!key) return null;
+    var raw = CacheService.getScriptCache().get(key);
+    if (!raw) return null;
+    var o = JSON.parse(raw);
+    if (!o || typeof o !== 'object') return null;
+    return o;
+  } catch (e) { return null; }
+}
+
+/**
+ * 制御状態キャッシュを消す（キャッシュとシートの食い違いを残さないため）。
+ */
+function hbClearStateCache_(studentId) {
+  var key = hbStateCacheKey_(studentId);
+  if (!key) return false;
+  try { CacheService.getScriptCache().remove(key); return true; }
+  catch (e) { return false; }
+}
+
+// 複数児童へ同じ制御状態を「書き込み前」にまとめて先行反映するための補助。
+//   CacheService の getAll / putAll を使い、1,600 台でも呼び出し回数を数回に抑える
+//   （1台ずつ get+put すると全校一斉操作で数千回のキャッシュ往復になり本末転倒）。
+var HB_STATE_CACHE_CHUNK = 90; // getAll / putAll の1回あたり上限に対する安全値
+
+/**
+ * 複数児童の制御状態をキャッシュへ先行反映する（シート setValues の「前」に呼ぶ）。
+ *   既存キャッシュがあれば項目単位でマージする（ロックだけ更新しても
+ *   URL規制の先行値が消えない）。失敗しても本処理は止めない。
+ */
+function hbPrimeStateCacheMany_(studentIds, state) {
+  var list = Array.isArray(studentIds) ? studentIds : (studentIds ? [studentIds] : []);
+  if (!list.length) return 0;
+  var keys = [];
+  var seen = {};
+  for (var i = 0; i < list.length; i++) {
+    var k = hbStateCacheKey_(list[i]);
+    if (!k || seen[k]) continue;
+    seen[k] = true;
+    keys.push(k);
+  }
+  if (!keys.length) return 0;
+
+  var nowMs = new Date().getTime();
+  var sks = Object.keys(state || {});
+  var written = 0;
+  var chunkSize = (typeof HB_STATE_CACHE_CHUNK === 'number' && HB_STATE_CACHE_CHUNK > 0)
+    ? HB_STATE_CACHE_CHUNK : 90;
+  var sec = (typeof HB_STATE_CACHE_SEC === 'number' && HB_STATE_CACHE_SEC > 0)
+    ? HB_STATE_CACHE_SEC : 600;
+  try {
+    var cache = CacheService.getScriptCache();
+    for (var c = 0; c < keys.length; c += chunkSize) {
+      var chunk = keys.slice(c, c + chunkSize);
+      var cur = {};
+      try { cur = cache.getAll(chunk) || {}; } catch (eAll) { cur = {}; }
+      var put = {};
+      for (var j = 0; j < chunk.length; j++) {
+        var kk = chunk[j];
+        var merged = {};
+        try { if (cur[kk]) merged = JSON.parse(cur[kk]) || {}; } catch (eP) { merged = {}; }
+        for (var m = 0; m < sks.length; m++) {
+          if (state[sks[m]] === undefined) continue;
+          merged[sks[m]] = state[sks[m]];
+        }
+        merged.__at = nowMs;
+        put[kk] = JSON.stringify(merged);
+      }
+      cache.putAll(put, sec);
+      written += Object.keys(put).length;
+    }
+    return written;
+  } catch (e) {
+    return written;
+  }
+}
+
+/**
+ * ハートビート応答の最終処理。処理時間を負荷観測へ記録してから応答を返す。
+ *   hbRecordLoad_ は CacheService だけを触る（シートI/Oゼロ）ので、
+ *   ここで1回フックするだけで全校1,600台ぶんの負荷を観測できる。
+ */
+function hbFinishHeartbeat_(res, t0) {
+  try {
+    var elapsed = new Date().getTime() - Number(t0 || 0);
+    hbRecordLoad_(elapsed, false, new Date().getTime());
+  } catch (e) { /* 観測できなくても応答は必ず返す */ }
+  return res;
+}
+
+/**
+ * 一括操作（ロック／一斉表示／URL規制）の直前に呼ぶ先行反映。
+ *   'ALL' や配列でない指定は、対象児童が確定できないため何もしない
+ *   （その場合も従来どおりシート書き込み後の応答で正しくなる）。
+ */
+function hbPrimeControlState_(studentIds, state) {
+  if (!Array.isArray(studentIds) || !studentIds.length) return 0;
+  try {
+    return hbPrimeStateCacheMany_(studentIds, state);
+  } catch (e) { return 0; }
+}
+
+// ----------------------------------------------------------------------------
+// 【初回接続】端末を眠らせないための「初回応答」判定
+//
+//  実機症状: 接続直後・経路切替直後の1回目だけ 26〜30 秒かかる。
+//  原因の一つが「初回応答で ka_active=false を返してしまい、端末が
+//  20〜30 秒のアイドル（同期停止）へ入る」こと。子GASは親から KA_SESSIONS の
+//  押し出しを受けるまで isTeacherConsoleActive() が false になるため、
+//  経路切替直後の初回だけ誤って「眠れ」と指示していた。
+//
+//  対策: 「行が無い（＝新規）」または「最終同期日時が空（＝未同期）」の初回だけ、
+//  ka_active=true / sync_interval_sec=1.5 を返して端末を起こしたままにする。
+//  暴走防止のため、同一端末には HB_FIRST_CONTACT_SEC 秒に1回しか発動しない
+//  （＝眠っている端末が永久に 1.5 秒ポーリングし続けることはない）。
+// ----------------------------------------------------------------------------
+var HB_FIRST_CONTACT_PREFIX = 'hb_fc:';
+var HB_FIRST_CONTACT_SEC = 120;
+
+/**
+ * 稼働中の同期周期（既定 1.5 秒）。
+ *   ACTIVE_SYNC_INTERVAL_SEC は Code.gs の const だが、関数を単体で切り出して
+ *   実行するテストでは未定義になり得るため typeof ガードを挟む
+ *   （＝テストのために関数が壊れない。本番では常に const の値を返す）。
+ */
+function hbActiveIntervalSec_() {
+  try {
+    if (typeof ACTIVE_SYNC_INTERVAL_SEC === 'number' && ACTIVE_SYNC_INTERVAL_SEC > 0) {
+      return ACTIVE_SYNC_INTERVAL_SEC;
+    }
+  } catch (e) { /* 未定義環境では既定値へ */ }
+  return 1.5;
+}
+
+function hbFirstContactKey_(studentId) {
+  var raw = String(studentId == null ? '' : studentId).trim();
+  if (!raw) return '';
+  var id = (typeof normalizeIdKey === 'function') ? normalizeIdKey(raw) : raw.toLowerCase();
+  if (!id) return '';
+  var pfx = (typeof HB_FIRST_CONTACT_PREFIX === 'string' && HB_FIRST_CONTACT_PREFIX)
+    ? HB_FIRST_CONTACT_PREFIX : 'hb_fc:';
+  return pfx + id;
+}
+
+/**
+ * この応答が「初回接続（または経路切替直後の初回）」かどうか。
+ *   ・最終同期日時が入っていれば初回ではない（false）
+ *   ・初回なら1度だけ true を返し、以降 HB_FIRST_CONTACT_SEC 秒は false
+ *   ※ キャッシュ不可時は false（＝従来どおりの挙動。無駄な常時ポーリングはしない）
+ */
+function hbIsFirstContact_(studentId, row, headerMap, nowMs) {
+  var syncCol = headerMap ? headerMap['最終同期日時'] : 0;
+  var lastSync = (syncCol && row) ? String(row[syncCol - 1] || '').trim() : '';
+  // 一度でも同期済みの行は「初回」ではない（＝アイドル復帰は通常判定に任せる）
+  if (lastSync) return false;
+  var key = hbFirstContactKey_(studentId);
+  if (!key) return false;
+  try {
+    var cache = CacheService.getScriptCache();
+    if (cache.get(key)) return false;
+    var holdSec = (typeof HB_FIRST_CONTACT_SEC === 'number' && HB_FIRST_CONTACT_SEC > 0)
+      ? HB_FIRST_CONTACT_SEC : 120;
+    cache.put(key, String(Number(nowMs) || new Date().getTime()), holdSec);
+    return true;
+  } catch (e) { return false; }
+}
+
+// ============================================================================
+// 【負荷保護】過負荷時の動的バックオフ（14校同時ピーク）
+//
+//  ACTIVE_SYNC_INTERVAL_SEC = 1.5 を基本最速値とし、GAS の同時実行制限や
+//  シート処理遅延の兆候が出たときだけ sync_interval_sec を一時的に緩和する。
+//  負荷が下がれば即 1.5 秒へ戻す（下げっぱなしにしない）。
+//
+//  観測はメモリ上（CacheService）の「直近の重さ」だけで行い、シートには触らない。
+// ============================================================================
+
+var HB_LOAD_CACHE_KEY = 'hb_load_v1';
+var HB_LOAD_WINDOW_MS = 60000;        // 直近60秒の観測で判断する
+var HB_LOAD_SLOW_MS = 2500;           // 1回のハートビートが2.5秒超なら「遅い」
+var HB_LOAD_SLOW_RATIO = 0.25;        // 遅い割合が25%を超えたら緩和
+var HB_LOAD_ERR_RATIO = 0.10;         // エラー率が10%を超えたら緩和
+var HB_BACKOFF_SEC = 4;               // 緩和中の周期（3〜5秒の範囲内）
+var HB_BACKOFF_HOLD_MS = 30000;       // 緩和は最低30秒続ける（ばたつき防止）
+
+/**
+ * 直近の負荷観測を読む。
+ *   { slow: 遅い件数, total: 総件数, err: エラー件数, since: 観測開始ms, until: 緩和期限ms }
+ */
+function hbReadLoad_() {
+  var empty = { slow: 0, total: 0, err: 0, since: 0, until: 0 };
+  try {
+    var lk = (typeof HB_LOAD_CACHE_KEY === 'string' && HB_LOAD_CACHE_KEY)
+      ? HB_LOAD_CACHE_KEY : 'hb_load_v1';
+    var raw = CacheService.getScriptCache().get(lk);
+    if (!raw) return empty;
+    var o = JSON.parse(raw);
+    if (!o || typeof o !== 'object') return empty;
+    return {
+      slow: Number(o.slow) || 0, total: Number(o.total) || 0,
+      err: Number(o.err) || 0, since: Number(o.since) || 0,
+      until: Number(o.until) || 0
+    };
+  } catch (e) { return empty; }
+}
+
+function hbWriteLoad_(o) {
+  try {
+    var lk = (typeof HB_LOAD_CACHE_KEY === 'string' && HB_LOAD_CACHE_KEY)
+      ? HB_LOAD_CACHE_KEY : 'hb_load_v1';
+    CacheService.getScriptCache().put(lk, JSON.stringify(o || {}), 300);
+  } catch (e) {}
+}
+
+/**
+ * 1回のハートビート処理時間を記録し、過負荷なら緩和期限を延ばす。
+ *   シートには一切触らない（書き込み負荷ゼロ）。
+ */
+function hbRecordLoad_(elapsedMs, isError, nowMs) {
+  var now = Number(nowMs) || new Date().getTime();
+  var o = hbReadLoad_();
+  // 観測窓を過ぎたらカウントをリセットする（古い重さを引きずらない）
+  if (!o.since || (now - o.since) > HB_LOAD_WINDOW_MS) {
+    o.since = now; o.slow = 0; o.total = 0; o.err = 0;
+  }
+  o.total++;
+  if (Number(elapsedMs) > HB_LOAD_SLOW_MS) o.slow++;
+  if (isError) o.err++;
+
+  var slowRatio = o.total ? (o.slow / o.total) : 0;
+  var errRatio = o.total ? (o.err / o.total) : 0;
+  var overloaded = (o.total >= 4) &&
+    (slowRatio > HB_LOAD_SLOW_RATIO || errRatio > HB_LOAD_ERR_RATIO);
+  if (overloaded) {
+    var until = now + HB_BACKOFF_HOLD_MS;
+    if (until > o.until) o.until = until; // 期限は延ばす方向のみ
+    try {
+      Logger.log('[LOAD] 過負荷を検知: slow=' + o.slow + '/' + o.total +
+        ' err=' + o.err + '/' + o.total +
+        ' → sync_interval_sec を ' + HB_BACKOFF_SEC + ' 秒へ緩和（〜' + o.until + '）');
+    } catch (eL) {}
+  }
+  hbWriteLoad_(o);
+  return o;
+}
+
+/**
+ * 過負荷中か（緩和期限が未来なら true）。
+ */
+function hbIsBackoffActive_(nowMs) {
+  var now = Number(nowMs) || new Date().getTime();
+  var o = hbReadLoad_();
+  return !!(o.until && now < o.until);
+}
+
+/**
+ * 端末へ配布する同期周期(秒)を、過負荷なら緩和して返す。
+ *   ・通常       … そのまま（=1.5）
+ *   ・過負荷     … HB_BACKOFF_SEC（4秒）
+ *   ・0（非稼働）… 0 のまま（緩和しない。眠っている端末は起きない）
+ */
+function hbThrottleIntervalSec_(baseSec, nowMs) {
+  var base = Number(baseSec);
+  if (!isFinite(base) || base <= 0) return 0;
+  if (!hbIsBackoffActive_(nowMs)) return base;
+  return Math.max(base, HB_BACKOFF_SEC);
 }
 
 /**
@@ -2769,31 +4554,79 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
 
   let schedulesPayload = { active: [], upcoming: [], overridden_ids: [] };
   try {
-    schedulesPayload = buildSchedulePayloadForDevice_(
+    // 【フェーズ5】子GASは親から受け取った展開済みキャッシュだけを見る
+    //   （シート読みを挟まないので、端末への応答が速い）。
+    schedulesPayload = resolveSchedulePayloadForDevice_(
       studentId, schClassName, schSchoolName, serverTimeMs);
   } catch (eSch) {
     try { Logger.log('[SCHEDULE] payload build failed: ' + eSch); } catch (eLog) {}
   }
+
+  // 【一斉表示 TTL マスク】端末の再起動・再連携の「初回同期」だけ、過去の
+  //   一斉表示URLが勝手に開く不具合への対策。
+  //   シートの I列/J列には過去の指示値が残ったままで、端末側の実行済みID記憶は
+  //   ログアウト／シャットダウンで揮発するため、古い `bc_<ms>_<rand>` が
+  //   「新規指示」と誤判定されていた。
+  //   ここでメモリ上のタイムスタンプ比較だけを行い、期限切れは空文字にする。
+  //   ※ シートへの書き込みは一切しない（書き込み負荷ゼロ）。
+  var bcMasked = maskStaleBroadcast_(
+    row[headerMap['一斉表示URL'] - 1],
+    row[headerMap['一斉表示実行ID'] - 1],
+    serverTimeMs,
+    kaInfo ? kaInfo.sync_interval_sec : 0
+  );
+
+  // 【高速化】制御状態のメモリ先行キャッシュ。
+  //   教員の操作時点で CacheService へ即時反映済みなので、シートの読み書き完了を
+  //   待たずにここで最新状態を採用して返す（初回・直後の反映遅延を解消する）。
+  //   キャッシュが無い／壊れているときは従来どおりシート値をそのまま使う。
+  var hbCached = hbReadStateCache_(studentId);
+  var effLock = parseBoolean(row[headerMap['画面ロック'] - 1]);
+  var effFilter = String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase();
+  var effWhite = parseUrlList(row[headerMap['許可URLリスト'] - 1]);
+  var effBlack = parseUrlList(row[headerMap['規制URLリスト'] - 1]);
+  if (hbCached) {
+    if (typeof hbCached.screen_lock === 'boolean') effLock = hbCached.screen_lock;
+    if (hbCached.filter_mode) effFilter = String(hbCached.filter_mode).toUpperCase();
+    if (Array.isArray(hbCached.whitelist_urls)) effWhite = hbCached.whitelist_urls;
+    if (Array.isArray(hbCached.blacklist_urls)) effBlack = hbCached.blacklist_urls;
+  }
+  // 【負荷保護】過負荷時のみ sync_interval_sec を緩和する（負荷が下がれば即 1.5 へ戻る）
+  var effSyncSec = hbThrottleIntervalSec_(kaInfo ? kaInfo.sync_interval_sec : 0, serverTimeMs);
+
+  // 【v1.6.8】ライブ視聴の対象か（教員がこの児童のライブ枠を開いているか）。
+  //   端末はこの値が true のあいだだけ軽量キャプチャを送る。
+  //   ライブ視聴は補助機能なので、判定に失敗してもハートビートは止めない。
+  var liveWatchFlag = false;
+  try {
+    if (typeof liveWatchIsWatched_ === 'function') {
+      liveWatchFlag = liveWatchIsWatched_(studentId) === true;
+    }
+  } catch (eLW) { liveWatchFlag = false; }
 
   return {
     student_id: studentId,
     school_name: String(row[headerMap['学校名'] - 1] || ''),
     student_name: String(row[headerMap['氏名'] - 1] || ''),
     class_name: String(row[headerMap['クラス'] - 1] || ''),
-    screen_lock: parseBoolean(row[headerMap['画面ロック'] - 1]),
-    filter_mode: String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase(),
-    whitelist_urls: parseUrlList(row[headerMap['許可URLリスト'] - 1]),
-    blacklist_urls: parseUrlList(row[headerMap['規制URLリスト'] - 1]),
-    broadcast_url: String(row[headerMap['一斉表示URL'] - 1] || '').trim(),
-    broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || '').trim(),
+    screen_lock: effLock,
+    filter_mode: effFilter,
+    whitelist_urls: effWhite,
+    blacklist_urls: effBlack,
+    // 【TTLマスク済み】期限切れは '' / '' になる（3分以内なら通常どおり返る）。
+    broadcast_url: bcMasked.broadcast_url,
+    broadcast_id: bcMasked.broadcast_id,
     current_url: String(row[headerMap['現在開いているURL'] - 1] || ''),
     screen_request_at: reqCol ? String(row[reqCol - 1] || '').trim() : '',
     screenshot_at: shotCol ? String(row[shotCol - 1] || '').trim() : '',
     monitor_flag: monFlagCol ? parseBoolean(row[monFlagCol - 1]) : false,
     monitor_reason: monReasonCol ? String(row[monReasonCol - 1] || '') : '',
     ka_active: kaActive,
-    sync_interval_sec: kaInfo.sync_interval_sec,
+    // 【負荷保護】通常は 1.5 秒のまま。過負荷のときだけ一時的に緩和（4秒）する。
+    sync_interval_sec: effSyncSec,
     idle_drift_until: kaInfo.idle_drift_until,
+    // 【v1.6.8】ライブ視聴の対象なら true（端末はこのときだけ画面を送る）
+    live_watch: liveWatchFlag,
     server_time: now,
     // 【フェーズ3】端末の時計補正とスケジュール判定のための配信契約。
     //   server_time_ms … server_time と同じ瞬間の epoch ms（端末はこれで時計を補正）
@@ -2805,7 +4638,7 @@ function buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now
 }
 
 /**
- * AI監視（学習に関係のないサイトの検知）。
+ * サイト監視（学習に関係のないサイトの検知）。
  * URL が変わったときだけ呼ばれ、4列が連続している場合のみ 1 回の getRange でまとめて書く。
  * 監視が OFF のときは列に一切触らない（履歴を保持したまま、表示側で伏せる）。
  */
@@ -2922,7 +4755,7 @@ function hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActiv
     newRow[headerMap['現在開いているURL'] - 1] = currentUrl;
     newRow[headerMap['最終同期日時'] - 1] = now;
 
-    // AI監視: 初回登録時点のURLも判定する（監視OFFなら何もしない＝既定は空欄）。
+    // サイト監視: 初回登録時点のURLも判定する（監視OFFなら何もしない＝既定は空欄）。
     let newMon = { flagged: false, reason: '', host: '' };
     try {
       newMon = evaluateUrlForMonitoring(
@@ -2983,10 +4816,10 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   const incomingSchool = canonicalizeIncomingSchool(schoolNameRaw);
 
   // 教員コンソールの稼働有無に応じた児童端末の同期周期を配布する（非稼働=0＝同期しない）。
-  const kaInfo = (typeof computeKaInterval === 'function')
+  let kaInfo = (typeof computeKaInterval === 'function')
     ? computeKaInterval(isTeacherConsoleActive() ? ACTIVE_SYNC_INTERVAL_SEC : 0, new Date().getTime())
     : { ka_active: false, sync_interval_sec: 0, idle_drift_until: 0 };
-  const kaActive = kaInfo.ka_active;
+  let kaActive = kaInfo.ka_active;
 
   const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
   const nowMs = new Date().getTime();
@@ -3005,7 +4838,28 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
   if (resolved.rowNum < 0) {
     // 未登録 → 新規自動登録へ（重複防止のため書き込みロック内で再確認する）
     hbLog('heartbeat: 未登録のため新規登録へ id=' + studentId);
-    return hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now);
+    // 初回接続（行がまだ無い）ので、登録直後の1回目から稼働周期で配る。
+    if (hbIsFirstContact_(studentId, null, headerMap, nowMs)) {
+      kaInfo = { ka_active: true, sync_interval_sec: hbActiveIntervalSec_(), idle_drift_until: 0 };
+      kaActive = true;
+    }
+    return hbFinishHeartbeat_(
+      hbRegisterDevice(studentId, currentUrl, incomingSchool, kaInfo, kaActive, now),
+      t0);
+  }
+
+  // 【初回接続】未同期の端末（新規・経路切替直後）は、ここで一度だけ
+  //   「稼働中」と同じ周期（1.5秒）を返してアイドル入りを防ぐ。
+  //   子GASは親から KA_SESSIONS の押し出しを受けるまで非稼働と判定してしまうため、
+  //   初回応答が ka_active=false になると端末が 20〜30 秒眠り、実機の
+  //   「最初の1回だけ 26〜30 秒」に直結していた。
+  //   ※ 発動は同一端末につき HB_FIRST_CONTACT_SEC 秒に1回だけ（暴走しない）。
+  if (hbIsFirstContact_(studentId, resolved.row, headerMap, nowMs)) {
+    var fcInterval = hbActiveIntervalSec_();
+    kaInfo = { ka_active: true, sync_interval_sec: fcInterval, idle_drift_until: 0 };
+    kaActive = true;
+    hbLog('heartbeat: 初回接続のため稼働周期を先行配布 id=' + studentId +
+      ' interval=' + fcInterval);
   }
 
   const row = resolved.row;
@@ -3038,11 +4892,25 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
     if (!cur || cur === '未設定') schoolFill = true;
   }
 
-  if (!urlChanged && !syncDue && !schoolFill) {
+  // 【サイト監視】監視が有効なときは毎回判定する（urlChanged 限定をやめる）。
+  //   従来は URL が変わったときしか判定しなかったため、
+  //    ・設定をONにした直後（URLは変わっていない）
+  //    ・同じタブを見続けている児童
+  //   が検知されなかった。インメモリの辞書照合は数ミリ秒で、
+  //   シートへの書き込みは「状態が変わったとき」だけなので I/O も増えない。
+  let monEnabled = false;
+  try {
+    if (typeof getMonitoringSettings === 'function') {
+      monEnabled = getMonitoringSettings().enabled === true;
+    }
+  } catch (eMon) { monEnabled = false; }
+
+  if (!urlChanged && !syncDue && !schoolFill && !monEnabled) {
     // 何も書かない → シートへは書かない（読み取りのみで応答）
     hbLog('heartbeat: 書き込み不要 row=' + rowNum +
       ' elapsed=' + (new Date().getTime() - t0) + 'ms');
-    return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
+    return hbFinishHeartbeat_(
+      buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now), t0);
   }
 
   // ここから先は書き込みが必要（sheet は手順1で開済み）
@@ -3074,14 +4942,14 @@ function processHeartbeat(studentId, currentUrl, schoolNameRaw) {
     }
   }
 
-  // ---- AI監視（URLが変わったときだけ判定。毎回の同期で辞書照合しない＝GASを軽く保つ） ----
-  if (urlChanged) hbApplyMonitor(sheet, rowNum, row, headerMap, currentUrl, now);
+  // ---- サイト監視（監視が有効なときは毎回判定する） ----
+  if (monEnabled) hbApplyMonitor(sheet, rowNum, row, headerMap, currentUrl, now);
 
   hbLog('heartbeat: 書き込み完了 row=' + rowNum + ' urlChanged=' + urlChanged +
-    ' syncDue=' + syncDue + ' schoolFill=' + schoolFill +
+    ' syncDue=' + syncDue + ' schoolFill=' + schoolFill + ' monitor=' + monEnabled +
     ' elapsed=' + (new Date().getTime() - t0) + 'ms');
 
-  return buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now);
+  return hbFinishHeartbeat_(buildHeartbeatResponse(row, headerMap, studentId, kaActive, kaInfo, now), t0);
 }
 
 /**
@@ -3413,7 +5281,10 @@ function getDeviceByStudentId(studentId) {
  * 教員の操作結果は次の読み取りで必ず最新が返る（誤情報を残さない）。
  * ※ CacheService が無い環境（GAS以外のテスト等）では従来どおり毎回シートを読む。
  */
-function getAllDevices(filterSchool, teacher, includeUnassigned) {
+function getAllDevices(filterSchool, teacher, includeUnassigned, fresh) {
+  // 【R55】fresh=true は読み取りキャッシュ（dev2_ 5秒）を迂回してシートを読み直す。
+  //   3引数の呼び出しは fresh=false として従来と完全に同一（キャッシュを使う）。
+  const __fresh = (fresh === true);
   const cacheEnabled = (typeof CacheService !== 'undefined');
   let devCache = null;
   let devCacheKey = '';
@@ -3428,8 +5299,10 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
         t.email || '', t.school || '', t.role || '', t.target_class || ''
       ].join('|');
       devCacheKey = 'dev2_' + version + '_' + scopeKey;
-      const hit = devCache.get(devCacheKey);
-      if (hit) return JSON.parse(hit);
+      if (!__fresh) {
+        const hit = devCache.get(devCacheKey);
+        if (hit) return JSON.parse(hit);
+      }
     } catch (e) {
       devCache = null;
     }
@@ -3455,6 +5328,16 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
   try {
     if (typeof readScheduleRows_ === 'function') schRows = readScheduleRows_();
   } catch (eSch) { schRows = []; }
+
+  // 【Request P】R41 子GAS は予約シートを持たない。親GAS が PropertiesService
+  //   経由で配った展開済みウィンドウのキャッシュからバッジを判定する。
+  //   シートへの書き戻しは行わない（読み取り専用の集計）。
+  let schCache = null;
+  let schChildMode = false;
+  try { schChildMode = (typeof isShardChild === 'function' && isShardChild()); } catch (eCM) { schChildMode = false; }
+  if (schChildMode) {
+    try { schCache = shardLoadScheduleCache_(); } catch (eSC) { schCache = null; }
+  }
 
   // 教員の所属学校スコープ（管理者は全校）
   const scopeInfo = getTeacherScopeInfo(teacher);
@@ -3509,11 +5392,22 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
     // 画面一覧用の制御列（列が無い既存シートでも安全に '' を返す）
     const reqColIdx = headerMap['画面情報要求日時'];
     const shotColIdx = headerMap['画面情報更新日時'];
-    // AI監視の列（既存シートでも ensureDeviceHeaders により末尾へ自動追加される）
+    // サイト監視の列（既存シートでも ensureDeviceHeaders により末尾へ自動追加される）
     const monFlagIdx = headerMap['要注意'];
     const monReasonIdx = headerMap['注意理由'];
     const monUrlIdx = headerMap['要注意URL'];
     const monAtIdx = headerMap['注意検知日時'];
+
+    // 【Request P】「予約実行中」バッジの材料（1端末ぶん）。
+    //   単一GAS: 予約シートの行をメモリ上で判定 / 子GAS: 親から配られたウィンドウで判定。
+    let schDetail = { active: false, count: 0, ids: [], types: [], label: '' };
+    try {
+      schDetail = schChildMode
+        ? scheduleActiveDetailFromCache_(schCache, studentId, now)
+        : scheduleActiveDetail_(schRows, studentId, String(row[headerMap['クラス'] - 1] || ''), schoolName, now);
+    } catch (eSD) {
+      schDetail = { active: false, count: 0, ids: [], types: [], label: '' };
+    }
 
     results.push({
       student_id: studentId,
@@ -3522,8 +5416,11 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
       class_name: String(row[headerMap['クラス'] - 1] || ''),
       screen_lock: parseBoolean(row[headerMap['画面ロック'] - 1]),
       filter_mode: String(row[headerMap['URL規制モード'] - 1] || 'OFF').toUpperCase(),
-      whitelist_urls: String(row[headerMap['許可URLリスト'] - 1] || ''),
-      blacklist_urls: String(row[headerMap['規制URLリスト'] - 1] || ''),
+      // 【配列化】シートのセルは "a.com, b.com" の文字列。端末（拡張機能）側の
+      //   normalizeHostList は Array.isArray でない入力を捨てるため、ここで
+      //   string[] に直してから返す（教員コンソールの画面も配列を前提にする）。
+      whitelist_urls: normalizeHostListToArray_(row[headerMap['許可URLリスト'] - 1]),
+      blacklist_urls: normalizeHostListToArray_(row[headerMap['規制URLリスト'] - 1]),
       broadcast_url: String(row[headerMap['一斉表示URL'] - 1] || ''),
       broadcast_id: String(row[headerMap['一斉表示実行ID'] - 1] || ''),
       current_url: String(row[headerMap['現在開いているURL'] - 1] || ''),
@@ -3539,11 +5436,13 @@ function getAllDevices(filterSchool, teacher, includeUnassigned) {
       // 【スケジュール】いま時間制限（タイマー）が効いている端末か。
       //   教員一覧に「予約により制限中」を出すための読み取り専用フラグ。
       //   シートへの書き戻しは一切しない（集計は読み取り時のみ）。
-      schedule_active: (function () {
-        try {
-          return isAnyScheduleActive_(schRows, studentId, String(row[headerMap['クラス'] - 1] || ''), schoolName, now);
-        } catch (e) { return false; }
-      })()
+      // 【Request P】「予約実行中」バッジ。active に加えて、どの予約が効いているかを
+      //   一目で分かる表示名（label）と件数・ID を返す（読み取り専用）。
+      schedule_active: schDetail.active,
+      schedule_active_label: schDetail.label,
+      schedule_active_count: schDetail.count,
+      schedule_active_ids: schDetail.ids,
+      schedule_active_types: schDetail.types
     });
   }
 
@@ -4050,6 +5949,10 @@ function bulkUpdateScreenLock(studentIds, lockState) {
   const __bt = function (label) {
     try { if (typeof bulkTraceMark === 'function') bulkTraceMark(label); } catch (e) {}
   };
+  // 【高速化】シート書き込み（最大15秒のロック待ちを含む）より前に、
+  //   制御状態を CacheService へ先行反映する。端末の次のハートビートは
+  //   シート書き込みの完了を待たずに最新状態を受け取れる。
+  hbPrimeControlState_(studentIds, { screen_lock: parseBoolean(lockState) });
   return withWriteLock(function () {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
@@ -4089,6 +5992,14 @@ function bulkUpdateScreenLock(studentIds, lockState) {
 // 一斉表示URLを配信し、実行IDを生成して返す。
 // ※ 実行IDの生成は必ずロック内で行い、同時配信でも別IDとなることを保証する。
 function bulkUpdateBroadcastUrl(studentIds, targetUrl, broadcastId) {
+  // 【高速化】先行反映。実行IDはロック内で採番するため、ここでは
+  //   呼び出し側が確定済みのIDがある場合だけ先行して配る（無ければシート値に任せる）。
+  if (broadcastId) {
+    hbPrimeControlState_(studentIds, {
+      broadcast_url: String(targetUrl == null ? '' : targetUrl),
+      broadcast_id: String(broadcastId)
+    });
+  }
   return withWriteLock(function () {
     const bcId = broadcastId || generateBroadcastId();
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
@@ -4128,6 +6039,19 @@ function bulkUpdateBroadcastUrl(studentIds, targetUrl, broadcastId) {
 }
 
 function bulkUpdateFilterMode(studentIds, filterMode, whitelistUrls, blacklistUrls) {
+  // 【高速化】先行反映（シート書き込み・ロック待ちの前に配る）。
+  (function () {
+    const st = { filter_mode: String(filterMode == null ? '' : filterMode) };
+    try {
+      if (whitelistUrls !== undefined && whitelistUrls !== null) {
+        st.whitelist_urls = parseUrlList(hostListToSheetString_(whitelistUrls));
+      }
+      if (blacklistUrls !== undefined && blacklistUrls !== null) {
+        st.blacklist_urls = parseUrlList(hostListToSheetString_(blacklistUrls));
+      }
+    } catch (eW) { /* 変換できなくてもモードだけは先行反映する */ }
+    hbPrimeControlState_(studentIds, st);
+  })();
   return withWriteLock(function () {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
@@ -4157,8 +6081,10 @@ function bulkUpdateFilterMode(studentIds, filterMode, whitelistUrls, blacklistUr
         const id = String(data[firstRow - 1 + r][idColIdx]).trim();
         if (isAll || (idSet && idSet.has(id))) {
           cur[r][0] = filterMode;
-          if (whitelistUrls !== undefined && whitelistUrls !== null) cur[r][1] = whitelistUrls;
-          if (blacklistUrls !== undefined && blacklistUrls !== null) cur[r][2] = blacklistUrls;
+          // 【配列化】呼び出し側は string[] で渡してくる。シートは 1 セルなので
+          //   必ず文字列へ戻す（配列をそのまま setValues するとセルが壊れる）。
+          if (whitelistUrls !== undefined && whitelistUrls !== null) cur[r][1] = hostListToSheetString_(whitelistUrls);
+          if (blacklistUrls !== undefined && blacklistUrls !== null) cur[r][2] = hostListToSheetString_(blacklistUrls);
         }
       }
       range.setValues(cur);
@@ -4166,7 +6092,113 @@ function bulkUpdateFilterMode(studentIds, filterMode, whitelistUrls, blacklistUr
   });
 }
 
+/**
+ * 個別操作（単体トグル）の最短経路を1か所に集約する。
+ *
+ *  実機症状: 「一斉ロック／一斉解除」は全端末4〜6秒で効くのに、児童一覧の
+ *  個別行の「画面ロック」を1人ずつ切り替えると、管理画面だけ「ロック中」に
+ *  なって端末が反応しない。
+ *
+ *  原因（二重の欠落）:
+ *    [1] 一括操作（bulkUpdate*）には CacheService 先行反映（hbPrimeControlState_）が
+ *        あるが、個別更新（updateSingleDevice）には無かった。
+ *    [2] 個別操作の子GAS転送は shardPropagatePolicy を forceSync 無しで呼んでいたため
+ *        SHARD_ASYNC_ENABLED 時に保留キューへ積まれ、deferred: true で即座に返る。
+ *        子GASは15秒周期の console_touch 回収まで指示を受け取らない。
+ *
+ *  確定方針（順序も固定）:
+ *    ① 親キャッシュへ先行反映（シートI/Oなし）
+ *    ② 子GASへ即時同期転送（forceSync=true。deferred は禁止）
+ *    ③ シートへ永続化（最後）
+ */
+function applySingleControl_(studentId, shardPatch, updateData) {
+  var patch = shardPatch || {};
+  // 呼び出し元の payload を書き換えないよう複製する
+  var ud = {};
+  try {
+    var src0 = updateData || {};
+    var ks = Object.keys(src0);
+    for (var i = 0; i < ks.length; i++) ud[ks[i]] = src0[ks[i]];
+  } catch (eCp) { ud = {}; }
+  if (patch.broadcast_id) ud.broadcast_id = patch.broadcast_id;
+
+  // ① 親キャッシュへ先行反映
+  try {
+    if (typeof hbPrimeControlState_ === 'function' && Object.keys(patch).length) {
+      var st = {};
+      if (patch.screen_lock !== undefined) st.screen_lock = parseBoolean(patch.screen_lock);
+      if (patch.filter_mode !== undefined) st.filter_mode = String(patch.filter_mode);
+      if (patch.whitelist_urls !== undefined) {
+        st.whitelist_urls = (typeof normalizeHostListToArray_ === 'function')
+          ? normalizeHostListToArray_(patch.whitelist_urls) : patch.whitelist_urls;
+      }
+      if (patch.blacklist_urls !== undefined) {
+        st.blacklist_urls = (typeof normalizeHostListToArray_ === 'function')
+          ? normalizeHostListToArray_(patch.blacklist_urls) : patch.blacklist_urls;
+      }
+      if (patch.broadcast_url !== undefined) {
+        st.broadcast_url = String(patch.broadcast_url == null ? '' : patch.broadcast_url);
+      }
+      if (patch.broadcast_id !== undefined) st.broadcast_id = String(patch.broadcast_id);
+      hbPrimeControlState_([studentId], st);
+    }
+  } catch (eP1) { /* 先行反映に失敗しても本処理は続ける */ }
+
+  // ② 子GASへ即時同期転送（forceSync=true で保留キューに積ませない）
+  var shardRes = { skipped: true };
+  if (Object.keys(patch).length && typeof shardPropagatePolicy === 'function') {
+    try { shardRes = shardPropagatePolicy([studentId], patch, true) || { skipped: true }; }
+    catch (eS) { shardRes = { error: String(eS) }; }
+  }
+
+  // ③ シートへ永続化（先行反映・転送の後）
+  var writeRes = updateSingleDevice(studentId, ud);
+  return {
+    shard: shardRes,
+    broadcast_id: (writeRes && writeRes.broadcast_id) || patch.broadcast_id || '',
+    write: writeRes || null
+  };
+}
+
 function updateSingleDevice(studentId, updateData) {
+  if (!updateData || typeof updateData !== 'object') updateData = {};
+
+  // 【高速化・不具合修正】シート書き込み（最大15秒のロック待ちを含む）より前に
+  //   制御状態を CacheService へ先行反映する。個別トグルでも一括操作と同じ
+  //   「先に返す」が効く（applySingleControl_ 経由なら二重反映になるが冪等）。
+  var primeSt = {};
+  try {
+    if (updateData.screen_lock !== undefined) primeSt.screen_lock = parseBoolean(updateData.screen_lock);
+    if (updateData.filter_mode !== undefined) primeSt.filter_mode = String(updateData.filter_mode);
+    if (updateData.whitelist_urls !== undefined) {
+      primeSt.whitelist_urls = parseUrlList(hostListToSheetString_(updateData.whitelist_urls));
+    }
+    if (updateData.blacklist_urls !== undefined) {
+      primeSt.blacklist_urls = parseUrlList(hostListToSheetString_(updateData.blacklist_urls));
+    }
+    if (updateData.broadcast_url !== undefined) {
+      primeSt.broadcast_url = String(updateData.broadcast_url == null ? '' : updateData.broadcast_url);
+    }
+    if (Object.keys(primeSt).length && typeof hbPrimeControlState_ === 'function') {
+      hbPrimeControlState_([studentId], primeSt);
+    }
+  } catch (ePrime) { /* 先行反映できなくても永続化は行う */ }
+
+  // 一斉表示の実行IDは「採番 → 先行反映 → シート書き込み」で1つだけ使う
+  //   （先行反映したIDとシートのIDがずれると、端末が同じ配信を新規扱いして2枚開く）。
+  var newBcId = '';
+  if (updateData.broadcast_url !== undefined) {
+    newBcId = String(updateData.broadcast_id || '').trim() || generateBroadcastId();
+    try {
+      if (typeof hbPrimeControlState_ === 'function') {
+        hbPrimeControlState_([studentId], {
+          broadcast_url: String(updateData.broadcast_url == null ? '' : updateData.broadcast_url),
+          broadcast_id: newBcId
+        });
+      }
+    } catch (eBc) { /* 先行反映できなくても永続化は行う */ }
+  }
+
   return withWriteLock(function () {
     const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
     const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
@@ -4189,15 +6221,17 @@ function updateSingleDevice(studentId, updateData) {
     if (updateData.filter_mode !== undefined && headerMap['URL規制モード']) {
       sheet.getRange(targetRow, headerMap['URL規制モード']).setValue(updateData.filter_mode);
     }
+    // 【配列化】string[] が来てもセルは文字列で保つ（次回の読み取りが壊れない）。
     if (updateData.whitelist_urls !== undefined && headerMap['許可URLリスト']) {
-      sheet.getRange(targetRow, headerMap['許可URLリスト']).setValue(updateData.whitelist_urls);
+      sheet.getRange(targetRow, headerMap['許可URLリスト']).setValue(hostListToSheetString_(updateData.whitelist_urls));
     }
     if (updateData.blacklist_urls !== undefined && headerMap['規制URLリスト']) {
-      sheet.getRange(targetRow, headerMap['規制URLリスト']).setValue(updateData.blacklist_urls);
+      sheet.getRange(targetRow, headerMap['規制URLリスト']).setValue(hostListToSheetString_(updateData.blacklist_urls));
     }
     if (updateData.broadcast_url !== undefined && headerMap['一斉表示URL']) {
       sheet.getRange(targetRow, headerMap['一斉表示URL']).setValue(updateData.broadcast_url);
-      sheet.getRange(targetRow, headerMap['一斉表示実行ID']).setValue(generateBroadcastId());
+      // 先行反映と同一のIDを書く（採番は1回だけ）
+      sheet.getRange(targetRow, headerMap['一斉表示実行ID']).setValue(newBcId || generateBroadcastId());
     }
     if (updateData.student_name !== undefined && headerMap['氏名']) {
       sheet.getRange(targetRow, headerMap['氏名']).setValue(String(updateData.student_name).trim());
@@ -4224,6 +6258,11 @@ function updateSingleDevice(studentId, updateData) {
         }]);
       }
     } catch (eIdx) {}
+
+    // 【個別操作・一斉表示ID】呼び出し元（applySingleControl_）がシートへ書いたのと
+    //   同じ実行IDを応答に載せられるよう返す。ここで返さないと個別一斉表示だけ
+    //   「2枚開き」防止のID共有が抜け落ちる。
+    return { student_id: studentId, broadcast_id: newBcId || '' };
   });
 }
 
@@ -4241,6 +6280,39 @@ function parseUrlList(val) {
   if (!val) return [];
   if (Array.isArray(val)) return val;
   return String(val).split(/[\r\n,]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+}
+
+/**
+ * 改行・カンマ区切りの文字列、または未知のオブジェクトを文字列配列へ安全に変換する。
+ *
+ * 【なぜ必要か】
+ *   シートの「許可URLリスト」「規制URLリスト」は 1 セルに
+ *   "youtube.com, game.example" のような「文字列」で入っている。
+ *   一方、端末（拡張機能）側の composeFilterRestriction -> normalizeHostList は
+ *   Array.isArray(list) でなければ [] を返す（＝文字列は黙って捨てる）。
+ *   そのため GAS が文字列のまま whitelist/blacklist を配ると、URL規制の
+ *   予約が端末に届いても規制が一切効かなかった。
+ *   ここで配列に正規化してから配る（シートへ書くときは逆向きに戻す）。
+ *
+ *   大文字小文字は変えない（利用者が入れた表記をそのまま見せる）。
+ *   ホスト名の突き合わせは端末側の normalizeHostList が小文字化して行う。
+ */
+function normalizeHostListToArray_(input) {
+  if (Array.isArray(input)) {
+    return input.map(function (item) { return String(item).trim(); }).filter(Boolean);
+  }
+  if (!input || typeof input !== 'string') return [];
+  return input.split(/[\r\n,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+}
+
+/**
+ * normalizeHostListToArray_ の逆方向。配列（または文字列）を 1 セルに書ける
+ * カンマ区切り文字列へ戻す。シートへの書き込みは必ずこれを通す
+ * （配列をそのまま setValue するとセルに配列が入り、次回の読み取りが壊れる）。
+ */
+function hostListToSheetString_(input) {
+  const arr = normalizeHostListToArray_(input);
+  return arr.length ? arr.join(', ') : '';
 }
 
 // ==================== 子GAS分散（SHARD_MODE / ハブ＆スポーク） ====================
@@ -4435,6 +6507,48 @@ function normalizeIdKey(value) {
 }
 
 /**
+ * 児童IDの「ローカル部（@より前）」を正規化して返す。
+ *   端末は Google アカウントのメール（1607002@city-mimasaka.ed.jp）を送ることも、
+ *   ローカル部だけ（1607002）を送ることもある。@ が無い場合は全体をローカル部とみなす。
+ */
+function normalizeUserLocalPart_(value) {
+  const key = normalizeIdKey(value);
+  if (!key) return '';
+  const at = key.indexOf('@');
+  return at >= 0 ? key.slice(0, at) : key;
+}
+
+/**
+ * 児童IDの同一性判定（表記ゆれの相互吸収）。
+ *   ① 正規化した完全一致 → true
+ *   ② 片方だけがメール形式のとき、ローカル部が一致すれば true
+ *      「1607002」と「1607002@city-mimasaka.ed.jp」→ 同一児童
+ *   ③ 双方がメール形式でドメインが違う場合は false（別児童の可能性）
+ *      「1607002@a.ed.jp」と「1607002@b.ed.jp」→ 別人として扱う
+ */
+function idKeysMatch_(a, b) {
+  const ka = normalizeIdKey(a);
+  const kb = normalizeIdKey(b);
+  if (!ka || !kb) return false;
+  if (ka === kb) return true;
+  if (ka.indexOf('@') >= 0 && kb.indexOf('@') >= 0) return false;
+  const la = normalizeUserLocalPart_(ka);
+  const lb = normalizeUserLocalPart_(kb);
+  return !!(la && lb && la === lb);
+}
+
+/** 児童IDの配列に対象の児童が含まれるかを idKeysMatch_ で判定する。 */
+function idMatchesAny_(list, studentId) {
+  if (!Array.isArray(list) || !list.length) return false;
+  const sid = String(studentId || '').trim();
+  if (!sid) return false;
+  for (let i = 0; i < list.length; i++) {
+    if (idKeysMatch_(list[i], sid)) return true;
+  }
+  return false;
+}
+
+/**
  * 児童IDから端末一覧の行を探す（親・子のどちらでも使える）。
  * 見つかれば { row_number, student_id, school_name, student_name, class_name } を返す。
  *
@@ -4464,8 +6578,7 @@ function findStudentById(studentId) {
     return String(row[c - 1] === null || row[c - 1] === undefined ? '' : row[c - 1]).trim();
   };
 
-  for (let i = 1; i < data.length; i++) {
-    if (normalizeIdKey(data[i][idCol - 1]) !== want) continue;
+  const __pick = function (i) {
     return {
       row_number: i + 1,
       student_id: cell(data[i], '児童ID'),
@@ -4473,7 +6586,15 @@ function findStudentById(studentId) {
       student_name: cell(data[i], '氏名'),
       class_name: cell(data[i], 'クラス')
     };
+  };
+  // 【表記ゆれの相互吸収】完全一致 → ローカル部一致（候補が1件のときだけ）。
+  //   子GASからの名簿照会が「@の有無」だけの差異で失敗するのを防ぐ。
+  const looseIdx = [];
+  for (let i = 1; i < data.length; i++) {
+    if (normalizeIdKey(data[i][idCol - 1]) === want) return __pick(i);
+    if (idKeysMatch_(data[i][idCol - 1], studentId)) looseIdx.push(i);
   }
+  if (looseIdx.length === 1) return __pick(looseIdx[0]);
   return null;
 }
 
@@ -4635,8 +6756,52 @@ function isShardParent() {
   try { return shardModeFlags().parent === true; } catch (e) { return false; }
 }
 
+/**
+ * 子GASを「設定漏れがあっても」自動判別する安全網。
+ *
+ * 【なぜ必要か】
+ *   子GASのスクリプトプロパティ SHARD_CHILD_MODE=true を入れ忘れると
+ *   isShardChild() が false になり、resolveSchedulePayloadForDevice_ が
+ *   親用ロジック（buildSchedulePayloadForDevice_）へ落ちて子シートを直接読む。
+ *   ところが「子シートにはスケジュール行を書かない」のが確定仕様なので、
+ *   端末には常に空の schedules が返り、予約が一切効かなくなる。
+ *   実機ではこれが「親→子は HTTP 200 なのに端末で制限が動かない」症状になった。
+ *
+ * 【判定材料に SHARD_SECRET を使わない理由】
+ *   親GASも getOrCreateShardSecret() で SHARD_SECRET を保持している。
+ *   これを子の証拠にすると親が子と誤判定され、全端末のハートビートが
+ *   空キャッシュ参照になって全滅する。よって「親が絶対に書かないキー」だけを見る。
+ *
+ *   ・SHARD_SCHEDULES_CACHE … 親から schedules を受け取ったときだけ書かれる
+ *   ・SHARD_INBOX_SEEN      … shard_apply を受けた痕跡（予約0件でも残す）
+ */
+function shardDetectChildByInbox_() {
+  try {
+    if (typeof PropertiesService === 'undefined') return false;
+    // 明示設定が最優先。明示的に「親」なら絶対に子と判定しない。
+    var explicitChild = false;
+    var explicitParent = false;
+    try { explicitChild = propBool(PROP_SHARD_CHILD_MODE, false); } catch (eC1) {}
+    try { explicitParent = propBool(PROP_SHARD_MODE, false); } catch (eC2) {}
+    if (explicitChild) return true;
+    if (explicitParent) return false;
+
+    var props = PropertiesService.getScriptProperties();
+    var cacheRaw = props.getProperty('SHARD_SCHEDULES_CACHE');
+    if (cacheRaw !== null && cacheRaw !== undefined && String(cacheRaw).trim() !== '') return true;
+    var seen = props.getProperty('SHARD_INBOX_SEEN');
+    if (seen !== null && seen !== undefined && String(seen).trim() !== '') return true;
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
 function isShardChild() {
-  try { return shardModeFlags().child === true; } catch (e) { return false; }
+  try { if (shardModeFlags().child === true) return true; } catch (e) { /* 自動判別へ */ }
+  // 設定漏れの救済（実機で発生した断線の再発防止）
+  try { if (typeof shardDetectChildByInbox_ === 'function' && shardDetectChildByInbox_()) return true; } catch (e2) {}
+  return false;
 }
 
 /**
@@ -4937,10 +7102,46 @@ function shardEnsureDeviceRows(idList, classMap) {
       if (id) existing[id] = true;
     }
 
+    // 【R49】担当クラス所有権ガード（二重防御）。
+    //   親は「この子GASへ解決した児童」だけを class_map に載せて送ってくる。
+    //   したがって class_map に無い児童は「自シャードの担当外」であり、
+    //   たとえ指示が届いても 未登録児童 の行を勝手に作ってはいけない
+    //   （実機: 子GASを持たない 3年1組 の児童行が 5年1組用の子シートへ復活した）。
+    //   ※ 既に自シートに居る児童は従来どおり何もしない（作成もしない）。
+    const assignedKeys = {};
+    if (classMap && typeof classMap === 'object') {
+      const ck = Object.keys(classMap);
+      for (let i = 0; i < ck.length; i++) {
+        const nk = (typeof normalizeIdKey === 'function')
+          ? normalizeIdKey(ck[i]) : String(ck[i] || '').trim().toLowerCase();
+        if (nk) assignedKeys[nk] = true;
+      }
+    }
+    const assignedList = Object.keys(assignedKeys);
+    const isOwnedByThisShard = function (id) {
+      const nk = (typeof normalizeIdKey === 'function')
+        ? normalizeIdKey(id) : String(id || '').trim().toLowerCase();
+      if (!nk) return false;
+      if (assignedKeys[nk]) return true;
+      // メール形式／ローカル部などの表記ゆれを相互吸収する（R41 の ID 照合と同じ規則）
+      if (typeof idKeysMatch_ === 'function') {
+        for (let i = 0; i < assignedList.length; i++) {
+          if (idKeysMatch_(assignedList[i], id)) return true;
+        }
+      }
+      return false;
+    };
+
     let created = 0;
+    let skippedOutOfScope = 0;
     for (let k = 0; k < idList.length; k++) {
       const id = String(idList[k] || '').trim();
       if (!id || existing[id]) continue;
+      if (!isOwnedByThisShard(id)) {
+        // 担当外クラスの児童は行を作らない（親GASのみで運用する）。
+        skippedOutOfScope++;
+        continue;
+      }
       const newRow = new Array(CONFIG.DEVICE_COLUMNS.length).fill('');
       newRow[headerMap['児童ID'] - 1] = id;
       newRow[headerMap['学校名'] - 1] = '未設定';
@@ -4951,6 +7152,12 @@ function shardEnsureDeviceRows(idList, classMap) {
       sheet.appendRow(newRow);
       existing[id] = true;
       created++;
+    }
+    if (skippedOutOfScope) {
+      try {
+        Logger.log('[SHARD] ensure: 担当外クラスのため行を作成しませんでした ' +
+          skippedOutOfScope + '件（class_map に無い児童）');
+      } catch (eLg) {}
     }
     return created;
   });
@@ -4963,6 +7170,12 @@ function shardApplyFromParent(payload) {
   }
   if (!shardSecretMatches(payload && payload.shard_secret)) {
     return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  // 【Request N】年次更新：前年度データの一斉クリア指令。
+  //   親の年次更新から呼ばれ、自校の「端末一覧」のヘッダー以外を全削除する。
+  //   ポリシー適用など他の処理は一切行わない（早期 return）。
+  if (payload && payload.annual_clear === true) {
+    return shardAnnualClearLocalDevices_();
   }
   // ① 教員稼働状態の同期（親コンソールにしかログインしないため、子は親から受け取る）。
   //    子の既存の ka 機構（touchTeacherConsole / releaseTeacherConsole）をそのまま使う。
@@ -4982,6 +7195,62 @@ function shardApplyFromParent(payload) {
     }
   }
 
+  // 【フェーズ5】親から同封された「展開済みスケジュール」を PropertiesService へ保存する。
+  //   ・親が繰り返し・曜日を解釈済みなので、子は再計算しない
+  //   ・シートには書かない（子シートへのI/Oを増やさず、ハートビートを速く保つ）
+  //   ・保存に失敗してもポリシー適用は続ける（スケジュールだけの欠落に留める）
+  let scheduleSaved = null;
+  if (payload && payload.schedules) {
+    try {
+      let sch = payload.schedules;
+      if (typeof sch === 'string') {
+        try { sch = JSON.parse(sch); } catch (eS) { sch = null; }
+      }
+      if (sch && typeof sch === 'object') {
+        if (sch.by_student && typeof sch.by_student === 'object') {
+          // 【確定仕様3】親は「その子GASの全児童」を丸ごと送ってくる。
+          //   差分マージではなく置き換えにして、取消した予約が子に残り続ける
+          //   不整合を原理的に排除する。
+          scheduleSaved = shardSaveScheduleCache_(sch.by_student, sch.updated_ms, true);
+        } else {
+          // 児童ID→ウィンドウ の素の地図でも受け付ける（後方互換・こちらはマージ）
+          scheduleSaved = shardSaveScheduleCache_(sch, 0, false);
+        }
+      }
+    } catch (eSch) {
+      scheduleSaved = { saved: 0, error: String((eSch && eSch.message) ? eSch.message : eSch) };
+    }
+  }
+
+  // 【サイト監視】親が保存した監視設定を受け取り、子の PropertiesService へ保存する。
+  //   これが無いと子GASのハートビート判定が常に enabled:false になり、
+  //   子配下の児童に「注意」が出ない（本不具合の本丸）。
+  let monitorSaved = null;
+  if (payload && payload.monitor_settings) {
+    monitorSaved = shardChildApplyMonitorSettings(payload.monitor_settings);
+  }
+
+  // 【子GAS自動判別】shard_apply を受けた痕跡を残す。
+  //   SHARD_CHILD_MODE の設定漏れがあっても、次回以降のハートビートで
+  //   子GASとして判別できるようにする（設定漏れで制限が届かない事故の対策）。
+  //   明示的に「親」と設定されているスクリプトには痕跡を残さない
+  //   （親が子扱いされると全端末が壊れるため）。
+  try {
+    var __explicitParent = false;
+    try { __explicitParent = propBool(PROP_SHARD_MODE, false); } catch (eXP) {}
+    if (!__explicitParent) {
+      PropertiesService.getScriptProperties()
+        .setProperty('SHARD_INBOX_SEEN', String(new Date().getTime()));
+    }
+  } catch (eMark) { /* 記録できなくても本処理は続ける */ }
+
+  // 【可観測性】子側で「実際に何件保存できたか」をログに残す。
+  //   親のログには ensure しか出ておらず、保存件数が見えなかった。
+  try {
+    Logger.log('[SHARD] apply: 受信 schedules=' + JSON.stringify(scheduleSaved) +
+      ' student_ids=' + (((payload && payload.student_ids) || []).length));
+  } catch (eLg) {}
+
   const ids = (payload && payload.student_ids) || [];
   // 【R38】patch の正規化。
   //   ・文字列で届いた場合は JSON として解釈する（false が文字列になっても落とさない）
@@ -4998,8 +7267,11 @@ function shardApplyFromParent(payload) {
   }
   const idList = Array.isArray(ids) ? ids : [];
   if (!idList.length) {
-    // ka 伝達だけの呼び出しは正常（ポリシー変更なし）
-    return { success: true, applied: 0, ka_active: kaApplied };
+    // ka 伝達だけの呼び出しは正常（ポリシー変更なし）。
+    // 【フェーズ5】ただし schedules は「ポリシーではない」ため、児童IDが空でも
+    //   保存結果を必ず返す。返さないと親が「同期できたか」を確認できない。
+    return { success: true, applied: 0, ka_active: kaApplied,
+      schedules: scheduleSaved, monitor_settings: monitorSaved };
   }
 
   // 行の用意結果。try の外で宣言する（return が try の外にあるため、
@@ -5023,7 +7295,11 @@ function shardApplyFromParent(payload) {
     }
     // 【R38】真偽値判定だと空文字（配信の取り消し）が落ちる。undefined で判定する。
     if (patch.broadcast_url !== undefined && patch.broadcast_url !== null) {
-      bulkUpdateBroadcastUrl(idList, String(patch.broadcast_url), '');
+      // 【要件1】親が採番した broadcast_id をそのまま使う。
+      //   ここで '' を渡して子が generateBroadcastId() すると、同じ配信に別IDが付き、
+      //   端末が「新しい配信」と誤認して同じページを新しいタブで開く（実機症状）。
+      //   空のときだけ bulkUpdateBroadcastUrl 側がフォールバック発番する（後方互換）。
+      bulkUpdateBroadcastUrl(idList, String(patch.broadcast_url), String(patch.broadcast_id || ''));
     }
     if (patch.filter_mode !== undefined) {
       bulkUpdateFilterMode(idList, String(patch.filter_mode),
@@ -5032,7 +7308,16 @@ function shardApplyFromParent(payload) {
   } catch (e) {
     return { success: false, error: String(e) };
   }
-  return { success: true, applied: idList.length, ka_active: kaApplied, ensure: ensureResult };
+  return {
+    success: true,
+    applied: idList.length,
+    ka_active: kaApplied,
+    ensure: ensureResult,
+    // 【フェーズ5】スケジュールを保存できたかを親が確認できるようにする
+    schedules: scheduleSaved,
+    // 【サイト監視】監視設定を保存できたかを親が確認できるようにする
+    monitor_settings: monitorSaved
+  };
 }
 
 /** 設定から子GASのURL一覧を取り出す（重複除去・既定URL含む）。 */
@@ -5185,6 +7470,13 @@ function shardPropagateKaState(active) {
         if (last && (nowMs - last) < 30000) return { throttled: true };
         cache.put(k, String(nowMs), 180);
       } catch (e) { /* キャッシュ不可時は毎回送る */ }
+    } else {
+      // 【Request L】解除（false）時は間引きタイムスタンプを必ず捨てる。
+      //   残したままだと、解除直後に再稼働したとき 30 秒の間引きに阻まれ、
+      //   active=true が子GASへ配られず、子担当の端末が「同期停止」のまま固まる。
+      try {
+        CacheService.getScriptCache().remove('shard_ka_ts');
+      } catch (eKa) { /* キャッシュ不可時は何もしない（送信自体は続行） */ }
     }
 
     const body = JSON.stringify({
@@ -5465,20 +7757,29 @@ function diagShardSetup() {
   return text;
 }
 
-function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
+function getShardMergedDevices(filterSchool, teacher, includeUnassigned, fresh) {
+  // 【R55】第4引数 fresh=true は「集約キャッシュを迂回して子GASの最新 last_seen を取り直す」。
+  //   実機症状: 自動更新 ON より「OFF にして手動再読み込み」の方がオンライン/オフラインが早い。
+  //   原因は、この集約キャッシュ（shard_ga_ 4秒）と子一覧キャッシュ（shard_ls_ 4秒）が
+  //   重なって子の last_seen が数秒古いまま返ること。書き込みは dev_v を進めて両方を
+  //   捨てるため、操作直後の手動更新だけが新鮮に見えていた。
+  //   コンソールの自動更新・タブ復帰・操作直後の取得は fresh=true を送る。
+  //   ※ 3引数の呼び出し（既存経路・テスト）は fresh=false として従来と完全に同一の挙動。
+  const __fresh = (fresh === true);
   // 【DIAG-1】集約が「親モード」として動いているか。
   // false の場合、子GASには一切問い合わせず親シートの古い日時だけで判定する（＝症状の直接原因）。
   if (typeof shardDiagLog === 'function') {
     shardDiagLog('DIAG-1 集約開始 isShardParent=' + String(isShardParent()) +
       ' filterSchool=' + String(filterSchool) +
-      ' includeUnassigned=' + String(!!includeUnassigned));
+      ' includeUnassigned=' + String(!!includeUnassigned) +
+      ' fresh=' + String(__fresh));
   }
   if (!isShardParent()) {
     if (typeof shardDiagLog === 'function') {
       shardDiagLog('DIAG-2 ★親モードではありません（子GASへ問い合わせません）' +
         ' → 親GASのスクリプトプロパティ SHARD_MODE=true が必要です');
     }
-    return getAllDevices(filterSchool, teacher, includeUnassigned);
+    return getAllDevices(filterSchool, teacher, includeUnassigned, __fresh);
   }
 
   const t = teacher || {};
@@ -5490,21 +7791,37 @@ function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
   const cacheKey = 'shard_ga_' + shardHash(scopeKey) + '_' + shardDevVersion();
 
   let cache = null;
-  try {
-    if (typeof CacheService !== 'undefined') {
-      cache = CacheService.getScriptCache();
-      const hit = cache.get(cacheKey);
-      if (hit) {
-        const arr = JSON.parse(hit);
-        if (Array.isArray(arr)) return arr;
+  // 【R55】fresh のときは集約キャッシュを読まない（子GASの最新 last_seen を取り直す）。
+  if (!__fresh) {
+    try {
+      if (typeof CacheService !== 'undefined') {
+        cache = CacheService.getScriptCache();
+        const hit = cache.get(cacheKey);
+        if (hit) {
+          const arr = JSON.parse(hit);
+          if (Array.isArray(arr)) return arr;
+        }
       }
+    } catch (e) {
+      cache = null;
     }
-  } catch (e) {
-    cache = null;
+  } else {
+    if (typeof shardDiagLog === 'function') {
+      shardDiagLog('DIAG-1b fresh 指定: 集約キャッシュを迂回して子GASへ最新を問い合わせる');
+    }
+    try { if (typeof CacheService !== 'undefined') cache = CacheService.getScriptCache(); } catch (eC) { cache = null; }
   }
 
-  const baseData = getAllDevices(filterSchool, teacher, includeUnassigned);
-  const data = shardMergeDevices(baseData, filterSchool, teacher, includeUnassigned);
+  // 【R55】fresh は下位の読み取りキャッシュ（dev2_ / shard_ls_）にも伝播させる。
+  const baseData = getAllDevices(filterSchool, teacher, includeUnassigned, __fresh);
+  const mergedData = shardMergeDevices(baseData, filterSchool, teacher, includeUnassigned, __fresh);
+  // 【サイト監視】集約結果にも表示の伏せ処理を適用する。
+  //   子GASから返る monitor_flag は子の設定に基づくため、親の設定がOFFなら
+  //   親と同様に伏せる必要がある（これをしないと子の注意マークだけ残る）。
+  //   ※ 監視設定の保存時は invalidateDevicesCache() が dev_v を進めるため、
+  //     この集約キャッシュ（キーに dev_v を含む）も自動的に失効する。
+  const data = (typeof applyMonitorVisibility === 'function')
+    ? applyMonitorVisibility(mergedData) : mergedData;
 
   if (cache) {
     try { cache.put(cacheKey, JSON.stringify(data), SHARD_LIST_CACHE_TTL); } catch (e) {}
@@ -5529,12 +7846,17 @@ function getShardMergedDevices(filterSchool, teacher, includeUnassigned) {
   return data;
 }
 
-function shardFetchChildDevices(urlsOverride) {
+function shardFetchChildDevices(urlsOverride, fresh) {
   if (!isShardParent()) return [];
   try {
     const cfg = shardConfigCached();
     const urls = Array.isArray(urlsOverride) ? urlsOverride : shardAllChildUrls(cfg);
     if (!urls.length) return [];
+
+    // 【R55】fresh=true は子一覧キャッシュ（shard_ls_ 4秒）を読まずに子GASへ直接問い合わせる。
+    //   コンソールの自動更新が「子の last_seen を最速で反映する」ための経路。
+    //   fresh=false（従来の 2引数呼び出し・1引数呼び出し）は今までどおりキャッシュを使う。
+    const __fresh = (fresh === true);
 
     // 集約結果の短時間キャッシュ（3〜5秒）。
     // キーに dev_v を混ぜるため、教員がロック/配信/規制を行うと自動的に無効化される。
@@ -5544,10 +7866,12 @@ function shardFetchChildDevices(urlsOverride) {
     try {
       if (typeof CacheService !== 'undefined') {
         cache = CacheService.getScriptCache();
-        const hit = cache.get(cacheKey);
-        if (hit) {
-          const arr = JSON.parse(hit);
-          if (Array.isArray(arr)) return arr;
+        if (!__fresh) {
+          const hit = cache.get(cacheKey);
+          if (hit) {
+            const arr = JSON.parse(hit);
+            if (Array.isArray(arr)) return arr;
+          }
         }
       }
     } catch (e) {
@@ -5555,7 +7879,8 @@ function shardFetchChildDevices(urlsOverride) {
     }
 
     if (typeof shardDiagLog === 'function') {
-      shardDiagLog('DIAG-6 子GASへ問い合わせ 台数=' + urls.length + ' ' + urls.join(' , '));
+      shardDiagLog('DIAG-6 子GASへ問い合わせ 台数=' + urls.length +
+        ' fresh=' + String(__fresh) + ' ' + urls.join(' , '));
     }
     const body = JSON.stringify({ action: 'shard_list', shard_secret: cfg.sec });
     const requests = [];
@@ -5820,7 +8145,7 @@ function shardMergeDeviceRow(parentDev, childDev) {
   return out;
 }
 
-function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
+function shardMergeDevices(base, filterSchool, teacher, includeUnassigned, fresh) {
   if (!isShardParent()) return base;
   try {
     const cfg = shardConfigCached();
@@ -5829,7 +8154,10 @@ function shardMergeDevices(base, filterSchool, teacher, includeUnassigned) {
     const urls = shardUrlsForTeacher(cfg, teacher);
     if (!urls.length) return base;
 
-    const childList = shardFetchChildDevices(urls);
+    // 【R55】fresh は子一覧キャッシュ（shard_ls_ 4秒）にも伝播させる。
+    //   これをしないと「集約キャッシュは迂回したのに子の行は 4 秒前」となり、
+    //   自動更新の反映遅延が残る。
+    const childList = shardFetchChildDevices(urls, fresh === true);
     const childDiag = (childList && childList._diag) || null;
     if (typeof shardDiagLog === 'function') {
       shardDiagLog('DIAG-12 子から受領=' + (Array.isArray(childList) ? childList.length : -1) +
@@ -6181,6 +8509,50 @@ function shardDropPending(doneKeys) {
  * 返り値: { requests: [送信するリクエスト], sources: [[元の保留キー]] }
  *   sources[i] は requests[i] が担当する元の保留。送信成功時にそれだけを除去する。
  */
+/**
+ * 【Request L】保留キュー統合時の schedules マージ。
+ *
+ *   保留キューの統合（coalesce）は児童単位で patch を合流させるが、
+ *   payload を作り直すときに schedules を素通ししていなかったため、
+ *   先にキューへ入っていた schedules（＝予約・時間制限タイマー）が
+ *   後続の保留で上書きされて消えることがあった。
+ *
+ *   仕様:
+ *     ・後続（next）に schedules が無ければ、既存（prev）をそのまま保持する。
+ *     ・両方に schedules がある場合は by_student を児童単位でマージし、
+ *       同じ児童だけ後続の値を優先する（他の児童の予約は脱落させない）。
+ *     ・文字列で渡ってきた場合は JSON として解釈を試みる（壊れていれば相手側を採る）。
+ */
+function shardMergeSchedulesForCoalesce(prev, next) {
+  if (next === undefined || next === null) return prev;
+  if (prev === undefined || prev === null) return next;
+  let p = prev, n = next;
+  if (typeof p === 'string') { try { p = JSON.parse(p); } catch (eP) { p = null; } }
+  if (typeof n === 'string') { try { n = JSON.parse(n); } catch (eN) { n = null; } }
+  const isObj = function (v) { return !!v && typeof v === 'object' && !Array.isArray(v); };
+  if (!isObj(p)) return next;
+  if (!isObj(n)) return prev;
+
+  const out = {};
+  const pk = Object.keys(p);
+  for (let i = 0; i < pk.length; i++) out[pk[i]] = p[pk[i]];
+  const nk = Object.keys(n);
+  for (let j = 0; j < nk.length; j++) {
+    const key = nk[j];
+    if (key === 'by_student' && isObj(out.by_student) && isObj(n.by_student)) {
+      const merged = {};
+      const aKeys = Object.keys(out.by_student);
+      for (let a = 0; a < aKeys.length; a++) merged[aKeys[a]] = out.by_student[aKeys[a]];
+      const bKeys = Object.keys(n.by_student);
+      for (let b = 0; b < bKeys.length; b++) merged[bKeys[b]] = n.by_student[bKeys[b]];
+      out.by_student = merged;
+    } else {
+      out[key] = n[key];
+    }
+  }
+  return out;
+}
+
 function shardCoalescePending(reqs) {
   const list = Array.isArray(reqs) ? reqs : [];
   const requests = [];
@@ -6188,6 +8560,8 @@ function shardCoalescePending(reqs) {
   const order = [];
   const state = {};
   const secrets = {};
+  // 【Request L】子GASごとの schedules を保持する器（統合時に脱落させない）
+  const schedulesByUrl = {};
 
   for (let i = 0; i < list.length; i++) {
     const r = list[i] || {};
@@ -6206,6 +8580,13 @@ function shardCoalescePending(reqs) {
     const url = String(r.url || '');
     if (!state[url]) { state[url] = {}; order.push(url); }
     secrets[url] = body.shard_secret;
+    // 【Request L】schedules（予約・時間制限タイマー）は後続の保留で消さず、
+    //   統合して保持する。後続に無ければ既存をそのまま残す。
+    if (body.schedules !== undefined && body.schedules !== null) {
+      schedulesByUrl[url] = (schedulesByUrl[url] === undefined)
+        ? body.schedules
+        : shardMergeSchedulesForCoalesce(schedulesByUrl[url], body.schedules);
+    }
     const ids = body.student_ids;
     const cm = body.class_map || {};
     const patch = body.patch || {};
@@ -6245,17 +8626,20 @@ function shardCoalescePending(reqs) {
     }
     for (let s = 0; s < sigOrder.length; s++) {
       const b = buckets[sigOrder[s]];
+      // 【Request L】統合後の payload にも schedules を必ず引き継ぐ
+      const outBody = {
+        action: 'shard_apply',
+        shard_secret: secrets[url],
+        student_ids: b.ids,
+        class_map: b.classMap,
+        patch: b.patch
+      };
+      if (schedulesByUrl[url] !== undefined) outBody.schedules = schedulesByUrl[url];
       requests.push({
         url: url,
         method: 'post',
         contentType: 'application/json',
-        payload: JSON.stringify({
-          action: 'shard_apply',
-          shard_secret: secrets[url],
-          student_ids: b.ids,
-          class_map: b.classMap,
-          patch: b.patch
-        }),
+        payload: JSON.stringify(outBody),
         muteHttpExceptions: true
       });
       sources.push(b.keys);
@@ -6359,7 +8743,9 @@ function shardFlushPending() {
   return { sent: sendReqs.length, removed: removed, queued: Math.max(0, reqs.length - removed) };
 }
 
-function shardPropagatePolicy(studentIds, patch) {
+function shardPropagatePolicy(studentIds, patch, forceSync) {
+  // forceSync=true … 保留キューを使わず、その場で同期送信する。
+  //   【フェーズ5】スケジュール（タイマー）の反映漏れ・遅延を防ぐために使う。
   // 【R41】子GASへの送信はブラウザが直接・並列で行う（親の /exec は待たない）。
   //   ここでは保留（PropertiesService）へ積むだけにして、親の実行時間を短く保つ。
   //   積んだ内容は 15秒周期の console_touch が回収する（取りこぼし防止）。
@@ -6367,7 +8753,10 @@ function shardPropagatePolicy(studentIds, patch) {
   const __bt = function (label) {
     try { if (typeof bulkTraceMark === 'function') bulkTraceMark(label); } catch (e) {}
   };
-  if (!isShardParent()) return { skipped: true };
+  if (!isShardParent()) {
+    try { Logger.log('[SHARD] policy: skip（親GASではありません）'); } catch (eL0) {}
+    return { skipped: true, reason: 'not_parent' };
+  }
   try {
     const cfg = shardConfigCached();
     __bt('shardPropagatePolicy:設定読込(CacheService/Properties)');
@@ -6376,7 +8765,10 @@ function shardPropagatePolicy(studentIds, patch) {
     // SHARD_MAP_V1 の空キー（""）で指定された既定の子GAS。
     // これを見落とすと、クラス未設定の児童にコマンドが一切届かない。
     const emptyDef = shardMapDefaultFromEmptyKey(cfg.map);
-    if (!Object.keys(idx).length && !defUrl && !emptyDef) return { skipped: true, reason: 'no_child' };
+    if (!Object.keys(idx).length && !defUrl && !emptyDef) {
+      try { Logger.log('[SHARD] policy: skip（子GASが1つも登録されていません。SHARD_MAP_V1 / SHARD_DEFAULT_URL を設定してください）'); } catch (eL1) {}
+      return { skipped: true, reason: 'no_child' };
+    }
 
     // 【R35】索引（CacheService）だけで解決する。
     //   【重要】ここで openById / getDataRange を呼んではいけない。
@@ -6387,8 +8779,10 @@ function shardPropagatePolicy(studentIds, patch) {
     try {
       if (typeof shardDeviceEntries === 'function') entries = shardDeviceEntries();
     } catch (e) { entries = null; }
-    if (!entries) {
+    if (!entries || !entries.length) {
       // 索引が使えない環境のみ従来通りのシート読み（機能は落とさない）
+      //   ※ [] は truthy なので `if (!entries)` だけでは素通りしてしまう。
+      //     索引キャッシュが空で固まった場合に全児童が脱落するのを防ぐ。
       const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
       const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
       const d = sheet.getDataRange().getValues();
@@ -6408,17 +8802,52 @@ function shardPropagatePolicy(studentIds, patch) {
     const isAll = (studentIds === 'ALL' || !Array.isArray(studentIds));
     const idSet = Array.isArray(studentIds) ? new Set(studentIds) : null;
 
+    // 【伝播の安全ガード】静かな脱落（sent: []）を根絶する。
+    //   従来、SHARD_MAP_V1 に一致するクラスが無く、空キー既定も SHARD_DEFAULT_URL も
+    //   未設定のとき、この児童は「黙って」捨てられていた。その結果、
+    //   子GASへは 1 件も送られないのに親の予約は正常に見え、子の実行ログも
+    //   HTTP 200 で返るため「成功しているのに端末で規制が効かない」という
+    //   最も厄介な壊れ方をする（本不具合の正体）。
+    //   1校=1子GAS の運用（R41）では、登録が 1 件だけならそれが正しい宛先なので
+    //   それを最終フォールバックに使う。加えて、落とした事実を必ずログに残す。
+    const idxKeys = Object.keys(idx);
+    const singleChildUrl = (idxKeys.length === 1) ? String(idx[idxKeys[0]] || '').trim() : '';
+
     const groups = {}; // url -> [studentId]
     const groupClasses = {}; // url -> { studentId: 元のクラス名 }
+    const urlById = {}; // studentId -> 解決済みURL（予約の同封先と共有する）
+    let droppedCount = 0;      // クラス不明＋既定URL無しで宛先が決まらなかった児童
+    let unassignedCount = 0;   // 既知クラスだが担当子GASが無い児童（親GASのみで運用）
     for (let i = 0; i < entries.length; i++) {
       const id = String(entries[i][0] || '').trim();
       if (!id) continue;
       if (!isAll && !(idSet && idSet.has(id))) continue;
       const rawClass = String(entries[i][2] || '').trim();
       const cls = normalizeShardClass(rawClass);
-      // クラス一致 → 空キー既定 → SHARD_DEFAULT_URL の順で解決する
-      const url = idx[cls] || emptyDef || defUrl;
-      if (!url) continue;
+      // 【R49】宛先解決の順序を「クラス一致 → 空キー既定 → SHARD_DEFAULT_URL」に限定し、
+      //   「唯一の子GAS」フォールバックは“クラスが未取得・不明”の児童だけに許す。
+      //
+      //   従来は既知クラス（例: 3年1組）が SHARD_MAP_V1 に無くても singleChildUrl へ
+      //   流していたため、子GASを持たないクラスの児童が 5年1組用の子GASへ送られ、
+      //   子シートに「未登録児童」行が勝手に作られる実機不具合になっていた。
+      //   子GASを持たないクラスは親GASのみで運用する（送らない・行も作らせない）。
+      let url = '';
+      if (cls && idx[cls]) {
+        url = idx[cls];
+      } else if (cls) {
+        unassignedCount++;
+        shardWarnOnce('cls-skip:' + cls,
+          'SHARD_MAP_V1 にクラス「' + rawClass + '」（正規化: ' + cls + '）がありません。' +
+          'このクラスは親GASのみで運用します（担当子GASが無いため子へは送りません）。');
+        continue;
+      } else {
+        // クラス未取得・不明の児童だけがフォールバック対象。
+        url = emptyDef || defUrl || singleChildUrl;
+        if (!url) { droppedCount++; continue; }
+        shardWarnOnce('cls-fb:' + rawClass + '|' + url,
+          'クラスが未取得の児童「' + id + '」を既定の子GASへ送ります（' + url + '）。');
+      }
+      urlById[id] = url;
       if (!groups[url]) groups[url] = [];
       groups[url].push(id);
       // 子のシートで行を作るときにクラスを埋めるため、元の表記のまま渡す。
@@ -6426,23 +8855,89 @@ function shardPropagatePolicy(studentIds, patch) {
       groupClasses[url][id] = rawClass;
     }
 
+    // 宛先が 1 つも無いのに児童が居た＝設定不備。成功に見せず理由を返す。
+    if (!Object.keys(groups).length && (droppedCount > 0 || unassignedCount > 0)) {
+      if (droppedCount > 0) {
+        shardWarnOnce('no-route:' + droppedCount,
+          'SHARD_MAP_V1 のどのクラスにも一致せず、既定URLも無いため伝播先がありません（対象 ' +
+          droppedCount + ' 名）。子GASへは何も送られていません。');
+        return { skipped: true, reason: 'no_route', dropped: droppedCount,
+          unassigned: unassignedCount };
+      }
+      // 【R49】既知クラスだが担当子GASが無い（親GASのみで運用するクラス）。
+      //   子GASへは送らないのが正しいが、「無言の成功」にはしない。
+      return { skipped: true, reason: 'no_assigned_child', unassigned: unassignedCount };
+    }
+
     const urls = Object.keys(groups);
+    try {
+      Logger.log('[SHARD] policy: 宛先=' + urls.length + '件 児童=' +
+        (function () { var n = 0; for (var k in groups) n += groups[k].length; return n; })() +
+        '名 forceSync=' + !!forceSync);
+    } catch (eL2) {}
+
+    // 【フェーズ5】スケジュール（タイマー）の同封。
+    //   確定仕様:
+    //     ・繰り返し・曜日を親が解釈し、start_ms/end_ms まで確定した
+    //       「展開済みウィンドウ」を渡す（子は再計算しない）
+    //     ・子GASごとの“全児童”を丸ごと送る（差分管理をしない＝不整合が出ない）
+    //     ・予約が1件も無いときは同封そのものを省く（通信量ゼロ）
+    let schRows = null;
+    let entriesByUrl = null;
+    try {
+      if (typeof readScheduleRows_ === 'function') {
+        // 予約が 0 件でも配列として読む（forceSync 時に「空」を丸ごと上書きするため）
+        schRows = readScheduleRows_();
+        if (Array.isArray(schRows)) {
+          entriesByUrl = {};
+          for (let i = 0; i < entries.length; i++) {
+            const sid0 = String(entries[i][0] || '').trim();
+            if (!sid0) continue;
+            // 【R49】上で決めた宛先をそのまま使う。
+            //   ここで旧フォールバック連鎖を再計算すると、担当子GASを持たない
+            //   クラスの児童が entriesByUrl に混ざり、子へ予約だけが送られる
+            //   （＝子シートに行が作られる）抜け道になる。
+            const u0 = urlById[sid0];
+            if (!u0) continue;
+            if (!entriesByUrl[u0]) entriesByUrl[u0] = [];
+            entriesByUrl[u0].push([sid0, String(entries[i][1] || ''), String(entries[i][2] || '')]);
+          }
+        }
+      }
+    } catch (eSch0) { schRows = null; entriesByUrl = null; }
+    const schNowMs = new Date().getTime();
+    let scheduleAttached = false;
+
     // 全校一括ロック／一括URL配信でも、全子GASへ 1 回分の待ち時間で一斉に伝達する（並列）。
     const requests = [];
     for (let i = 0; i < urls.length; i++) {
       const url = urls[i];
+      const body = {
+        action: 'shard_apply',
+        shard_secret: cfg.sec,
+        student_ids: groups[url],
+        // 子が行を作るときにクラスを埋められるよう、児童ID→クラス名を添える。
+        class_map: groupClasses[url] || {},
+        patch: patch
+      };
+      // この子GASに属する全児童の展開済みウィンドウを丸ごと添える。
+      if (entriesByUrl && entriesByUrl[url]) {
+        try {
+          const byStudent = shardBuildScheduleByStudent_(schRows, entriesByUrl[url], schNowMs);
+          // 【確定仕様2】有効な予約が無い児童は地図に入れない（子は「制限なし」と解釈）。
+          // 【確定仕様3】ただし forceSync（予約CRUD起点）では 0 件でも「空の地図」を送る。
+          //   最後の1件を取り消したとき、何も送らないと子に古い制限が残り続けるため。
+          if (Object.keys(byStudent).length || forceSync) {
+            body.schedules = { updated_ms: schNowMs, by_student: byStudent };
+            scheduleAttached = true;
+          }
+        } catch (eSch1) { /* 同封に失敗してもポリシー伝達は続ける */ }
+      }
       requests.push({
         url: url,
         method: 'post',
         contentType: 'application/json',
-        payload: JSON.stringify({
-          action: 'shard_apply',
-          shard_secret: cfg.sec,
-          student_ids: groups[url],
-            // 子が行を作るときにクラスを埋められるよう、児童ID→クラス名を添える。
-            class_map: groupClasses[url] || {},
-            patch: patch
-          }),
+        payload: JSON.stringify(body),
         muteHttpExceptions: true
       });
     }
@@ -6451,8 +8946,11 @@ function shardPropagatePolicy(studentIds, patch) {
 
     // 【R34】応答を待たずに保留へ積み、ブラウザ起点のビーコンで送る（実測 4,122ms の解消）。
     //   積めなければ従来どおり同期送信するため、機能は落ちない。
+    // 【フェーズ5】ただしスケジュールを同封したリクエストは保留に積まない。
+    //   タイマーの反映漏れ・遅延を防ぐため、必ず即時の同期送信にする（確定仕様1・2）。
     try {
-      if (typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
+      if (!scheduleAttached && !forceSync &&
+          typeof SHARD_ASYNC_ENABLED !== 'undefined' && SHARD_ASYNC_ENABLED &&
           typeof shardQueuePending === 'function' && shardQueuePending(requests)) {
         __bt('shardPropagatePolicy:保留へ積む(応答待ちなし)');
         const queuedResults = [];
@@ -6477,20 +8975,24 @@ function shardPropagatePolicy(studentIds, patch) {
         const code = res.getResponseCode();
         // 子が「行を用意できなかった」場合は一括操作が効いていない。握りつぶさず伝える。
         let childEnsure = null;
+        let childSchedules = null;
         try {
           const parsed = JSON.parse(res.getContentText() || '{}');
           childEnsure = (parsed && parsed.ensure) || null;
+          childSchedules = (parsed && parsed.schedules) || null;
           if (childEnsure && childEnsure.error) {
             results.push({ url: url, count: groups[url].length, status: code, ensure_error: childEnsure.error });
             continue;
           }
         } catch (e2) { /* 本文が読めなくてもステータスは残す */ }
-        results.push({ url: url, count: groups[url].length, status: code, ensure: childEnsure });
+        results.push({ url: url, count: groups[url].length, status: code,
+          ensure: childEnsure, schedules: childSchedules });
       } catch (e) {
         results.push({ url: url, count: groups[url].length, error: String(e) });
       }
     }
     __bt('shardPropagatePolicy:応答解析(完了)');
+    try { Logger.log('[SHARD] policy: 送信完了 ' + JSON.stringify(results)); } catch (eL3) {}
     return { sent: results };
   } catch (e) {
     // 子への伝達に失敗しても、親のシート更新（＝コンソール表示）は成立させる
@@ -6749,7 +9251,7 @@ function shardClientConfig() {
   }
 }
 
-function api_getAllDevices(token, schoolName, includeUnassigned) {
+function api_getAllDevices(token, schoolName, includeUnassigned, fresh) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
@@ -6759,7 +9261,10 @@ function api_getAllDevices(token, schoolName, includeUnassigned) {
     // google.script.run 経由のときだけ子GASの端末が見えなかった（経路による差）。
     // 集約（親＋子の統合）を通る getShardMergedDevices に統一する。
     // SHARD_MODE=false のときは内部で getAllDevices をそのまま返す＝従来と完全同一。
-    const data = getShardMergedDevices(schoolName, currentTeacher, Boolean(includeUnassigned));
+    // 【R55】第4引数 fresh=true で読み取りキャッシュを迂回し、子GASの最新 last_seen を
+    //   取り直す（自動更新・タブ復帰・操作直後の取得用）。3引数の呼び出しは従来どおり。
+    const data = getShardMergedDevices(
+      schoolName, currentTeacher, Boolean(includeUnassigned), parseBoolean(fresh));
     return { success: true, data: data };
   } catch (err) {
     return { success: false, error: err.toString() };
@@ -6834,7 +9339,7 @@ function api_bulkLock(token, studentIds, locked) {
   }
 }
 
-function api_bulkBroadcast(token, studentIds, url) {
+function api_bulkBroadcast(token, studentIds, url, broadcastId) {
   try {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
@@ -6844,9 +9349,14 @@ function api_bulkBroadcast(token, studentIds, url) {
     if (Array.isArray(scoped.ids) && scoped.ids.length === 0) {
       return { success: false, error: '操作対象の児童がありません（自校の児童のみ操作できます）' };
     }
-    const bcId = bulkUpdateBroadcastUrl(scoped.ids, url, '');
+    // 【要件1】管理画面が押下時に採番したIDをそのまま使う（空なら従来どおり発番）。
+    //   親・子直送・保留キューflush の3経路で同一IDになることが二重タブ防止の要。
+    const bcId = bulkUpdateBroadcastUrl(scoped.ids, url, String(broadcastId || '').trim());
     // 子GAS分散: 一斉URL配信も子へ伝達する（届かないと端末側で配信されない）
-    const shardBc = shardPropagatePolicy(scoped.ids, { broadcast_url: url });
+    const shardBc = shardPropagatePolicy(scoped.ids, {
+      broadcast_url: url,
+      broadcast_id: bcId
+    });
     return { success: true, broadcast_id: bcId, shard: shardBc };
   } catch (err) {
     return { success: false, error: err.toString() };
@@ -6893,7 +9403,6 @@ function api_updateSingle(token, studentId, data) {
     if (!isDeviceInTeacherScope(targetStudent.school_name, currentTeacher, targetStudent.class_name)) {
       return { success: false, error: '対象外の児童は操作できません（学校・対象クラスの範囲外）' };
     }
-    updateSingleDevice(studentId, data || {});
     // 子GAS分散: 個別更新も子へ伝達する（doPost の update_single と同じ組み立て）
     const single = data || {};
     const shardPatch = {};
@@ -6901,10 +9410,15 @@ function api_updateSingle(token, studentId, data) {
     if (single.filter_mode !== undefined) shardPatch.filter_mode = single.filter_mode;
     if (single.whitelist_urls !== undefined) shardPatch.whitelist_urls = single.whitelist_urls;
     if (single.blacklist_urls !== undefined) shardPatch.blacklist_urls = single.blacklist_urls;
-    if (single.broadcast_url !== undefined) shardPatch.broadcast_url = single.broadcast_url;
-    const shardSingle = Object.keys(shardPatch).length
-      ? shardPropagatePolicy([studentId], shardPatch) : { skipped: true };
-    return { success: true, message: '設定を更新しました', shard: shardSingle };
+    if (single.broadcast_url !== undefined) {
+      shardPatch.broadcast_url = single.broadcast_url;
+      if (single.broadcast_id) shardPatch.broadcast_id = String(single.broadcast_id);
+    }
+    // 【個別操作の統一経路】① 親キャッシュ先行反映 → ② 子GASへ即時同期転送
+    //   （forceSync=true / deferred 禁止）→ ③ シート永続化 の順で必ず通す。
+    const singleRes = applySingleControl_(studentId, shardPatch, single);
+    return { success: true, message: '設定を更新しました',
+      shard: singleRes.shard, broadcast_id: singleRes.broadcast_id || '' };
   } catch (err) {
     return { success: false, error: err.toString() };
   }
@@ -7020,7 +9534,7 @@ function api_getArchivedStudents(token) {
   }
 }
 
-// ---- AI監視設定 API (google.script.run 用) ----
+// ---- サイト監視設定 API (google.script.run 用) ----
 
 function api_getMonitorSettings(token) {
   try {
@@ -7047,6 +9561,171 @@ function api_saveMonitorSettings(token, settings) {
   } catch (err) {
     return { success: false, error: err.toString() };
   }
+}
+
+// ---- ライブ視聴 API (google.script.run 用 / v1.6.8) ----
+
+function api_liveWatchStatus(token) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    // 【R57】R41分散時は子GASの使用枠と和集合を取る（単独モードは従来どおり）。
+    return liveWatchStatusSharded(currentTeacher);
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_liveWatchStart(token, studentIds) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
+    // 【R57】親の台帳＋子GASの台帳の両方に登録する（子のハートビートが live_watch:true になる）。
+    return liveWatchApplyBatchSharded(currentTeacher, scoped.ids, 'start');
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_liveWatchExtend(token, studentIds) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    return liveWatchApplyBatchSharded(currentTeacher, studentIds, 'extend');
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_liveWatchStop(token, studentIds) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    return liveWatchApplyBatchSharded(currentTeacher, studentIds, 'stop');
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+function api_liveWatchFrames(token, studentIds) {
+  try {
+    const auth = verifyToken(token);
+    if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
+    const currentTeacher = resolveCurrentTeacher(auth.teacher);
+    const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
+    // 【R57】端末は子GASへ live_frame を送るため、子GASからも並列取得してマージする。
+    return { success: true, data: liveWatchGetFramesSharded(scoped.ids, currentTeacher), ids: scoped.ids };
+  } catch (err) {
+    return { success: false, error: err.toString() };
+  }
+}
+
+// ==================== Googleアカウント シングルサインオン（SSO） ====================
+// 【設計（Request K）】SSOの可否は「教員マスタ（アカウント管理）」だけで完結する。
+//   二重管理をしない。判定は次の3点のみ。
+//     ① Session.getActiveUser().getEmail() でメールアドレスを取得できる
+//     ② 教員マスタ（アカウント管理）に登録済み
+//     ③ その行の「Google SSO許可」列が有効
+//   満たした場合のみ、手動ログインと同一の正規トークン（generateToken）を発行する。
+//
+//   ※ 旧仕様の独立SSO設定（PropertiesService の SSO_SETTINGS_V1 /
+//     SSO_ALLOWED_EMAILS / SSO_ALLOWED_DOMAINS による許可リスト・ドメイン一括許可）は
+//     全廃した。既存環境にこれらのキーが残っていても一切参照しない。
+//
+// ■ 前提（デプロイ設定）
+//   次のユーザーとして実行: 自分（管理者） ／ アクセス: 組織（ドメイン）内の全員
+//   「全員（匿名を含む）」だと getEmail() が空文字になり no_email で拒否する。
+const SSO_DENY_MESSAGE = 'このGoogleアカウントには管理権限がありません。許可された教員アカウントでログインするか、上の欄から管理者パスワードを入力してください。';
+const SSO_NO_EMAIL_MESSAGE = 'このGoogleアカウントからメールアドレスを取得できませんでした（Webアプリのデプロイ設定が「全員（匿名を含む）」になっている可能性があります）。上の欄から管理者パスワードを入力してログインしてください。';
+
+/**
+ * 「Google SSO許可」セルの値を真偽値へ変換する。
+ *   空欄（未設定）は既定で【許可】とする。
+ *   教員マスタに行が存在する時点で管理者が承認した教員であるため、
+ *   列追加前から存在する既存教員がSSOを使えなくなる事故を避ける（移行措置）。
+ *   明示的に FALSE / 0 / no / off / 無効 等が入っている行だけ拒否する。
+ */
+function parseSsoAllowedFlag(value) {
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  const s = String(value == null ? '' : value).trim().toLowerCase();
+  if (!s) return true;              // 未設定＝既定ON（既存教員の移行措置）
+  if (['false', '0', 'no', 'off', 'ng', 'x', '不可', '無効', '拒否'].indexOf(s) >= 0) return false;
+  return true;
+}
+
+/**
+ * 【google.script.run】GoogleアカウントSSOログイン。
+ * アクセス中のGoogleアカウントを取得し、教員マスタ＋SSO許可で判定する。
+ */
+function api_ssoLogin() {
+  let email = '';
+  try { email = String(Session.getActiveUser().getEmail() || '').trim(); }
+  catch (eSession) { email = ''; }
+  try {
+    return ssoLoginWithEmail(email);
+  } catch (err) {
+    return { success: false, reason: 'error', error: err.toString() };
+  }
+}
+
+/**
+ * メールアドレスを受け取ってSSO認証を行う本体（Session に依存しないので試験可能）。
+ *   成功時は handleTeacherLogin と同一形状（token / teacher / schools）を返す。
+ */
+function ssoLoginWithEmail(email) {
+  const em = String(email == null ? '' : email).trim().toLowerCase();
+
+  // ① メールアドレスが取得できない（デプロイ設定が「全員（匿名）」等）
+  if (!em) {
+    return { success: false, reason: 'no_email', error: SSO_NO_EMAIL_MESSAGE };
+  }
+
+  // ② 教員マスタ（アカウント管理）に登録済みか
+  let teacher = null;
+  try { teacher = getTeacherSettings(em); } catch (eTeacher) { teacher = null; }
+  if (!teacher || !teacher.email) {
+    // 児童アカウント・未登録アカウントはここで必ず落ちる
+    return { success: false, reason: 'not_registered', email: em, error: SSO_DENY_MESSAGE };
+  }
+
+  // ③ その教員の「Google SSO許可」が有効か
+  if (parseSsoAllowedFlag(teacher.sso_allowed) !== true) {
+    return { success: false, reason: 'sso_disabled', email: em, error: SSO_DENY_MESSAGE };
+  }
+
+  // 最終ログイン日時の記録（失敗してもログインは成立させる）
+  try {
+    const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
+    ensureTeacherHeaders(sheet);
+    const hm = getHeaderMap(sheet, CONFIG.TEACHER_COLUMNS);
+    if (hm['最終ログイン日時']) {
+      const vals = sheet.getDataRange().getValues();
+      const ci = hm['教員ID(メールアドレス)'] - 1;
+      for (let i = 1; i < vals.length; i++) {
+        if (String(vals[i][ci] || '').trim().toLowerCase() === em) {
+          sheet.getRange(i + 1, hm['最終ログイン日時'])
+            .setValue(Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
+          break;
+        }
+      }
+    }
+  } catch (eLast) { /* 最終ログインの記録失敗はログイン成否に影響させない */ }
+
+  // 正規セッションの発行（手動ログインと同一のトークン生成）
+  const token = generateToken(teacher);
+  return {
+    success: true,
+    sso: true,
+    token: token,
+    teacher: teacher,
+    schools: CONFIG.SCHOOL_LIST
+  };
 }
 
 // ============================================================================
@@ -7282,19 +9961,38 @@ function deviceMatchesSchedule_(row, studentId, normClassName, schoolName) {
   if (!row) return false;
   const sid = String(studentId || '').trim();
   const tt = String(row.targetType || '').trim().toLowerCase();
+
+  // 【Request P】school（全校生徒）: 学校名が一致すればその学校の全児童が対象。
+  //   学校名が空の全校予約は「管理者が全校に配る予約」として全児童を対象にする。
+  if (tt === 'school') {
+    if (!row.schoolName) return true;
+    if (!schoolName) return false;
+    return schoolNamesMatch(row.schoolName, schoolName);
+  }
+
   if (tt === 'class') {
-    const rc = String(row.className || '').trim();
-    if (!rc) return false;
-    if (normalizeClassName(rc) !== String(normClassName || '')) return false;
+    // 【Request P】クラス名はカンマ区切りで複数指定できる（シートは1セルに保存）。
+    //   どれか1つでも一致すればその端末は対象。
+    const list = scheduleClassList_(row.className);
+    if (!list.length) return false;
+    const cn = String(normClassName || '');
+    let hit = false;
+    for (let i = 0; i < list.length; i++) {
+      if (normalizeClassName(list[i]) === cn) { hit = true; break; }
+    }
+    if (!hit) return false;
     // 学校名が入っていれば一致確認（表記ゆれは schoolNamesMatch で吸収）
     if (row.schoolName && schoolName && !schoolNamesMatch(row.schoolName, schoolName)) return false;
     return true;
   }
   if (tt === 'student') {
-    return Array.isArray(row.studentIds) && row.studentIds.indexOf(sid) >= 0;
+    // 【表記ゆれの相互吸収】予約シートの対象児童IDは教員の手入力で、
+    //   メール形式とローカル部の両方が存在し得る。indexOf の生比較だけだと
+    //   「@の有無」だけの差異で対象から外れ、子GASの by_student が空になる。
+    return idMatchesAny_(row.studentIds, sid);
   }
   // 対象種別が空（手入力行の保険）→ 児童ID一致で判定
-  return !!(sid && Array.isArray(row.studentIds) && row.studentIds.indexOf(sid) >= 0);
+  return !!(sid && idMatchesAny_(row.studentIds, sid));
 }
 
 /**
@@ -7334,8 +10032,11 @@ function readScheduleRows_() {
       studentIds: idsRaw.split(/[,\u3001\s]+/).map(function (s) { return s.trim(); }).filter(Boolean),
       type: String(get('制限タイプ') || 'url_block').trim().toLowerCase(),
       filterMode: String(get('URL規制モード') || '').trim().toUpperCase(),
-      whitelist: String(get('許可URLリスト') || '').trim(),
-      blacklist: String(get('規制URLリスト') || '').trim(),
+      // 【配列化】シートは "a.com, b.com" の文字列。端末側の normalizeHostList は
+      //   配列以外を捨てるため、読み取り時点で string[] に直しておく
+      //   （シートへ書き戻すときは hostListToSheetString_ で文字列に戻す）。
+      whitelist: normalizeHostListToArray_(get('許可URLリスト')),
+      blacklist: normalizeHostListToArray_(get('規制URLリスト')),
       dateFrom: scheduleDatePart_(get('開始日')),
       dateTo: scheduleDatePart_(get('終了日')),
       repeat: String(get('繰り返し') || 'NONE').trim().toUpperCase(),
@@ -7355,11 +10056,14 @@ function readScheduleRows_() {
 }
 
 /** 端末のハートビートに載せる「有効/予定/解除済み」の塊を作る */
-function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs) {
+function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs, rowsArg) {
   const payload = { active: [], upcoming: [], overridden_ids: [] };
   const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  // 【フェーズ5】親が全校ぶんを一度に組み立てるとき、予約シートを児童数だけ
+  //   読み直してしまう。読み込み済みの行を渡せるようにして 1 回に畳む。
   let rows = [];
-  try { rows = readScheduleRows_(); } catch (e) { return payload; }
+  if (Array.isArray(rowsArg)) rows = rowsArg;
+  else { try { rows = readScheduleRows_(); } catch (e) { return payload; } }
   if (!rows.length) return payload;
 
   const sid = String(studentId || '').trim();
@@ -7385,12 +10089,19 @@ function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs)
         id: r.id,
         type: r.type,
         filter_mode: r.filterMode,
-        whitelist: r.whitelist,
-        blacklist: r.blacklist,
+        // 【配列化】端末（拡張機能）の normalizeHostList は配列以外を捨てる。
+        //   文字列のまま配ると URL規制が無効化される。
+        whitelist: normalizeHostListToArray_(r.whitelist),
+        blacklist: normalizeHostListToArray_(r.blacklist),
         start_ms: w.start_ms,
         end_ms: w.end_ms,
         start_jst: schMsToJstStr_(w.start_ms),
-        end_jst: schMsToJstStr_(w.end_ms)
+        end_jst: schMsToJstStr_(w.end_ms),
+        // 【Request P】教員一覧の「予約実行中」バッジ用の表示情報。
+        //   拡張機能（端末）は未知フィールドを無視するので後方互換。
+        label: scheduleActiveLabel_(r),
+        target_type: r.targetType,
+        target_label: scheduleTargetLabel_(r)
       };
       if (w.start_ms <= now && now < w.end_ms) {
         if (payload.active.length < maxActive) payload.active.push(item);
@@ -7405,12 +10116,439 @@ function buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs)
   return payload;
 }
 
+// ============================================================================
+// 【フェーズ5】子GAS 伝播: 展開済みスケジュールの受け取りと配信
+//
+//   設計（確定）:
+//     ・親が繰り返し・曜日を解釈し、start_ms / end_ms まで確定した
+//       「展開済みウィンドウ」を子へ渡す（子は再計算しない）
+//     ・子はシートではなく PropertiesService に保持する（シートI/Oを増やさない）
+//     ・経路は既存の shard_apply に schedules を同封する 1 本に集約する
+//
+//   子のハートビートは PropertiesService（+ 30秒のCacheServiceメモ）から
+//   引くだけになるため、端末への応答がシート読みに引きずられない。
+// ============================================================================
+
+/** 子GASが親から受け取った展開済みスケジュールを持つプロパティキー */
+const SHARD_SCHEDULES_PROP = 'SHARD_SCHEDULES_CACHE';
+/** ハートビート毎の PropertiesService 読みを避けるためのメモ（秒） */
+const SHARD_SCHEDULES_MEMO_SEC = 30;
+const SHARD_SCHEDULES_MEMO_KEY = 'shard_sched_memo1';
+
+/** 予約の無い端末へ返す空の配信契約（フェーズ3と同じ形） */
+function emptySchedulePayload_() {
+  return { active: [], upcoming: [], overridden_ids: [] };
+}
+
+/**
+ * 子GAS: 親から受け取った展開済みスケジュールを保存する。
+ *   byStudent = { "<児童ID>": { windows:[{id,type,filter_mode,whitelist,blacklist,start_ms,end_ms}],
+ *                              overridden_ids:["..."] } }
+ *   マージではなく「受け取った児童ぶんを置き換える」方式。親が常に正である。
+ */
+function shardSaveScheduleCache_(byStudent, updatedMs, replace) {
+  const now = (typeof updatedMs === 'number' && updatedMs > 0) ? updatedMs : new Date().getTime();
+  // 【確定仕様3】親は「その子GASの全児童」を丸ごと送る。差分マージではなく
+  //   置き換え（replace=true）にすることで、取消した予約が子に残り続ける
+  //   不整合を原理的に排除する。replace が無いときは従来どおりマージ。
+  let cur = {};
+  if (replace !== true) {
+    try {
+      const existing = shardLoadScheduleCache_();
+      if (existing && existing.by_student) cur = existing.by_student;
+    } catch (e0) { cur = {}; }
+  }
+
+  let n = 0;
+  Object.keys(byStudent || {}).forEach(function (sid) {
+    const key = String(sid || '').trim();
+    if (!key) return;
+    const rec = byStudent[sid] || {};
+    cur[key] = {
+      windows: Array.isArray(rec.windows) ? rec.windows : [],
+      overridden_ids: Array.isArray(rec.overridden_ids) ? rec.overridden_ids : []
+    };
+    n++;
+  });
+
+  const obj = { updated_ms: now, by_student: cur };
+  try {
+    PropertiesService.getScriptProperties().setProperty(SHARD_SCHEDULES_PROP, JSON.stringify(obj));
+  } catch (e) {
+    return { saved: 0, error: String(e) };
+  }
+  // メモを捨てて、次のハートビートから新しい内容を読ませる
+  try { CacheService.getScriptCache().remove(SHARD_SCHEDULES_MEMO_KEY); } catch (e2) {}
+  return { saved: n, total: Object.keys(cur).length };
+}
+
+/** 子GAS: 保持しているスケジュールキャッシュを読む（無ければ null） */
+function shardLoadScheduleCache_() {
+  try {
+    const memo = CacheService.getScriptCache().get(SHARD_SCHEDULES_MEMO_KEY);
+    if (memo) {
+      const o = JSON.parse(memo);
+      if (o && typeof o === 'object' && o.by_student) return o;
+    }
+  } catch (eM) { /* キャッシュ不可時はプロパティへ */ }
+  try {
+    const raw = PropertiesService.getScriptProperties().getProperty(SHARD_SCHEDULES_PROP);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || typeof o !== 'object' || !o.by_student || typeof o.by_student !== 'object') return null;
+    try { CacheService.getScriptCache().put(SHARD_SCHEDULES_MEMO_KEY, raw, SHARD_SCHEDULES_MEMO_SEC); } catch (eC) {}
+    return o;
+  } catch (e) { return null; }
+}
+
+/**
+ * 親GAS: 1児童ぶんの「展開済みウィンドウ」を組み立てる。
+ *   buildSchedulePayloadForDevice_ と違い、active / upcoming に振り分けず
+ *   全ウィンドウをそのまま渡す（子の時刻で判定させるため）。
+ *   rows を渡すことで予約シートの読みを呼び出し側で1回に畳める。
+ */
+function shardBuildWindowsForStudent_(rows, studentId, className, schoolName, nowMs) {
+  const out = { windows: [], overridden_ids: [] };
+  if (!rows || !rows.length) return out;
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const sid = String(studentId || '').trim();
+  const cn = normalizeClassName(className);
+  const horizon = (CONFIG.SCHEDULE_HORIZON_DAYS || 14) * 86400000;
+  const maxWin = CONFIG.SCHEDULE_MAX_WINDOWS || 20;
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!deviceMatchesSchedule_(r, sid, cn, schoolName)) continue;
+    // 解除済みは窓を配信せずIDだけ渡す（端末は「今回解除」の表示に使う）
+    if (r.overridden) { out.overridden_ids.push(r.id); continue; }
+    if (!r.enabled) continue;
+    const sched = {
+      dateFrom: r.dateFrom, dateTo: r.dateTo, repeat: r.repeat,
+      startTimeOfDayMs: schTimeOfDayMs_(r.startTime),
+      endTimeOfDayMs: schTimeOfDayMs_(r.endTime),
+      weekdays: parseWeekdays_(r.weekdaysRaw)
+    };
+    let wins = [];
+    try { wins = expandScheduleWindows_(sched, now, horizon); } catch (eW) { wins = []; }
+    for (let w = 0; w < wins.length; w++) {
+      if (out.windows.length >= maxWin) break;
+      out.windows.push({
+        id: r.id,
+        type: r.type,
+        filter_mode: r.filterMode,
+        // 【配列化】親から子GASへ渡す展開済みウィンドウも string[] で運ぶ。
+        whitelist: normalizeHostListToArray_(r.whitelist),
+        blacklist: normalizeHostListToArray_(r.blacklist),
+        start_ms: wins[w].start_ms,
+        end_ms: wins[w].end_ms,
+        // 【Request P】R41 子GAS でも「予約実行中」バッジを出せるよう、
+        //   子に予約シートを持たせずに済む表示情報をウィンドウへ同封する。
+        label: scheduleActiveLabel_(r),
+        target_type: r.targetType,
+        target_label: scheduleTargetLabel_(r),
+        school_name: String(r.schoolName || '')
+      });
+    }
+  }
+  out.windows.sort(function (a, b) { return a.start_ms - b.start_ms; });
+  return out;
+}
+
+/** 親GAS: 子GASへ渡す「児童ID→展開済みウィンドウ」の地図を作る */
+function shardBuildScheduleByStudent_(rows, entries, nowMs) {
+  const by = {};
+  if (!Array.isArray(entries) || !entries.length) return by;
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return by; // 予約が1件も無ければ同封そのものを省く（通信量ゼロ）
+  for (let i = 0; i < entries.length; i++) {
+    const sid = String(entries[i][0] || '').trim();
+    if (!sid || by[sid]) continue;
+    const school = String(entries[i][1] || '').trim();
+    const cls = String(entries[i][2] || '').trim();
+    const r = shardBuildWindowsForStudent_(list, sid, cls, school, now);
+    if (r.windows.length || r.overridden_ids.length) by[sid] = r;
+  }
+  return by;
+}
+
+/** 親GAS: 地図から、その子GASへ送る児童ぶんだけを抜き出す */
+function shardPickSchedulesFor_(byStudent, ids, nowMs) {
+  if (!byStudent) return null;
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const picked = {};
+  let n = 0;
+  const list = Array.isArray(ids) ? ids : [];
+  for (let i = 0; i < list.length; i++) {
+    const k = String(list[i] || '').trim();
+    if (!k || !byStudent[k]) continue;
+    picked[k] = byStudent[k];
+    n++;
+  }
+  if (!n) return null;
+  return { updated_ms: now, by_student: picked };
+}
+
+/**
+ * 子GAS: 保持しているキャッシュから、端末へ返す配信契約を組み立てる。
+ *   時刻比較（start_ms <= now < end_ms）だけを行う。繰り返しの再解釈はしない。
+ */
+function shardSchedulePayloadFromCache_(studentId, nowMs) {
+  const payload = emptySchedulePayload_();
+  const cache = shardLoadScheduleCache_();
+  if (!cache || !cache.by_student) return payload;
+  const sid = String(studentId || '').trim();
+  if (!sid) return payload;
+
+  // 【二段構えの照合】端末の student_id は「メール全体」と「@より前のローカル部」の
+  //   両方が届く。生の完全一致（cache.by_student[sid]）だけで引くと、「@の有無」だけの
+  //   差異で無言の空配列になり、「親→子は saved:1 なのに端末で規制が効かない」
+  //   という最も厄介な壊れ方をする（実機で発生した断線の正体）。
+  //   ① 正規化した完全一致 → ② ローカル部一致（片方だけメール形式のとき）の順で解決する。
+  let rec = null;
+  let hitKey = '';
+  try {
+    const want = normalizeIdKey(sid);
+    const keys = Object.keys(cache.by_student || {});
+    for (let i = 0; i < keys.length; i++) {
+      if (normalizeIdKey(keys[i]) === want) { hitKey = keys[i]; break; }
+    }
+    if (!hitKey) {
+      // 候補が1件に絞れたときだけ採用する。
+      //   複数候補＝別児童の同名ローカル部。誤配信して無実の児童を
+      //   止めるより、配信しないほうが安全なので採用しない。
+      const cands = [];
+      for (let j = 0; j < keys.length; j++) {
+        if (idKeysMatch_(keys[j], sid)) cands.push(keys[j]);
+      }
+      if (cands.length === 1) {
+        hitKey = cands[0];
+      } else if (cands.length > 1) {
+        try {
+          Logger.log('[SHARD] heartbeat: ID照合が曖昧 sid=' + sid +
+            ' 候補=' + cands.length + '（配信を見送り）');
+        } catch (eA) {}
+      }
+    }
+    if (hitKey) rec = cache.by_student[hitKey];
+  } catch (eM) {
+    rec = null;
+  }
+  if (!rec) {
+    try {
+      Logger.log('[SHARD] heartbeat: 照合なし sid=' + sid +
+        ' 保持キー数=' + Object.keys(cache.by_student || {}).length);
+    } catch (eN) {}
+    return payload;
+  }
+
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const active = [];
+  const upcoming = [];
+  const wins = Array.isArray(rec.windows) ? rec.windows : [];
+  for (let i = 0; i < wins.length; i++) {
+    const w = wins[i];
+    if (!w || typeof w.start_ms !== 'number' || typeof w.end_ms !== 'number') continue;
+    const item = {
+      id: w.id,
+      type: w.type,
+      filter_mode: w.filter_mode,
+      // 【配列化】親から受け取った時点で既に配列だが、旧バージョンのキャッシュ
+      //   （文字列で保存された回）が残っている端末を救うため、ここでも正規化する。
+      whitelist: normalizeHostListToArray_(w.whitelist),
+      blacklist: normalizeHostListToArray_(w.blacklist),
+      start_ms: w.start_ms,
+      end_ms: w.end_ms,
+      start_jst: schMsToJstStr_(w.start_ms),
+      end_jst: schMsToJstStr_(w.end_ms),
+      // 【Request P】親が同封したバッジ表示情報をそのまま引き継ぐ
+      //   （子は予約シートを持たないため、ここで落とすとバッジが出せない）。
+      label: String(w.label || scheduleActiveLabel_(w)),
+      target_type: String(w.target_type || ''),
+      target_label: String(w.target_label || '')
+    };
+    if (w.start_ms <= now && now < w.end_ms) active.push(item);
+    else if (w.start_ms > now) upcoming.push(item);
+  }
+  active.sort(function (a, b) { return a.start_ms - b.start_ms; });
+  upcoming.sort(function (a, b) { return a.start_ms - b.start_ms; });
+
+  const maxActive = CONFIG.SCHEDULE_MAX_ACTIVE || 5;
+  payload.active = active.slice(0, maxActive);
+  // 直近の1件だけ先出し（次に来る制限を端末が事前に把握できるようにする）
+  if (upcoming.length) payload.upcoming = [upcoming[0]];
+  payload.overridden_ids = Array.isArray(rec.overridden_ids) ? rec.overridden_ids.slice() : [];
+  return payload;
+}
+
+/**
+ * 端末へ渡す配信契約の解決口（buildHeartbeatResponse から呼ぶ）。
+ *   子GASで、かつ親から受け取ったキャッシュがあるときはキャッシュだけを見る。
+ *   これにより子のハートビートがスケジュールシート読みに引きずられない。
+ */
+function resolveSchedulePayloadForDevice_(studentId, className, schoolName, nowMs) {
+  let isChild = false;
+  try { isChild = (typeof isShardChild === 'function' && isShardChild()); } catch (eC) { isChild = false; }
+  // 【設定漏れの救済】isShardChild が false でも、親から受け取った痕跡があれば
+  //   子として扱い、空の子シートではなくプロパティストアを読む。
+  if (!isChild) {
+    try { if (typeof shardDetectChildByInbox_ === 'function' && shardDetectChildByInbox_()) isChild = true; } catch (eD) {}
+  }
+  if (isChild) {
+    // 【確定仕様2】子GASは親から受け取ったキャッシュだけを正とする。
+    //   キャッシュが無い＝まだ親から同期されていない＝制限なし。
+    //   ここでシート読みへフォールバックすると、子側に残った古い行が復活し
+    //   「解除したのに制限が残る」不整合になるため、あえて読みに行かない。
+    try {
+      var __pl = shardSchedulePayloadFromCache_(studentId, nowMs);
+      try {
+        Logger.log('[SHARD] heartbeat: 子GASとして配信 sid=' + String(studentId || '') +
+          ' active=' + ((__pl && __pl.active) ? __pl.active.length : 0) +
+          ' upcoming=' + ((__pl && __pl.upcoming) ? __pl.upcoming.length : 0));
+      } catch (eL) {}
+      return __pl;
+    }
+    catch (eC2) { return emptySchedulePayload_(); }
+  }
+  // 親・単体GASは従来どおり自前のシートから組み立てる。
+  return buildSchedulePayloadForDevice_(studentId, className, schoolName, nowMs);
+}
+
+/**
+ * 親GAS: 予約の作成・取消・解除を、該当する子GASへ即時伝播する。
+ *   確定仕様:
+ *     ・保留キューを使わず、その場で同期送信する（forceSync=true）
+ *     ・子GASごとに「全児童の最新構造体」を丸ごと送る（差分管理しない）
+ *   対象校の児童が1人もいない（子GAS未設定など）ときは何もしない。
+ */
+function propagateScheduleToChildren_(schedRow) {
+  // 【可観測性】この関数は無言で成功もスキップもできてしまうため、実機で
+  //   「伝播が走ったのか」をログから切り分けられなかった。どの分岐を通ったかを
+  //   必ず 1 行残す（無言の成功／無言のスキップを作らない）。
+  const __plog = function (msg) { try { Logger.log('[SHARD] ' + msg); } catch (eL) {} };
+  try {
+    if (typeof isShardParent !== 'function' || !isShardParent()) {
+      __plog('propagate: skip（このスクリプトは親GASではありません。' +
+        'スクリプトプロパティ SHARD_MODE=true を確認してください）');
+      return { skipped: true, reason: 'not_parent' };
+    }
+    if (!schedRow) {
+      __plog('propagate: skip（予約行がありません）');
+      return { skipped: true, reason: 'no_row' };
+    }
+
+    const ids = [];
+    const seen = {};
+    const pushId = function (v) {
+      const s = String(v || '').trim();
+      if (!s || seen[s]) return;
+      seen[s] = true;
+      ids.push(s);
+    };
+    if (schedRow.targetType === 'student') {
+      const list = Array.isArray(schedRow.studentIds) ? schedRow.studentIds : [];
+      for (let i = 0; i < list.length; i++) pushId(list[i]);
+    } else if (schedRow.targetType === 'school') {
+      // 【Request P】全校生徒対象: 同一校の全端末へ配信する（他校は絶対に含めない）
+      let entries = [];
+      try { entries = (typeof shardDeviceEntries === 'function') ? (shardDeviceEntries() || []) : []; }
+      catch (eE) { entries = []; }
+      for (let i = 0; i < entries.length; i++) {
+        const entrySchool = String(entries[i][1] || '');
+        if (schedRow.schoolName && entrySchool &&
+            !schoolNamesMatch(schedRow.schoolName, entrySchool)) continue;
+        if (schedRow.schoolName && !entrySchool) continue;
+        pushId(entries[i][0]);
+      }
+    } else {
+      // クラス対象: 索引から該当クラスの児童IDを集める（シート全読みはしない）
+      //   【Request P】クラス名はカンマ区切りの複数指定に対応（いずれかに一致すれば対象）。
+      let entries = [];
+      try { entries = (typeof shardDeviceEntries === 'function') ? (shardDeviceEntries() || []) : []; }
+      catch (eE) { entries = []; }
+      const clsList = scheduleClassList_(schedRow.className);
+      const cnSet = {};
+      for (let k = 0; k < clsList.length; k++) cnSet[normalizeClassName(clsList[k])] = true;
+      for (let i = 0; i < entries.length; i++) {
+        const sid = String(entries[i][0] || '').trim();
+        if (!sid) continue;
+        if (!cnSet[normalizeClassName(entries[i][2])]) continue;
+        // 学校名が入っていれば一致確認（表記ゆれは schoolNamesMatch で吸収）
+        if (schedRow.schoolName && entries[i][1] &&
+            !schoolNamesMatch(schedRow.schoolName, entries[i][1])) continue;
+        pushId(sid);
+      }
+    }
+    if (!ids.length) {
+      __plog('propagate: skip（対象児童が見つかりません target=' + schedRow.targetType +
+        ' class=' + String(schedRow.className || '') + '）。' +
+        '端末一覧に児童が居るか、クラス表記が一致するかを確認してください');
+      return { skipped: true, reason: 'no_target' };
+    }
+    __plog('propagate: 開始 target=' + schedRow.targetType + ' ids=' + ids.length);
+
+    // patch は空（ロック・配信・規制には触れない）。スケジュールだけを運ぶ。
+    const __res = shardPropagatePolicy(ids, {}, true);
+    __plog('propagate: 完了 ' + JSON.stringify(__res));
+    return __res;
+  } catch (e) {
+    // 伝播に失敗しても予約自体は成立させる（次回の伝播で追いつく）
+    __plog('propagate: 例外 ' + String((e && e.message) ? e.message : e));
+    return { error: String(e) };
+  }
+}
+
 /**
  * 一覧表示用の軽量判定（予約行を1回読んだだけで全端末ぶんを判定する）。
  * getAllDevices から呼ぶため、シート読みは呼び出し側で1回に畳む。
  */
-function isAnyScheduleActive_(rows, studentId, className, schoolName, nowMs) {
-  if (!rows || !rows.length) return false;
+/**
+ * 予約の対象クラス文字列（カンマ区切り）を配列へ分解する。
+ *   【Request P】「1年1組,1年2組」のような複数指定と、従来の単一クラスを同一に扱う。
+ *   区切りはカンマ・読点・スラッシュ・中黒（教員の手入力ゆれを吸収）。
+ */
+function scheduleClassList_(raw) {
+  if (Array.isArray(raw)) {
+    return raw.map(function (x) { return String(x === null || x === undefined ? '' : x).trim(); })
+      .filter(Boolean);
+  }
+  return String(raw === null || raw === undefined ? '' : raw)
+    .split(/[,、\/／・]+/)
+    .map(function (s) { return s.trim(); })
+    .filter(Boolean);
+}
+
+/** 予約実行中バッジの表示名（備考があればそれ、無ければ制限タイプ）。 */
+function scheduleActiveLabel_(r) {
+  const note = String((r && r.note) || '').trim();
+  if (note) return note;
+  const t = String((r && r.type) || 'url_block').toLowerCase();
+  return t === 'screen_lock' ? '画面ロック' : 'URL制限';
+}
+
+/** 予約1件の対象を人が読める形にする（一覧APIの target_label）。 */
+function scheduleTargetLabel_(r) {
+  if (!r) return '';
+  const tt = String(r.targetType || 'class').toLowerCase();
+  if (tt === 'student') {
+    const n = Array.isArray(r.studentIds) ? r.studentIds.length : 0;
+    return '個別 ' + n + '名';
+  }
+  if (tt === 'school') return '全校生徒';
+  const list = scheduleClassList_(r.className);
+  return list.length ? list.join('・') : '';
+}
+
+/**
+ * いま効いている予約の詳細（教員一覧のバッジ表示用）。
+ *   単一GAS はこの関数を「予約シートの行」に対して呼ぶ。
+ *   R41 子GAS は親から配られた展開済みウィンドウを別経路で判定する
+ *   （shardSchedulePayloadFromCache_ が label を運ぶ）。
+ *   シートへの書き戻しは一切しない（読み取り専用の集計）。
+ */
+function scheduleActiveDetail_(rows, studentId, className, schoolName, nowMs) {
+  const out = { active: false, count: 0, ids: [], types: [], label: '' };
+  if (!rows || !rows.length) return out;
   const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
   const sid = String(studentId || '').trim();
   const cn = normalizeClassName(className);
@@ -7425,11 +10563,77 @@ function isAnyScheduleActive_(rows, studentId, className, schoolName, nowMs) {
       weekdays: parseWeekdays_(r.weekdaysRaw)
     };
     const wins = expandScheduleWindows_(sched, now, 2 * 86400000);
+    let hit = false;
     for (let k = 0; k < wins.length; k++) {
-      if (wins[k].start_ms <= now && now < wins[k].end_ms) return true;
+      if (wins[k].start_ms <= now && now < wins[k].end_ms) { hit = true; break; }
     }
+    if (!hit) continue;
+    out.active = true;
+    out.count++;
+    if (out.ids.indexOf(r.id) < 0) out.ids.push(r.id);
+    const t = String(r.type || '').toLowerCase();
+    if (out.types.indexOf(t) < 0) out.types.push(t);
+    if (!out.label) out.label = scheduleActiveLabel_(r);
   }
-  return false;
+  return out;
+}
+
+/** 旧APIの後方互換（真偽値だけを返す）。 */
+function isAnyScheduleActive_(rows, studentId, className, schoolName, nowMs) {
+  return scheduleActiveDetail_(rows, studentId, className, schoolName, nowMs).active;
+}
+
+/**
+ * 【Request P】R41 子GAS 用:「予約実行中」バッジの詳細。
+ *   子GAS に予約シートは持たせない。親GAS が PropertiesService 経由で配った
+ *   展開済みウィンドウ（by_student）だけを見て、いま効いている予約を数える。
+ *   表示名（label）も親が計算してウィンドウに同封しているため、子は再解釈しない。
+ */
+function scheduleActiveDetailFromCache_(cache, studentId, nowMs) {
+  const out = { active: false, count: 0, ids: [], types: [], label: '' };
+  if (!cache || typeof cache !== 'object' || !cache.by_student) return out;
+  const sid = String(studentId || '').trim();
+  if (!sid) return out;
+
+  // 親→子で student_id の表記（メール全体／ローカル部）が揺れるため、
+  //   shardSchedulePayloadFromCache_ と同じ二段構えで照合する。
+  let rec = null;
+  try {
+    const want = normalizeIdKey(sid);
+    const keys = Object.keys(cache.by_student || {});
+    for (let i = 0; i < keys.length; i++) {
+      if (normalizeIdKey(keys[i]) === want) { rec = cache.by_student[keys[i]]; break; }
+    }
+    if (!rec) {
+      const cands = [];
+      for (let j = 0; j < keys.length; j++) {
+        if (idKeysMatch_(keys[j], sid)) cands.push(keys[j]);
+      }
+      // 候補が1件に絞れたときだけ採用（誤配信を避ける）
+      if (cands.length === 1) rec = cache.by_student[cands[0]];
+    }
+  } catch (eK) { return out; }
+  if (!rec || !Array.isArray(rec.windows)) return out;
+
+  const now = (typeof nowMs === 'number' && nowMs > 0) ? nowMs : new Date().getTime();
+  const overridden = Array.isArray(rec.overridden_ids) ? rec.overridden_ids : [];
+  for (let i = 0; i < rec.windows.length; i++) {
+    const w = rec.windows[i];
+    if (!w) continue;
+    // 端末側 isScheduleActiveAt と同じ「開始を含み終了を含まない」判定
+    if (!(Number(w.start_ms) <= now && now < Number(w.end_ms))) continue;
+    if (w.id && overridden.indexOf(w.id) >= 0) continue;
+    out.active = true;
+    out.count++;
+    if (w.id && out.ids.indexOf(w.id) < 0) out.ids.push(w.id);
+    const t = String(w.type || '').toLowerCase();
+    if (t && out.types.indexOf(t) < 0) out.types.push(t);
+    if (!out.label) out.label = String(w.label || '');
+  }
+  if (out.active && !out.label) {
+    out.label = out.types.indexOf('screen_lock') >= 0 ? '画面ロック' : 'URL制限';
+  }
+  return out;
 }
 
 // ============================================================================
@@ -7476,11 +10680,15 @@ function validateScheduleInput_(p) {
     targetType: String(src.target_type || src.targetType || '').trim().toLowerCase(),
     schoolName: String(src.school_name || src.schoolName || '').trim(),
     className: String(src.class_name || src.className || '').trim(),
+    // 【Request P】クラスは複数指定できる。シートは1セルなのでカンマ区切りで保持する。
+    classNames: [],
     studentIds: [],
     type: String(src.type || src.restriction_type || 'url_block').trim().toLowerCase(),
     filterMode: String(src.filter_mode || src.filterMode || 'BLACKLIST').trim().toUpperCase(),
-    whitelist: String(src.whitelist_urls || src.whitelist || '').trim(),
-    blacklist: String(src.blacklist_urls || src.blacklist || '').trim(),
+    // 【配列化】入力は「カンマ区切り文字列」でも「配列」でも受ける（後方互換）。
+    //   内部（norm）では string[] に統一する。空判定は .length で行う（下記）。
+    whitelist: normalizeHostListToArray_(src.whitelist_urls || src.whitelist || ''),
+    blacklist: normalizeHostListToArray_(src.blacklist_urls || src.blacklist || ''),
     dateFrom: '',
     dateTo: '',
     repeat: String(src.repeat || 'NONE').trim().toUpperCase(),
@@ -7491,8 +10699,9 @@ function validateScheduleInput_(p) {
   };
 
   // --- 対象種別 ---
-  if (norm.targetType !== 'class' && norm.targetType !== 'student') {
-    errs.push('対象種別は class か student を指定してください');
+  //   【Request P】school（全校生徒）を追加。class は複数指定できる。
+  if (norm.targetType !== 'class' && norm.targetType !== 'student' && norm.targetType !== 'school') {
+    errs.push('対象種別は class / student / school を指定してください');
   }
 
   // --- 児童ID（student のとき） ---
@@ -7506,8 +10715,22 @@ function validateScheduleInput_(p) {
   if (norm.targetType === 'student' && norm.studentIds.length === 0) {
     errs.push('児童IDを1つ以上指定してください');
   }
-  if (norm.targetType === 'class' && !norm.className) {
-    errs.push('クラス名を指定してください');
+  if (norm.targetType === 'class') {
+    // 【Request P】class_names（配列）/ class_name（カンマ区切り文字列）の両方を受ける。
+    const rawClasses = src.class_names || src.classNames || src.class_name || src.className || '';
+    norm.classNames = scheduleClassList_(rawClasses);
+    if (!norm.classNames.length) {
+      errs.push('クラス名を1つ以上指定してください');
+    }
+    // シートへは 1 セルにカンマ区切りで書く（列追加なし・後方互換）。
+    norm.className = norm.classNames.join(',');
+  } else {
+    norm.classNames = [];
+    norm.className = '';
+  }
+  // school は学校名が必須（管理者の全校配布は schoolName='' を許容する）
+  if (norm.targetType === 'school' && !norm.schoolName) {
+    // 教員の所属校で補完されるため、ここでは空でもエラーにしない。
   }
 
   // --- 制限タイプ ---
@@ -7519,10 +10742,12 @@ function validateScheduleInput_(p) {
     if (norm.filterMode !== 'BLACKLIST' && norm.filterMode !== 'WHITELIST') {
       errs.push('URL規制モードは BLACKLIST か WHITELIST を指定してください');
     }
-    if (norm.filterMode === 'BLACKLIST' && !norm.blacklist) {
+    // 【配列化】norm.* は string[] になった。空配列は truthy なので
+    //   !norm.blacklist では判定できない（必ず .length を見る）。
+    if (norm.filterMode === 'BLACKLIST' && norm.blacklist.length === 0) {
       errs.push('BLACKLIST を選んだ場合は規制URLリストが必要です');
     }
-    if (norm.filterMode === 'WHITELIST' && !norm.whitelist) {
+    if (norm.filterMode === 'WHITELIST' && norm.whitelist.length === 0) {
       errs.push('WHITELIST を選んだ場合は許可URLリストが必要です');
     }
   }
@@ -7584,8 +10809,32 @@ function authorizeScheduleTarget_(norm, teacher) {
       }
     }
     // クラス境界（「対象クラス」は権限の境界）
-    if (!isClassInTeacherScope(norm.className, teacher)) {
-      return { ok: false, error: '対象クラスの権限がありません: ' + norm.className };
+    //   【Request P】複数クラスの場合は「すべて」が権限内であること。
+    const clsList = Array.isArray(norm.classNames) && norm.classNames.length
+      ? norm.classNames : scheduleClassList_(norm.className);
+    for (let i = 0; i < clsList.length; i++) {
+      if (!isClassInTeacherScope(clsList[i], teacher)) {
+        return { ok: false, error: '対象クラスの権限がありません: ' + clsList[i] };
+      }
+    }
+    return { ok: true };
+  }
+
+  // 【Request P】school: 自校の教員は自校全体を対象にできる（他校へは越境不可）。
+  if (norm.targetType === 'school') {
+    if (scope.type === 'school' || scope.type === 'unknown') {
+      if (!norm.schoolName) {
+        norm.schoolName = scope.school || '';
+      } else if (!schoolNamesMatch(norm.schoolName, scope.school)) {
+        return { ok: false, error: '自校以外の学校全体は予約できません' };
+      } else {
+        norm.schoolName = scope.school;
+      }
+    }
+    // 「対象クラス」制限のある教員は、クラス境界を越える全校予約を作れない。
+    //   （学年主任が「校内全部」に制限をかけてしまう事故を防ぐ）
+    if (getTeacherTargetClasses(teacher).length > 0) {
+      return { ok: false, error: '対象クラスが限定されているため、全校生徒は予約できません' };
     }
     return { ok: true };
   }
@@ -7627,8 +10876,11 @@ function appendScheduleRow_(obj) {
   set('児童ID', Array.isArray(obj.studentIds) ? obj.studentIds.join(',') : String(obj.studentIds || ''));
   set('制限タイプ', obj.type);
   set('URL規制モード', obj.type === 'url_block' ? obj.filterMode : '');
-  set('許可URLリスト', obj.type === 'url_block' ? obj.whitelist : '');
-  set('規制URLリスト', obj.type === 'url_block' ? obj.blacklist : '');
+  // 【配列化】obj.whitelist / obj.blacklist は string[]（または文字列）で来る。
+  //   シートは 1 セルなので、必ずカンマ区切り文字列へ戻してから書く
+  //   （配列をそのまま setValues するとセルに配列が入り、次回の読み取りが壊れる）。
+  set('許可URLリスト', obj.type === 'url_block' ? hostListToSheetString_(obj.whitelist) : '');
+  set('規制URLリスト', obj.type === 'url_block' ? hostListToSheetString_(obj.blacklist) : '');
   set('開始日', obj.dateFrom);
   set('終了日', obj.dateTo);
   set('繰り返し', obj.repeat);
@@ -7673,7 +10925,22 @@ function isScheduleRowInTeacherScope_(row, teacher) {
     if (!schoolNamesMatch(row.schoolName, scope.school)) return false;
   }
   if (row.targetType === 'class') {
-    return isClassInTeacherScope(row.className, teacher);
+    // 【Request P】複数クラスの行は、1つでも権限内なら「触れる」
+    //   （取消・解除は行単位のため。作成・編集は authorizeScheduleTarget_ が全件検査する）
+    const list = scheduleClassList_(row.className);
+    if (!list.length) return isClassInTeacherScope(row.className, teacher);
+    for (let i = 0; i < list.length; i++) {
+      if (isClassInTeacherScope(list[i], teacher)) return true;
+    }
+    return false;
+  }
+  // 【Request P】school: 学校境界のみで判定（クラス境界は全クラスを含むため）
+  if (row.targetType === 'school') {
+    if (isAdminTeacher(teacher)) return true;
+    if (row.schoolName && (scope.type === 'school' || scope.type === 'unknown')) {
+      return schoolNamesMatch(row.schoolName, scope.school);
+    }
+    return true;
   }
   if (row.targetType === 'student') {
     const scoped = scopeStudentIdsForTeacher(row.studentIds || [], teacher);
@@ -7705,14 +10972,20 @@ function scheduleRowToJson_(r, nowMs) {
     student_ids: r.studentIds,
     type: r.type,
     filter_mode: r.filterMode,
-    whitelist_urls: r.whitelist,
-    blacklist_urls: r.blacklist,
+    // 【配列化】一覧APIの応答も string[] で返す（端末/画面側の契約に合わせる）。
+    whitelist_urls: normalizeHostListToArray_(r.whitelist),
+    blacklist_urls: normalizeHostListToArray_(r.blacklist),
     date_from: r.dateFrom,
     date_to: r.dateTo,
     repeat: r.repeat,
     start_time: r.startTime,
     end_time: r.endTime,
     weekdays: parseWeekdays_(r.weekdaysRaw),
+    // 【Request P】複数クラス・全校生徒を画面がそのまま表示できるようにする。
+    target_label: scheduleTargetLabel_(r),
+    class_list: scheduleClassList_(r.className),
+    // 予約実行中バッジに出す表示名（備考 → 制限タイプの順で採用）
+    active_label: scheduleActiveLabel_(r),
     enabled: r.enabled,
     overridden: r.overridden,
     override_at: r.overrideAt,
@@ -7743,7 +11016,8 @@ function handleSaveSchedule_(payload, teacher) {
     id: generateScheduleId_(),
     targetType: v.norm.targetType,
     schoolName: v.norm.schoolName,
-    className: v.norm.targetType === 'class' ? v.norm.className : '',
+    className: v.norm.targetType === 'class' ? v.norm.classNames.join(',') : '',
+    // 【Request P】school（全校生徒）はクラスも児童も持たない（学校名だけで対象が決まる）
     studentIds: v.norm.targetType === 'student' ? v.norm.studentIds : [],
     type: v.norm.type,
     filterMode: v.norm.filterMode,
@@ -7765,19 +11039,57 @@ function handleSaveSchedule_(payload, teacher) {
   withWriteLock(function () { rowIndex = appendScheduleRow_(obj); });
 
   const nowMs = new Date().getTime();
-  const rows = readScheduleRows_();
-  let saved = null;
-  for (let i = 0; i < rows.length; i++) {
-    if (rows[i].id === obj.id) { saved = rows[i]; break; }
-  }
+
+  // 【性能】書き込み直後に readScheduleRows_() でシート全体を読み直していた。
+  //   予約シートが 1,000〜2,000 行に育つと、この 1 回の往復だけで
+  //   「予約を登録」→「完了表示」が数秒遅れていた（追加した行は obj に
+  //   そのまま在るので、読み直す必要が無い）。
+  //   appendScheduleRow_ が書く値と readScheduleRows_ が返す正規化済みの形を
+  //   ここで 1:1 に再現する（条件付きで空になる列も同じ条件で落とす）。
+  const isUrlBlock = obj.type === 'url_block';
+  const saved = {
+    rowIndex: rowIndex,
+    id: obj.id,
+    targetType: obj.targetType,
+    schoolName: String(obj.schoolName || '').trim(),
+    className: String(obj.className || '').trim(),
+    studentIds: Array.isArray(obj.studentIds) ? obj.studentIds : [],
+    type: obj.type,
+    // 規制モード／URL リストは url_block のときだけ列に載る（appendScheduleRow_ と同じ）
+    filterMode: isUrlBlock ? String(obj.filterMode || '').trim().toUpperCase() : '',
+    // 【配列化】readScheduleRows_ が返す形（string[]）を 1:1 で再現する。
+    //   obj.whitelist は norm 由来の配列（または空文字）なので正規化して載せる。
+    whitelist: isUrlBlock ? normalizeHostListToArray_(obj.whitelist) : [],
+    blacklist: isUrlBlock ? normalizeHostListToArray_(obj.blacklist) : [],
+    dateFrom: obj.dateFrom,
+    dateTo: obj.dateTo,
+    repeat: obj.repeat,
+    startTime: obj.startTime,
+    endTime: obj.endTime,
+    weekdaysRaw: (Array.isArray(obj.weekdays) && obj.weekdays.length) ? obj.weekdays.join(',') : '',
+    enabled: true,          // 新規は必ず有効（appendScheduleRow_ が true を書く）
+    overridden: false,      // 新規は必ず未解除
+    overrideAt: '',
+    createdBy: obj.createdBy,
+    createdAt: obj.createdAt,
+    updatedAt: obj.updatedAt,
+    note: obj.note
+  };
 
   Logger.log('[SCHEDULE] saved id=' + obj.id + ' target=' + obj.targetType +
     ' by=' + obj.createdBy + ' row=' + rowIndex);
+
+  // 【フェーズ5】子GASへ即時伝播（保留キューを使わない同期送信）。
+  //   saved は上のとおり必ず非 null。propagateScheduleToChildren_ が参照するのは
+  //   targetType / className / schoolName / studentIds のみ。
+  const shardProp = propagateScheduleToChildren_(saved);
+
   return {
     success: true,
     message: 'スケジュールを登録しました',
-    schedule: saved ? scheduleRowToJson_(saved, nowMs) : null,
-    row_index: rowIndex
+    schedule: scheduleRowToJson_(saved, nowMs),
+    row_index: rowIndex,
+    shard: shardProp
   };
 }
 
@@ -7796,6 +11108,136 @@ function handleListSchedules_(payload, teacher) {
   out.sort(function (a, b) { return String(a.created_at).localeCompare(String(b.created_at)); });
 
   return { success: true, data: out, count: out.length, server_time_ms: nowMs, server_time: schNowJstSec_() };
+}
+
+/**
+ * update_schedule … 既存予約を編集する（行は残す・更新日時を記録する）
+ *
+ *   【Request P】設計確定：
+ *     - 予約ID（schedule_id）は維持する（監査ログの連続性を保つ）。
+ *     - 対象行の内容だけを書き換え、列21「更新日時」を必ず更新する。
+ *     - 有効/手動解除（列16/17/18）と作成者・作成日時（列19/20）は触らない。
+ *     - 権限判定は作成時と同じ authorizeScheduleTarget_ を通す（越境不可）。
+ *     - 「予約そのものを止める」のは cancel、「今回だけ解除」は override。編集はこの3つ目。
+ */
+function handleUpdateSchedule_(payload, teacher) {
+  const id = String((payload && (payload.schedule_id || payload.id)) || '').trim();
+  if (!id) return { success: false, error: 'スケジュールIDが必要です', error_code: 'validation_failed' };
+
+  // --- 1) 対象行を探す（他校・権限外は 1 件も触れない） ---
+  const rows = readScheduleRows_();
+  let target = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].id === id) { target = rows[i]; break; }
+  }
+  if (!target) {
+    return { success: false, error: 'スケジュールが見つかりません: ' + id, error_code: 'not_found' };
+  }
+  if (!isScheduleRowInTeacherScope_(target, teacher)) {
+    return { success: false, error: 'この予約を編集する権限がありません', error_code: 'forbidden' };
+  }
+
+  // --- 2) 入力の正規化と検証（新規作成とまったく同じ規則を通す） ---
+  //   部分更新（変更した項目だけ送る）でも壊れないよう、未指定は既存値で補う。
+  const src = {};
+  const srcIn = (payload && typeof payload === 'object') ? payload : {};
+  const pick = function (camel, snake, cur) {
+    const v = (srcIn[snake] !== undefined) ? srcIn[snake]
+      : ((srcIn[camel] !== undefined) ? srcIn[camel] : cur);
+    return v;
+  };
+  src.target_type = pick('targetType', 'target_type', target.targetType);
+  src.school_name = pick('schoolName', 'school_name', target.schoolName);
+  src.class_name = pick('className', 'class_name',
+    (target.className || ''));
+  src.class_names = srcIn.class_names || srcIn.classNames;
+  src.student_ids = pick('studentIds', 'student_ids', (target.studentIds || []).join(','));
+  src.type = pick('type', 'restriction_type', target.type);
+  src.filter_mode = pick('filterMode', 'filter_mode', target.filterMode || 'BLACKLIST');
+  src.whitelist_urls = pick('whitelistUrls', 'whitelist_urls', (target.whitelist || []).join('\n'));
+  src.blacklist_urls = pick('blacklistUrls', 'blacklist_urls', (target.blacklist || []).join('\n'));
+  src.date_from = pick('dateFrom', 'date_from', target.dateFrom);
+  src.date_to = pick('dateTo', 'date_to', target.dateTo);
+  src.repeat = pick('repeat', 'repeat', target.repeat);
+  src.start_time = pick('startTime', 'start_time', target.startTime);
+  src.end_time = pick('endTime', 'end_time', target.endTime);
+  src.weekdays = (srcIn.weekdays !== undefined) ? srcIn.weekdays : target.weekdaysRaw;
+  src.note = pick('note', 'note', target.note);
+
+  const v = validateScheduleInput_(src);
+  if (!v.ok) {
+    return { success: false, error: v.errors.join(' / '), error_code: 'validation_failed', errors: v.errors };
+  }
+  const authz = authorizeScheduleTarget_(v.norm, teacher);
+  if (!authz.ok) {
+    return { success: false, error: authz.error, error_code: 'forbidden' };
+  }
+
+  // --- 3) 書き換える列だけを patch にする ---
+  //   有効(16)/手動解除(17)/手動解除日時(18)/作成者(19)/作成日時(20) は保持する。
+  const nowStr = schNowJstSec_();
+  const isUrlBlock = (v.norm.type === 'url_block');
+  const patch = {
+    '対象種別': v.norm.targetType,
+    '学校名': v.norm.schoolName,
+    'クラス名': v.norm.targetType === 'class' ? v.norm.classNames.join(',') : '',
+    '児童ID': v.norm.targetType === 'student' ? v.norm.studentIds.join(',') : '',
+    '制限タイプ': v.norm.type,
+    'URL規制モード': isUrlBlock ? v.norm.filterMode : '',
+    '許可URLリスト': isUrlBlock ? hostListToSheetString_(v.norm.whitelist) : '',
+    '規制URLリスト': isUrlBlock ? hostListToSheetString_(v.norm.blacklist) : '',
+    '開始日': v.norm.dateFrom,
+    '終了日': v.norm.dateTo,
+    '繰り返し': v.norm.repeat,
+    '開始時刻': v.norm.startTime,
+    '終了時刻': v.norm.endTime,
+    '曜日': (v.norm.repeat === 'WEEKLY' && v.norm.weekdays.length) ? v.norm.weekdays.join(',') : '',
+    '更新日時': nowStr,
+    '備考': v.norm.note
+  };
+  withWriteLock(function () { updateScheduleCells_(target.rowIndex, patch); });
+
+  // --- 4) 編集後の行を返す（シート再読込はしない＝性能） ---
+  const saved = {
+    rowIndex: target.rowIndex,
+    id: target.id,
+    targetType: v.norm.targetType,
+    schoolName: String(v.norm.schoolName || '').trim(),
+    className: patch['クラス名'],
+    studentIds: v.norm.targetType === 'student' ? v.norm.studentIds : [],
+    type: v.norm.type,
+    filterMode: isUrlBlock ? String(v.norm.filterMode || '').trim().toUpperCase() : '',
+    whitelist: isUrlBlock ? normalizeHostListToArray_(v.norm.whitelist) : [],
+    blacklist: isUrlBlock ? normalizeHostListToArray_(v.norm.blacklist) : [],
+    dateFrom: v.norm.dateFrom,
+    dateTo: v.norm.dateTo,
+    repeat: v.norm.repeat,
+    startTime: v.norm.startTime,
+    endTime: v.norm.endTime,
+    weekdaysRaw: (v.norm.repeat === 'WEEKLY' && v.norm.weekdays.length) ? v.norm.weekdays.join(',') : '',
+    enabled: target.enabled,
+    overridden: target.overridden,
+    overrideAt: target.overrideAt,
+    createdBy: target.createdBy,
+    createdAt: target.createdAt,
+    updatedAt: nowStr,
+    note: v.norm.note
+  };
+
+  Logger.log('[SCHEDULE] updated id=' + target.id + ' target=' + v.norm.targetType +
+    ' by=' + String((teacher && teacher.email) || '') + ' row=' + target.rowIndex);
+
+  // 編集内容を子GASへ即時伝播（子は丸ごと置き換えなので取消も同時に反映される）
+  const shardProp = propagateScheduleToChildren_(saved);
+
+  return {
+    success: true,
+    message: '予約を更新しました',
+    schedule: scheduleRowToJson_(saved, new Date().getTime()),
+    row_index: target.rowIndex,
+    updated_at: nowStr,
+    shard: shardProp
+  };
 }
 
 /** cancel_schedule … 予約そのものを止める（有効=FALSE／行は残す） */
@@ -7819,7 +11261,12 @@ function handleCancelSchedule_(payload, teacher) {
   });
 
   Logger.log('[SCHEDULE] cancelled id=' + id + ' by=' + String((teacher && teacher.email) || ''));
-  return { success: true, message: '予約を取り消しました（履歴は残ります）', schedule_id: id, enabled: false, updated_at: nowStr };
+
+  // 【フェーズ5】取消を子GASへ即時伝播する。
+  //   子は丸ごと上書きなので、この予約が子のキャッシュからも消える。
+  const shardProp = propagateScheduleToChildren_(target);
+
+  return { success: true, message: '予約を取り消しました（履歴は残ります）', schedule_id: id, enabled: false, updated_at: nowStr, shard: shardProp };
 }
 
 /** override_schedule … 今回の時間帯だけ解除（予約は残す） */
@@ -7847,8 +11294,1276 @@ function handleOverrideSchedule_(payload, teacher) {
   });
 
   Logger.log('[SCHEDULE] overridden id=' + id + ' by=' + String((teacher && teacher.email) || ''));
-  return { success: true, message: 'この予約を今回だけ解除しました（次回以降は再び適用されます）', schedule_id: id, overridden: true, override_at: nowStr };
+
+  // 【フェーズ5】解除を子GASへ即時伝播する（子は overridden_ids として端末へ配る）。
+  const shardProp = propagateScheduleToChildren_(target);
+
+  return { success: true, message: 'この予約を今回だけ解除しました（次回以降は再び適用されます）', schedule_id: id, overridden: true, override_at: nowStr, shard: shardProp };
 }
 
+/**
+ * スケジュール機能用 Web API エントリーポイント（google.script.run 用）
+ *
+ * 【確定仕様】teacher オブジェクトの正しいプロパティ
+ *     email … 教員ID（メールアドレス）  ← これが空だと by= が空になり監査ログが壊れる
+ *     school … 所属学校（school_name ではない）
+ *   認証検証は既存の verifyToken(authToken) のみを信頼する。
+ *   存在しないヘルパー（getTeacherByToken_ / authenticateToken_ /
+ *   getSessionUserEmail_）は一切呼び出さない。
+ *
+ * 【過去の不具合】存在しないヘルパーを呼んでいたため teacher が常に null になり、
+ *   isScheduleRowInTeacherScope_ が全行 false を返して一覧が 0 件（カレンダーが空）
+ *   になっていた。また by= が空文字になっていた。
+ */
+function extractTeacherFromToken_(authToken) {
+  if (!authToken) return null;
+  var res = null;
+  try { res = (typeof verifyToken === 'function') ? verifyToken(authToken) : null; } catch (e) { res = null; }
+  if (!res || !res.valid || !res.teacher) return null;
+  // トークンは発行時点のスナップショット。教員マスタの最新レコードで解決し直す
+  // （api_getAllDevices と同じ鎖。所属校・権限の変更を即座に反映させる）。
+  try {
+    if (typeof resolveCurrentTeacher === 'function') return resolveCurrentTeacher(res.teacher);
+  } catch (e2) { /* 最新化に失敗してもトークン内容で続行する */ }
+  return res.teacher;
+}
 
+/**
+ * 認証できなかったときの共通応答。
+ *   null のまま内部ハンドラへ渡すと「権限外＝0件」として黙って空になるため、
+ *   ここで明示的に失敗させてフロントを再ログインへ誘導する。
+ */
+function apiNeedAuth_() {
+  return { success: false, need_auth: true, error: '認証セッションが無効です。再ログインしてください。' };
+}
 
+function api_listSchedules(authToken, schoolName) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  var payload = {
+    school_name: schoolName || (teacher.school || ''),
+    token: authToken
+  };
+  return handleListSchedules_(payload, teacher);
+}
+
+function api_saveSchedule(authToken, scheduleData) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  var payload = (scheduleData && typeof scheduleData === 'object') ? scheduleData : {};
+  payload.token = authToken;
+  // 学校名が未指定なら教員の所属校で補う（スコープ判定の取りこぼしを防ぐ）
+  if (!payload.schoolName && !payload.school_name && teacher.school) {
+    payload.schoolName = teacher.school;
+    payload.school_name = teacher.school;
+  }
+  return handleSaveSchedule_(payload, teacher);
+}
+
+function api_cancelSchedule(authToken, scheduleId) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  return handleCancelSchedule_({ schedule_id: scheduleId, id: scheduleId, token: authToken }, teacher);
+}
+
+/** 【Request P】予約の編集（予約IDは維持）。学校名未指定なら教員の所属校で補う。 */
+function api_updateSchedule(authToken, scheduleData) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  var payload = (scheduleData && typeof scheduleData === 'object') ? scheduleData : {};
+  payload.token = authToken;
+  if (!payload.scheduleId && !payload.schedule_id && payload.id) {
+    payload.scheduleId = payload.id;
+    payload.schedule_id = payload.id;
+  }
+  if (!payload.schoolName && !payload.school_name && teacher.school) {
+    payload.schoolName = teacher.school;
+    payload.school_name = teacher.school;
+  }
+  return handleUpdateSchedule_(payload, teacher);
+}
+
+function api_overrideSchedule(authToken, scheduleId, actionType) {
+  var teacher = extractTeacherFromToken_(authToken);
+  if (!teacher) return apiNeedAuth_();
+  return handleOverrideSchedule_({
+    schedule_id: scheduleId,
+    id: scheduleId,
+    action_type: actionType,
+    override_type: actionType,
+    token: authToken
+  }, teacher);
+}
+
+// =====================================================================
+// 【Request N】予約実行型 年次更新（新年度の一括切替）
+//
+//   管理者は 3月のうちに「実行予定日時」「次年度 児童CSV」「次年度 教員CSV」
+//   「前年度データ削除の可否」を登録しておく。指定日時になると
+//   ScriptApp の時刻トリガーが自動発火し、
+//     ① 前年度データの自動クリア（親シート＋R41 全子GASへ並列プッシュ）
+//     ② 次年度 児童リストの反映（新入生追加・進級更新・卒業生整理）
+//     ③ 次年度 教員リストの反映（11列マスタ・Google SSO許可を含む）
+//     ④ 完了記録の保存
+//   を順に実行する。
+//
+//   ★ 設計上の要点
+//     - 予約データは PropertiesService のみに保存する（シートに書かない）。
+//       1プロパティ 9KB 制限に対して、gzip+base64 → 8,000文字ずつ分割保存する。
+//     - トリガーは「その日時ちょうど 1 回」＋「1時間ごとの保険」の二段構え。
+//       さらに管理画面を開いた時点でも「予約日時を過ぎて未実行なら実行」する
+//       フォールバック判定を入れる（トリガー権限や遅延への備え）。
+//     - 二重実行は withWriteLock（LockService）と status フラグの二重ガードで防ぐ。
+//     - 子GASが 0 台の学校（単一GASモード）では UrlFetchApp を一切呼ばず、
+//       親シートのクリアと CSV 反映のみを正常完了させる。
+// =====================================================================
+
+/** 予約本体（メタ情報）を保持するプロパティキー */
+const ANNUAL_PLAN_PROP = 'ANNUAL_ROLLOVER_PLAN_V1';
+/** 予約本体の分割チャンクの接頭辞 */
+const ANNUAL_PLAN_CHUNK_PREFIX = 'ANNUAL_ROLLOVER_PLAN_V1__C';
+/** 1プロパティの安全上限（GAS の 9KB 制限に対する余裕） */
+const ANNUAL_PLAN_MAX_CHARS = 8000;
+/** 分割チャンク数のメタキー */
+const ANNUAL_PLAN_CHUNK_COUNT = 'ANNUAL_ROLLOVER_PLAN_V1__N';
+/** 分割数の上限（40 × 8000 ≒ 320,000 文字） */
+const ANNUAL_PLAN_CHUNKS_MAX = 40;
+/** 予約実行トリガーのハンドラ名（1回だけ発火するもの） */
+const ANNUAL_TRIGGER_FN = 'annualRolloverTriggered_';
+/** 保険用の定期トリガーのハンドラ名 */
+const ANNUAL_PERIODIC_FN = 'annualRolloverPeriodicTick_';
+/** タイムゾーン（日本時間）のオフセット（ミリ秒） */
+const ANNUAL_JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+/**
+ * 現在時刻（ミリ秒）。テストから固定できるようにフックを設ける。
+ * ※ GAS 本番では ANNUAL_TEST_NOW_MS が未定義なので Date.now() を返す。
+ */
+function annualNowMs_() {
+  if (typeof ANNUAL_TEST_NOW_MS !== 'undefined' &&
+      typeof ANNUAL_TEST_NOW_MS === 'number' && ANNUAL_TEST_NOW_MS > 0) {
+    return ANNUAL_TEST_NOW_MS;
+  }
+  return Date.now();
+}
+
+/** 2桁ゼロ詰め */
+function annualPad2_(v) {
+  const s = String(v);
+  return s.length < 2 ? '0' + s : s;
+}
+
+/** ミリ秒 → "YYYY/MM/DD HH:mm"（日本時間） */
+function annualFormatRunAt_(ms) {
+  const n = Number(ms || 0);
+  if (!n) return '';
+  const t = new Date(n + ANNUAL_JST_OFFSET_MS);
+  return t.getUTCFullYear() + '/' + annualPad2_(t.getUTCMonth() + 1) + '/' +
+    annualPad2_(t.getUTCDate()) + ' ' + annualPad2_(t.getUTCHours()) + ':' +
+    annualPad2_(t.getUTCMinutes());
+}
+
+/** ミリ秒 → "YYYY/MM/DD HH:mm:ss"（日本時間） */
+function annualFormatRunAtFull_(ms) {
+  const n = Number(ms || 0);
+  if (!n) return '';
+  const t = new Date(n + ANNUAL_JST_OFFSET_MS);
+  return annualFormatRunAt_(n) + ':' + annualPad2_(t.getUTCSeconds());
+}
+
+/** 現在時刻をシート記法（YYYY/MM/DD HH:mm:ss）で返す */
+function annualNowText_() {
+  return annualFormatRunAtFull_(annualNowMs_());
+}
+
+/**
+ * "YYYY-MM-DDTHH:mm" / "YYYY-MM-DD HH:mm" / "YYYY/MM/DD HH:mm[:ss]"
+ * を日本時間として解釈し、ミリ秒を返す。不正なら 0。
+ */
+function annualParseRunAt_(value) {
+  const s = String(value == null ? '' : value).trim();
+  if (!s) return 0;
+  const m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return 0;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const hh = Number(m[4]);
+  const mi = Number(m[5]);
+  const ss = Number(m[6] || 0);
+  if (!(y >= 2000 && y <= 2100)) return 0;
+  if (!(mo >= 1 && mo <= 12)) return 0;
+  if (!(d >= 1 && d <= 31)) return 0;
+  if (!(hh >= 0 && hh <= 23)) return 0;
+  if (!(mi >= 0 && mi <= 59)) return 0;
+  if (!(ss >= 0 && ss <= 59)) return 0;
+  const ms = Date.UTC(y, mo - 1, d, hh, mi, ss) - ANNUAL_JST_OFFSET_MS;
+  const chk = new Date(ms + ANNUAL_JST_OFFSET_MS);
+  // 2/30 のような存在しない日付を弾く
+  if (chk.getUTCFullYear() !== y || chk.getUTCMonth() !== mo - 1 || chk.getUTCDate() !== d) return 0;
+  return ms;
+}
+
+// ---------------------------------------------------------------------
+// 予約データの保存（PropertiesService のみ・容量対策つき）
+// ---------------------------------------------------------------------
+
+/** JSON 文字列を gzip+base64 に圧縮する（縮まなければ生JSONのまま） */
+function annualEncode_(obj) {
+  const json = JSON.stringify(obj);
+  try {
+    if (typeof Utilities !== 'undefined' && Utilities &&
+        typeof Utilities.gzip === 'function' && typeof Utilities.base64Encode === 'function' &&
+        typeof Utilities.newBlob === 'function') {
+      const gz = Utilities.gzip(Utilities.newBlob(json, 'application/json', 'plan.json'));
+      const b64 = Utilities.base64Encode(gz.getBytes());
+      if (b64 && b64.length > 0 && b64.length < json.length) {
+        return { mode: 'gz', payload: b64 };
+      }
+    }
+  } catch (e) { /* 圧縮できない環境では生JSONで保存する */ }
+  return { mode: 'raw', payload: json };
+}
+
+/** 文字列を固定長で分割する */
+function annualChunk_(s, size) {
+  const str = String(s == null ? '' : s);
+  const n = Math.max(1, Math.ceil(str.length / size));
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(str.substr(i * size, size));
+  return out;
+}
+
+/** 予約データを消す（メタ＋全チャンク） */
+function annualPlanClear_() {
+  let removed = 0;
+  try {
+    if (typeof PropertiesService === 'undefined') return { removed: 0 };
+    const props = PropertiesService.getScriptProperties();
+    const all = props.getProperties() || {};
+    for (const k in all) {
+      if (k === ANNUAL_PLAN_PROP || k === ANNUAL_PLAN_CHUNK_COUNT ||
+          k.indexOf(ANNUAL_PLAN_CHUNK_PREFIX) === 0) {
+        try { props.deleteProperty(k); removed++; } catch (eD) { /* 個別失敗は無視 */ }
+      }
+    }
+  } catch (e) { /* プロパティが使えない環境では何もしない */ }
+  return { removed: removed };
+}
+
+/** 予約データを保存する（既存の予約は置き換え） */
+function annualPlanSave_(plan) {
+  if (typeof PropertiesService === 'undefined') {
+    return { chunks: 0, chars: 0, mode: 'raw', stored: false };
+  }
+  const props = PropertiesService.getScriptProperties();
+  const enc = annualEncode_(plan);
+  const chunks = annualChunk_(enc.payload, ANNUAL_PLAN_MAX_CHARS);
+  if (chunks.length > ANNUAL_PLAN_CHUNKS_MAX) {
+    throw new Error('予約データが大きすぎます（児童・教員CSVを分割して登録してください）');
+  }
+  annualPlanClear_();
+  const patch = {};
+  patch[ANNUAL_PLAN_PROP] = JSON.stringify({
+    v: 1, mode: enc.mode, chunks: chunks.length, saved_at_ms: annualNowMs_()
+  });
+  for (let i = 0; i < chunks.length; i++) {
+    patch[ANNUAL_PLAN_CHUNK_PREFIX + i] = chunks[i];
+  }
+  patch[ANNUAL_PLAN_CHUNK_COUNT] = String(chunks.length);
+  props.setProperties(patch, false);
+  return { chunks: chunks.length, chars: enc.payload.length, mode: enc.mode, stored: true };
+}
+
+/** 予約データを読み出す（無ければ null） */
+function annualPlanLoad_() {
+  try {
+    if (typeof PropertiesService === 'undefined') return null;
+    const props = PropertiesService.getScriptProperties();
+    const metaRaw = props.getProperty(ANNUAL_PLAN_PROP);
+    if (!metaRaw) return null;
+    let meta = null;
+    try { meta = JSON.parse(metaRaw); } catch (eM) { meta = null; }
+    if (!meta || typeof meta !== 'object') return null;
+    const n = Number(meta.chunks || 0);
+    if (!(n >= 1) || n > ANNUAL_PLAN_CHUNKS_MAX) return null;
+    let payload = '';
+    for (let i = 0; i < n; i++) {
+      const part = props.getProperty(ANNUAL_PLAN_CHUNK_PREFIX + i);
+      if (part == null) return null; // チャンク欠落＝破損として扱う
+      payload += part;
+    }
+    let json = payload;
+    if (meta.mode === 'gz') {
+      try {
+        if (typeof Utilities === 'undefined' || !Utilities ||
+            typeof Utilities.base64Decode !== 'function' || typeof Utilities.ungzip !== 'function') {
+          return null;
+        }
+        const bytes = Utilities.base64Decode(payload);
+        json = Utilities.ungzip(Utilities.newBlob(bytes)).getDataAsString();
+      } catch (eG) { return null; }
+    }
+    let plan = null;
+    try { plan = JSON.parse(json); } catch (eP) { return null; }
+    return (plan && typeof plan === 'object') ? plan : null;
+  } catch (e) { return null; }
+}
+
+/** 画面に返すための要約（CSV全文は返さない＝応答を軽くする） */
+function annualPlanPublicView_(plan) {
+  if (!plan) return null;
+  const students = Array.isArray(plan.students) ? plan.students : [];
+  const teachers = Array.isArray(plan.teachers) ? plan.teachers : [];
+  const at = Number(plan.run_at_ms || 0);
+  const status = String(plan.status || 'pending');
+  return {
+    status: status,
+    run_at_ms: at,
+    run_at_text: plan.run_at_text || annualFormatRunAt_(at),
+    clear_previous: plan.clear_previous !== false,
+    created_at_ms: Number(plan.created_at_ms || 0),
+    created_at_text: annualFormatRunAtFull_(plan.created_at_ms),
+    created_by: plan.created_by || '',
+    ran_at_ms: Number(plan.ran_at_ms || 0),
+    ran_at_text: plan.ran_at_text || '',
+    counts: plan.counts || null,
+    student_count: students.length,
+    teacher_count: teachers.length,
+    student_sample: students.slice(0, 30),
+    teacher_sample: teachers.slice(0, 30),
+    student_errors: (plan.student_errors || []).slice(0, 20),
+    teacher_errors: (plan.teacher_errors || []).slice(0, 20),
+    last_error: plan.last_error || '',
+    is_due: !!(at && status !== 'done' && annualNowMs_() >= at)
+  };
+}
+
+// ---------------------------------------------------------------------
+// CSV パース（RFC4180 準拠の最小実装）
+// ---------------------------------------------------------------------
+
+/**
+ * CSV テキストを行×列の配列へ変換する。
+ *   - BOM を除去する
+ *   - "..." で囲まれたフィールド内のカンマ・改行・"" を正しく扱う
+ *   - CRLF / LF / CR いずれの改行にも対応
+ *   - 全セルが空の行は捨てる
+ */
+function annualParseCsv_(text) {
+  const s = String(text == null ? '' : text).replace(/^\uFEFF/, '');
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuote = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charAt(i);
+    if (inQuote) {
+      if (c === '"') {
+        if (s.charAt(i + 1) === '"') { field += '"'; i++; }
+        else { inQuote = false; }
+      } else {
+        field += c;
+      }
+      continue;
+    }
+    if (c === '"') { inQuote = true; }
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\r') { /* CRLF の CR は無視（LF 側で行を閉じる） */ }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else { field += c; }
+  }
+  if (field !== '' || row.length > 0) { row.push(field); rows.push(row); }
+
+  const out = [];
+  for (let r = 0; r < rows.length; r++) {
+    const cells = rows[r];
+    let any = false;
+    const trimmed = [];
+    for (let c2 = 0; c2 < cells.length; c2++) {
+      const v = String(cells[c2] == null ? '' : cells[c2]).trim();
+      trimmed.push(v);
+      if (v !== '') any = true;
+    }
+    if (any) out.push(trimmed);
+  }
+  return out;
+}
+
+/** ヘッダー比較用の正規化（空白・括弧・大文字小文字の揺れを吸収） */
+function annualNormHeader_(h) {
+  return String(h == null ? '' : h)
+    .replace(/[\s\u3000]/g, '')
+    .replace(/[（）()【】\[\]「」]/g, '')
+    .toLowerCase();
+}
+
+/** メールアドレスらしいか */
+function annualLooksLikeEmail_(s) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s == null ? '' : s).trim());
+}
+
+/** メールのローカル部から児童IDを作る（例: taro.yamada@… → taro.yamada） */
+function annualStudentIdFromEmail_(email) {
+  const e = String(email == null ? '' : email).trim().toLowerCase();
+  const at = e.indexOf('@');
+  const local = at > 0 ? e.slice(0, at) : e;
+  return local.replace(/[^0-9a-z._-]/g, '');
+}
+
+/**
+ * 次年度 児童リストCSV をパースする。
+ *   想定列: メール（必須）・児童ID・氏名・学校名・学年・クラス
+ *   児童IDが空ならメールのローカル部から生成する。
+ */
+function parseAnnualStudentCsv_(text) {
+  const rows = annualParseCsv_(text);
+  const empt = { students: [], errors: [], headers: [], total: 0 };
+  if (!rows.length) { empt.errors.push('CSVが空です'); return empt; }
+
+  const headers = rows[0];
+  const map = {};
+  for (let i = 0; i < headers.length; i++) {
+    const h = annualNormHeader_(headers[i]);
+    if (!h) continue;
+    if (map.email === undefined && (h.indexOf('メール') >= 0 || h === 'email' || h === 'mail')) map.email = i;
+    else if (map.student_id === undefined && (h.indexOf('児童id') >= 0 || h === 'id' || h === 'studentid')) map.student_id = i;
+    else if (map.name === undefined && (h.indexOf('氏名') >= 0 || h === '名前' || h === 'name')) map.name = i;
+    else if (map.school === undefined && (h.indexOf('学校') >= 0 || h === 'school')) map.school = i;
+    else if (map.grade === undefined && (h.indexOf('学年') >= 0 || h === 'grade')) map.grade = i;
+    else if (map.class_name === undefined && (h.indexOf('クラス') >= 0 || h.indexOf('組') >= 0 || h === 'class')) map.class_name = i;
+  }
+
+  const students = [];
+  const errors = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    const get = function (k) {
+      const idx = map[k];
+      if (idx === undefined || idx === null) return '';
+      return String(cells[idx] == null ? '' : cells[idx]).trim();
+    };
+    const email = get('email');
+    let sid = get('student_id');
+    if (!sid) sid = annualStudentIdFromEmail_(email);
+    if (!sid) {
+      errors.push((r + 1) + '行目: 児童IDもメールアドレスも無いためスキップしました');
+      continue;
+    }
+    students.push({
+      student_id: sid,
+      email: email,
+      name: get('name'),
+      school_name: get('school'),
+      grade: normalizeDigits(get('grade')),
+      class_name: get('class_name')
+    });
+  }
+  return { students: students, errors: errors, headers: headers, total: rows.length - 1 };
+}
+
+/**
+ * 次年度 教員リストCSV をパースする。
+ *   想定列（TEACHER_COLUMNS と同一の11列）:
+ *     教員ID(メールアドレス)・パスワード・氏名・所属学校・権限・対象クラス・
+ *     登録URL情報・個別ホワイトリスト・個別ブラックリスト・最終ログイン日時・
+ *     Google SSO許可
+ */
+function parseAnnualTeacherCsv_(text) {
+  const rows = annualParseCsv_(text);
+  const empt = { teachers: [], errors: [], headers: [], total: 0 };
+  if (!rows.length) { empt.errors.push('CSVが空です'); return empt; }
+
+  const headers = rows[0];
+  const map = {};
+  for (let i = 0; i < headers.length; i++) {
+    const h = annualNormHeader_(headers[i]);
+    if (!h) continue;
+    if (map.email === undefined && (h.indexOf('メール') >= 0 || h.indexOf('教員id') >= 0 || h === 'email' || h === 'id')) map.email = i;
+    else if (map.password === undefined && (h.indexOf('パスワード') >= 0 || h === 'password' || h === 'pass')) map.password = i;
+    else if (map.name === undefined && (h.indexOf('氏名') >= 0 || h === '名前' || h === 'name')) map.name = i;
+    else if (map.school === undefined && (h.indexOf('所属学校') >= 0 || h.indexOf('学校') >= 0 || h === 'school')) map.school = i;
+    else if (map.role === undefined && (h.indexOf('権限') >= 0 || h === 'role')) map.role = i;
+    else if (map.classes === undefined && (h.indexOf('対象クラス') >= 0 || h.indexOf('クラス') >= 0)) map.classes = i;
+    else if (map.sso === undefined && (h.indexOf('sso') >= 0 || h.indexOf('シングルサインオン') >= 0)) map.sso = i;
+    else if (map.urls === undefined && (h.indexOf('登録url') >= 0 || h.indexOf('url情報') >= 0)) map.urls = i;
+    else if (map.white === undefined && h.indexOf('ホワイト') >= 0) map.white = i;
+    else if (map.black === undefined && h.indexOf('ブラック') >= 0) map.black = i;
+    else if (map.last_login === undefined && h.indexOf('最終ログイン') >= 0) map.last_login = i;
+  }
+
+  const teachers = [];
+  const errors = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    const get = function (k) {
+      const idx = map[k];
+      if (idx === undefined || idx === null) return '';
+      return String(cells[idx] == null ? '' : cells[idx]).trim();
+    };
+    const email = get('email').toLowerCase();
+    if (!annualLooksLikeEmail_(email)) {
+      errors.push((r + 1) + '行目: メールアドレスが不正なためスキップしました');
+      continue;
+    }
+    const ssoRaw = get('sso');
+    teachers.push({
+      email: email,
+      password: get('password'),
+      name: get('name'),
+      school_name: get('school'),
+      role: get('role') ? get('role').toUpperCase() : 'TEACHER',
+      classes: get('classes'),
+      registered_urls: get('urls'),
+      whitelist: get('white'),
+      blacklist: get('black'),
+      last_login: get('last_login'),
+      has_sso: map.sso !== undefined,
+      sso_raw: ssoRaw,
+      sso_allowed: parseSsoAllowedFlag(ssoRaw)
+    });
+  }
+  return { teachers: teachers, errors: errors, headers: headers, total: rows.length - 1 };
+}
+
+// ---------------------------------------------------------------------
+// ScriptApp トリガー（指定日時 1 回 ＋ 1時間ごとの保険）
+// ---------------------------------------------------------------------
+
+/** 保険用の定期トリガーが既にあるか */
+function annualHasPeriodicTrigger_() {
+  try {
+    if (typeof ScriptApp === 'undefined' || !ScriptApp ||
+        typeof ScriptApp.getProjectTriggers !== 'function') return false;
+    const trs = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < trs.length; i++) {
+      let h = '';
+      try { h = trs[i].getHandlerFunction(); } catch (eH) { h = ''; }
+      if (h === ANNUAL_PERIODIC_FN) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+/** 予約実行トリガー（1回発火）を全削除する */
+function annualRemoveTriggers_() {
+  let removed = 0;
+  try {
+    if (typeof ScriptApp === 'undefined' || !ScriptApp ||
+        typeof ScriptApp.getProjectTriggers !== 'function') return { removed: 0 };
+    const trs = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < trs.length; i++) {
+      let h = '';
+      try { h = trs[i].getHandlerFunction(); } catch (eH) { h = ''; }
+      if (h === ANNUAL_TRIGGER_FN) {
+        try { ScriptApp.deleteTrigger(trs[i]); removed++; } catch (eD) {}
+      }
+    }
+  } catch (e) {}
+  return { removed: removed };
+}
+
+/**
+ * 指定日時に発火するトリガーを張り直す。
+ * 併せて「1時間ごとの保険トリガー」も 1 本だけ用意する。
+ */
+function annualInstallTrigger_(atMs) {
+  const ms = Number(atMs || 0);
+  if (!ms) return { ok: false, error: '実行予定日時が不正です' };
+  if (typeof ScriptApp === 'undefined' || !ScriptApp ||
+      typeof ScriptApp.newTrigger !== 'function') {
+    return { ok: false, error: 'トリガーを作成できない環境です（フォールバック判定で実行します）' };
+  }
+  annualRemoveTriggers_();
+  // 過去日時を渡すと ScriptApp が例外を投げるため、最低1分後にする
+  const when = new Date(Math.max(ms, annualNowMs_() + 60000));
+  ScriptApp.newTrigger(ANNUAL_TRIGGER_FN).timeBased().at(when).create();
+  let periodic = false;
+  try {
+    if (!annualHasPeriodicTrigger_()) {
+      ScriptApp.newTrigger(ANNUAL_PERIODIC_FN).timeBased().everyHours(1).create();
+      periodic = true;
+    }
+  } catch (eP) { periodic = false; }
+  return {
+    ok: true,
+    at_ms: when.getTime(),
+    at_text: annualFormatRunAt_(when.getTime()),
+    periodic_created: periodic
+  };
+}
+
+// ---------------------------------------------------------------------
+// シート操作の小道具
+// ---------------------------------------------------------------------
+
+/** シートの 2 行目以降（ヘッダー以外）を全削除し、削除行数を返す */
+function annualClearSheetBody_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  const rows = lastRow - 1;
+  sheet.deleteRows(2, rows);
+  return rows;
+}
+
+/** 学年とクラスから「1年1組」形式のクラス名を組み立てる */
+function annualComposeClass_(s) {
+  const grade = normalizeDigits(String((s && s.grade) || '').trim()).replace(/[^0-9]/g, '');
+  const cls = String((s && s.class_name) || '').trim();
+  if (!cls) return grade ? (grade + '年') : '';
+  if (cls.indexOf('年') >= 0) return cls;
+  if (!grade) return cls;
+  return grade + '年' + cls;
+}
+
+/** 児童 1 行分の配列を作る（DEVICE_COLUMNS 幅） */
+function annualBuildStudentRow_(headerMap, s) {
+  const width = CONFIG.DEVICE_COLUMNS.length;
+  const row = [];
+  for (let i = 0; i < width; i++) row.push('');
+  const put = function (name, val) {
+    const idx = headerMap[name];
+    if (idx && idx >= 1 && idx <= width) row[idx - 1] = val;
+  };
+  put('児童ID', String((s && s.student_id) || ''));
+  put('学校名', String((s && s.school_name) || ''));
+  put('氏名', String((s && s.name) || ''));
+  put('クラス', annualComposeClass_(s));
+  return row;
+}
+
+/** 既存の児童行の名簿列だけを更新する（他端末の状態列は触らない） */
+function annualWriteStudentCells_(sheet, headerMap, rowNum, s) {
+  const put = function (name, val) {
+    const idx = headerMap[name];
+    if (!idx) return;
+    try { sheet.getRange(rowNum, idx, 1, 1).setValue(val); } catch (e) {}
+  };
+  put('学校名', String((s && s.school_name) || ''));
+  put('氏名', String((s && s.name) || ''));
+  put('クラス', annualComposeClass_(s));
+}
+
+/** 教員 1 行分の配列を作る（TEACHER_COLUMNS 幅・11列） */
+function annualBuildTeacherRow_(headerMap, t) {
+  const width = CONFIG.TEACHER_COLUMNS.length;
+  const row = [];
+  for (let i = 0; i < width; i++) row.push('');
+  const put = function (name, val) {
+    const idx = headerMap[name];
+    if (idx && idx >= 1 && idx <= width) row[idx - 1] = val;
+  };
+  put('教員ID(メールアドレス)', String((t && t.email) || '').toLowerCase());
+  put('パスワード', String((t && t.password) || ''));
+  put('氏名', String((t && t.name) || ''));
+  put('所属学校', String((t && t.school_name) || ''));
+  put('権限', String((t && t.role) || 'TEACHER').toUpperCase());
+  put('対象クラス', String((t && t.classes) || ''));
+  put('登録URL情報', String((t && t.registered_urls) || ''));
+  put('個別ホワイトリスト', String((t && t.whitelist) || ''));
+  put('個別ブラックリスト', String((t && t.blacklist) || ''));
+  put('Google SSO許可', parseSsoAllowedFlag(t && t.sso_allowed) ? 'TRUE' : 'FALSE');
+  return row;
+}
+
+/** 既存の教員行を更新する（CSV で空の列は既存値を残す） */
+function annualWriteTeacherCells_(sheet, headerMap, rowNum, t) {
+  const put = function (name, val, force) {
+    const idx = headerMap[name];
+    if (!idx) return;
+    const v = String(val == null ? '' : val);
+    if (!force && v === '') return;
+    try { sheet.getRange(rowNum, idx, 1, 1).setValue(v); } catch (e) {}
+  };
+  put('氏名', (t && t.name) || '', false);
+  put('所属学校', (t && t.school_name) || '', false);
+  put('権限', (t && t.role) ? String(t.role).toUpperCase() : '', false);
+  put('対象クラス', (t && t.classes) || '', false);
+  put('パスワード', (t && t.password) || '', false);
+  put('登録URL情報', (t && t.registered_urls) || '', false);
+  put('個別ホワイトリスト', (t && t.whitelist) || '', false);
+  put('個別ブラックリスト', (t && t.blacklist) || '', false);
+  // SSO 列が CSV に存在するときだけ上書きする（無い場合は既存設定を尊重）
+  if (t && t.has_sso !== false) {
+    put('Google SSO許可', parseSsoAllowedFlag(t.sso_allowed) ? 'TRUE' : 'FALSE', true);
+  }
+}
+
+// ---------------------------------------------------------------------
+// ① 前年度データの自動クリア（親シート ＋ R41 全子GASへ並列プッシュ）
+// ---------------------------------------------------------------------
+
+/**
+ * 前年度の端末・児童行データを全削除する。
+ *   - 親（自校）シートの「端末一覧」はヘッダー以外を全削除
+ *   - R41 分散モードでは全子GASへ annual_clear 指令を並列プッシュし、
+ *     各子GASが自分の「端末一覧」のヘッダー以外を全削除する
+ *   - 子GAS が 0 台（単一GASモード）の学校では通信せずに正常終了する
+ */
+function annualClearPreviousData_() {
+  const out = {
+    parent_rows: 0,
+    parent_error: '',
+    child_urls: 0,
+    child_ok: 0,
+    child_failed: 0,
+    child_skipped: 0
+  };
+
+  // (1) 親シート（自校の端末一覧）
+  try {
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    try { ensureDeviceHeaders(sheet); } catch (eH) {}
+    out.parent_rows = annualClearSheetBody_(sheet);
+  } catch (eP) {
+    out.parent_error = String(eP && eP.message ? eP.message : eP);
+  }
+
+  // (2) R41 子GAS への並列クリア伝播
+  let urls = [];
+  try {
+    if (typeof isShardParent === 'function' && isShardParent()) {
+      urls = shardAllChildUrls(shardConfigCached()) || [];
+    }
+  } catch (eU) { urls = []; }
+  urls = Array.isArray(urls) ? urls.filter(function (u) { return String(u || '').trim() !== ''; }) : [];
+  out.child_urls = urls.length;
+  if (!urls.length) {
+    // 子GAS未登録（単一GAS構成）の学校：ここで正常終了する
+    out.child_skipped = 0;
+    return out;
+  }
+
+  let secret = '';
+  try {
+    if (typeof PropertiesService !== 'undefined') {
+      secret = String(PropertiesService.getScriptProperties().getProperty(SHARD_SECRET_PROP) || '').trim();
+    }
+  } catch (eSec) { secret = ''; }
+
+  const reqs = [];
+  for (let i = 0; i < urls.length; i++) {
+    reqs.push({
+      url: urls[i],
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        action: 'shard_apply',
+        annual_clear: true,
+        shard_secret: secret,
+        cleared_by: 'annual_rollover'
+      }),
+      muteHttpExceptions: true
+    });
+  }
+
+  let res = [];
+  try { res = shardFetchMany(reqs) || []; } catch (eF) { res = []; }
+  for (let j = 0; j < reqs.length; j++) {
+    const r = res[j];
+    if (!r) { out.child_failed++; continue; }
+    let ok = false;
+    try {
+      const code = (typeof r.getResponseCode === 'function') ? Number(r.getResponseCode()) : 0;
+      const body = (typeof r.getContentText === 'function') ? r.getContentText() : '';
+      if (code >= 200 && code < 300) {
+        try { const jb = JSON.parse(body); ok = !!(jb && jb.success); } catch (eJ) { ok = false; }
+      }
+    } catch (eR) { ok = false; }
+    if (ok) out.child_ok++; else out.child_failed++;
+  }
+  return out;
+}
+
+/**
+ * 子GAS 側：自分の「端末一覧」シートのヘッダー以外を全削除する。
+ * shardApplyFromParent から annual_clear 指令を受けて呼ばれる。
+ */
+function shardAnnualClearFromParent(payload) {
+  if (!isShardChild() && !isShardParent()) {
+    return { success: false, error: '子GASとして構成されていません' };
+  }
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  return shardAnnualClearLocalDevices_();
+}
+
+function shardAnnualClearLocalDevices_() {
+  try {
+    const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+    try { ensureDeviceHeaders(sheet); } catch (eH) {}
+    const cleared = annualClearSheetBody_(sheet);
+    try { if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache(); } catch (eC) {}
+    return { success: true, cleared: cleared, sheet: CONFIG.DEVICE_SHEET_NAME };
+  } catch (e) {
+    return { success: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+// ---------------------------------------------------------------------
+// ② 次年度 児童リストの反映 / ③ 次年度 教員リストの反映
+// ---------------------------------------------------------------------
+
+/**
+ * 次年度の児童リストを「端末一覧」へ反映する。
+ *   - 新入生は行を追加
+ *   - 進級（学年・クラス変更）は既存行を更新
+ *   - pruneMissing=true のときは新リストに無い児童＝卒業生を削除する
+ *     （前年度データをクリアした場合は空になっているので何もしない）
+ */
+function annualApplyStudents_(students, opts) {
+  const o = opts || {};
+  const out = { added: 0, updated: 0, skipped: 0, removed: 0 };
+  const list = Array.isArray(students) ? students : [];
+  if (!list.length) return out;
+
+  const sheet = getTargetSheet(CONFIG.DEVICE_SHEET_NAME);
+  try { ensureDeviceHeaders(sheet); } catch (eH) {}
+  const headerMap = getHeaderMap(sheet, CONFIG.DEVICE_COLUMNS);
+  const idCol = headerMap['児童ID'] || 1;
+
+  const lastRow = sheet.getLastRow();
+  const existing = {};
+  if (lastRow >= 2) {
+    const ids = sheet.getRange(2, idCol, lastRow - 1, 1).getValues();
+    for (let i = 0; i < ids.length; i++) {
+      const key = String(ids[i][0] == null ? '' : ids[i][0]).trim();
+      if (key) existing[key] = i + 2;
+    }
+  }
+
+  // 卒業生の整理（新リストに存在しない児童を下から削除）
+  if (o.pruneMissing) {
+    const keep = {};
+    for (let k = 0; k < list.length; k++) {
+      const sid = String((list[k] && list[k].student_id) || '').trim();
+      if (sid) keep[sid] = true;
+    }
+    const delRows = [];
+    for (const sid2 in existing) {
+      if (!keep[sid2]) delRows.push(existing[sid2]);
+    }
+    delRows.sort(function (a, b) { return b - a; });
+    for (let d = 0; d < delRows.length; d++) {
+      try { sheet.deleteRow(delRows[d]); out.removed++; } catch (eD) {}
+    }
+  }
+
+  const appendRows = [];
+  for (let j = 0; j < list.length; j++) {
+    const s = list[j] || {};
+    const sid = String(s.student_id || '').trim();
+    if (!sid) { out.skipped++; continue; }
+    const rowNum = existing[sid];
+    if (rowNum) {
+      annualWriteStudentCells_(sheet, headerMap, rowNum, s);
+      out.updated++;
+    } else {
+      appendRows.push(annualBuildStudentRow_(headerMap, s));
+      out.added++;
+    }
+  }
+  if (appendRows.length) {
+    const width = CONFIG.DEVICE_COLUMNS.length;
+    const start = sheet.getLastRow() + 1;
+    sheet.getRange(start, 1, appendRows.length, width).setValues(appendRows);
+  }
+  return out;
+}
+
+/**
+ * 次年度の教員リストを「教員マスタ」へ反映する（11列・Google SSO許可を含む）。
+ *   - 異動で去った教員の整理は「管理者が CSV に載せない」ことで実現する
+ *     （自動削除はしない：誤操作でログイン不能になる事故を避けるため）
+ *   - 新任教員は行を追加、既存教員は担当クラス・権限などを更新
+ */
+function annualApplyTeachers_(teachers) {
+  const out = { added: 0, updated: 0, skipped: 0 };
+  const list = Array.isArray(teachers) ? teachers : [];
+  if (!list.length) return out;
+
+  const sheet = getTargetSheet(CONFIG.TEACHER_SHEET_NAME);
+  try { ensureTeacherHeaders(sheet); } catch (eH) {}
+  const headerMap = getHeaderMap(sheet, CONFIG.TEACHER_COLUMNS);
+  const idCol = headerMap['教員ID(メールアドレス)'] || 1;
+
+  const lastRow = sheet.getLastRow();
+  const existing = {};
+  if (lastRow >= 2) {
+    const ids = sheet.getRange(2, idCol, lastRow - 1, 1).getValues();
+    for (let i = 0; i < ids.length; i++) {
+      const key = String(ids[i][0] == null ? '' : ids[i][0]).trim().toLowerCase();
+      if (key) existing[key] = i + 2;
+    }
+  }
+
+  const appendRows = [];
+  for (let j = 0; j < list.length; j++) {
+    const t = list[j] || {};
+    const email = String(t.email || '').trim().toLowerCase();
+    if (!email) { out.skipped++; continue; }
+    const rowNum = existing[email];
+    if (rowNum) {
+      annualWriteTeacherCells_(sheet, headerMap, rowNum, t);
+      out.updated++;
+    } else {
+      appendRows.push(annualBuildTeacherRow_(headerMap, t));
+      out.added++;
+    }
+  }
+  if (appendRows.length) {
+    const width = CONFIG.TEACHER_COLUMNS.length;
+    const start = sheet.getLastRow() + 1;
+    sheet.getRange(start, 1, appendRows.length, width).setValues(appendRows);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------
+// 年次更新の実行本体（①〜③をまとめて行い、件数を返す）
+// ---------------------------------------------------------------------
+
+function annualExecutePlan_(plan) {
+  const p = plan || {};
+  const counts = {
+    cleared_parent_rows: 0,
+    previous_rows_deleted: 0,
+    child_urls: 0,
+    child_ok: 0,
+    child_failed: 0,
+    students_added: 0,
+    students_updated: 0,
+    students_removed: 0,
+    students_skipped: 0,
+    teachers_added: 0,
+    teachers_updated: 0,
+    teachers_skipped: 0
+  };
+
+  const clearPrev = p.clear_previous !== false;
+  if (clearPrev) {
+    const cl = annualClearPreviousData_();
+    counts.cleared_parent_rows = cl.parent_rows || 0;
+    counts.previous_rows_deleted = cl.parent_rows || 0;
+    counts.child_urls = cl.child_urls || 0;
+    counts.child_ok = cl.child_ok || 0;
+    counts.child_failed = cl.child_failed || 0;
+    if (cl.parent_error) counts.parent_error = cl.parent_error;
+  }
+
+  const st = annualApplyStudents_(p.students || [], { pruneMissing: !clearPrev });
+  counts.students_added = st.added || 0;
+  counts.students_updated = st.updated || 0;
+  counts.students_removed = st.removed || 0;
+  counts.students_skipped = st.skipped || 0;
+
+  const te = annualApplyTeachers_(p.teachers || []);
+  counts.teachers_added = te.added || 0;
+  counts.teachers_updated = te.updated || 0;
+  counts.teachers_skipped = te.skipped || 0;
+
+  return counts;
+}
+
+/**
+ * 予約を実行する（二重実行防止つき）。
+ *   - withWriteLock（LockService）で同時実行を直列化
+ *   - ロック取得後に予約を読み直し、既に done なら何もしない
+ *   - 実行前に status='running' を保存し、異常終了時は 'error' を残す
+ */
+function annualRolloverExecutor(opts) {
+  const o = opts || {};
+  const source = String(o.source || 'manual');
+
+  const plan0 = annualPlanLoad_();
+  if (!plan0) return { success: false, executed: false, reason: 'no_plan', error: '予約が登録されていません' };
+  if (plan0.status === 'done') {
+    return { success: true, executed: false, reason: 'already_done', ran_at_text: plan0.ran_at_text || '' };
+  }
+
+  let result = null;
+  try {
+    result = withWriteLock(function () {
+      // ロック取得後に読み直す（他実行が先に完了している可能性がある）
+      const fresh = annualPlanLoad_();
+      if (!fresh) return { success: false, executed: false, reason: 'no_plan' };
+      if (fresh.status === 'done') {
+        return { success: true, executed: false, reason: 'already_done', ran_at_text: fresh.ran_at_text || '' };
+      }
+
+      fresh.status = 'running';
+      fresh.run_started_at_ms = annualNowMs_();
+      try { annualPlanSave_(fresh); } catch (eS) {}
+
+      let counts = null;
+      try {
+        counts = annualExecutePlan_(fresh);
+      } catch (eX) {
+        fresh.status = 'error';
+        fresh.last_error = String(eX && eX.message ? eX.message : eX);
+        fresh.last_error_at_ms = annualNowMs_();
+        try { annualPlanSave_(fresh); } catch (eS2) {}
+        return {
+          success: false, executed: false, reason: 'error',
+          error: String(eX && eX.message ? eX.message : eX)
+        };
+      }
+
+      fresh.status = 'done';
+      fresh.ran_at_ms = annualNowMs_();
+      fresh.ran_at_text = annualFormatRunAtFull_(fresh.ran_at_ms);
+      fresh.counts = counts;
+      fresh.last_error = '';
+      try { annualPlanSave_(fresh); } catch (eS3) {}
+      try { annualRemoveTriggers_(); } catch (eR) {}
+      invalidateAnnualCaches_();
+
+      return {
+        success: true,
+        executed: true,
+        ran_at_text: fresh.ran_at_text,
+        counts: counts,
+        source: source
+      };
+    });
+  } catch (eLock) {
+    // withWriteLock は競合時に例外を投げる
+    return {
+      success: false, executed: false, reason: 'locked',
+      error: String(eLock && eLock.message ? eLock.message : eLock)
+    };
+  }
+  return result || { success: false, executed: false, reason: 'unknown' };
+}
+
+/** 年次更新後に読み取りキャッシュを捨てる */
+function invalidateAnnualCaches_() {
+  try { if (typeof invalidateDevicesCache === 'function') invalidateDevicesCache(); } catch (e) {}
+  try {
+    if (typeof CacheService !== 'undefined' && CacheService) {
+      CacheService.getScriptCache().remove('shard_ga_v');
+    }
+  } catch (e2) {}
+}
+
+/**
+ * フォールバック判定：予約日時を過ぎて未実行の予約があれば、その場で実行する。
+ * 管理画面アクセス時（api_annualReservationStatus）と定期トリガーから呼ばれる。
+ */
+function annualRolloverFallbackCheck_() {
+  let plan = null;
+  try { plan = annualPlanLoad_(); } catch (eL) { return { checked: false, reason: 'load_error', executed: false }; }
+  if (!plan) return { checked: true, due: false, executed: false, reason: 'no_plan' };
+  if (plan.status === 'done') return { checked: true, due: false, executed: false, reason: 'already_done' };
+
+  const at = Number(plan.run_at_ms || 0);
+  if (!at) return { checked: true, due: false, executed: false, reason: 'no_datetime' };
+  if (annualNowMs_() < at) {
+    return {
+      checked: true, due: false, executed: false, reason: 'not_yet',
+      at_text: plan.run_at_text || annualFormatRunAt_(at)
+    };
+  }
+  const res = annualRolloverExecutor({ source: 'fallback' });
+  return {
+    checked: true,
+    due: true,
+    executed: !!(res && res.executed),
+    result: res
+  };
+}
+
+/** 時刻トリガーのハンドラ（1回発火） */
+function annualRolloverTriggered_() {
+  const res = annualRolloverExecutor({ source: 'trigger' });
+  try {
+    Logger.log('[ANNUAL] trigger fired: ' + JSON.stringify({
+      success: res.success, executed: res.executed, reason: res.reason || ''
+    }));
+  } catch (e) {}
+  return res;
+}
+
+/** 保険用・1時間ごとのハンドラ */
+function annualRolloverPeriodicTick_() {
+  const fb = annualRolloverFallbackCheck_();
+  try {
+    Logger.log('[ANNUAL] periodic tick: ' + JSON.stringify({
+      due: fb.due, executed: fb.executed, reason: fb.reason || ''
+    }));
+  } catch (e) {}
+  return fb;
+}
+
+// ---------------------------------------------------------------------
+// google.script.run API（管理者専用）
+// ---------------------------------------------------------------------
+
+/** 認証＋管理者判定の共通部。失敗時は { error: {...} } を返す。 */
+function annualAuthAdmin_(token) {
+  const auth = verifyToken(token);
+  if (!auth || !auth.valid) {
+    return { ok: false, res: { success: false, need_auth: true, error: '認証セッションが無効です' } };
+  }
+  let teacher = auth.teacher;
+  try { teacher = resolveCurrentTeacher(auth.teacher); } catch (e) { teacher = auth.teacher; }
+  if (!isAdminTeacher(teacher)) {
+    return { ok: false, res: { success: false, error: '年次更新の操作は管理者のみ実行できます' } };
+  }
+  return { ok: true, teacher: teacher || {} };
+}
+
+/**
+ * 予約を保存する。
+ * payload = { run_at, student_csv, teacher_csv, clear_previous }
+ */
+function api_annualReservationSave(token, payload) {
+  try {
+    const a = annualAuthAdmin_(token);
+    if (!a.ok) return a.res;
+
+    const p = payload || {};
+    const atMs = annualParseRunAt_(p.run_at);
+    if (!atMs) {
+      return { success: false, error: '実行予定日時が不正です（例: 2027-04-01T06:00）' };
+    }
+    const st = parseAnnualStudentCsv_(p.student_csv || '');
+    const te = parseAnnualTeacherCsv_(p.teacher_csv || '');
+    if (!st.students.length && !te.teachers.length) {
+      return {
+        success: false,
+        error: '児童・教員のいずれのCSVにもデータ行がありません（ヘッダー行とデータ行を確認してください）',
+        student_errors: st.errors || [],
+        teacher_errors: te.errors || []
+      };
+    }
+
+    const plan = {
+      run_at_ms: atMs,
+      run_at_text: annualFormatRunAt_(atMs),
+      clear_previous: p.clear_previous === undefined ? true : !!p.clear_previous,
+      students: st.students,
+      teachers: te.teachers,
+      student_errors: st.errors || [],
+      teacher_errors: te.errors || [],
+      student_total: st.total || 0,
+      teacher_total: te.total || 0,
+      created_at_ms: annualNowMs_(),
+      created_by: String((a.teacher && a.teacher.email) || ''),
+      status: 'pending',
+      ran_at_ms: 0,
+      ran_at_text: '',
+      counts: null,
+      last_error: ''
+    };
+
+    const saved = annualPlanSave_(plan);
+    let trigger = null;
+    try { trigger = annualInstallTrigger_(atMs); } catch (eT) {
+      trigger = { ok: false, error: String(eT && eT.message ? eT.message : eT) };
+    }
+
+    return {
+      success: true,
+      message: '年次更新を予約保存しました',
+      plan: annualPlanPublicView_(plan),
+      storage: saved,
+      trigger: trigger
+    };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+}
+
+/** 予約の状態を返す（予約日時を過ぎていれば自動実行するフォールバック付き） */
+function api_annualReservationStatus(token) {
+  try {
+    const a = annualAuthAdmin_(token);
+    if (!a.ok) return a.res;
+
+    let fallback = null;
+    try { fallback = annualRolloverFallbackCheck_(); } catch (eF) {
+      fallback = { checked: false, executed: false, reason: 'error' };
+    }
+    const plan = annualPlanLoad_();
+    return {
+      success: true,
+      plan: plan ? annualPlanPublicView_(plan) : null,
+      fallback: fallback
+    };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+}
+
+/** 予約をキャンセルする（実行済みは不可） */
+function api_annualReservationCancel(token) {
+  try {
+    const a = annualAuthAdmin_(token);
+    if (!a.ok) return a.res;
+
+    const plan = annualPlanLoad_();
+    if (!plan) {
+      return { success: true, cancelled: false, message: 'キャンセルする予約はありません' };
+    }
+    if (plan.status === 'done') {
+      return { success: false, cancelled: false, error: '実行済みの年次更新はキャンセルできません' };
+    }
+    const cleared = annualPlanClear_();
+    const tr = annualRemoveTriggers_();
+    return {
+      success: true,
+      cancelled: true,
+      message: '予約をキャンセルしました',
+      removed_props: cleared.removed || 0,
+      removed_triggers: tr.removed || 0
+    };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+}
+
+/**
+ * 今すぐ実行（テスト実行／即時反映）。
+ * 予約が未保存で CSV が渡された場合は、先に同じ設定で保存してから実行する。
+ */
+function api_annualRolloverRunNow(token, payload) {
+  try {
+    const a = annualAuthAdmin_(token);
+    if (!a.ok) return a.res;
+
+    const p = payload || {};
+    const hasCsv = !!(String(p.student_csv || '').trim() || String(p.teacher_csv || '').trim());
+    if (hasCsv) {
+      // その場の CSV を正として保存し直す（run_at 未指定なら現在時刻）
+      const runAt = p.run_at || annualFormatRunAt_(annualNowMs_()).replace(/\//g, '-').replace(' ', 'T');
+      const saved = api_annualReservationSave(token, {
+        run_at: runAt,
+        clear_previous: p.clear_previous,
+        student_csv: p.student_csv,
+        teacher_csv: p.teacher_csv
+      });
+      if (!saved || !saved.success) return saved || { success: false, error: '予約の保存に失敗しました' };
+    } else if (!annualPlanLoad_()) {
+      return { success: false, error: '実行する予約がありません（CSVを読み込んでください）' };
+    }
+
+    const res = annualRolloverExecutor({ source: 'run_now' });
+    if (!res || !res.success) {
+      return {
+        success: false,
+        error: (res && res.error) || '年次更新の実行に失敗しました',
+        result: res
+      };
+    }
+    return {
+      success: true,
+      message: res.executed ? '年次更新を即時反映しました' : '年次更新は実行済みです',
+      result: res,
+      plan: annualPlanPublicView_(annualPlanLoad_())
+    };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+}

@@ -56,70 +56,6 @@
       margin: 0 0 12px 0;
       color: #f8fafc;
     }
-    .lock-subtitle {
-      font-size: 18px;
-      font-weight: 600;
-      color: #cbd5e1;
-      margin: 0 0 24px 0;
-    }
-    .lock-bar {
-      width: 60px;
-      height: 4px;
-      background: #3b82f6;
-      border-radius: 2px;
-      margin: 0 auto 20px auto;
-    }
-    .lock-notice {
-      font-size: 13px;
-      line-height: 1.9;
-      color: #94a3b8;
-      margin: 0;
-    }
-    .lock-detail {
-      margin: 18px 0 0 0;
-      padding: 14px 16px;
-      background: rgba(15, 23, 42, 0.55);
-      border: 1px solid rgba(148, 163, 184, 0.22);
-      border-radius: 14px;
-      text-align: left;
-    }
-    .lock-detail-label {
-      font-size: 11px;
-      font-weight: 700;
-      color: #64748b;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      margin: 0 0 6px 0;
-    }
-    .lock-detail-url {
-      font-size: 12px;
-      color: #cbd5e1;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      word-break: break-all;
-      margin: 0;
-    }
-    .lock-detail-mode {
-      font-size: 11px;
-      color: #94a3b8;
-      margin: 8px 0 0 0;
-    }
-    .lock-detail-mode b { color: #e2e8f0; }
-    .lock-account {
-      margin-top: 22px;
-      font-size: 11px;
-      color: #64748b;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-    }
-    .lock-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #10b981;
-      animation: lockPing 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
-    }
     @keyframes lockFadeIn {
       from { opacity: 0; transform: scale(0.96); }
       to   { opacity: 1; transform: scale(1); }
@@ -143,22 +79,6 @@
     </div>
 
     <h1 class="lock-title">アクセスが制限されています</h1>
-    <p class="lock-subtitle">先生の指示に従って作業を進めましょう</p>
-
-    <div class="lock-bar"></div>
-
-    <p class="lock-notice">※ 授業中はこのWebサイトを開くことができません。<br>規制が解除されると、自動的に元の画面に戻ります。</p>
-
-    <div class="lock-detail">
-      <div class="lock-detail-label">ブロック対象URL</div>
-      <p id="blockedUrl" class="lock-detail-url">-</p>
-      <p class="lock-detail-mode">規制モード: <b id="filterMode">-</b></p>
-    </div>
-
-    <div class="lock-account">
-      <span class="lock-dot"></span>
-      <span id="accountLabel">児童アカウント連携中...</span>
-    </div>
   </div>
 
   <!-- インラインスクリプトは拡張機能CSPで禁止のため外部ファイル化 -->

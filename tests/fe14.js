@@ -41,7 +41,11 @@ mkEl('autoRefreshToggle').checked=true;
 store['edu_auto_refresh']='1';
 ctx.__setupAuto();
 check('保存がオン(1)なら復元時にオン', mkEl('autoRefreshToggle').checked===true);
-check('オン時は5秒間隔のタイマーを開始', timers.indexOf(5000)!==-1, timers);
+// 【R55】自動更新は「1秒刻みのタイマー＋経過時間判定」方式になった。
+//   実効周期は AUTO_REFRESH_INTERVAL_MS（3〜5秒要件）で決まる。
+check('オン時に自動更新タイマーを開始（1秒刻み）', timers.indexOf(1000)!==-1, timers);
+const __autoMs = vm.runInContext('AUTO_REFRESH_INTERVAL_MS', ctx);
+check('実効周期が3〜5秒の範囲', __autoMs >= 3000 && __autoMs <= 5000, __autoMs);
 
 console.log('===== 画面一覧タブの配線 =====');
 check('画面一覧の関数が存在（requestScreenInfo/loadScreens）', ctx.__isScreen()===true);

@@ -32,8 +32,9 @@ let pass=0,fail=0;
 function check(n,c,e){ if(c){console.log('PASS',n,e!==undefined?'=> '+JSON.stringify(e):'');pass++;} else {console.log('FAIL',n,e!==undefined?'=> '+JSON.stringify(e):'');fail++;} }
 
 // ---- maybeSync（レート制御）の実挙動を vm 上で検証 ----
-// 稼働中=1.5秒／非稼働=停止（同期しない）／猶予期間=1秒上限。
-console.log('===== maybeSync: 稼働中=1.5秒／非稼働=停止／猶予=1秒 のレート制御 =====');
+// 稼働中=1.5秒／非稼働=停止（同期しない）／猶予期間=1秒上限／
+// 非稼働でも予約保持または子GAS割り当て済みなら 5 分周期の低速ポーリング。
+console.log('===== maybeSync: 稼働中=1.5秒／非稼働=停止（予約保持時のみ5分）／猶予=1秒 のレート制御 =====');
 let t = 1000000;
 const calls = [];
 const ctx = {
@@ -44,17 +45,34 @@ const ctx = {
     clear:(name)=>{ calls.push({clear:name}); return Promise.resolve(true); },
     clearAll(){}
   } },
-  syncWithGas: () => { calls.push({sync:true}); return Promise.resolve(); }
+  // 【v1.6.6】syncWithGas は実物と同じく「送信開始時刻」を控える。
+  //   これを再現しないと 0.8×interval の重複排除を検証できない。
+  syncWithGas: () => {
+    calls.push({sync:true});
+    try { vm.runInContext('lastHeartbeatStartMs = ' + t + ';', ctx); } catch (e) {}
+    return Promise.resolve();
+  },
+  // 【v1.6.6】稼働中の setTimeout チェーン（ensureSyncLoop/stopSyncLoop が触る）
+  setTimeout: () => 1,
+  clearTimeout: () => {}
 };
 const syncCount = () => calls.filter(c=>c.sync).length;
 vm.createContext(ctx);
 vm.runInContext(
   'const ACTIVE_SYNC_MS = 1500;\nconst IDLE_SYNC_MS = 0;\nconst IDLE_DRIFT_MS = 1000;\nconst IDLE_DRIFT_ALARM_MIN = 5/60;\n' +
-  'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\nlet idleDriftUntil = 0;\nlet lastSyncMs = 0;\n' +
-  extract('maybeSync') + '\n' + extract('ensureSyncLoop') + '\n' + extract('stopSyncLoop') +
+  'const SLOW_POLL_MS = 5*60*1000;\nconst SLOW_POLL_ALARM = \'schedulePoll\';\nconst SLOW_POLL_ALARM_MIN = 5;\n' +
+  'let keepaliveActive = true;\nlet activeIntervalMs = 1500;\nlet idleDriftUntil = 0;\nlet lastSyncMs = 0;\nlet hasSyncedOnce = false;\n' +
+  // 【v1.6.6】稼働中の高精度チェーンと重複排除用の状態（明示リスト方式）
+  'const FAST_MIN_GAP_RATIO = 0.8;\nlet fastChainTimer = null;\nlet lastHeartbeatStartMs = 0;\nlet syncInFlight = false;\n' +
+  'let shardAssignedCache = \'\';  // 子GASへ割り当て済みか（低速ポーリングの判定材料）\n' +
+  extract('maybeSync') + '\n' + extract('scheduleInterestActive') + '\n' +
+  extract('clearFastChain') + '\n' + extract('scheduleFastChain') + '\n' +
+  extract('ensureSyncLoop') + '\n' + extract('stopSyncLoop') +
   '\n' + extract('scheduleIdleDrift') + '\n' + extract('clearIdleDriftAlarm') +
+  '\n' + extract('ensureSlowPoll') + '\n' + extract('clearSlowPoll') +
   '\n__sync=maybeSync; __ensure=ensureSyncLoop; __stop=stopSyncLoop;' +
-  '\n__setActive=(v)=>{keepaliveActive=v;}; __setDrift=(u)=>{idleDriftUntil=u;};', ctx);
+  '\n__setActive=(v)=>{keepaliveActive=v;}; __setDrift=(u)=>{idleDriftUntil=u;};' +
+  '\n__setShard=(v)=>{shardAssignedCache=v;};', ctx);
 
 ctx.__sync();
 check('稼働中: 初回の maybeSync で同期する', syncCount() === 1, syncCount());
@@ -102,20 +120,31 @@ check('停止後もコンソール検知で復帰（resumeFromConsoleTab）', /f
 check('KEEPALIVE_PING ハンドラが存在', /message\.type === 'KEEPALIVE_PING'/.test(bg));
 check('KEEPALIVE_PING ハンドラが maybeSync を呼ぶ', /message\.type === 'KEEPALIVE_PING'[\s\S]*?maybeSync\(\)/.test(bg));
 
-console.log('===== 送信側: content/lock/blocked が稼働中のみ 1500ms で ping =====');
-function senderOk(src, label){
+console.log('===== 送信側: content/lock/blocked が稼働中のみ ping =====');
+// 【v1.6.6】content.js は「固定 1500ms の setInterval」から
+//   「keepalive_interval_sec に追従する setTimeout チェーン(schedulePing)」へ移行した。
+//   lock.js / blocked.js は従来どおり 1500ms の setInterval を維持している。
+function senderOk(src, label, useChain){
   const hasPing = /type:\s*'KEEPALIVE_PING'/.test(src);
-  // ping 送信ブロックが 1500ms 間隔であること
-  const intervalOk = /setInterval\(\(\)\s*=>\s*\{[\s\S]{0,260}?KEEPALIVE_PING[\s\S]{0,260}?\}\s*,\s*1500\s*\)/.test(src);
+  // 稼働中の ping が正しい周期制御で送出されること
+  const intervalOk = useChain
+    // v1.6.6: 自己再帰の setTimeout チェーンで、周期は keepalive_interval_sec に追従する
+    ? (/function schedulePing\(\)/.test(src) &&
+       /pingTimer = setTimeout\(/.test(src) &&
+       /schedulePing\(\);\s*\n\s*\}, nextDelay\(\)\);/.test(src) &&
+       /keepalive_interval_sec/.test(src) &&
+       !/setInterval\(/.test(src.split('KEEPALIVE_PING')[0].slice(-600)))
+    // lock.js / blocked.js: 従来の 1500ms 固定間隔
+    : /setInterval\(\(\)\s*=>\s*\{[\s\S]{0,260}?KEEPALIVE_PING[\s\S]{0,260}?\}\s*,\s*1500\s*\)/.test(src);
   // 非稼働時（keepalive_active=false）は送信しないゲートがあること
   const gateOk = /if \(!kaActiveCache\) return;/.test(src) && /keepalive_active/.test(src);
   check(label+': KEEPALIVE_PING を送信', hasPing);
-  check(label+': 1500ms 間隔', intervalOk);
+  check(label+': ' + (useChain ? '周期追従チェーン(schedulePing)' : '1500ms 間隔'), intervalOk);
   check(label+': 非稼働時は送信しない（keepalive_active ゲート）', gateOk);
 }
-senderOk(content, 'content.js');
-senderOk(lock, 'lock.js');
-senderOk(blocked, 'blocked.js');
+senderOk(content, 'content.js', true);
+senderOk(lock, 'lock.js', false);
+senderOk(blocked, 'blocked.js', false);
 check('content.js: トップフレームのみ ping（iframe 暴発防止）', /window\.top === window[\s\S]{0,1400}?KEEPALIVE_PING/.test(content));
 check('blocked.js: 既存の checkAndRestore(1500) を保持', /setInterval\(checkAndRestore,\s*1500\)/.test(blocked));
 

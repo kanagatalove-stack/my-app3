@@ -91,8 +91,12 @@ check('showLoginView（ログアウト）で稼働停止', /function showLoginVi
 
 console.log('===== 課題A: 拡張側のレート制御（稼働中=1.5秒） =====');
 check('ACTIVE_SYNC_MS=1500（3秒以内反映の要）', /const ACTIVE_SYNC_MS = 1500;/.test(bgJs));
-check('IDLE_SYNC_MS=0（非稼働時は定期ポーリングしない＝通信ゼロ）', /const IDLE_SYNC_MS = 0;/.test(bgJs));
-check('maybeSync が非稼働時（猶予終了）に同期しない', /function maybeSync\(\)[\s\S]*?clearIdleDriftAlarm\(\);[\s\S]*?return;/.test(bgJs));
+check('IDLE_SYNC_MS=0（非稼働時は 1.5 秒の速いポーリングをしない）', /const IDLE_SYNC_MS = 0;/.test(bgJs));
+check('maybeSync が未割り当て・非稼働（猶予終了）に同期しない＝通信ゼロを維持',
+  /function maybeSync\(\)[\s\S]*?clearIdleDriftAlarm\(\);[\s\S]*?clearSlowPoll\(\);[\s\S]*?return;/.test(bgJs));
+check('予約保持または子GAS割り当て済みなら低速ポーリング（5分）を継続する',
+  /else if \(scheduleInterestActive\(\)\)[\s\S]{0,240}?interval = SLOW_POLL_MS;/.test(bgJs) &&
+  /SLOW_POLL_MS = 5 \* 60 \* 1000/.test(bgJs));
 check('稼働へ切替時に即同期（lastSyncMs=0）', /if \(activeChanged\) \{[\s\S]{0,80}?lastSyncMs = 0;/.test(bgJs));
 check('状態不変時は storage 書込み・アラーム再登録をしない（チャーン防止）', /if \(!activeChanged && !intervalChanged && !driftChanged\) return;/.test(bgJs));
 check('KEEPALIVE_PING が maybeSync を呼ぶ（非稼働時は doPost しない）', /message\.type === 'KEEPALIVE_PING'[\s\S]{0,200}?maybeSync\(\)/.test(bgJs));
@@ -116,7 +120,12 @@ check('OffscreenCanvas + createImageBitmap で縮小する', /new OffscreenCanva
 check('上限に収まるまで段階的に縮小（幅候補を順に試す）', /SCREENSHOT_WIDTHS/.test(bgJs) && /SCREENSHOT_QUALITIES/.test(bgJs));
 check('縮小結果が上限以下かを判定して返す', /b64\.length <= SCREENSHOT_MAX_B64/.test(bgJs));
 check('captureAndUploadScreenshot が縮小を経由する', /function captureAndUploadScreenshot[\s\S]*?downscaleForSheet\(raw\)/.test(bgJs));
-check('縮小できなければ送信しない（壊れたデータを残さない）', /if \(!dataUrl\) \{[\s\S]{0,200}?return;/.test(bgJs));
+// 【v1.6.9 / R58】ロック中・規制中のみ「状態フレーム」で代替する。
+//   ロック中・規制中でない通常時は、従来どおり縮小不可なら通知して送信しない
+//   （＝壊れたデータを保存しない不変条件は維持）。
+check('縮小できなければ送信しない（壊れたデータを残さない／状態フレーム代替はロック中・規制中のみ）',
+  /if \(!dataUrl\) \{[\s\S]{0,600}?notifyScreenshotBlocked\(effectiveGasUrl, studentId, 'image_too_large'\);\s*\n\s*return;/.test(bgJs)
+  && /if \(rest\.active\) \{[\s\S]{0,200}?renderRestrictionStateFrame_\(rest, SCREENSHOT_MAX_B64\)/.test(bgJs));
 check('GAS は保存後 has_image=true を返す（画面が表示される）', /has_image: ready/.test(codeGs));
 check('GAS は画像データを1シートで upsert（1児童=1行）', /function processScreenshotUpload[\s\S]*?SCREENSHOT_SHEET_NAME/.test(codeGs));
 

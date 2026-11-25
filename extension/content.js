@@ -42,26 +42,59 @@
   //      非稼働時は ping を一切送らない＝SW を起こさない＝管理アプリ未使用時の通信負荷はゼロ。
   //      （管理アプリの再起動は SW 側のタブ作成/更新検知で即再開するため、常時 ping は不要）
   if (window.top === window) {
+    // 【v1.6.6】稼働中のみ、GAS 応答の sync_interval_sec に追従して起床パルスを送る。
+    //   ・稼働中（1.5秒／過負荷バックオフ時 4秒）… setTimeout チェーンで SW を起こす
+    //   ・非稼働 … パルスを完全停止（＝SW を起こさない＝無駄な doPost ゼロ）
+    //   ※ 実際の送信要否・重複排除は background 側（sync_interval_sec×0.8 と in-flight）が担う。
+    //     ここは「SW を眠らせない」ためだけの軽量パルス。
     let kaActiveCache = false;
+    let kaIntervalMs = 1500;
+    let pingTimer = null;
+    const PING_MIN_MS = 800;
+    function nextDelay() {
+      return Math.max(PING_MIN_MS, kaIntervalMs || 1500);
+    }
+    function sendPing() {
+      if (kaActiveCache) {
+        try {
+          chrome.runtime.sendMessage({ type: 'KEEPALIVE_PING' }, () => { void chrome.runtime.lastError; });
+        } catch (e) {}
+      }
+    }
+    function schedulePing() {
+      if (pingTimer) { try { clearTimeout(pingTimer); } catch (e) {} pingTimer = null; }
+      if (!kaActiveCache) return; // 非稼働時はチェーンを張らない
+      pingTimer = setTimeout(() => {
+        pingTimer = null;
+        sendPing();
+        schedulePing();
+      }, nextDelay());
+    }
     try {
-      chrome.storage.local.get(['keepalive_active'], (d) => {
+      chrome.storage.local.get(['keepalive_active', 'keepalive_interval_sec'], (d) => {
         if (chrome.runtime.lastError) return;
+        const sec = Number(d && d.keepalive_interval_sec);
+        if (isFinite(sec) && sec > 0) kaIntervalMs = Math.round(sec * 1000);
         kaActiveCache = !!(d && d.keepalive_active);
+        schedulePing();
       });
     } catch (e) {}
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
-        if (area === 'local' && 'keepalive_active' in changes) {
+        if (area !== 'local') return;
+        let touched = false;
+        if ('keepalive_active' in changes) {
           kaActiveCache = !!changes.keepalive_active.newValue;
+          touched = true;
         }
+        if ('keepalive_interval_sec' in changes) {
+          const sec = Number(changes.keepalive_interval_sec.newValue);
+          if (isFinite(sec) && sec > 0) kaIntervalMs = Math.round(sec * 1000);
+          touched = true;
+        }
+        if (touched) schedulePing(); // 稼働開始/停止・周期変更へ即時追従
       });
     } catch (e) {}
-    setInterval(() => {
-      if (!kaActiveCache) return; // 非稼働時は送信しない（無駄な SW 起床・doPost を防ぐ）
-      try {
-        chrome.runtime.sendMessage({ type: 'KEEPALIVE_PING' }, () => { void chrome.runtime.lastError; });
-      } catch (e) {}
-    }, 1500);
   }
 
   // 5. 教員コンソール（GAS管理画面）からのセッション通知を SW へ中継する。

@@ -122,6 +122,39 @@
         </button>
       </form>
 
+      <!-- ==================== Googleアカウント シングルサインオン（SSO） ==================== -->
+      <!-- 既存の手動ログイン（上の欄）はそのまま。その下に区切り線とSSOボタンを置く。 -->
+      <div class="space-y-4">
+        <div class="flex items-center space-x-3">
+          <div class="flex-1 h-px bg-slate-200"></div>
+          <span class="text-[11px] font-bold text-slate-400 tracking-wider">または</span>
+          <div class="flex-1 h-px bg-slate-200"></div>
+        </div>
+
+        <button type="button" id="ssoLoginBtn" onclick="handleSsoLogin()"
+          class="w-full bg-white hover:bg-slate-50 active:bg-slate-100 text-slate-700 font-bold py-3 rounded-xl border border-slate-300 shadow-sm transition text-sm flex items-center justify-center space-x-2.5 disabled:opacity-60 disabled:cursor-not-allowed">
+          <!-- Google ロゴ（インラインSVGのみ・外部画像URLは使用しない） -->
+          <svg class="w-5 h-5 shrink-0" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+            <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+            <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+            <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+            <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+          </svg>
+          <span id="ssoLoginBtnText">Googleアカウントでログイン（シングルサインオン）</span>
+          <svg id="ssoLoginBtnSpinner" class="w-4 h-4 animate-spin hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+          </svg>
+        </button>
+
+        <!-- SSO 拒否理由（児童アカウント・未許可・メール取得不可など） -->
+        <div id="ssoError" class="hidden p-3 bg-rose-50 border border-rose-200 text-rose-600 text-xs rounded-xl font-medium leading-relaxed"></div>
+
+        <p class="text-[10px] text-slate-400 leading-relaxed text-center">
+          学校のGoogleアカウントにログインした状態で押すと、パスワード入力なしでログインできます。<br>
+          許可された教員アカウントのみ利用できます（児童アカウントは利用できません）。
+        </p>
+      </div>
+
       <!-- 接続先ステータス & 設定アコーディオン -->
       <div class="border-t pt-3">
         <div class="flex items-center justify-between text-[11px] text-slate-500">
@@ -193,8 +226,23 @@
             <span class="font-medium text-indigo-100 text-[11px]">自動更新(任意)</span>
           </label>
 
+          <!-- ===== ライブ視聴の使用枠インジケーター（常時表示 / v1.6.8） =====
+               教員がひと目で「今どれだけ枠を使っているか」を把握できるようにする。
+               値は live_watch_status（1.5〜2秒ごとの更新に同乗）で更新する。 -->
+          <div id="liveWatchBadges" class="flex items-center space-x-1.5 flex-wrap gap-y-1">
+            <span id="liveWatchPoolBadge" title="このGAS環境で同時にライブ視聴している端末数（相乗りは1台と数えます）"
+                  class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-indigo-900/90 border border-indigo-600 text-indigo-100">
+              <svg class="w-3.5 h-3.5 mr-1 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+              全体ライブ枠: <span id="liveWatchPoolUsed" class="mx-0.5">0</span> / <span id="liveWatchPoolMax">24</span>台（残り <span id="liveWatchPoolLeft">24</span>枠）
+            </span>
+            <span id="liveWatchMineBadge" title="あなたが同時にライブ視聴している台数（管理設定の上限）"
+                  class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-indigo-900/70 border border-indigo-500 text-indigo-200">
+              あなたの視聴枠: <span id="liveWatchMineText">0 / 3台</span>
+            </span>
+          </div>
+
           <!-- 更新ボタン -->
-          <button id="refreshBtn" onclick="loadDevices()" class="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-indigo-400">
+          <button id="refreshBtn" onclick="refreshDevicesManual()" class="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-indigo-400">
             <svg id="refreshSpinner" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
             </svg>
@@ -218,7 +266,7 @@
             <span id="teacherSettingsBtnLabel">設定 (クラス・URL)</span>
           </button>
 
-          <!-- AI監視設定ボタン（管理者のみ） -->
+          <!-- サイト監視設定ボタン（管理者のみ） -->
           <button id="monitorSettingsBtn" onclick="openMonitoringModal()" title="学習に関係のないサイトの監視設定（管理者のみ）" class="hidden flex items-center space-x-1.5 bg-rose-700 hover:bg-rose-800 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-sm transition border border-rose-500">
             <svg class="w-4 h-4 text-rose-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
@@ -494,6 +542,46 @@
 
         <div id="screenStatusBar" class="text-xs text-slate-500 px-1"></div>
 
+        <!-- ===== ライブ視聴パネル（準リアルタイム / v1.6.8） =====
+             管理設定の上限まで同時に枠を並べ、約1.5〜2秒間隔で画像を更新する。
+             枠を閉じた／タブが非表示になった／自動タイムアウト満了で即座に枠を解放する。 -->
+        <div id="liveWatchPanel" class="bg-white p-4 rounded-xl shadow-sm border border-sky-200">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div class="flex items-start space-x-3">
+              <div class="p-2.5 bg-sky-100 text-sky-700 rounded-xl shrink-0">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+              </div>
+              <div>
+                <h2 class="text-sm font-bold text-slate-800">ライブ視聴（準リアルタイム）</h2>
+                <p class="text-[11px] text-slate-500 leading-relaxed">
+                  対象の児童端末が数秒おきに画面を送信します。全体 <b>24台</b> まで、あなたは管理設定の上限まで同時に表示できます。
+                </p>
+                <div id="liveWatchPanelStatus" class="text-[11px] text-slate-500 mt-1"></div>
+              </div>
+            </div>
+            <div class="flex items-center space-x-2 flex-wrap gap-y-2">
+              <button id="liveWatchStartBtn" onclick="startLiveWatchFromSelection()" class="flex items-center space-x-1.5 bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold px-3.5 py-2 rounded-lg shadow-sm transition">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                <span>ライブ視聴を開始</span>
+              </button>
+              <button id="liveWatchStopAllBtn" onclick="stopAllLiveWatch()" class="hidden flex items-center space-x-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3.5 py-2 rounded-lg shadow-sm transition">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                <span>すべて停止</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="liveWatchGrid" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 mt-4">
+            <div class="col-span-full text-center py-8 text-slate-400">
+              <div class="flex flex-col items-center justify-center space-y-2">
+                <svg class="w-9 h-9 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="text-sm font-semibold text-slate-600">「ライブ視聴を開始」を押すと、対象児童の画面を準リアルタイムで表示します</span>
+                <span class="text-xs text-slate-400">常時送信は行いません（枠を開いている間だけ送信します）</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- 画面一覧グリッド -->
         <div id="screenGrid" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
           <div class="col-span-full text-center py-12 text-slate-400">
@@ -589,7 +677,7 @@
           <span class="p-1.5 bg-violet-100 text-violet-700 rounded-lg">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
           </span>
-          <span>スケジュール（時間制限タイマー）の新規予約</span>
+          <span id="scheduleModalTitle">スケジュール（時間制限タイマー）の新規予約</span>
         </h3>
         <button onclick="closeModal('scheduleModal')" class="text-slate-400 hover:text-slate-600 text-lg leading-none">✕</button>
       </div>
@@ -602,8 +690,9 @@
             <div>
               <label class="block text-[11px] font-semibold text-slate-600 mb-1">対象種別</label>
               <select id="scheduleTargetType" onchange="toggleScheduleTargetFields()" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2">
-                <option value="class">クラス全体</option>
+                <option value="class">クラス全体（複数選択可）</option>
                 <option value="student">個別の児童</option>
+                <option value="school">全校生徒</option>
               </select>
             </div>
             <div>
@@ -613,8 +702,17 @@
             </div>
           </div>
           <div id="scheduleClassWrap">
-            <label class="block text-[11px] font-semibold text-slate-600 mb-1">クラス</label>
-            <select id="scheduleClass" class="w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2"></select>
+            <label class="block text-[11px] font-semibold text-slate-600 mb-1">クラス（複数選択できます）</label>
+            <div id="scheduleClassBox" class="max-h-40 overflow-y-auto border border-slate-200 rounded-lg p-1.5 bg-slate-50/60"></div>
+            <!-- 選択結果の唯一の保持先（カンマ区切り）。既存の クラス名 列にそのまま1セルで保存する -->
+            <input type="hidden" id="scheduleClass" value="">
+            <p class="text-[10px] text-slate-400 mt-1">複数選ぶと、そのすべてのクラスが対象になります。</p>
+          </div>
+          <div id="scheduleSchoolTargetWrap" class="hidden">
+            <div class="rounded-lg border border-violet-200 bg-violet-50 px-3 py-2">
+              <p class="text-[11px] font-bold text-violet-800">全校生徒が対象です</p>
+              <p id="scheduleSchoolTargetNote" class="text-[10px] text-violet-600 mt-0.5">自校の全児童に適用されます（他校には適用されません）。</p>
+            </div>
           </div>
           <div id="scheduleStudentWrap" class="hidden">
             <label class="block text-[11px] font-semibold text-slate-600 mb-1">児童（複数選択可）</label>
@@ -703,7 +801,7 @@
 
       <div class="sticky bottom-0 bg-slate-50 px-6 py-4 border-t border-slate-200 flex items-center justify-end space-x-2 rounded-b-2xl">
         <button onclick="closeModal('scheduleModal')" class="px-4 py-2 text-xs font-semibold text-slate-600 bg-white border border-slate-300 rounded-lg hover:bg-slate-100 transition">キャンセル</button>
-        <button id="scheduleSaveBtn" onclick="saveSchedule()" class="px-4 py-2 text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 rounded-lg shadow-sm transition">予約を登録</button>
+        <button id="scheduleSaveBtn" onclick="saveSchedule()" class="px-4 py-2 text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 rounded-lg shadow-sm transition"><span id="scheduleSaveBtnText">予約を登録</span></button>
       </div>
     </div>
   </div>
@@ -1071,7 +1169,7 @@
           <div class="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
             <div class="flex items-center justify-between">
               <h4 class="font-bold text-slate-800 text-sm">➕ 教員の新規登録</h4>
-              <span class="text-[11px] text-slate-400">メール・パスワードは必須</span>
+              <span class="text-[11px] text-slate-400">メール必須／パスワードは任意（SSO許可ONなら空欄可）</span>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
@@ -1079,8 +1177,15 @@
                 <input type="email" id="newTeacherEmail" placeholder="teacher@school.ed.jp" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-sm focus:ring-indigo-500 focus:border-indigo-500">
               </div>
               <div>
-                <label class="block font-semibold text-slate-700 mb-1">パスワード*</label>
-                <input type="text" id="newTeacherPassword" placeholder="初期パスワード" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-sm focus:ring-indigo-500 focus:border-indigo-500">
+                <label class="block font-semibold text-slate-700 mb-1">パスワード（任意）</label>
+                <input type="text" id="newTeacherPassword" placeholder="初期パスワード（SSO許可ONなら空欄可）" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-sm focus:ring-indigo-500 focus:border-indigo-500">
+              </div>
+              <div class="sm:col-span-2 bg-white border border-slate-300 rounded-lg p-3 flex items-start space-x-3">
+                <input type="checkbox" id="newTeacherSsoAllowed" checked class="w-5 h-5 mt-0.5 text-indigo-600 rounded shrink-0">
+                <label for="newTeacherSsoAllowed" class="cursor-pointer select-none">
+                  <span class="block text-sm font-bold text-slate-800">GoogleアカウントSSO許可</span>
+                  <span class="block text-[11px] text-slate-500 mt-1 leading-relaxed">ONにすると、この教員はログイン画面の「Googleアカウントでログイン」からパスワードなしで入れます。</span>
+                </label>
               </div>
               <div>
                 <label class="block font-semibold text-slate-700 mb-1">氏名</label>
@@ -1102,6 +1207,39 @@
                 <input type="text" id="newTeacherClass" placeholder="例: 5年1組" class="w-full bg-white border border-slate-300 rounded-lg p-2 text-sm focus:ring-indigo-500 focus:border-indigo-500">
               </div>
             </div>
+
+            <!-- 登録URL情報・個別ホワイトリスト・個別ブラックリスト（Request K） -->
+            <div class="space-y-3">
+              <div>
+                <div class="flex items-center justify-between mb-1">
+                  <label class="font-semibold text-slate-700">登録URL情報（任意）</label>
+                  <span class="text-[11px] text-slate-400">1行に1URL</span>
+                </div>
+                <textarea id="newTeacherUrls" rows="3" spellcheck="false"
+                  class="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-mono focus:ring-indigo-500 focus:border-indigo-500"
+                  placeholder="https://www.mext.go.jp/&#10;https://www.city.mimasaka.lg.jp/"></textarea>
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <label class="font-semibold text-slate-700">個別ホワイトリスト（任意）</label>
+                    <span class="text-[11px] text-slate-400">1行に1件</span>
+                  </div>
+                  <textarea id="newTeacherWhitelist" rows="3" spellcheck="false"
+                    class="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-mono focus:ring-indigo-500 focus:border-indigo-500"
+                    placeholder="mimasaka.ed.jp&#10;edu.ac.jp"></textarea>
+                </div>
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <label class="font-semibold text-slate-700">個別ブラックリスト（任意）</label>
+                    <span class="text-[11px] text-slate-400">1行に1件</span>
+                  </div>
+                  <textarea id="newTeacherBlacklist" rows="3" spellcheck="false"
+                    class="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-mono focus:ring-indigo-500 focus:border-indigo-500"
+                    placeholder="example.com&#10;game-site.jp"></textarea>
+                </div>
+              </div>
+            </div>
             <div class="flex justify-end items-center space-x-2">
               <span id="teacherFormStatus" class="text-[11px] text-indigo-600 font-semibold hidden">編集中</span>
               <button id="cancelTeacherEditBtn" onclick="resetTeacherForm()" class="hidden px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-200 rounded-lg transition">編集をやめる</button>
@@ -1121,11 +1259,12 @@
                     <th class="text-left p-2.5 font-bold">所属学校</th>
                     <th class="text-left p-2.5 font-bold">権限</th>
                     <th class="text-left p-2.5 font-bold">対象クラス</th>
+                    <th class="text-left p-2.5 font-bold">SSO</th>
                     <th class="text-right p-2.5 font-bold">操作</th>
                   </tr>
                 </thead>
                 <tbody id="teacherListBody">
-                  <tr><td colspan="6" class="text-center text-slate-400 p-4">読み込み中...</td></tr>
+                  <tr><td colspan="7" class="text-center text-slate-400 p-4">読み込み中...</td></tr>
                 </tbody>
               </table>
             </div>
@@ -1290,13 +1429,87 @@
             <div id="archiveListBox" class="text-[11px] text-slate-400">「読み込む」を押すと卒業生シートの内容を表示します。</div>
           </div>
 
+          <!-- ===== 【Request N】予約実行型 年次更新（新年度の一括切替） ===== -->
+          <div class="border-2 border-indigo-200 bg-indigo-50/40 rounded-xl p-4 space-y-3">
+            <div class="flex items-start space-x-2">
+              <span class="p-1.5 bg-indigo-100 text-indigo-600 rounded-lg shrink-0">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+              </span>
+              <div>
+                <h4 class="font-bold text-slate-800 text-sm">🗓 予約実行型 年次更新（新年度の一括切替）</h4>
+                <p class="text-[11px] text-slate-500 leading-relaxed mt-1">
+                  3月のうちに「実行予定日時」と「次年度の児童・教員CSV」を登録しておくと、指定日時に自動で
+                  前年度データを整理し、次年度の名簿へ切り替えます。管理画面を開いた時点でも
+                  「予約日時を過ぎて未実行」なら自動実行されます。
+                </p>
+              </div>
+            </div>
+
+            <!-- 1. 実行予定日時 -->
+            <div>
+              <label for="annualReserveAt" class="block text-[11px] font-bold text-slate-700 mb-1">① 実行予定日時（日本時間）</label>
+              <input type="datetime-local" id="annualReserveAt"
+                     class="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 bg-white">
+              <p class="text-[11px] text-slate-500 mt-1">例: 2027-04-01 06:00（4月1日朝に自動切替）</p>
+            </div>
+
+            <!-- 2. 次年度 児童リストCSV -->
+            <div>
+              <label for="annualReserveStudentFile" class="block text-[11px] font-bold text-slate-700 mb-1">② 次年度 児童リストCSV</label>
+              <input type="file" id="annualReserveStudentFile" accept=".csv,.txt,.xlsx,.xls"
+                     onchange="onAnnualReserveStudentFile(this)"
+                     class="w-full text-[11px] text-slate-600 file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:text-[11px] file:font-semibold file:bg-indigo-100 file:text-indigo-700 hover:file:bg-indigo-200">
+              <p class="text-[11px] text-slate-500 mt-1">列: メールアドレス・児童ID・氏名・学校名・学年・クラス（児童IDは空ならメールから生成）</p>
+              <div id="annualReserveStudentPreview" class="text-[11px] text-slate-400 mt-1 whitespace-pre-wrap break-all">未選択</div>
+            </div>
+
+            <!-- 3. 次年度 教員リストCSV -->
+            <div>
+              <label for="annualReserveTeacherFile" class="block text-[11px] font-bold text-slate-700 mb-1">③ 次年度 教員リストCSV</label>
+              <input type="file" id="annualReserveTeacherFile" accept=".csv,.txt,.xlsx,.xls"
+                     onchange="onAnnualReserveTeacherFile(this)"
+                     class="w-full text-[11px] text-slate-600 file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:text-[11px] file:font-semibold file:bg-indigo-100 file:text-indigo-700 hover:file:bg-indigo-200">
+              <p class="text-[11px] text-slate-500 mt-1">列: 教員ID(メール)・パスワード・氏名・所属学校・権限・対象クラス・Google SSO許可（空欄は許可）</p>
+              <div id="annualReserveTeacherPreview" class="text-[11px] text-slate-400 mt-1 whitespace-pre-wrap break-all">未選択</div>
+            </div>
+
+            <!-- 4. 前年度データ削除オプション -->
+            <div class="bg-white border border-indigo-200 rounded-lg p-3 flex items-start space-x-3">
+              <input type="checkbox" id="annualReserveClearPrev" checked
+                     class="w-5 h-5 mt-0.5 text-indigo-600 rounded shrink-0">
+              <label for="annualReserveClearPrev" class="cursor-pointer select-none">
+                <span class="block text-xs font-bold text-slate-800">④ 前年度データを削除する（デフォルトON）</span>
+                <span class="block text-[11px] text-slate-600 mt-1 leading-relaxed">
+                  前年度の「端末一覧」（児童端末の行データ）を削除します。R41 分散構成では
+                  全子GASの端末一覧も並列でクリアします。<br>
+                  <span class="font-bold text-rose-700">教員マスタ・管理アカウント・各種設定シートは削除しません。</span>
+                </span>
+              </label>
+            </div>
+
+            <!-- 5. 操作ボタン -->
+            <div class="flex flex-wrap items-center gap-2">
+              <button id="annualReserveSaveBtn" onclick="saveAnnualReservation()"
+                      class="px-4 py-2 text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg shadow-sm transition">年次更新を予約保存</button>
+              <button id="annualReserveRunNowBtn" onclick="runAnnualReservationNow()"
+                      class="px-4 py-2 text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg shadow-sm transition">今すぐテスト実行／即時反映</button>
+              <button id="annualReserveCancelBtn" onclick="cancelAnnualReservation()"
+                      class="px-4 py-2 text-xs font-bold bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg transition">予約をキャンセル</button>
+              <button onclick="refreshAnnualReservationStatus()"
+                      class="px-3 py-2 text-[11px] font-semibold bg-white border border-slate-300 hover:bg-slate-50 text-slate-600 rounded-lg transition">状態を再読み込み</button>
+            </div>
+
+            <!-- 予約ステータス表示 -->
+            <div id="annualReserveStatusBox" class="text-[11px] text-slate-400">予約状態を読み込み中...</div>
+          </div>
+
         </div>
 
       </div>
     </div>
   </div>
 
-  <!-- ==================== モーダル: AI監視設定（管理者のみ・システム全体） ==================== -->
+  <!-- ==================== モーダル: サイト監視設定（管理者のみ・システム全体） ==================== -->
   <div id="monitorModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[65] hidden flex items-center justify-center p-3 sm:p-4">
     <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden">
       <div class="p-5 border-b flex items-center justify-between bg-slate-50 shrink-0">
@@ -1306,7 +1519,7 @@
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
             </svg>
           </span>
-          <span>AI監視設定（システム全体）</span>
+          <span>サイト監視設定（システム全体）</span>
         </h3>
         <button onclick="closeModal('monitorModal')" class="text-slate-400 hover:text-slate-600">✕</button>
       </div>
@@ -1316,7 +1529,7 @@
         <div class="bg-rose-50 border border-rose-200 rounded-xl p-4 flex items-start space-x-3">
           <input type="checkbox" id="monitorEnabledToggle" class="w-5 h-5 mt-0.5 text-rose-600 rounded shrink-0">
           <label for="monitorEnabledToggle" class="cursor-pointer select-none">
-            <span class="block text-sm font-bold text-rose-900">AI監視を有効にする（システム全体）</span>
+            <span class="block text-sm font-bold text-rose-900">サイト監視を有効にする（システム全体）</span>
             <span class="block text-[11px] text-rose-700 mt-1 leading-relaxed">
               有効にすると、児童が学習に関係のないサイトを開いたときに、端末一覧の氏名の横へ
               <span class="font-bold">⚠ 注意</span> マークが表示されます。<br>
@@ -1353,6 +1566,70 @@
           <textarea id="monitorLearningDomains" rows="8" spellcheck="false"
             class="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs font-mono focus:ring-indigo-500 focus:border-indigo-500"
             placeholder="google.com&#10;nhk.or.jp&#10;scratch.mit.edu"></textarea>
+        </div>
+
+        <!-- ===== ライブ視聴の管理設定（v1.6.8・管理者のみ） =====
+             システム全体に効くため、一般教員には表示しない（openMonitoringModal が弾く）。
+             保存は既存の MONITOR_SETTINGS_V1（PropertiesService）に相乗りし、
+             R41 では shard_apply 同梱経路で子GASへも配られる。 -->
+        <div class="border border-sky-200 bg-sky-50 rounded-xl p-4 space-y-3">
+          <div class="flex items-start space-x-2">
+            <span class="p-1.5 bg-sky-100 text-sky-700 rounded-lg shrink-0">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+            </span>
+            <div>
+              <span class="block text-sm font-bold text-sky-900">ライブ視聴の制限（準リアルタイム画面視聴）</span>
+              <span class="block text-[11px] text-sky-700 mt-1 leading-relaxed">
+                児童端末が<b>数秒おき</b>に現在の画面を送る「ライブ視聴」の同時枠を制限します。<br>
+                全体の上限は <b>24台</b>（相乗り視聴は満枠でも可）です。
+              </span>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label for="liveWatchPerTeacherLimit" class="block text-[11px] font-bold text-slate-700 mb-1">1教員あたりの同時ライブ視聴上限</label>
+              <select id="liveWatchPerTeacherLimit"
+                      class="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-2 text-xs focus:ring-sky-500 focus:border-sky-500">
+                <option value="0">0台（機能を停止）</option>
+                <option value="1">1台</option>
+                <option value="2">2台</option>
+                <option value="3" selected>3台（初期値）</option>
+                <option value="4">4台</option>
+                <option value="6">6台</option>
+                <option value="9">9台</option>
+                <option value="12">12台</option>
+                <option value="16">16台</option>
+                <option value="24">24台</option>
+                <option value="-1">無限（全体24台まで）</option>
+              </select>
+              <div class="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                0にすると一般教員の新規ライブ視聴は「現在管理者によりライブ視聴が制限されています」で止まります。
+              </div>
+            </div>
+            <div>
+              <label for="liveWatchTimeoutSec" class="block text-[11px] font-bold text-slate-700 mb-1">自動タイムアウト時間</label>
+              <select id="liveWatchTimeoutSec" onchange="syncLiveWatchTimeoutCustom()"
+                      class="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-2 text-xs focus:ring-sky-500 focus:border-sky-500">
+                <option value="60">60秒（1分）</option>
+                <option value="180" selected>180秒（3分・初期値）</option>
+                <option value="300">300秒（5分）</option>
+                <option value="600">600秒（10分）</option>
+                <option value="900">900秒（15分）</option>
+                <option value="custom">任意の秒数を指定</option>
+              </select>
+              <div class="flex items-center space-x-1.5 mt-1.5">
+                <input type="number" id="liveWatchTimeoutCustom" min="30" max="3600" step="10" placeholder="30〜3600"
+                       class="hidden w-24 bg-white border border-slate-300 rounded-lg px-2 py-1.5 text-xs">
+                <span id="liveWatchTimeoutCustomUnit" class="hidden text-[11px] text-slate-500">秒</span>
+              </div>
+              <div class="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                この時間を超えると自動で枠が解放されます（見忘れによる占有を防ぐ）。
+              </div>
+            </div>
+          </div>
+
+          <div id="liveWatchSettingsInfo" class="text-[10px] text-sky-700 leading-relaxed"></div>
         </div>
 
         <div id="monitorUpdatedInfo" class="text-[11px] text-slate-400"></div>
@@ -1776,6 +2053,10 @@
 
       loadDevices();
       setupAutoRefresh();
+      // 【R56】全体ライブ枠／自分の視聴枠のインジケーターをログイン直後に最新化する。
+      //   ここでは読み取り1回のみ（setInterval は作らない）。ポーリングは
+      //   ライブ視聴パネルで枠を開いたときだけ startLiveWatchPolling() が開始する。
+      try { refreshLiveWatchStatus(true); } catch (eLW0) {}
       // ログイン中は拡張機能のキープアライブを有効化（児童端末の同期を数秒以内に反映）
       startExtensionKeepalive();
     }
@@ -1872,8 +2153,101 @@
     // ==================================================================
     const SCREEN_FETCH_TIMEOUT_MS = 12000;  // 画面情報（子GAS・親/exec 共通）
     const WRITE_FETCH_TIMEOUT_MS = 25000;   // 書き込み系（従来の挙動を壊さない余裕）
+    const LIST_FETCH_TIMEOUT_MS = 12000;    // 【R55】端末一覧（get_all）の /exec 直送
     function isDirectFetchAction(act) {
       return act === 'get_screens' || act === 'request_screens';
+    }
+
+    // ==================================================================
+    // 【R55】端末一覧（get_all）の /exec 直送
+    //
+    //   自動更新は 4 秒周期で一覧を取り直す。しかし get_all が
+    //   google.script.run を通ると、裏の callback?nocache_id= ポーリングで
+    //   往復に 3.6〜7.1 秒かかる（R36 の実測）。「周期 4 秒なのに画面は
+    //   10 秒前の状態」という体感の直接原因がこれ。
+    //   書き込み系・画面情報系と同じ /exec 直送に揃え、往復を 1 回分にする。
+    //
+    //   失敗（URL未設定・ネットワーク断・タイムアウト）は呼び出し側で
+    //   従来の google.script.run 経路へ退避する（挙動を壊さない）。
+    //   認証切れ（need_auth）は退避しない（再ログイン導線を二重に走らせない）。
+    // ==================================================================
+    async function apiRequestDirectList(payload) {
+      const apiUrl = getApiUrl();
+      if (!apiUrl) {
+        const e = new Error('GAS APIエンドポイントが取得できません。');
+        e.noFallback = false;
+        throw e;
+      }
+      const body = Object.assign({}, payload);
+      if (authToken) body.token = authToken;
+      const res = await eduFetchWithTimeout(apiUrl, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        redirect: 'follow'
+      }, LIST_FETCH_TIMEOUT_MS);
+      const data = await res.json();
+      if (data && data.need_auth) {
+        logout();
+        const e = new Error('セッションの有効期限が切れました。再ログインしてください。');
+        e.noFallback = true;
+        throw e;
+      }
+      if (data && data.success === false) {
+        const e = new Error(data.error || 'リクエスト処理に失敗しました');
+        e.noFallback = true;   // サーバーが明示的に拒否＝退避しても同じ結果
+        throw e;
+      }
+      return data;
+    }
+
+    // ==================================================================
+    // 【R59】ライブ視聴フレーム（live_watch_frames）の /exec 直送
+    //
+    //   実機ではライブ視聴の画像が切り替わるまで約 6 秒かかっていた。
+    //   拡張機能は 1.5 秒で撮影・送信しているのに、管理画面側の取得が
+    //   google.script.run の callback?nocache_id= ポーリング（実測 3.6〜7.1 秒）
+    //   を通っていたため、往復待ちがそのまま「切り替わりの遅さ」になっていた。
+    //   R55 の get_all と同じく /exec へ直送し、往復を 1 回分にする。
+    //
+    //   ・失敗（URL未設定・ネットワーク断・タイムアウト）だけ google.script.run
+    //     へ退避する（環境差で画像が取れなくなることはない）。
+    //   ・認証切れ（need_auth）は退避しない（再ログイン導線を二重に走らせない）。
+    //   ・直送が続けて失敗する環境では、毎回タイムアウトを待つと遅くなるため
+    //     一定時間だけ従来経路を優先する（クールダウン）。
+    // ==================================================================
+    const LIVE_FRAME_FETCH_TIMEOUT_MS = 9000;   // フレーム取得の上限（画像 1〜数枚）
+    const LIVE_FRAME_DIRECT_COOLDOWN_MS = 10000;
+    let liveFramesDirectCooldownUntil = 0;
+
+    async function apiRequestDirectLiveFrames(payload) {
+      const apiUrl = getApiUrl();
+      if (!apiUrl) {
+        const e = new Error('GAS APIエンドポイントが取得できません。');
+        e.noFallback = false;
+        throw e;
+      }
+      const body = Object.assign({}, payload);
+      if (authToken) body.token = authToken;
+      const res = await eduFetchWithTimeout(apiUrl, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        redirect: 'follow'
+      }, LIVE_FRAME_FETCH_TIMEOUT_MS);
+      const data = await res.json();
+      if (data && data.need_auth) {
+        logout();
+        const e = new Error('セッションの有効期限が切れました。再ログインしてください。');
+        e.noFallback = true;
+        throw e;
+      }
+      if (data && data.success === false) {
+        const e = new Error(data.error || 'リクエスト処理に失敗しました');
+        e.noFallback = true;   // サーバーが明示的に拒否＝退避しても同じ結果
+        throw e;
+      }
+      return data;
     }
 
     // fetch に上限時間を付ける。AbortController が無い環境では素の fetch。
@@ -2050,6 +2424,15 @@
     }
 
     // GAS 側 parseBoolean と同じ意味（"false" を true にしない）。
+    // 【要件1】一斉URL配信の broadcast_id は「押下した瞬間」にクライアントで1つだけ採番する。
+    //   理由: R41 の高速配信は 親/exec と 子GAS直送 を同一tickで撃つため、
+    //         親の応答を待ってからIDを受け取る方式では直送にIDを載せられない。
+    //   ここで採番した1つのIDを 親・子直送・保留キューflush の全経路に載せることで、
+    //   端末側が「同じ配信」と判定でき、同じページが2枚開く事故を防ぐ。
+    function mintBroadcastId() {
+      return 'bc_' + new Date().getTime() + '_' + Math.random().toString(36).slice(2, 7);
+    }
+
     function parseBoolJs(v) {
       if (v === true || v === false) return v;
       if (typeof v === 'number') return v !== 0;
@@ -2116,6 +2499,12 @@
         patch.screen_lock = parseBoolJs(src.locked);
       } else if (act === 'bulk_broadcast') {
         patch.broadcast_url = String(src.url === undefined ? '' : src.url);
+        // 【要件1】子GAS直送にも押下時に採番したIDを載せる。
+        //   載せないと子が generateBroadcastId() で別IDを発番し、
+        //   親経由と子直送で2つのIDになり端末が2枚開く（実機症状の本丸）。
+        if (src.broadcast_id !== undefined && src.broadcast_id !== null) {
+          patch.broadcast_id = String(src.broadcast_id);
+        }
       } else if (act === 'bulk_filter') {
         if (src.filter_mode !== undefined) patch.filter_mode = src.filter_mode;
         if (src.whitelist_urls !== undefined) patch.whitelist_urls = src.whitelist_urls;
@@ -2127,6 +2516,9 @@
         if (d.whitelist_urls !== undefined) patch.whitelist_urls = d.whitelist_urls;
         if (d.blacklist_urls !== undefined) patch.blacklist_urls = d.blacklist_urls;
         if (d.broadcast_url !== undefined) patch.broadcast_url = d.broadcast_url;
+        if (d.broadcast_id !== undefined && d.broadcast_id !== null) {
+          patch.broadcast_id = String(d.broadcast_id);
+        }
       }
       return patch;
     }
@@ -2536,9 +2928,25 @@
         //     基準 0 では pending にならないため、安全側（固着しない側）に倒れる。
         const ownBaseMs = (baseById && typeof baseById[id] === 'number' && baseById[id] > 0)
           ? baseById[id] : 0;
-        const refMs = sheetReqMs > 0 ? sheetReqMs : ownBaseMs;
+        //   3) どちらも無ければ「押下した瞬間（ブラウザ時計）」を時計ズレ許容付きで使う。
+        //      ここを 0 のままにすると isFresh が常に false になり、シート要求日時が
+        //      空の環境で「新着を永久に検出できない」ことになる。
+        const skewMs = (typeof SCREEN_CLOCK_SKEW_MS === 'number' && SCREEN_CLOCK_SKEW_MS > 0)
+          ? SCREEN_CLOCK_SKEW_MS : 5000;
+        const browserBaseMs = (typeof screenRequestAfterTs === 'number' && screenRequestAfterTs > 0)
+          ? (screenRequestAfterTs - skewMs) : 0;
+        const refMs = sheetReqMs > 0 ? sheetReqMs : (ownBaseMs > 0 ? ownBaseMs : browserBaseMs);
+        // 【要件1】押下時刻（ブラウザ時計）を「厳格な下限」として必ず併用する。
+        //   ・シートの『画面情報要求日時』(sheetReqMs) が空の運用（端末オフライン／
+        //     スリープ等）でも、押下より前の更新日時は「前回の古い画像」である。
+        //   ・上の refMs は「その児童の押下時の最新撮影時刻」を基準にするため、
+        //     押下前の画像が基準と一致して isFresh=true になり得る（実機の誤判定）。
+        //   よって refMs の結果に関わらず、押下前の日時は無条件で「新着でない」。
+        const strictFloorMs = (typeof screenRequestAfterTs === 'number' && screenRequestAfterTs > 0)
+          ? (screenRequestAfterTs - skewMs) : 0;
+        const belowFloor = (strictFloorMs > 0 && rawShotMs > 0 && rawShotMs < strictFloorMs);
         // 新着 = 撮影時刻が要求時刻以降（同一秒は新着とみなす＝切捨て誤差を吸収）
-        const isFresh = rawShotMs > 0 && refMs > 0 && rawShotMs >= refMs;
+        const isFresh = !belowFloor && rawShotMs > 0 && refMs > 0 && rawShotMs >= refMs;
         // 【R43.3】端末が「撮影できなかった」と報告している場合は、
         //   要求より新しい画像が無くても「更新待ち」にしない。
         //   chrome://newtab/ 等の特権ページは Chrome の仕様上撮影できず、
@@ -2553,12 +2961,26 @@
         //   ・万一の時計ズレでも TTL 超過で解除される
         //   → R43 のような「永久に更新待ち」の固着は原理的に起こらない。
         r.pending_new = !!(reqActive && !pendExpired && !isBlocked &&
-                           r.has_image && refMs > 0 && !isFresh);
+                           r.has_image && (refMs > 0 || belowFloor) && !isFresh);
         r.shot_is_fresh = !!(r.has_image && isFresh);
+        // 【要件1】押下前の日時＝「前回の古い画像」。完了扱いにせず、描画でも隠す。
+        r.stale_before_request = !!belowFloor;
+        // 【要件1/仕様(a)】押下後ポーリング中は旧画像を「今の画面」と誤認させない。
+        //   needs_image=true の間、renderScreens は画像を出さず「取得中」を表示する。
+        r.needs_image = !!(belowFloor || r.needs_image === true);
         r.screenshot_ms = rawShotMs;
       });
 
       return order.map(function (id) { return byId[id]; });
+    }
+
+    // 【Bug B】画像(Base64)の同一性を短い署名にする。
+    //   Base64 全体を sig に入れると毎回巨大な文字列比較になって重いので、
+    //   「長さ + 末尾16文字」で同一性を判定する（実機例: ...EUUAAQAE → ...BQAQ== を区別）。
+    function screenImageSig(d) {
+      const u = (d && typeof d.image_data_url === 'string') ? d.image_data_url : '';
+      if (!u) return '0';
+      return u.length + ':' + u.slice(-16);
     }
 
     // GAS へ「コンソール稼働中」を通知（google.script.run 優先、無ければ fetch フォールバック）。
@@ -2651,7 +3073,7 @@
       const settingsLabel = document.getElementById('teacherSettingsBtnLabel');
       if (settingsLabel) settingsLabel.textContent = isAdminUser() ? '設定 (クラス・URL)' : '設定 (URL・規制)';
 
-      // AI監視設定は「システム全体」に効くため、管理者(ADMIN)のみに表示する。
+      // サイト監視設定は「システム全体」に効くため、管理者(ADMIN)のみに表示する。
       const monitorBtn = document.getElementById('monitorSettingsBtn');
       if (monitorBtn) monitorBtn.classList.toggle('hidden', !isAdminUser());
 
@@ -2710,6 +3132,73 @@
       }
     }
 
+    // ==================== Googleアカウント シングルサインオン（SSO） ====================
+    // 教員が「Googleアカウントでログイン」を押したときの処理。
+    //   サーバー側 api_ssoLogin() が Session.getActiveUser().getEmail() で
+    //   アクセス中のGoogleアカウントを取得し、許可リスト（SSO_SETTINGS_V1）と
+    //   教員マスタの両方に一致したときだけ、手動ログインと同一の正規トークンを返す。
+    //   児童アカウント・未許可アカウント・メール取得不可は、すべてサーバー側で拒否される。
+    async function handleSsoLogin() {
+      const errBox = document.getElementById('ssoError');
+      const btn = document.getElementById('ssoLoginBtn');
+      const btnText = document.getElementById('ssoLoginBtnText');
+      const spinner = document.getElementById('ssoLoginBtnSpinner');
+
+      if (errBox) errBox.classList.add('hidden');
+
+      // google.script.run が無い環境（拡張機能・通常Webページ）ではSSOできない旨を案内する。
+      if (typeof google === 'undefined' || !google.script || !google.script.run) {
+        if (errBox) {
+          errBox.textContent = 'この環境ではGoogleアカウントSSOを利用できません。上の欄から管理者パスワードを入力してログインしてください。';
+          errBox.classList.remove('hidden');
+        }
+        return;
+      }
+
+      if (btn) btn.disabled = true;
+      if (btnText) btnText.textContent = 'ログイン中...';
+      if (spinner) spinner.classList.remove('hidden');
+
+      try {
+        const res = await new Promise((resolve, reject) => {
+          google.script.run
+            .withSuccessHandler(function (r) {
+              if (typeof r === 'string') { try { r = JSON.parse(r); } catch (e) {} }
+              resolve(r);
+            })
+            .withFailureHandler(function (err) {
+              reject(new Error(err && err.message ? err.message : String(err)));
+            })
+            .api_ssoLogin();
+        });
+
+        if (res && res.success && res.token) {
+          authToken = res.token;
+          currentTeacher = res.teacher;
+          localStorage.setItem('edu_teacher_token', authToken);
+          localStorage.setItem('edu_teacher_info', JSON.stringify(currentTeacher));
+          showToast(`ようこそ、${currentTeacher.name} 先生（Googleアカウント）`, 'success');
+          showDashboard();
+          // 【R41】子GASのURLと共有シークレットを取得しておく（並列直送の準備）
+          try { syncShardClientConfig(true); } catch (eSC) {}
+        } else {
+          const msg = (res && res.error)
+            ? res.error
+            : 'このGoogleアカウントには管理権限がありません。許可された教員アカウントでログインするか、上の欄から管理者パスワードを入力してください。';
+          if (errBox) { errBox.textContent = msg; errBox.classList.remove('hidden'); }
+        }
+      } catch (err) {
+        if (errBox) {
+          errBox.textContent = 'GoogleアカウントSSOに失敗しました: ' + (err && err.message ? err.message : String(err));
+          errBox.classList.remove('hidden');
+        }
+      } finally {
+        if (btn) btn.disabled = false;
+        if (btnText) btnText.textContent = 'Googleアカウントでログイン（シングルサインオン）';
+        if (spinner) spinner.classList.add('hidden');
+      }
+    }
+
     // ログアウト処理
     function logout() {
       if (confirm('ログアウトしますか？')) {
@@ -2738,6 +3227,40 @@
       // 【R43】画面情報（get_screens / request_screens）も /exec 直送にする。
       //   google.script.run の callback ポーリング往復（3.6〜7.1秒）を無くすため。
       const __screenAction = isDirectFetchAction(payload && payload.action);
+      // 【R55】端末一覧（get_all）は /exec 直送。google.script.run の callback ポーリング
+      //   往復（実測 3.6〜7.1 秒）を無くし、自動更新の 4 秒周期を実効化する。
+      //   失敗（URL未設定・ネットワーク断・タイムアウト）は従来経路（google.script.run）へ
+      //   退避するので、環境差で一覧が取れなくなることはない。
+      const __listAction = !!(payload && payload.action === 'get_all');
+      if (__listAction) {
+        try {
+          return await apiRequestDirectList(payload);
+        } catch (eList) {
+          const __hasRunner = (typeof google !== 'undefined' && google.script && google.script.run);
+          if ((eList && eList.noFallback) || !__hasRunner) throw eList;
+          // ここから下の従来経路へ落ちる（退避）
+        }
+      }
+      // 【R59】ライブ視聴フレーム（live_watch_frames）も /exec 直送を優先する。
+      //   画像の切り替わりが約 6 秒かかっていたのは、この取得だけが
+      //   google.script.run の callback ポーリング往復（実測 3.6〜7.1 秒）を
+      //   通っていたため。R55 の get_all と同じ扱いに揃える。
+      //   直送が続けて失敗する環境では、クールダウン中だけ従来経路を優先して
+      //   毎回タイムアウトを待つ遅さを避ける（画像は必ず取れる）。
+      const __liveFramesAction = !!(payload && payload.action === 'live_watch_frames');
+      if (__liveFramesAction && Date.now() >= liveFramesDirectCooldownUntil) {
+        try {
+          const __lf = await apiRequestDirectLiveFrames(payload);
+          liveFramesDirectCooldownUntil = 0;
+          return __lf;
+        } catch (eLf) {
+          const __hasRunner2 = (typeof google !== 'undefined' && google.script && google.script.run);
+          if ((eLf && eLf.noFallback) || !__hasRunner2) throw eLf;
+          // 非認証の失敗のみ退避する。次回以降は一定時間だけ従来経路を優先する。
+          liveFramesDirectCooldownUntil = Date.now() + LIVE_FRAME_DIRECT_COOLDOWN_MS;
+          // ここから下の従来経路へ落ちる（退避）
+        }
+      }
       if (__directFetch) {
         // 【R37】応答を待たず、送信と「完全同時（0ms）」に子GASビーコンを撃つ。
         //   親シートの書き込みと子シートの書き込みを時間軸で重ねるため。
@@ -2783,7 +3306,7 @@
           } else if (act === 'bulk_lock') {
             runner.api_bulkLock(authToken, payload.student_ids, payload.locked);
           } else if (act === 'bulk_broadcast') {
-            runner.api_bulkBroadcast(authToken, payload.student_ids, payload.url);
+            runner.api_bulkBroadcast(authToken, payload.student_ids, payload.url, payload.broadcast_id || '');
           } else if (act === 'bulk_filter') {
             runner.api_bulkFilter(authToken, payload.student_ids, payload.filter_mode, payload.whitelist_urls, payload.blacklist_urls);
           } else if (act === 'update_single') {
@@ -2808,10 +3331,42 @@
             runner.api_runAnnualRollover(authToken, payload.data || payload);
           } else if (act === 'get_archived_students') {
             runner.api_getArchivedStudents(authToken);
+          } else if (act === 'annual_reservation_save') {
+            runner.api_annualReservationSave(authToken, payload.data || payload);
+          } else if (act === 'annual_reservation_status') {
+            runner.api_annualReservationStatus(authToken);
+          } else if (act === 'annual_reservation_cancel') {
+            runner.api_annualReservationCancel(authToken);
+          } else if (act === 'annual_rollover_run_now') {
+            runner.api_annualRolloverRunNow(authToken, payload.data || payload);
           } else if (act === 'get_monitor_settings') {
             runner.api_getMonitorSettings(authToken);
           } else if (act === 'save_monitor_settings') {
             runner.api_saveMonitorSettings(authToken, payload.settings || {});
+          } else if (act === 'live_watch_status') {
+            // 【R56】全体系のライブ枠使用数・自分の枠数を取得（読み取りのみ）。
+            runner.api_liveWatchStatus(authToken);
+          } else if (act === 'live_watch_start') {
+            runner.api_liveWatchStart(authToken, payload.student_ids);
+          } else if (act === 'live_watch_extend') {
+            runner.api_liveWatchExtend(authToken, payload.student_ids);
+          } else if (act === 'live_watch_stop') {
+            runner.api_liveWatchStop(authToken, payload.student_ids);
+          } else if (act === 'live_watch_frames') {
+            runner.api_liveWatchFrames(authToken, payload.student_ids);
+          } else if (act === 'list_schedules') {
+            runner.api_listSchedules(authToken, payload.school_name);
+          } else if (act === 'save_schedule') {
+            runner.api_saveSchedule(authToken, payload);
+          } else if (act === 'cancel_schedule') {
+            runner.api_cancelSchedule(authToken, payload.schedule_id || payload.id);
+          } else if (act === 'override_schedule') {
+            runner.api_overrideSchedule(authToken, payload.schedule_id || payload.id, payload.action_type || payload.override_type);
+          } else if (act === 'update_schedule' || act === 'schedule_update') {
+            // 【Request P 修正】予約の編集。google.script.run 連鎖に分岐が無く
+            //   「未対応のアクション: update_schedule」で失敗していた。
+            //   doPost（G6）と同じく schedule_id を維持したまま行を書き換える。
+            runner.api_updateSchedule(authToken, payload);
           } else {
             reject(new Error('未対応のアクション: ' + act));
           }
@@ -2861,12 +3416,51 @@
       return data;
     }
 
-    // 自動更新の制御
+    // ==================== 自動更新の制御（R55） ====================
     // 既定は「オフ（手動更新メイン）」。児童情報はログイン後に一度読み込み、以降は
     // 教員が指示（ロック/配信/規制/画面取得）したときだけ通信する運用のため、
-    // 5秒ごとの自動取得は標準では行わない（通信・GAS実行回数の節約）。
+    // 自動取得は標準では行わない（通信・GAS実行回数の節約）。
     // 教員が明示的にオンにした場合のみ自動更新し、その選択は localStorage に保存する。
+    //
+    // 【R55 実機不具合の修正】
+    //   症状: 自動更新を ON にしていても、ON を OFF にして手動「再読み込み」を押した方が
+    //         オンライン／オフラインの反映が早い。
+    //   原因は「呼ぶ関数の違い」ではなく、次の 3 点だった。
+    //     ① 一覧取得（get_all）が google.script.run の callback ポーリング経路
+    //        （実測 3.6〜7.1 秒の往復）を通っていた。手動も同じ経路なので、
+    //        自動更新は毎周期この往復待ちを払い、結果として「反映が遅い」体感になる。
+    //     ② GAS 側に 3 段の読み取りキャッシュ（dev2_ 5 秒 / shard_ga_ 4 秒 /
+    //        shard_ls_ 4 秒）があり、子GAS の最新 last_seen が数秒古いまま返る。
+    //        書込は dev_v を進めてキャッシュを捨てるため、操作直後の手動更新だけが
+    //        「新鮮」に見えていた（＝手動の方が早い、という錯覚の正体）。
+    //     ③ 自動更新の周期が固定で、通信中の次周期が重なると多重リクエストになり、
+    //        古い応答が後から届いて画面を巻き戻すことがあった。
+    //   対策:
+    //     ・取得経路を 1 本化（refreshDevicesNow → loadDevices）。自動更新・
+    //       タブ復帰・操作直後のいずれも同じ loadDevices を fresh 指定で呼ぶ。
+    //     ・get_all を /exec 直送にして往復待ちを無くす（失敗時は従来経路へ退避）。
+    //     ・fresh 指定で GAS 側の読み取りキャッシュを迂回し、子GAS の最新
+    //       last_seen まで取り直す（Code.gs の第4引数 fresh）。
+    //     ・isFetching による排他制御（多重リクエストを作らない）。
+    //     ・周期は 4 秒（3〜5 秒要件）。連続失敗時のみ 8 秒へ自動緩和する。
+    //     ・document.hidden の間はポーリングを止め、復帰した瞬間に 1 回取得する。
+    const AUTO_REFRESH_INTERVAL_MS = 4000;      // 既定周期（3〜5 秒要件の中央値）
+    const AUTO_REFRESH_MAX_INTERVAL_MS = 8000;  // 連続失敗時の緩和上限
+    const AUTO_REFRESH_TICK_MS = 1000;          // 内部の刻み（経過時間で間引く）
+    const AUTO_REFRESH_FAIL_STREAK = 3;         // この回数連続で失敗したら緩和する
+
     let autoRefreshBound = false;
+    let autoRefreshOn = false;                  // 教員が ON にしているか
+    let autoRefreshVisibilityBound = false;     // visibilitychange の二重登録防止
+    let autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS; // 現在の実効周期
+    let autoRefreshNextAt = 0;                  // 次に取得してよい時刻（0＝即時）
+    let autoRefreshFailStreak = 0;              // 連続失敗回数
+    // 通信中フラグ（in-flight ガード）。loadDevices が立て、完了時に必ず下ろす。
+    //   ※ 手動更新は常に許可する。ガードするのは自動更新／復帰／操作直後の
+    //     「タイマー起点」の取得だけ（教員の明示操作を握りつぶさない）。
+    let isFetching = false;
+    let refreshTriggerSource = '';              // 直近の取得トリガ（診断用）
+
     function setupAutoRefresh() {
       const toggle = document.getElementById('autoRefreshToggle');
       if (!toggle) return;
@@ -2879,39 +3473,224 @@
         autoRefreshBound = true;
         toggle.addEventListener('change', () => {
           try { localStorage.setItem('edu_auto_refresh', toggle.checked ? '1' : '0'); } catch (e) {}
-          if (toggle.checked) startAutoRefresh();
-          else stopAutoRefresh();
+          if (toggle.checked) {
+            startAutoRefresh();
+            refreshDevicesNow('toggle');
+          } else {
+            stopAutoRefresh();
+          }
         });
       }
+      bindAutoRefreshVisibility();
       if (toggle.checked) startAutoRefresh();
       else stopAutoRefresh();
     }
 
+    // 自動更新の開始。周期は「1 秒刻みのタイマー＋経過時間判定」で実現する。
+    //   setInterval を周期そのもので張ると、動的緩和（8 秒）へ切り替えるたびに
+    //   タイマーを張り直す必要があり、張り直しの隙間で取得が飛ぶ。
+    //   1 秒刻みにしておけば、周期の変更は変数 1 つの書き換えで済む。
     function startAutoRefresh() {
       stopAutoRefresh();
-      autoRefreshTimer = setInterval(() => {
-        loadDevices(true);
-      }, 5000);
+      autoRefreshOn = true;
+      autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
+      autoRefreshFailStreak = 0;
+      autoRefreshNextAt = Date.now() + autoRefreshIntervalMs;
+      autoRefreshTimer = setInterval(autoRefreshTick, AUTO_REFRESH_TICK_MS);
     }
 
     function stopAutoRefresh() {
+      autoRefreshOn = false;
       if (autoRefreshTimer) {
         clearInterval(autoRefreshTimer);
         autoRefreshTimer = null;
       }
     }
 
+    // タイマーの 1 刻み。実際に取得するかをここで判定する。
+    function autoRefreshTick() {
+      if (!autoRefreshOn) return;
+      // 【省電力】タブが非表示（他タブ／最小化／画面ロック）の間は取得しない。
+      if (isTabHidden()) return;
+      const now = Date.now();
+      if (autoRefreshNextAt && now < autoRefreshNextAt) return;
+      autoRefreshNextAt = now + autoRefreshIntervalMs;
+      refreshDevicesNow('auto');
+    }
+
+    // タブが非表示か（document.hidden）。判定できない環境では「表示中」とみなす。
+    function isTabHidden() {
+      try {
+        return !!(typeof document !== 'undefined' && document && document.hidden === true);
+      } catch (e) { return false; }
+    }
+
+    // タブの表示状態の監視。非表示中はポーリングを止め、復帰した瞬間に 1 回取得する。
+    function bindAutoRefreshVisibility() {
+      if (autoRefreshVisibilityBound) return;
+      autoRefreshVisibilityBound = true;
+      try {
+        if (typeof document !== 'undefined' && document &&
+            typeof document.addEventListener === 'function') {
+          document.addEventListener('visibilitychange', onAutoRefreshVisibilityChange);
+        }
+        if (typeof window !== 'undefined' && window &&
+            typeof window.addEventListener === 'function') {
+          // visibilitychange が発火しない環境（一部の埋め込み）への保険。
+          window.addEventListener('focus', onAutoRefreshVisibilityChange);
+        }
+      } catch (e) {}
+    }
+
+    function onAutoRefreshVisibilityChange() {
+      if (!autoRefreshOn) return;
+      if (isTabHidden()) {
+        // 非表示になったら次の機会を無効化しておく（tick 側でも止まる）。
+        autoRefreshNextAt = 0;
+        return;
+      }
+      // 復帰: 緩和を解除し、タイマーを待たずに即座に 1 回取得する。
+      autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
+      autoRefreshFailStreak = 0;
+      autoRefreshNextAt = 0;
+      refreshDevicesNow('visible');
+    }
+
+    // タイマー起点の取得は必ずここを通す（in-flight ガード付き）。
+    //   戻り値: 実際に取得を開始したら true、多重／即時取得できないとき false。
+    function refreshDevicesNow(trigger) {
+      if (isFetching) return false;   // 通信中は次周期に任せる（多重リクエスト禁止）
+      refreshTriggerSource = trigger || 'auto';
+      try {
+        loadDevices(true, { fresh: true, trigger: refreshTriggerSource });
+      } catch (e) {
+        return false;
+      }
+      return true;
+    }
+
+    // 手動「再読み込み」ボタンの入口。
+    //   自動更新と同じ loadDevices（fresh 指定）を通すので取得経路は完全に同一。
+    //   教員の明示操作なので in-flight ガードでは止めない（loadSeq が古い応答を捨てる）。
+    //   併せて自動更新の次回時刻をリセットし、直後の二重取得を避ける。
+    function refreshDevicesManual() {
+      refreshTriggerSource = 'manual';
+      autoRefreshNextAt = Date.now() + autoRefreshIntervalMs;
+      try {
+        loadDevices(false, { fresh: true, trigger: 'manual' });
+      } catch (e) {}
+    }
+
+    // 取得結果を周期制御へフィードバックする（失敗が続いたときだけ緩和）。
+    function noteRefreshResult(ok) {
+      if (ok) {
+        autoRefreshFailStreak = 0;
+        autoRefreshIntervalMs = AUTO_REFRESH_INTERVAL_MS;
+        return;
+      }
+      autoRefreshFailStreak++;
+      if (autoRefreshFailStreak < AUTO_REFRESH_FAIL_STREAK) return;
+      const relaxed = AUTO_REFRESH_INTERVAL_MS * Math.pow(2, autoRefreshFailStreak - AUTO_REFRESH_FAIL_STREAK + 1);
+      autoRefreshIntervalMs = Math.min(relaxed, AUTO_REFRESH_MAX_INTERVAL_MS);
+      autoRefreshNextAt = Date.now() + autoRefreshIntervalMs;
+    }
+
     // ==================== 同時使用時の競合対策（フロント側） ====================
     // 同じ学校に複数の教員が同時ログインし、各クラスで操作する運用を想定する。
-    //  - loadSeq: 自動更新(5秒)と手動更新が重なった場合に、古い応答が新しい応答を
+    //  - loadSeq: 自動更新と手動更新が重なった場合に、古い応答が新しい応答を
     //    上書きしてしまう（＝直前の操作結果が一瞬巻き戻って見える）のを防ぐ。
     //  - refreshSuppressedUntil: 一括操作の直後は自動更新の反映を少し止め、
     //    サーバー反映前の古い状態が一瞬表示されるのを防ぐ。
     let loadSeq = 0;
     let refreshSuppressedUntil = 0;
 
-    // 端末データの取得
-    async function loadDevices(isSilent = false) {
+    // ==================== 楽観更新保護（ロールバックバウンス対策） ====================
+    //
+    // 【実機症状】ロック解除を押すと即座に「解除中」になるのに、約5秒後に勝手に
+    //   「ロック中」へ先祖返りし、さらに約15秒後にようやく「解除中」で落ち着く。
+    //   URL規制の実行・解除でも同じ。つまり「楽観更新 → 古い応答で上書き →
+    //   本当の応答で復帰」という往復（バウンス）が起きていた。
+    //
+    // 【原因】操作直後も 5 秒間隔の自動更新（startAutoRefresh → loadDevices(true)）が
+    //   止まらない。下の loadSeq は「新しい取得が始まったら古い応答を捨てる」だけで、
+    //   「その応答が【操作より前】に発行されたか」を見ていない。さらにサーバー応答は
+    //   GAS /exec のリダイレクトで 3.8 秒かかるため、操作前に発行された取得が
+    //   操作後に結果を返し、devicesData を丸ごと差し替えて楽観更新を消していた。
+    //   apply は devicesData を直接ミューテートするが、代入で配列ごと入れ替わるため
+    //   楽観更新の痕跡は残らず、「期待値」を別に持っていないので検知もできなかった。
+    //   （refreshSuppressedUntil という抑止の器はあったが、未来時刻で武装された箇所が
+    //     1つも無く、実質デッドコードだった。成功時に 0 へ戻す処理だけが残っていた。）
+    //
+    // 【対策：二段構え】片方だけでは防げないため両方入れる。
+    //   ① optimisticGuard … 児童ID × フィールドごとに「期待値」と「保護期限」を持ち、
+    //      期限内にサーバーから【古い値】が来たら上書きをスキップして楽観値を守る。
+    //      サーバーが期待値と一致した時点でそのフィールドの保護を解除する（＝値の防衛）。
+    //   ② loadSeq++（世代飛ばし）… 操作開始時に世代を進め、操作前に発行された
+    //      取得の応答そのものを破棄する（＝到着の遮断）。
+    //
+    //   保護期限は必ず切れる（期限切れで保護を捨ててサーバー値に従う）ので、
+    //   サーバー側が異常に古いままでも永久に画面が固まることはない。
+    const OPTIMISTIC_GUARD_MS = 12000;   // 保護期間（要件1の 10〜15 秒の範囲内）
+    let optimisticGuard = {};            // { studentId: { field: { expect, until } } }
+
+    // 操作の対象児童について「期待する最新状態」を記録する。
+    //   ids   : ['a1','a2'] のような児童IDの配列
+    //   patch : { screen_lock:false } / { filter_mode:'OFF' } / { broadcast_url:url }
+    function armOptimisticGuard(ids, patch) {
+      const fields = Object.keys(patch || {});
+      if (!fields.length) return;
+      const until = Date.now() + OPTIMISTIC_GUARD_MS;
+      (ids || []).forEach(function (id) {
+        if (!id) return;
+        const cur = optimisticGuard[id] || (optimisticGuard[id] = {});
+        fields.forEach(function (field) {
+          cur[field] = { expect: patch[field], until: until };
+        });
+      });
+    }
+
+    // 保護を明示的に解除する（通信失敗で revert したときなど）。
+    //   revert 後は画面もサーバーも「操作前」に戻るので、保護を残すと
+    //   以後の正当な更新までブロックしてしまう。必ず一緒に消す。
+    function clearOptimisticGuard(ids) {
+      (ids || []).forEach(function (id) {
+        if (id) delete optimisticGuard[id];
+      });
+    }
+
+    // サーバー応答の1件を保護レジストリと突き合わせ、必要なら値を書き換える。
+    //   ・期待値と一致        → 反映済み。保護を解除して以後は素直に従う
+    //   ・期限内かつ古い値    → 上書きをスキップ（楽観値を押し戻す）
+    //   ・期限切れ            → 保護を捨ててサーバー値に従う（永久に固まらせない）
+    function reconcileOptimisticGuard(dev) {
+      if (!dev || !dev.student_id) return;
+      const g = optimisticGuard[dev.student_id];
+      if (!g) return;
+      const now = Date.now();
+      Object.keys(g).forEach(function (field) {
+        const e = g[field];
+        if (!e) return;
+        if (now > e.until) { delete g[field]; return; }              // 期限切れ → 諦める
+        if (String(dev[field]) === String(e.expect)) {               // 一致 → 解除
+          delete g[field];
+        } else {
+          dev[field] = e.expect;                                     // 古い → 楽観値を維持
+        }
+      });
+      if (Object.keys(g).length === 0) delete optimisticGuard[dev.student_id];
+    }
+
+    // 端末データの取得（手動「再読み込み」・自動更新・タブ復帰・操作直後の共通経路）
+    //
+    //   【R55】第2引数 opts:
+    //     fresh   … true で GAS 側の読み取りキャッシュを迂回し、子GASの最新 last_seen を
+    //               取り直す（自動更新／タブ復帰／操作直後は常に true。手動も fresh）。
+    //     trigger … 取得の発火元（'manual' / 'auto' / 'visible' / 'mutation' / 'toggle'）。
+    //   手動「再読み込み」と自動更新は同じこの関数を通るので、取得経路は完全に同一。
+    async function loadDevices(isSilent = false, opts) {
+      const __o = opts || {};
+      const __trigger = __o.trigger || (isSilent ? 'auto' : 'manual');
+      const __fresh = (__o.fresh === true);
       // 一括操作直後の自動更新は、サーバー反映が完了するまで抑止する
       // （手動更新 isSilent=false は常に許可する）
       if (isSilent && Date.now() < refreshSuppressedUntil) return;
@@ -2920,6 +3699,10 @@
       if (!isSilent && spinner) spinner.classList.add('animate-spin');
 
       const mySeq = ++loadSeq;
+      // 通信中フラグ（in-flight ガード）。タイマー起点の呼び出しは
+      // refreshDevicesNow 側でこのフラグを見て多重リクエストを作らない。
+      isFetching = true;
+      let __ok = false;
       try {
         const scopeSchool = getTeacherScopeSchool();
         const includeUnassigned = document.getElementById('includeUnassignedCheckbox')?.checked ?? true;
@@ -2934,17 +3717,29 @@
         const res = await apiRequest({
           action: 'get_all',
           school_name: schoolFilter,
-          include_unassigned: scopeSchool ? true : includeUnassigned
+          include_unassigned: scopeSchool ? true : includeUnassigned,
+          // 【R55】読み取りキャッシュを迂回して子GASの最新 last_seen を取り直す
+          fresh: __fresh
         });
 
         // 新しい取得が始まっていたら、この（古い）応答は破棄する
         if (mySeq !== loadSeq) return;
 
         if (res && Array.isArray(res.data)) {
-          devicesData = res.data;
+          // 【ロールバックバウンス対策】届いた配列を採用する前に、保護期間内の
+          //   児童について「サーバー値がまだ操作前のままか」を突き合わせる。
+          //   まだ古ければ楽観更新の値を書き戻してから採用する（要件1）。
+          //   これにより児童行・集計カード・クラスチップ（同じ devicesData から
+          //   描かれる3面すべて）が同時に守られる。
+          const incoming = res.data;
+          try {
+            incoming.forEach(function (dev) { reconcileOptimisticGuard(dev); });
+          } catch (eG) {}
+          devicesData = incoming;
           updateClassFilterOptions();
           renderDevices();
           updateStatistics();
+          __ok = true;
         } else {
           throw new Error((res && res.error) || '端末データを受信できませんでした');
         }
@@ -2958,8 +3753,584 @@
           showToast('データ取得エラー: ' + err.message, 'error');
         }
       } finally {
+        isFetching = false;
+        // 【R55】取得結果を自動更新の周期制御へフィードバックする
+        //   （成功＝既定周期へ戻す／失敗が続いたときだけ緩和する）。
+        try { noteRefreshResult(__ok); } catch (eN) {}
         if (!isSilent && spinner) spinner.classList.remove('animate-spin');
       }
+    }
+
+    // ==================== ライブ視聴（準リアルタイム / v1.6.8） ====================
+    //
+    // 【設計】
+    //   ・GAS 側のプール（全体 24 台）と管理設定（1教員あたり上限／自動タイムアウト）に従う。
+    //   ・画像は 1.3 秒間隔で取得する（1.2〜1.5 秒要件）。取得は /exec 直送で行い、
+    //     google.script.run の callback ポーリング往復（実測 3.6〜7.1 秒）を避ける。
+    //   ・枠が開いている間だけ 10 秒ごとに延長を送る。GAS 側の TTL は 25 秒なので、
+    //     ブラウザが強制終了しても 25 秒で自動解放される。
+    //   ・枠を閉じた／タブが非表示／自動タイムアウト満了 → 即座に停止 API を呼ぶ。
+    //
+    // 【R59】画像の切り替わりを約 6 秒 → 1.5〜2.5 秒へ短縮する。
+    //   ① 取得経路を /exec 直送にする（上の apiRequestDirectLiveFrames）。
+    //   ② ポーリング周期を 1800ms → 1300ms（1.2〜1.5 秒の範囲）へ短縮する。
+    //   ③ 「ライブ視聴を開始」直後の 6 秒間だけ 900ms 周期で取得し、
+    //      1 枚目が届くまでの待ち時間を縮める。
+    //   ④ in-flight 排他は維持し、古い応答（周回遅れ）は破棄する。
+    //      → 速くしても画像が巻き戻ってちらつくことがない。
+    const LIVE_WATCH_POLL_MS = 1300;               // 通常時の画像更新周期（1.2〜1.5秒）
+    const LIVE_WATCH_BOOT_POLL_MS = 900;           // 開始直後（最初の6秒）の周期（0.8〜1秒）
+    const LIVE_WATCH_BOOT_MS = 6000;               // 「開始直後」とみなす時間
+    const LIVE_WATCH_EXTEND_MS = 10000;            // 延長ハートビート（TTL 25 秒より短い）
+    const LIVE_WATCH_FALLBACK_TIMEOUT_SEC = 180;   // 管理設定が取れないときの既定
+    const LIVE_WATCH_TILE_LIMIT_FALLBACK = 3;      // 管理設定が取れないときの上限
+
+    let liveWatchSlots = [];          // [{ studentId, name, openedAt }]
+    let liveWatchPollTimer = null;
+    let liveWatchLastExtendAt = 0;
+    let liveWatchFramesFetching = false;
+    let liveWatchStatusInfo = null;
+    let liveWatchVisibilityBound = false;
+    let liveWatchStartedAt = 0;       // 【R59】開始時刻（最初の6秒を判定する）
+    let liveWatchFramesSeq = 0;       // 【R59】取得要求の通し番号（古い応答の破棄用）
+    let liveWatchFramesAppliedSeq = 0;// 【R59】最後に画面へ反映した通し番号
+    let liveWatchFrameAtById = {};    // 【R59】児童ごとの最終反映「撮影時刻」（巻き戻り防止）
+
+    /** 管理設定の自動タイムアウト（秒）。取れないときは既定 180 秒。 */
+    function getLiveWatchTimeoutSec() {
+      const s = liveWatchStatusInfo || {};
+      const n = Number(s.timeout_sec);
+      return (isFinite(n) && n > 0) ? n : LIVE_WATCH_FALLBACK_TIMEOUT_SEC;
+    }
+
+    /** 1教員あたりの同時表示上限（無限は全体上限 24 を返す）。 */
+    function getLiveWatchTileLimit() {
+      const s = liveWatchStatusInfo || {};
+      if (s.teacher_unlimited === true) return 24;
+      const n = Number(s.teacher_limit);
+      if (!isFinite(n) || n < 0) return LIVE_WATCH_TILE_LIMIT_FALLBACK;
+      return n;
+    }
+
+    /**
+     * 常時表示インジケーターを更新する。
+     *   全体プール使用状況: 「全体ライブ枠: X / 24台（残り Y枠）」
+     *   自分の使用状況    : 「あなたの視聴枠: A / B台」／「A台（上限なし）」／「停止中（0台）」
+     *   満枠時はバッジを警告色にし、「相乗り視聴のみ可能」を併記する。
+     */
+    function updateLiveWatchIndicators(status) {
+      const s = status || liveWatchStatusInfo || {};
+      const used = Number(s.used) || 0;
+      const max = Number(s.max) || 24;
+      const left = (typeof s.remaining === 'number') ? s.remaining : Math.max(0, max - used);
+      const full = (s.full === true) || used >= max;
+
+      const usedEl = document.getElementById('liveWatchPoolUsed');
+      const maxEl = document.getElementById('liveWatchPoolMax');
+      const leftEl = document.getElementById('liveWatchPoolLeft');
+      if (usedEl) usedEl.textContent = String(used);
+      if (maxEl) maxEl.textContent = String(max);
+      if (leftEl) leftEl.textContent = String(left);
+
+      const poolBadge = document.getElementById('liveWatchPoolBadge');
+      if (poolBadge) {
+        // 満枠は警告色（rose）、通常は indigo。状態が一目で分かるようにする。
+        poolBadge.className = full
+          ? 'inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-rose-600 border border-rose-300 text-white'
+          : 'inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-indigo-900/90 border border-indigo-600 text-indigo-100';
+        poolBadge.title = full
+          ? '全体のライブ枠が満杯です（新規追加はできません。相乗り視聴のみ可能）'
+          : 'このGAS環境で同時にライブ視聴している端末数（相乗りは1台と数えます）';
+      }
+
+      const mineText = document.getElementById('liveWatchMineText');
+      if (mineText) {
+        const mine = Number(s.teacher_used) || 0;
+        if (s.disabled === true) {
+          mineText.textContent = '停止中（0台）';
+        } else if (s.teacher_unlimited === true) {
+          mineText.textContent = mine + '台（上限なし）';
+        } else {
+          const lim = (typeof s.teacher_limit === 'number') ? s.teacher_limit : LIVE_WATCH_TILE_LIMIT_FALLBACK;
+          mineText.textContent = mine + ' / ' + lim + '台';
+        }
+      }
+
+      const panelStatus = document.getElementById('liveWatchPanelStatus');
+      if (panelStatus) {
+        const bits = [];
+        if (s.disabled === true) {
+          bits.push('現在管理者によりライブ視聴が制限されています');
+        } else {
+          bits.push('全体 ' + used + '/' + max + '台（残り ' + left + '枠）');
+          if (full) bits.push('相乗り視聴のみ可能');
+          if (s.teacher_unlimited === true) bits.push('あなたは上限なし');
+          else if (typeof s.teacher_limit === 'number') bits.push('あなたは ' + s.teacher_limit + '台まで');
+          if (typeof s.timeout_sec === 'number') bits.push('自動終了 ' + s.timeout_sec + '秒');
+        }
+        panelStatus.textContent = bits.join(' ／ ');
+      }
+
+      const startBtn = document.getElementById('liveWatchStartBtn');
+      if (startBtn) startBtn.disabled = (s.disabled === true);
+    }
+
+    /** 使用枠の最新値を取り直してインジケーターを更新する（読み取りのみ）。 */
+    async function refreshLiveWatchStatus(silent) {
+      try {
+        const res = await apiRequest({ action: 'live_watch_status' });
+        if (res && res.success !== false) {
+          liveWatchStatusInfo = res;
+          updateLiveWatchIndicators(res);
+        }
+        return res;
+      } catch (e) {
+        if (!silent) console.warn('live_watch_status 取得失敗:', e && e.message ? e.message : e);
+        return null;
+      }
+    }
+
+    /** ライブ枠の一覧を描画する（枠の増減時にだけ呼ぶ＝画像更新は img.src の差し替えのみ）。 */
+    function renderLiveWatchGrid() {
+      const grid = document.getElementById('liveWatchGrid');
+      const stopAllBtn = document.getElementById('liveWatchStopAllBtn');
+      if (stopAllBtn) stopAllBtn.classList.toggle('hidden', liveWatchSlots.length === 0);
+      if (!grid) return;
+
+      if (liveWatchSlots.length === 0) {
+        grid.innerHTML = [
+          '<div class="col-span-full text-center py-8 text-slate-400">',
+          '  <div class="flex flex-col items-center justify-center space-y-2">',
+          '    <span class="text-sm font-semibold text-slate-600">「ライブ視聴を開始」を押すと、対象児童の画面を準リアルタイムで表示します</span>',
+          '    <span class="text-xs text-slate-400">常時送信は行いません（枠を開いている間だけ送信します）</span>',
+          '  </div>',
+          '</div>'
+        ].join('');
+        return;
+      }
+
+      const tiles = [];
+      liveWatchSlots.forEach(function (slot, i) {
+        const name = escapeHtml(slot.name || slot.studentId);
+        tiles.push([
+          '<div class="border border-slate-200 rounded-xl overflow-hidden bg-slate-900 shadow-sm">',
+          '  <div class="flex items-center justify-between px-3 py-2 bg-slate-800">',
+          '    <div class="flex items-center space-x-1.5 min-w-0">',
+          '      <span class="w-2 h-2 rounded-full bg-rose-500 animate-pulse shrink-0"></span>',
+          '      <span class="text-[11px] font-bold text-slate-100 truncate" title="' + name + '">' + name + '</span>',
+          '    </div>',
+          '    <button onclick="stopLiveWatch(\'' + escapeHtml(slot.studentId) + '\', \'close\')" title="この枠を閉じる（枠を解放します）"',
+          '            class="p-1 text-slate-300 hover:text-white hover:bg-slate-700 rounded transition shrink-0">',
+          '      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>',
+          '    </button>',
+          '  </div>',
+          '  <div class="relative bg-black" style="aspect-ratio:16/9">',
+          '    <img id="liveFrameImg' + i + '" alt="' + name + ' の現在画面" class="absolute inset-0 w-full h-full object-contain hidden">',
+          '    <div id="liveFrameEmpty' + i + '" class="absolute inset-0 flex items-center justify-center text-[11px] text-slate-400">端末の送信を待っています...</div>',
+          '  </div>',
+          '  <div id="liveFrameMeta' + i + '" class="px-3 py-1.5 text-[10px] text-slate-400 font-mono">-</div>',
+          '</div>'
+        ].join('\n'));
+      });
+      grid.innerHTML = tiles.join('\n');
+    }
+
+    /** 取得した画像を枠へ反映する（枠の並びは renderLiveWatchGrid が決めた順）。 */
+    /**
+     * 取得した画像を枠へ反映する（枠の並びは renderLiveWatchGrid が決めた順）。
+     *
+     * 【R59】取得周期を 1.3 秒へ縮めたため、応答の到着順が前後することがある。
+     *   児童ごとに「最後に反映した撮影時刻（at）」を覚えておき、それより古い
+     *   フレームは捨てる（＝画像が一瞬前の状態へ巻き戻るのを防ぐ）。
+     *   at が同じ／新しいものだけを反映するので、体感は「速いのに滑らか」になる。
+     */
+    function updateLiveWatchImages(frames) {
+      const byId = {};
+      (frames || []).forEach(function (f) { if (f && f.student_id) byId[String(f.student_id)] = f; });
+      liveWatchSlots.forEach(function (slot, i) {
+        const f = byId[String(slot.studentId)] || null;
+        const img = document.getElementById('liveFrameImg' + i);
+        const empty = document.getElementById('liveFrameEmpty' + i);
+        const meta = document.getElementById('liveFrameMeta' + i);
+        if (f && f.data_url) {
+          const sid = String(slot.studentId);
+          const at = Number(f.at) || 0;
+          const seen = Number(liveWatchFrameAtById[sid]) || 0;
+          // 直近に反映したものより古い撮影時刻のフレームは捨てる（巻き戻り防止）
+          if (at > 0 && seen > 0 && at < seen) return;
+          if (at > 0) liveWatchFrameAtById[sid] = at;
+          if (img) {
+            // src の差し替えだけにする（DOM を作り直さない＝ちらつきを防ぐ）
+            if (img.getAttribute('src') !== f.data_url) img.setAttribute('src', f.data_url);
+            img.classList.remove('hidden');
+          }
+          if (empty) empty.classList.add('hidden');
+          if (meta) meta.textContent = '更新: ' + String(f.at_text || '-');
+        } else if (meta && f) {
+          meta.textContent = f.live_watch === false ? '枠が解放されました' : '端末の送信を待っています...';
+        }
+      });
+    }
+
+    /** タブ非表示・ウィンドウ離脱で即座に枠を解放する（見忘れの占有を防ぐ）。 */
+    function bindLiveWatchVisibility() {
+      if (liveWatchVisibilityBound) return;
+      liveWatchVisibilityBound = true;
+      try {
+        document.addEventListener('visibilitychange', function () {
+          if (document.hidden === true) {
+            stopAllLiveWatch('hidden');
+          } else if (liveWatchSlots.length > 0) {
+            liveWatchLastExtendAt = 0;
+            liveWatchPollTick();
+          }
+        });
+      } catch (e) {}
+      try {
+        window.addEventListener('pagehide', function () { stopAllLiveWatch('pagehide'); });
+      } catch (e2) {}
+    }
+
+    /** 選択中（未選択なら表示中）の児童でライブ視聴を開始する。 */
+    async function startLiveWatchFromSelection() {
+      const res = resolveBulkTargetIds();
+      let ids = (res && res.ids) ? res.ids.slice() : [];
+      if (!ids.length) {
+        showToast('対象の児童がいません。表示中の児童を確認してください。', 'error');
+        return;
+      }
+
+      const info = await refreshLiveWatchStatus(true);
+      if (info && info.disabled === true) {
+        showAlertModal('ライブ視聴は制限されています',
+          '現在管理者によりライブ視聴が制限されています。', 'warning');
+        return;
+      }
+
+      // すでに開いている枠は二重に開かない
+      const opened = {};
+      liveWatchSlots.forEach(function (s) { opened[String(s.studentId)] = true; });
+      ids = ids.filter(function (id) { return !opened[String(id)]; });
+      if (!ids.length) {
+        showToast('選択した児童はすでに表示中です。', 'info');
+        return;
+      }
+
+      // 上限（管理設定）を超える場合は最も古い枠との入れ替えを確認する
+      const limit = getLiveWatchTileLimit();
+      const over = (liveWatchSlots.length + ids.length) - limit;
+      if (limit > 0 && over > 0) {
+        const victims = liveWatchSlots.slice(0, over).map(function (s) { return s.studentId; });
+        const victimNames = liveWatchSlots.slice(0, over)
+          .map(function (s) { return s.name || s.studentId; }).join('、');
+        const ok = (typeof window !== 'undefined' && window.confirm)
+          ? window.confirm('同時ライブ視聴は ' + limit + ' 台までです。\n最も古い枠（' + victimNames +
+              '）を閉じて入れ替えますか？')
+          : true;
+        if (!ok) {
+          showAlertModal('ライブ視聴の上限',
+            '同時にライブ視聴できるのは ' + limit + ' 台までです。先に表示中の枠を閉じてください。', 'info');
+          return;
+        }
+        await stopLiveWatchList(victims, 'replace');
+      }
+
+      let startRes = null;
+      try {
+        startRes = await apiRequest({ action: 'live_watch_start', student_ids: ids });
+      } catch (err) {
+        showToast('ライブ視聴の開始に失敗しました: ' + err.message, 'error');
+        return;
+      }
+
+      // 1件ずつ結果を確認する（満枠の児童だけ弾く）
+      const results = (startRes && Array.isArray(startRes.results)) ? startRes.results : [];
+      const okIds = [];
+      let fullMessage = '';
+      let limitMessage = '';
+      let blockMessage = '';
+      results.forEach(function (r) {
+        if (!r) return;
+        if (r.success === true) { okIds.push(String(r.student_id)); return; }
+        if (r.code === 'LIVE_WATCH_POOL_FULL') {
+          fullMessage = '全体のライブ枠が満杯です（' + (r.usage || (r.used + '/' + r.max)) +
+            '）。新規の追加はできません（相乗り視聴のみ可能）。';
+        } else if (r.code === 'LIVE_WATCH_TEACHER_LIMIT') {
+          limitMessage = r.error || '1人あたりの同時ライブ視聴上限に達しています';
+        } else if (r.code === 'LIVE_WATCH_DISABLED') {
+          blockMessage = '現在管理者によりライブ視聴が制限されています';
+        }
+      });
+
+      if (okIds.length) {
+        okIds.forEach(function (id) {
+          const dev = (devicesData || []).find(function (d) { return d && d.student_id === id; });
+          liveWatchSlots.push({
+            studentId: id,
+            name: (dev && dev.student_name) ? dev.student_name : id,
+            openedAt: Date.now()
+          });
+        });
+        bindLiveWatchVisibility();
+        renderLiveWatchGrid();
+        liveWatchLastExtendAt = 0;
+        startLiveWatchPolling();
+        showToast(okIds.length + ' 台のライブ視聴を開始しました', 'success');
+      }
+      if (blockMessage) {
+        showAlertModal('ライブ視聴は制限されています', blockMessage, 'warning');
+      } else if (fullMessage) {
+        showAlertModal('全体のライブ枠が満杯です', fullMessage, 'warning');
+      } else if (limitMessage && !okIds.length) {
+        showAlertModal('ライブ視聴の上限', limitMessage, 'info');
+      }
+
+      if (startRes) {
+        liveWatchStatusInfo = Object.assign({}, liveWatchStatusInfo || {}, {
+          used: startRes.used, max: startRes.max, remaining: startRes.remaining,
+          full: startRes.full, teacher_used: startRes.teacher_used,
+          teacher_limit: startRes.teacher_limit, teacher_unlimited: startRes.teacher_unlimited,
+          timeout_sec: startRes.timeout_sec, disabled: startRes.disabled === true
+            ? true : (liveWatchStatusInfo ? liveWatchStatusInfo.disabled === true : false)
+        });
+        updateLiveWatchIndicators(liveWatchStatusInfo);
+      }
+    }
+
+    /** 1枠を停止する（枠を閉じた・タブ非表示・自動タイムアウト）。 */
+    async function stopLiveWatch(studentId, reason) {
+      await stopLiveWatchList([studentId], reason);
+    }
+
+    /** まとめて停止し、GAS 側の枠を解放する。 */
+    async function stopLiveWatchList(studentIds, reason) {
+      const ids = (Array.isArray(studentIds) ? studentIds : []).map(String).filter(Boolean);
+      if (!ids.length) return;
+      // 先に手元の枠を閉じる（通信を待たずに即座に UI を解放する）
+      const drop = {};
+      ids.forEach(function (id) { drop[id] = true; });
+      liveWatchSlots = liveWatchSlots.filter(function (s) { return !drop[String(s.studentId)]; });
+      renderLiveWatchGrid();
+      if (liveWatchSlots.length === 0) stopLiveWatchPolling();
+
+      try {
+        const res = await apiRequest({ action: 'live_watch_stop', student_ids: ids });
+        if (res && typeof res.used === 'number') {
+          liveWatchStatusInfo = Object.assign({}, liveWatchStatusInfo || {}, {
+            used: res.used, max: res.max, remaining: res.remaining,
+            teacher_used: res.teacher_used, teacher_limit: res.teacher_limit,
+            teacher_unlimited: res.teacher_unlimited
+          });
+          updateLiveWatchIndicators(liveWatchStatusInfo);
+        }
+      } catch (e) {
+        // 停止要求が届かなくても TTL（25秒）で自動解放されるため、UI は閉じたままにする。
+        console.warn('live_watch_stop 送信失敗（TTLで自動解放されます）:', e && e.message ? e.message : e);
+      }
+      if (reason === 'hidden') {
+        showToast('タブが非表示になったためライブ視聴を停止しました', 'info');
+      } else if (reason === 'timeout') {
+        showToast('自動タイムアウトのためライブ視聴を停止しました', 'info');
+      }
+    }
+
+    /** すべてのライブ枠を停止する。 */
+    async function stopAllLiveWatch(reason) {
+      const ids = liveWatchSlots.map(function (s) { return s.studentId; });
+      if (!ids.length) {
+        stopLiveWatchPolling();
+        return;
+      }
+      await stopLiveWatchList(ids, reason || 'all');
+    }
+
+    /**
+     * ポーリング周期を決める（【R59】開始直後の 6 秒間だけ速くする）。
+     *   ・「ライブ視聴を開始」直後の 6 秒 … 900ms（1 枚目を素早く出す）
+     *   ・それ以降                     … 1300ms（1.2〜1.5 秒の範囲）
+     */
+    function getLiveWatchPollMs() {
+      if (liveWatchStartedAt > 0 && (Date.now() - liveWatchStartedAt) < LIVE_WATCH_BOOT_MS) {
+        return LIVE_WATCH_BOOT_POLL_MS;
+      }
+      return LIVE_WATCH_POLL_MS;
+    }
+
+    function startLiveWatchPolling() {
+      stopLiveWatchPolling();
+      // 【R59】開始直後は短い周期で 1 枚目を取りに行く。6 秒経過後は
+      //   liveWatchPollTick が自分で周期を見直す（resetLiveWatchPollTimer）。
+      liveWatchStartedAt = Date.now();
+      liveWatchFramesSeq = 0;
+      liveWatchFramesAppliedSeq = 0;
+      liveWatchFrameAtById = {};
+      resetLiveWatchPollTimer();
+    }
+
+    /** 現在の周期でタイマーを張り直す（周期が変わるときだけ呼ぶ）。 */
+    function resetLiveWatchPollTimer() {
+      const ms = getLiveWatchPollMs();
+      if (liveWatchPollTimer === ms) return;   // 既に同じ周期で張ってある
+      if (liveWatchPollTimer) { clearInterval(liveWatchPollTimer); liveWatchPollTimer = null; }
+      liveWatchPollTimer = setInterval(liveWatchPollTick, ms);
+    }
+
+    function stopLiveWatchPolling() {
+      if (liveWatchPollTimer) { clearInterval(liveWatchPollTimer); liveWatchPollTimer = null; }
+      liveWatchLastExtendAt = 0;
+      liveWatchStartedAt = 0;
+    }
+
+    /**
+     * ポーリング 1 周期分。
+     *   ① 管理設定の自動タイムアウト満了した枠を停止する
+     *   ② 10 秒ごとに延長ハートビートを送る（TTL を切らさない）
+     *   ③ 画像を取得して枠へ反映する（in-flight 排他で多重送信しない）
+     *
+     * 【R59】③ は次の 2 点で「速いのにちらつかない」を担保する。
+     *   ・in-flight 排他: 前の取得が返る前に次を投げない（多重送信しない）。
+     *   ・古い応答の破棄: 通し番号が古い応答は画面へ反映しない（巻き戻り防止）。
+     *   ・児童ごとの撮影時刻: 直近に反映したものより古い画像は捨てる。
+     */
+    async function liveWatchPollTick() {
+      if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
+      if (document.hidden === true) return; // 非表示中は送らない（復帰時に再開）
+
+      // 開始直後の速い周期から通常周期へ切り替える（6 秒経過で 1 回だけ）
+      resetLiveWatchPollTimer();
+
+      // ① 自動タイムアウト
+      const timeoutMs = getLiveWatchTimeoutSec() * 1000;
+      const now = Date.now();
+      const expired = liveWatchSlots.filter(function (s) {
+        return timeoutMs > 0 && s.openedAt > 0 && (now - s.openedAt) >= timeoutMs;
+      }).map(function (s) { return s.studentId; });
+      if (expired.length) {
+        await stopLiveWatchList(expired, 'timeout');
+        if (liveWatchSlots.length === 0) return;
+      }
+
+      const ids = liveWatchSlots.map(function (s) { return s.studentId; });
+
+      // ② 延長（10 秒ごと）
+      if (!liveWatchLastExtendAt || (now - liveWatchLastExtendAt) >= LIVE_WATCH_EXTEND_MS) {
+        liveWatchLastExtendAt = now;
+        try {
+          const ext = await apiRequest({ action: 'live_watch_extend', student_ids: ids });
+          const results = (ext && Array.isArray(ext.results)) ? ext.results : [];
+          const dead = results.filter(function (r) {
+            return r && r.success !== true &&
+              (r.code === 'LIVE_WATCH_SESSION_EXPIRED' || r.code === 'LIVE_WATCH_DISABLED');
+          }).map(function (r) { return r.student_id; });
+          if (dead.length) {
+            // GAS 側で枠が消えている（タイムアウト／管理者が無効化）→ 手元も閉じる
+            const drop = {};
+            dead.forEach(function (id) { drop[String(id)] = true; });
+            liveWatchSlots = liveWatchSlots.filter(function (s) { return !drop[String(s.studentId)]; });
+            renderLiveWatchGrid();
+            if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
+          }
+        } catch (eExt) { /* 延長失敗は次周期で再試行（TTL 25 秒あるため猶予あり） */ }
+      }
+
+      // ③ 画像取得（in-flight 排他＋古い応答の破棄）
+      if (liveWatchFramesFetching) return;
+      const wantIds = liveWatchSlots.map(function (s) { return s.studentId; });
+      if (!wantIds.length) return;
+      liveWatchFramesFetching = true;
+      liveWatchFramesSeq += 1;
+      const mySeq = liveWatchFramesSeq;
+      try {
+        const res = await apiRequest({ action: 'live_watch_frames', student_ids: wantIds });
+        // 【R59】自分より新しい要求が既に走っている／走っていたなら、
+        //   この応答は周回遅れ。画面へ反映すると画像が巻き戻るので捨てる。
+        if (mySeq < liveWatchFramesAppliedSeq) return;
+        liveWatchFramesAppliedSeq = mySeq;
+        if (res && Array.isArray(res.data)) updateLiveWatchImages(res.data);
+      } catch (eF) {
+        // 画像 1 枚の失敗で枠を閉じない（次の周期で取り直す）
+      } finally {
+        liveWatchFramesFetching = false;
+      }
+    }
+
+    // ---- 管理設定（ライブ視聴）: 監視モーダル内の入力補助 ----
+
+    /** 「任意の秒数」を選んだときだけ数値入力を表示する。 */
+    function syncLiveWatchTimeoutCustom() {
+      const sel = document.getElementById('liveWatchTimeoutSec');
+      const inp = document.getElementById('liveWatchTimeoutCustom');
+      const unit = document.getElementById('liveWatchTimeoutCustomUnit');
+      const custom = !!(sel && sel.value === 'custom');
+      if (inp) inp.classList.toggle('hidden', !custom);
+      if (unit) unit.classList.toggle('hidden', !custom);
+    }
+
+    /** 保存済みの設定値をモーダルへ反映する（openMonitoringModal から呼ぶ）。 */
+    function applyLiveWatchSettingsToModal(s) {
+      const src = s || {};
+      const sel = document.getElementById('liveWatchPerTeacherLimit');
+      if (sel) {
+        const v = (src.live_watch_per_teacher_limit === undefined || src.live_watch_per_teacher_limit === null)
+          ? '3' : String(src.live_watch_per_teacher_limit);
+        const exists = Array.prototype.some.call(sel.options || [], function (o) { return o.value === v; });
+        sel.value = exists ? v : '3';
+      }
+
+      const tsel = document.getElementById('liveWatchTimeoutSec');
+      const tinp = document.getElementById('liveWatchTimeoutCustom');
+      const t = Number(src.live_watch_timeout_sec);
+      const presets = ['60', '180', '300', '600', '900'];
+      if (tsel) {
+        if (isFinite(t) && t > 0 && presets.indexOf(String(t)) >= 0) {
+          tsel.value = String(t);
+          if (tinp) tinp.value = '';
+        } else if (isFinite(t) && t > 0) {
+          tsel.value = 'custom';
+          if (tinp) tinp.value = String(t);
+        } else {
+          tsel.value = '180';
+        }
+      }
+      syncLiveWatchTimeoutCustom();
+
+      const infoEl = document.getElementById('liveWatchSettingsInfo');
+      if (infoEl) {
+        const lim = (src.live_watch_per_teacher_limit !== undefined)
+          ? src.live_watch_per_teacher_limit : 3;
+        const tmo = (src.live_watch_timeout_sec !== undefined) ? src.live_watch_timeout_sec : 180;
+        infoEl.textContent = '現在の設定: 1教員あたり ' +
+          (String(lim) === '-1' ? '無限' : (String(lim) + '台')) +
+          ' ／ 自動タイムアウト ' + String(tmo) + '秒';
+      }
+    }
+
+    /** モーダルの入力値から保存用の2項目を組み立てる。 */
+    function readLiveWatchSettingsFromModal() {
+      const sel = document.getElementById('liveWatchPerTeacherLimit');
+      const tsel = document.getElementById('liveWatchTimeoutSec');
+      const tinp = document.getElementById('liveWatchTimeoutCustom');
+
+      let limit = 3;
+      if (sel && sel.value !== '') {
+        const n = Number(sel.value);
+        limit = isFinite(n) ? n : 3;
+      }
+
+      let timeout = 180;
+      if (tsel) {
+        if (tsel.value === 'custom') {
+          const n = Number(tinp ? tinp.value : '');
+          if (isFinite(n) && n > 0) timeout = Math.round(n);
+        } else {
+          const n = Number(tsel.value);
+          if (isFinite(n) && n > 0) timeout = Math.round(n);
+        }
+      }
+      return {
+        live_watch_per_teacher_limit: limit,
+        live_watch_timeout_sec: timeout
+      };
     }
 
     // ==================== 画面一覧（押下時のみ取得） ====================
@@ -2992,6 +4363,13 @@
     //   そのまま判定できる（ユーザー指定の方式）。
     let screenBaseById = {};
     let screenPendingSince = 0; // 更新待ちが始まった時刻（ブラウザ時計・期限切れ用）
+    // 【今回】押下した瞬間の「これ以降に更新された画像だけを合格とする」基準時刻。
+    //   シート側の『画面情報要求日時』(screen_request_ms) が取れない場合の最終手段として
+    //   使う。シート時計とブラウザ時計は出どころが違うため、SCREEN_CLOCK_SKEW_MS の
+    //   マージンだけ甘く見る（厳密一致を要求すると永久に不合格になる）。
+    //   ※ シート側の要求日時があるときはそちらを優先する（R43.1 のデッドロック回避）。
+    const SCREEN_CLOCK_SKEW_MS = 5000;
+    let screenRequestAfterTs = 0;
     // 【R43.1】保険：この時間を超えたら「更新待ち」表示を強制解除する。
     //   時計の不整合が万一あっても永久に固まらないようにする最終防壁。
     const SCREEN_PENDING_TTL_MS = 45000;
@@ -3010,12 +4388,17 @@
     const SCHEDULE_WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
     let scheduleLoaded = false;        // 一度でも取得できたか
     let scheduleLoading = false;       // 二重取得の防止
+    let scheduleLoadPending = null;    // 実行中の取得（後続の要求を合流させる）
     let scheduleData = [];             // list_schedules の data 配列
     let scheduleServerMs = 0;          // サーバ時計（表示の目安）
     let scheduleCursorYear = 0;        // カレンダーの表示年
     let scheduleCursorMonth = 0;       // カレンダーの表示月（0-11）
     let scheduleSelectedDate = '';     // 選択日 'yyyy/MM/dd'
     let scheduleSelectedStudentIds = new Set(); // 個別指定時の選択児童
+    // 【Request P】複数クラス選択。1クラス名セルにカンマ区切りで保存する（列追加なし）。
+    let scheduleSelectedClassNames = new Set();
+    // 【Request P】予約編集モード。空文字＝新規登録、非空＝この予約IDを書き換える。
+    let scheduleEditingId = '';
 
     // JST の壁時計パーツ（epoch ms → y/mo/da）
     function schJstParts(ms) {
@@ -3024,6 +4407,30 @@
     }
     function schPad2(n) { return ('0' + n).slice(-2); }
     function schKeyFromParts(y, mo, da) { return y + '/' + schPad2(mo) + '/' + schPad2(da); }
+    // 【Request P 修正】<input type="date"> が受け付けるのは YYYY-MM-DD のみ。
+    //   シート由来の日付（Date / ISO / "2026/11/10" / 英語表記）を JST 壁時計で
+    //   YYYY-MM-DD へ正規化する。変換できない場合は空文字（＝空欄のまま）。
+    function schDateInputValue(raw) {
+      if (raw === null || raw === undefined || raw === '') return '';
+      if (Object.prototype.toString.call(raw) === '[object Date]') {
+        const t = raw.getTime();
+        if (!isFinite(t)) return '';
+        const p = schJstParts(t);
+        return p.y + '-' + schPad2(p.mo) + '-' + schPad2(p.da);
+      }
+      const s = String(raw).trim();
+      if (!s) return '';
+      const m = /^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/.exec(s);
+      if (m) return m[1] + '-' + schPad2(Number(m[2])) + '-' + schPad2(Number(m[3]));
+      // 英語表記 "Tue Nov 10 2026 00:00:00 GMT+0900 (日本標準時)"
+      const e = /^(?:[A-Za-z]{3}\s+)?([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})/.exec(s);
+      if (e) {
+        const MON = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const mo = MON.indexOf(e[1].toUpperCase());
+        if (mo >= 0) return e[3] + '-' + schPad2(mo + 1) + '-' + schPad2(Number(e[2]));
+      }
+      return '';
+    }
     function schTodayKey() {
       const p = schJstParts(Date.now());
       return schKeyFromParts(p.y, p.mo, p.da);
@@ -3113,9 +4520,18 @@
       const sum = scheduleRowSummary(r);
       const enabled = !!(r && r.enabled);
       const overridden = !!(r && r.overridden);
-      const targetLabel = (r && r.target_type === 'student')
-        ? ('個別 ' + ((r.student_ids && r.student_ids.length) || 0) + '名')
-        : ('クラス ' + escapeHtml(String((r && r.class_name) || '—')));
+      // 【Request P】GAS が返す target_label（複数クラス／全校生徒／個別 N名）を優先して使う。
+      //   古い応答（target_label が無い）でも従来どおり表示できるようフォールバックする。
+      let targetLabel = '';
+      if (r && r.target_label) {
+        const tt = String(r.target_type || '').toLowerCase();
+        targetLabel = (tt === 'school' ? '' : (tt === 'student' ? '' : 'クラス '))
+          + escapeHtml(String(r.target_label));
+      } else {
+        targetLabel = (r && r.target_type === 'student')
+          ? ('個別 ' + ((r.student_ids && r.student_ids.length) || 0) + '名')
+          : ('クラス ' + escapeHtml(String((r && r.class_name) || '—')));
+      }
       let badge = '<span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">有効</span>';
       if (!enabled) badge = '<span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-200 text-slate-600">取消済</span>';
       else if (overridden) badge = '<span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">今回解除済</span>';
@@ -3136,6 +4552,8 @@
         '  </div>',
         '  <div class="text-[10px] text-slate-400">' + escapeHtml(String((r && r.school_name) || '')) + ' / 期間 ' + escapeHtml(String((r && r.date_from) || '')) + '〜' + escapeHtml(String((r && r.date_to) || '')) + '</div>',
         '  <div class="flex flex-wrap gap-1.5 pt-1">',
+        // 【Request P】予約の編集（予約IDは維持したまま内容を書き換える）
+        '    <button onclick="openScheduleEditModal(\'' + id + '\')" class="text-[10px] font-bold px-2 py-1.5 rounded-lg bg-violet-100 hover:bg-violet-200 text-violet-800 transition">編集</button>',
         '    <button onclick="overrideSchedule(\'' + id + '\')"' + dis + ' class="text-[10px] font-bold px-2 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-800 transition' + disCls + '">手動解除（今回のみ停止）</button>',
         '    <button onclick="cancelSchedule(\'' + id + '\')"' + dis + ' class="text-[10px] font-bold px-2 py-1.5 rounded-lg bg-rose-100 hover:bg-rose-200 text-rose-700 transition' + disCls + '">取消（設定破棄）</button>',
         '  </div>',
@@ -3248,11 +4666,32 @@
       renderScheduleDayList();
     }
 
-    // 予約一覧の取得（タブを開いたとき / 再読込押下時のみ）
-    async function loadSchedules(force) {
-      if (scheduleLoading) return;
-      scheduleLoading = true;
+    // 【性能】登録・取消・解除の直後に一覧を取り直すが、その完了を待たせない。
+    //   google.script.run は往復に数秒かかるため、await すると
+    //   「完了トーストは出ているのにボタンが押せない」時間が残る。
+    //   取り直し自体は必ず走らせる（表示は数秒後に追いつく）。
+    function refreshSchedulesAfterChange() {
       try {
+        const p = loadSchedules(false);
+        if (p && typeof p.catch === 'function') p.catch(function () {});
+      } catch (e) { /* 再取得の失敗で操作結果を壊さない */ }
+    }
+
+    // 予約一覧の取得（タブを開いたとき / 再読込押下時のみ）
+    //   【性能】取得中に来た要求は「捨てる」のではなく「合流」させる。
+    //     捨てると、登録直後の裏取得が走っている数秒間に再読込ボタンを押しても
+    //     何も起きず「ボタンが無反応」に見える。合流なら必ず1回は取得が走る。
+    async function loadSchedules(force) {
+      // 取得中に来た要求は「捨てる」のではなく「順番待ち」にする。
+      //   捨てると、登録直後の裏取得が走っている数秒間に再読込を押しても
+      //   何も起きず「ボタンが無反応」に見える。待ってから自分の分を必ず取得する。
+      if (scheduleLoading) {
+        try {
+          await scheduleLoadPending;
+        } catch (eJ) { /* 進行中の取得の失敗はそちらで通知済み */ }
+      }
+      scheduleLoading = true;
+      scheduleLoadPending = (async function () {
         const res = await apiRequest({ action: 'list_schedules' });
         scheduleData = Array.isArray(res && res.data) ? res.data : [];
         scheduleServerMs = Number(res && res.server_time_ms) || 0;
@@ -3263,15 +4702,19 @@
         renderScheduleCalendar();
         renderScheduleDayList();
         if (force) showToast('スケジュールを再読込しました（' + scheduleData.length + '件）', 'success');
+      })();
+      try {
+        await scheduleLoadPending;
       } catch (e) {
         showToast('スケジュールの取得に失敗しました: ' + (e && e.message ? e.message : e), 'error');
       } finally {
         scheduleLoading = false;
+        scheduleLoadPending = null;
       }
     }
 
     // 対象校の選択肢を作る（非管理者は自校で固定・変更不可＝承認済み仕様）
-    function renderScheduleModalTargets() {
+    function renderScheduleModalTargets(keepStudents) {
       const scope = (typeof getTeacherScopeSchool === 'function') ? getTeacherScopeSchool() : '';
       const schSel = document.getElementById('scheduleSchool');
       if (schSel) {
@@ -3286,11 +4729,77 @@
           : 'w-full bg-slate-50 border border-slate-300 text-slate-800 text-xs rounded-lg p-2';
         schSel.title = scope ? '所属校に固定されています（変更できません）' : '';
       }
-      refreshScheduleClasses();
+      refreshScheduleClasses(keepStudents);
     }
 
     // 学校に応じたクラス一覧と個別児童リスト（既存 devicesData を流用＝承認済み）
-    function refreshScheduleClasses() {
+    // 【Request P】クラス名の文字列（カンマ・読点・スラッシュ・中黒区切り）を配列へ。
+    //   GAS 側 scheduleClassList_ と同じ区切り規則にして、画面と保存結果を一致させる。
+    function scheduleClassListFromValue(raw) {
+      return String(raw === null || raw === undefined ? '' : raw)
+        .split(/[,、\/／・]+/)
+        .map(function (x) { return x.trim(); })
+        .filter(Boolean);
+    }
+
+    // 【Request P】チェック状態を唯一の保持先（隠し input #scheduleClass）へ反映する。
+    // 【Request P 修正】児童IDの表記ゆれ（メール形式 / 大文字小文字 / 前後空白）を吸収する。
+    //   シートの「児童ID」は運用でメール形式が混ざるため、ローカル部でも同一人物とみなす。
+    function scheduleStudentIdKey(id) {
+      let v = String(id === null || id === undefined ? '' : id).trim().toLowerCase();
+      if (!v) return '';
+      const at = v.indexOf('@');
+      if (at > 0) v = v.slice(0, at);
+      return v;
+    }
+    function scheduleStudentIdsMatch(a, b) {
+      const ka = scheduleStudentIdKey(a);
+      const kb = scheduleStudentIdKey(b);
+      return !!ka && ka === kb;
+    }
+
+    // 【Request P 修正】描画済みの児童チェックボックスへ選択状態を反映する。
+    function applyScheduleStudentCheckboxes() {
+      const box = document.getElementById('scheduleStudentBox');
+      if (!box || !box.querySelectorAll) return;
+      const picked = Array.from(scheduleSelectedStudentIds || []);
+      const boxes = box.querySelectorAll('input[type="checkbox"]');
+      for (let i = 0; i < boxes.length; i++) {
+        const v = boxes[i].value;
+        boxes[i].checked = picked.some(function (x) { return scheduleStudentIdsMatch(x, v); });
+      }
+    }
+
+    // 【Request P 修正】描画済みのクラスチェックボックスへ選択状態を反映する。
+    function applyScheduleClassCheckboxes() {
+      const box = document.getElementById('scheduleClassBox');
+      if (!box || !box.querySelectorAll) return;
+      const boxes = box.querySelectorAll('input[type="checkbox"]');
+      for (let i = 0; i < boxes.length; i++) {
+        boxes[i].checked = scheduleSelectedClassNames.has(String(boxes[i].value));
+      }
+    }
+
+    function syncScheduleClassValue() {
+      const hidden = document.getElementById('scheduleClass');
+      const v = Array.from(scheduleSelectedClassNames).join(',');
+      if (hidden) hidden.value = v;
+      return v;
+    }
+
+    // 【Request P】クラスチェックの切り替え（複数選択可）
+    function toggleScheduleClass(name, on) {
+      const c = String(name || '').trim();
+      if (!c) return;
+      if (on) scheduleSelectedClassNames.add(c);
+      else scheduleSelectedClassNames.delete(c);
+      syncScheduleClassValue();
+    }
+
+    // 【Request P 修正】keepStudents=true のときは児童の選択状態を消さない。
+    //   編集モーダルは「描画 → 復元」の順で動くため、描画のたびに選択を
+    //   全消しすると復元したチェックが必ず外れる（実機で発生した不具合）。
+    function refreshScheduleClasses(keepStudents) {
       const schSel = document.getElementById('scheduleSchool');
       const clsSel = document.getElementById('scheduleClass');
       const school = schSel ? String(schSel.value || '') : '';
@@ -3307,11 +4816,24 @@
         if (c && classes.indexOf(c) < 0) classes.push(c);
       });
       classes.sort();
-      if (clsSel) {
-        clsSel.innerHTML = classes.length
-          ? classes.map(function (c) { return '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>'; }).join('')
-          : '<option value="">（クラス未割当）</option>';
+      // 【Request P】クラスはチェックボックスで複数選択できる。
+      //   いまの学校に存在しないクラスは選択から落とす（学校を切り替えたときの持ち越し防止）。
+      const kept = new Set();
+      scheduleSelectedClassNames.forEach(function (c) { if (classes.indexOf(c) >= 0) kept.add(c); });
+      scheduleSelectedClassNames = kept;
+      const classBox = document.getElementById('scheduleClassBox');
+      if (classBox) {
+        classBox.innerHTML = classes.length
+          ? classes.map(function (c) {
+              const on = scheduleSelectedClassNames.has(c);
+              return '<label class="flex items-center space-x-1.5 text-[11px] text-slate-600 px-1 py-0.5">'
+                + '<input type="checkbox" value="' + escapeHtml(c) + '"' + (on ? ' checked' : '')
+                + ' onchange="toggleScheduleClass(this.value, this.checked)" class="rounded border-slate-300">'
+                + '<span class="truncate">' + escapeHtml(c) + '</span></label>';
+            }).join('')
+          : '<p class="text-[11px] text-slate-400">クラスのある児童がいません（端末一覧を先に読み込んでください）。</p>';
       }
+      syncScheduleClassValue();
       const box = document.getElementById('scheduleStudentBox');
       if (box) {
         box.innerHTML = devs.length
@@ -3319,14 +4841,20 @@
               const id = String(d.student_id || '');
               const cls = String(d.class_name || '未割当');
               const nm = String(d.student_name || id);
+              const onStu = Array.from(scheduleSelectedStudentIds || []).some(function (x) {
+                return scheduleStudentIdsMatch(x, id);
+              });
               return '<label class="flex items-center space-x-1.5 text-[11px] text-slate-600 px-1 py-0.5">'
-                + '<input type="checkbox" value="' + escapeHtml(id) + '" onchange="toggleScheduleStudent(this.value, this.checked)" class="rounded border-slate-300">'
+                + '<input type="checkbox" value="' + escapeHtml(id) + '"' + (onStu ? ' checked' : '')
+                + ' onchange="toggleScheduleStudent(this.value, this.checked)" class="rounded border-slate-300">'
                 + '<span class="truncate">' + escapeHtml(nm) + ' <span class="text-slate-400">(' + escapeHtml(cls) + ')</span></span>'
                 + '</label>';
             }).join('')
           : '<p class="text-[11px] text-slate-400">対象児童がいません（端末一覧を先に読み込んでください）。</p>';
       }
-      scheduleSelectedStudentIds = new Set();
+      // 【Request P 修正】新規登録では選択を初期化する。編集モーダルは
+      //   keepStudents=true で呼び、復元済みの選択を保つ。
+      if (!keepStudents) scheduleSelectedStudentIds = new Set();
       toggleScheduleTargetFields();
     }
 
@@ -3337,13 +4865,28 @@
     }
 
     // 対象種別・制限タイプに応じて入力欄の表示/必須を切り替える
+    //   【Request P】対象種別は class（複数クラス）／student（個別）／school（全校生徒）の3種。
     function toggleScheduleTargetFields() {
       const tt = document.getElementById('scheduleTargetType');
-      const isStudent = !!tt && String(tt.value) === 'student';
+      const tv = tt ? String(tt.value) : 'class';
+      const isStudent = tv === 'student';
+      const isSchool = tv === 'school';
+      const isClass = !isStudent && !isSchool;
       const clsWrap = document.getElementById('scheduleClassWrap');
       const stuWrap = document.getElementById('scheduleStudentWrap');
-      if (clsWrap) clsWrap.classList.toggle('hidden', isStudent);
+      const schWrap = document.getElementById('scheduleSchoolTargetWrap');
+      if (clsWrap) clsWrap.classList.toggle('hidden', !isClass);
       if (stuWrap) stuWrap.classList.toggle('hidden', !isStudent);
+      if (schWrap) schWrap.classList.toggle('hidden', !isSchool);
+      // 全校生徒は「自校の全児童」なので、学校名を明示しておく（越境不可の注意喚起）。
+      if (isSchool && schWrap) {
+        const note = document.getElementById('scheduleSchoolTargetNote');
+        const schSel = document.getElementById('scheduleSchool');
+        const school = schSel ? String(schSel.value || '') : '';
+        if (note && school) {
+          note.textContent = '「' + school + '」の全児童に適用されます（他校には適用されません）。';
+        }
+      }
 
       const rt = document.getElementById('scheduleRestrictionType');
       const isUrl = !rt || String(rt.value) !== 'screen_lock';
@@ -3359,6 +4902,16 @@
     // 新規予約モーダルを開く（初期値を今日・19:00〜20:00 で埋める）
     function openScheduleModal() {
       scheduleSelectedStudentIds = new Set();
+      // 【Request P】新規時はクラス選択と編集モードを必ず初期化する
+      //   （編集の途中で閉じても、次の新規登録に選択が持ち越されない）。
+      scheduleSelectedClassNames = new Set();
+      scheduleEditingId = '';
+      const title = document.getElementById('scheduleModalTitle');
+      if (title) title.textContent = 'スケジュール（時間制限タイマー）の新規予約';
+      const btnText = document.getElementById('scheduleSaveBtnText');
+      if (btnText) btnText.textContent = '予約を登録';
+      const hiddenCls = document.getElementById('scheduleClass');
+      if (hiddenCls) hiddenCls.value = '';
       const today = schTodayKey();
       const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
       set('scheduleTargetType', 'class');
@@ -3366,8 +4919,11 @@
       set('scheduleFilterMode', 'BLACKLIST');
       set('scheduleWhitelist', '');
       set('scheduleBlacklist', '');
-      set('scheduleDateFrom', today);
-      set('scheduleDateTo', today);
+      // 【Request P 修正】新規モーダルも同じ罠を踏む。schTodayKey() は
+      //   'yyyy/MM/dd' を返すため、そのまま type="date" に入れると空欄になる。
+      //   input には YYYY-MM-DD で入れる（内部の日付計算は従来どおりキー形式）。
+      set('scheduleDateFrom', schDateInputValue(today));
+      set('scheduleDateTo', schDateInputValue(today));
       set('scheduleStartTime', '19:00');
       set('scheduleEndTime', '20:00');
       set('scheduleRepeat', 'NONE');
@@ -3380,7 +4936,7 @@
       openModal('scheduleModal');
     }
 
-    // 新規予約の保存
+    // 予約の保存（新規登録 / 編集）。scheduleEditingId があれば編集として扱う。
     async function saveSchedule() {
       const val = function (id) { const e = document.getElementById(id); return e ? String(e.value || '').trim() : ''; };
       const targetType = val('scheduleTargetType') || 'class';
@@ -3389,6 +4945,8 @@
       const dateTo = val('scheduleDateTo') || dateFrom;
       const startTime = val('scheduleStartTime');
       const endTime = val('scheduleEndTime');
+      const editingId = String(scheduleEditingId || '');
+      const isEdit = !!editingId;
 
       if (!dateFrom) { showToast('開始日を指定してください', 'error'); return; }
       if (!startTime || !endTime) { showToast('開始時刻と終了時刻を指定してください', 'error'); return; }
@@ -3396,12 +4954,23 @@
       if (targetType === 'student' && scheduleSelectedStudentIds.size === 0) {
         showToast('個別指定の場合は児童を1名以上選択してください', 'error'); return;
       }
+      // 【Request P】クラス全体は1つ以上のクラス選択が必須（複数可）。
+      //   全校生徒はクラス指定が不要（自校の全児童が対象）。
+      const classNames = (targetType === 'class')
+        ? Array.from(scheduleSelectedClassNames)
+        : [];
+      if (targetType === 'class' && !classNames.length) {
+        showToast('クラスを1つ以上選択してください', 'error'); return;
+      }
 
       const payload = {
-        action: 'save_schedule',
+        action: isEdit ? 'update_schedule' : 'save_schedule',
         target_type: targetType,
         school_name: val('scheduleSchool'),
-        class_name: val('scheduleClass'),
+        // 【Request P】複数クラスは既存の単一「クラス名」セルへカンマ区切りで格納する
+        //   （列追加なし・後方互換）。読み取り側はカンマで分割して解釈する。
+        class_name: classNames.join(','),
+        class_names: classNames,
         student_ids: Array.from(scheduleSelectedStudentIds),
         type: restrictionType,
         filter_mode: val('scheduleFilterMode') || 'BLACKLIST',
@@ -3414,6 +4983,10 @@
         repeat: val('scheduleRepeat') || 'NONE',
         note: val('scheduleNote')
       };
+      if (isEdit) {
+        // 予約IDは維持する（行を書き換えるだけで、新しい予約は作らない）。
+        payload.schedule_id = editingId;
+      }
       if (payload.repeat === 'WEEKLY') {
         const wds = [];
         for (let i = 0; i < 7; i++) {
@@ -3434,13 +5007,105 @@
       try {
         await apiRequest(payload);
         closeModal('scheduleModal');
-        showToast('予約を登録しました', 'success');
-        await loadSchedules(true);
+        showToast(isEdit ? '予約を更新しました' : '予約を登録しました', 'success');
+        // 【性能】一覧の取り直しを待たない（完了表示のあとボタンを即座に戻す）
+        refreshSchedulesAfterChange();
       } catch (e) {
-        showToast('予約の登録に失敗しました: ' + (e && e.message ? e.message : e), 'error');
+        showToast((isEdit ? '予約の更新に失敗しました: ' : '予約の登録に失敗しました: ') +
+          (e && e.message ? e.message : e), 'error');
       } finally {
         if (btn) { btn.disabled = false; btn.classList.remove('opacity-60', 'cursor-not-allowed'); }
       }
+    }
+
+    /**
+     * 【Request P】予約の編集モーダルを開く。
+     *   予約IDは維持したまま内容だけを書き換える（update_schedule）。
+     *   有効/手動解除/手動解除日時（16/17/18）と 作成者/作成日時（19/20）は
+     *   サーバ側で保持されるため、ここでは触らない。
+     */
+    function openScheduleEditModal(id) {
+      const sid = String(id || '');
+      if (!sid) return;
+      const row = (scheduleData || []).filter(function (r) { return r && String(r.id) === sid; })[0];
+      if (!row) { showToast('対象の予約が見つかりません（一覧を再読込してください）', 'error'); return; }
+
+      const set = function (eid, v) { const e = document.getElementById(eid); if (e) e.value = v; };
+
+      // 編集モードへ移行（件名・ボタン名を切り替える）
+      scheduleEditingId = sid;
+      const title = document.getElementById('scheduleModalTitle');
+      if (title) title.textContent = 'スケジュール（時間制限タイマー）の編集';
+      const btnText = document.getElementById('scheduleSaveBtnText');
+      if (btnText) btnText.textContent = '予約を更新';
+
+      // 個別選択の復元
+      scheduleSelectedStudentIds = new Set(
+        Array.isArray(row.student_ids) ? row.student_ids.map(String) : []
+      );
+      // クラス選択の復元（class_list が無い古い応答でもカンマ分割で復元する）
+      const clsList = Array.isArray(row.class_list) && row.class_list.length
+        ? row.class_list.map(String)
+        : scheduleClassListFromValue(row.class_name);
+      scheduleSelectedClassNames = new Set(clsList.filter(Boolean));
+
+      set('scheduleTargetType', String(row.target_type || 'class'));
+      set('scheduleRestrictionType', String(row.type || 'url_block'));
+      set('scheduleFilterMode', String(row.filter_mode || 'BLACKLIST'));
+      const wl = Array.isArray(row.whitelist_urls) ? row.whitelist_urls.join('\n') : String(row.whitelist_urls || '');
+      const bl = Array.isArray(row.blacklist_urls) ? row.blacklist_urls.join('\n') : String(row.blacklist_urls || '');
+      set('scheduleWhitelist', wl);
+      set('scheduleBlacklist', bl);
+      // 【Request P 修正】<input type="date"> は YYYY-MM-DD 以外を受け付けず、
+      //   スラッシュ形式（サーバの date_from は "2026/11/10"）を代入すると
+      //   無言で空欄になる（実機で発生した不具合）。必ず正規化してから設定する。
+      set('scheduleDateFrom', schDateInputValue(row.date_from));
+      set('scheduleDateTo', schDateInputValue(row.date_to));
+      set('scheduleStartTime', String(row.start_time || ''));
+      set('scheduleEndTime', String(row.end_time || ''));
+      set('scheduleRepeat', String(row.repeat || 'NONE'));
+      set('scheduleNote', String(row.note || ''));
+
+      // 曜日（0=日 … 6=土）
+      const wds = Array.isArray(row.weekdays) ? row.weekdays.map(Number) : [];
+      for (let i = 0; i < 7; i++) {
+        const cb = document.getElementById('scheduleWeekday' + i);
+        if (cb) cb.checked = (wds.indexOf(i) >= 0);
+      }
+
+      // 学校の選択肢を作ってから、その予約の学校を選び直す
+      //   （非管理者は自校固定なので、値は自校のまま）
+      // 【Request P 修正】keepStudents=true で描画し、復元済みの児童選択を消さない。
+      renderScheduleModalTargets(true);
+      const schSel = document.getElementById('scheduleSchool');
+      if (schSel && row.school_name) {
+        const want = String(row.school_name);
+        const has = Array.prototype.some.call(schSel.options || [], function (o) {
+          return String(o.value) === want;
+        });
+        if (schSel.disabled || !has) {
+          // 固定表示中は選択肢が自校だけ。値だけ合わせておく（サーバ側で再認可される）。
+          if (schSel.disabled) schSel.value = want;
+        } else {
+          schSel.value = want;
+        }
+      }
+      // 【Request P 修正】学校を確定させてから再描画する（児童選択は保持）。
+      //   refreshScheduleClasses は「いまの学校に無いクラス」を選択から落とすため、
+      //   クラス選択はここで明示的に復元し直す。
+      refreshScheduleClasses(true);
+      scheduleSelectedClassNames = new Set(clsList.filter(function (c) { return c; }));
+      applyScheduleClassCheckboxes();
+      syncScheduleClassValue();
+      // 児童チェックボックスは描画完了後にまとめて checked を立てる
+      //   （ID 表記ゆれは scheduleStudentIdsMatch が吸収する）。
+      applyScheduleStudentCheckboxes();
+
+      toggleScheduleTargetFields();
+      // 対象種別の表示切替は上で済んでいるので、最後に児童チェックを再度立てる
+      //   （hidden の付け外しでブラウザがチェックを保持しない実装差に備える）。
+      applyScheduleStudentCheckboxes();
+      openModal('scheduleModal');
     }
 
     // 「取消」＝予約そのものを停止（有効=FALSE。行は監査ログとして残る）
@@ -3451,7 +5116,7 @@
       try {
         await apiRequest({ action: 'cancel_schedule', schedule_id: id });
         showToast('予約を取り消しました', 'success');
-        await loadSchedules(false);
+        refreshSchedulesAfterChange();
       } catch (e) {
         showToast('取消に失敗しました: ' + (e && e.message ? e.message : e), 'error');
       }
@@ -3465,7 +5130,7 @@
       try {
         await apiRequest({ action: 'override_schedule', schedule_id: id });
         showToast('今回の時間帯を解除しました', 'success');
-        await loadSchedules(false);
+        refreshSchedulesAfterChange();
       } catch (e) {
         showToast('手動解除に失敗しました: ' + (e && e.message ? e.message : e), 'error');
       }
@@ -3532,6 +5197,8 @@
       //   児童ごとに控え、それより新しい撮影が来た＝新着、と判定する
       //   （基準も比較対象も同じGASが書いたシート時計なので精度差が生じない）。
       screenReqTs = new Date().getTime();  // 表示用の目安（判定には使わない）
+      // 【今回】「この瞬間より後に更新された画像だけを合格とする」基準。
+      screenRequestAfterTs = new Date().getTime();
       let __base = 0;
       const __baseById = {};
       try {
@@ -3598,15 +5265,36 @@
     //   /exec が待たされ、UI が固まって見えた（実機の「26s 停止」）。
     //   1本ずつ直列に回せば、遅いときは自然に間隔が延びるだけで詰まらない。
     function startScreenPolling() {
-      // stopScreenPolling は後片付けで screenPendingSince を 0 に戻すため、
+      // stopScreenPolling は後片付けで screenPendingSince / screenRequestAfterTs を
+      //   0 に戻すため、押下時に控えた基準を退避してから復元する。
+      const keepAfterTs = screenRequestAfterTs;
       // 【R43.1】期限の基準はその“後”で必ず引き直す（ここで上書きする）。
       stopScreenPolling();
+      screenRequestAfterTs = keepAfterTs;
       screenPollGen++;
       screenPollTries = 0;
       screenFetchActive = true;
       screenPendingSince = new Date().getTime();  // TTL の起点
       updateScreenFetchButton(true, SCREEN_POLL_MAX);
       scheduleScreenPollTick(1000);
+    }
+
+    // 【仕様(c)】対象端末のうち「まだ新しい画像が揃っていない」台数を返す。
+    //   0 になった時点でポーリングを即停止し「取得済」へ遷移させる
+    //   （最大 30 秒 = SCREEN_POLL_MAX は、オフライン／撮影不可端末が
+    //     混ざる場合の安全上限としてのみ機能する）。
+    //   ・needs_image   … 新しい更新日時は来たが画像本体が未取得（旧画像を隠している）
+    //   ・!has_image かつ要求済み … 初回画像の到着待ち
+    //   ・capture_blocked … 撮影不可が確定しており待っても来ない（R43.3）
+    function screenPendingFreshCount() {
+      let n = 0;
+      (screensData || []).forEach(function (d) {
+        if (!d) return;
+        if (d.capture_blocked) return;                 // 待っても来ない（保護ページ）
+        if (d.needs_image) { n++; return; }            // 本体待ち
+        if (!d.has_image && d.screen_request_at) n++;  // 初回画像待ち
+      });
+      return n;
     }
 
     // 1 回分のポーリング。軽量メタ取得（画像なし）→ 新着があれば画像を取り直す。
@@ -3630,8 +5318,15 @@
         if (gen !== screenPollGen || !screenFetchActive) return;
         if (changed) {
           // 新しい撮影が届いた瞬間だけ、画像本体を取り直して描画する。
+          //   ここで必ず metaOnly:false のフル取得を通すため、
+          //   メモリ上の旧 Base64 は使われず、新しい更新日時の本体で置き換わる。
           try { await loadScreens({ silent: true, wantImages: true }); } catch (eI) {}
           if (gen !== screenPollGen) return;
+        }
+        // 【仕様(c)】対象全員の新着画像が揃った時点で即停止する。
+        //   以前は「誰か 1 人でも新着が来たら停止」だったため、他の児童の
+        //   画像が揃う前に旧画像で確定してしまっていた。
+        if (screenPendingFreshCount() === 0) {
           stopScreenPolling();
           return;
         }
@@ -3654,6 +5349,10 @@
       const wasActive = !!screenFetchActive;
       screenFetchActive = false;
       screenPendingSince = 0;   // 期限の基準もリセット（次回押下で引き直す）
+      // 【仕様(b)】ポーリング終了（取得完了／タイムアウト）時は押下基準を必ず解除する。
+      //   残したままだと以後の表示でも古い画像が弾かれ続け、
+      //   R43 の「更新待ち固着」に似た見え方の固着が再発する。
+      screenRequestAfterTs = 0;
       updateScreenFetchButton(false, 0);
       // 【R43.1】ポーリング終了時に「更新待ち」を必ず解除して描き直す。
       //   R43 は screenFetchActive を false にしたまま再描画しなかったため、
@@ -3664,7 +5363,12 @@
       if (wasActive) {
         let dirty = false;
         (screensData || []).forEach(function (d) {
-          if (d && d.pending_new) { d.pending_new = false; dirty = true; }
+          if (!d) return;
+          if (d.pending_new) { d.pending_new = false; dirty = true; }
+          // 【仕様(b)】押下基準を解除したので、旧画像を再び「取得済（前回の画像）」として
+          //   表示できる状態に戻す（取得できなかった場合に操作不能に見せない）。
+          if (d.needs_image) { d.needs_image = false; dirty = true; }
+          if (d.stale_before_request) { d.stale_before_request = false; dirty = true; }
         });
         if (dirty) {
           screenRenderedSig = '';
@@ -3759,15 +5463,33 @@
         //   フォールバックも必ずシート時計（screen_request_ms → screenBaseMs）で行う。
         const hasFresh = data.some(function (d) {
           if (!d || !d.has_image) return false;
-          if (d.shot_is_fresh === true) return true;
-          if (d.pending_new) return false;
+          // 【要件1】押下前の更新日時は、画像が付いていても「取得完了」ではない。
+          //   ここを素通しすると 00:15 時点で古い画像を完了扱いにして
+          //   ポーリングを打ち切ってしまう（実機症状の直接原因）。
+          if (d.stale_before_request === true) return false;
           const ms = (typeof d.screenshot_ms === 'number' && d.screenshot_ms > 0)
             ? d.screenshot_ms : screenTsToMs(d.screenshot_at);
+          // フォールバック経路でも同じ下限で弾く（押下前＝前回画像）。
+          const __floor = (typeof screenRequestAfterTs === 'number' && screenRequestAfterTs > 0)
+            ? (screenRequestAfterTs - ((typeof SCREEN_CLOCK_SKEW_MS === 'number' && SCREEN_CLOCK_SKEW_MS > 0) ? SCREEN_CLOCK_SKEW_MS : 5000))
+            : 0;
+          if (__floor > 0 && ms > 0 && ms < __floor) return false;
+          if (d.shot_is_fresh === true) return true;
+          if (d.pending_new) return false;
           const reqMs = (typeof d.screen_request_ms === 'number' && d.screen_request_ms > 0)
             ? d.screen_request_ms : 0;
           if (reqMs > 0 && ms > 0) return ms >= reqMs;   // シートの要求日時と比較
           if (screenBaseMs > 0 && ms > 0) return ms > screenBaseMs; // 押下時の最新より新しい
-          return true;  // 基準が無い（未要求の単純表示）なら「取得済み」として扱う
+          // 【今回】基準が無いときに無条件 true にしない。
+          //   ここが true だと「押下前から存在した古い画像」を完了扱いにしてしまい、
+          //   ポーリングを即座に打ち切って古い画像のまま止まる（実機症状）。
+          //   押下時刻を時計ズレ許容付きで基準にする（厳密比較のデッドロックは避ける）。
+          if (typeof screenRequestAfterTs === 'number' && screenRequestAfterTs > 0 && ms > 0) {
+            const skew = (typeof SCREEN_CLOCK_SKEW_MS === 'number' && SCREEN_CLOCK_SKEW_MS > 0)
+              ? SCREEN_CLOCK_SKEW_MS : 5000;
+            return ms >= (screenRequestAfterTs - skew);
+          }
+          return true;  // 押下を経ていない単純表示（取得済みを表示）は従来どおり
         });
 
         // メタ取得のときは、既に持っている画像を消さない（画像本体は返ってこないため）。
@@ -3780,13 +5502,25 @@
             if (!d || !d.student_id) return;
             const prev = prevById[String(d.student_id)];
             if (!prev) return;
-            // 新着（要求時刻以降に撮れた）でなければ、手元の画像を維持する。
-            if (!d.pending_new && prev.has_image && !d.image_data_url) {
-              d.image_data_url = prev.image_data_url;
-            }
-            if (d.pending_new && prev.has_image) {
-              // 要求後にまだ撮れていない → 旧画像は残すが「更新待ち」として描く。
-              d.image_data_url = prev.image_data_url;
+            // 【Bug A】メタ取得では画像本体が返らない。よって手元の画像と撮影日時は
+            //   「必ず対（ペア）で」扱う。片方だけ新しくすると、
+            //   「16:39:32 という新しい更新日時」に「16:38:07 の古い画像」を
+            //   結びつけてしまい、管理画面は古い画像のまま停止する（実機症状）。
+            const sameShot = String(prev.screenshot_at || '') === String(d.screenshot_at || '');
+            if (!d.image_data_url && prev.has_image) {
+              if (sameShot) {
+                // 同じ撮影の続き → 手元の画像をそのまま使う（日時も一致）。
+                d.image_data_url = prev.image_data_url;
+              } else {
+                // 【要件2】新しい更新日時を検知したが本体は未取得。
+                //   古い Base64 を新しい日時に貼らない。表示は従来の対に据え置き、
+                //   needs_image で「取得中」に切り替える（＝古い画像を見せない）。
+                //   本体が届いたフル取得で新しい対に入れ替わる。
+                d.image_data_url = prev.image_data_url;
+                d.screenshot_at = prev.screenshot_at;
+                d.screenshot_ms = prev.screenshot_ms;
+                d.needs_image = true;
+              }
             }
           });
         }
@@ -3841,15 +5575,18 @@
       //   すべてやり直しになり、重くて操作できない（実機の固まり）。
       const light = !!(opts && opts.light);
 
-      const ready = screensData.filter(d => d.has_image).length;
+      // 【要件1】needs_image（＝新しい更新日時は来たが画像本体が未取得）は
+      //   「取得済」に数えない。古い画像を新しい日時として見せないため。
+      const ready = screensData.filter(d => d.has_image && !d.needs_image).length;
       // 【R43】要求より前に撮れた旧画像 = 「更新待ち」（取得済みだが最新ではない）
-      const waiting = screensData.filter(d => d.has_image && d.pending_new).length;
+      const waiting = screensData.filter(d => d.has_image && d.pending_new && !d.needs_image).length;
       // 【R43.3】「保護されたページ表示中」＝端末は応答したが撮影できなかった。
       //   更新待ち／取得待ちとは別枠で数える（待っても来ないため）。
       //   画像が既にある端末（更新待ちの旧画像表示）は取得済み側に残す。
       const blocked = screensData.filter(d => d.capture_blocked && !d.has_image).length;
-      const pending = screensData.filter(d => !d.has_image && !d.capture_blocked && d.screen_request_at).length;
-      const none = screensData.filter(d => !d.has_image && !d.capture_blocked && !d.screen_request_at).length;
+      // 画像本体の到着待ち（旧画像しか無い場合もここに含める）
+      const pending = screensData.filter(d => (d.needs_image || !d.has_image) && !d.capture_blocked && d.screen_request_at).length;
+      const none = screensData.filter(d => !d.has_image && !d.needs_image && !d.capture_blocked && !d.screen_request_at).length;
       if (statusBar) {
         statusBar.innerHTML = `対象 <b>${screensData.length}</b> 台 ／ 取得済 <span class="text-emerald-600 font-bold">${ready}</span> ／ 更新待ち <span class="text-amber-600 font-bold">${waiting}</span> ／ 取得待ち <span class="text-amber-600 font-bold">${pending}</span> ／ 保護ページ <span class="text-sky-600 font-bold">${blocked}</span> ／ 未取得 <span class="text-slate-500 font-bold">${none}</span>`;
       }
@@ -3858,11 +5595,19 @@
       //   【R43.3】capture_blocked を署名に含める。含めないと、
       //   「更新待ち → 保護ページ表示中」の切り替えが同一署名と判定され、
       //   カードが描き直されずに古い表示のまま残ってしまう。
+      //   【Bug B】画像(Base64)の同一性を署名に含める。
+      //   含めないと「同じ撮影日時のまま Base64 だけ差し替わった」場合や、
+      //   「日時だけ進んで画像本体は後から届く」場合に署名が一致してしまい、
+      //   下の `!light && sig === screenRenderedSig` で再構築が握り潰され、
+      //   <img> が古いまま残る（実機：2回目押下で初めて新画像が出る症状の本体）。
+      //   needs_image も含める（本体未取得 → 取得後に必ず作り直させる）。
       const sig = screensData.map(function (d) {
         return [d.student_id, d.screenshot_at || '', d.has_image ? 1 : 0,
                 d.pending_new ? 1 : 0, d.is_online ? 1 : 0,
                 d.capture_blocked ? 1 : 0,
-                d.capture_blocked_reason || ''].join('~');
+                d.capture_blocked_reason || '',
+                screenImageSig(d),
+                d.needs_image ? 1 : 0].join('~');
       }).join('|');
 
       if (light && screenRenderedSig) {
@@ -3895,7 +5640,8 @@
         const onlineBadge = onlineBadgeHtml(d.is_online);
 
         let body;
-        if (d.has_image) {
+        // 【要件1/仕様(a)】needs_image の間は画像を描かない（古い画面の誤認防止）。
+        if (d.has_image && !d.needs_image) {
           const isNew = screenRevealTime[d.student_id] && !d.pending_new;
           // 【R43】要求後にまだ撮れていない場合は「更新待ち」と明示する
           //   （古い画像を最新として見せない＝空振りの防止）。
@@ -3923,6 +5669,14 @@
             <svg class="w-7 h-7 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
             <span class="text-xs mt-2 font-semibold text-sky-700 text-center px-2 leading-snug">${escapeHtml(why)}</span>
             <span class="text-[10px] text-slate-400 mt-0.5">${escapeHtml(d.capture_blocked_at || '')}</span>
+          </div>`;
+        } else if (d.needs_image) {
+          // 【要件1/仕様(a)】押下直後に古い画面を出すと「今の児童の画面」と誤認される。
+          //   新しい画像本体が届くまでは隠して「取得中」を表示する。
+          body = `<div class="bg-slate-100 aspect-video flex flex-col items-center justify-center text-slate-400">
+            <svg class="w-6 h-6 animate-spin text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+            <span class="text-xs mt-2 font-semibold text-amber-600">取得中（最新の画面を待っています）</span>
+            <span class="text-[10px] text-slate-400 mt-0.5">要求: ${escapeHtml(d.screen_request_at || '')}</span>
           </div>`;
         } else if (d.screen_request_at) {
           body = `<div class="bg-slate-100 aspect-video flex flex-col items-center justify-center text-slate-400">
@@ -4228,6 +5982,24 @@
       document.getElementById('statFiltered').textContent = filtered;
     }
 
+    // 【表示同期】端末データを描く「3つの面」を必ず一緒に更新する共通ヘルパー。
+    //   端末一覧の各行（renderDevices）と上部の集計カード（updateStatistics）に加え、
+    //   クラスチップ（updateClassFilterOptions → renderClassChips）も同時に描き直す。
+    //
+    //   これが無いと、ロック／URL規制を押した瞬間は行と集計だけが楽観更新され、
+    //   クラスチップの🔒・🛡バッジは次回の全件再取得（1.5秒後の遅延 + GAS 応答待ち）
+    //   まで古いまま残る。実機で「児童の行はすぐ変わるのに、クラスの表示だけ遅れる」
+    //   と見えていた正体がこれ。
+    //
+    //   ※ 選択状態は selectedClasses / selectedStudentIds（モジュール変数）が正であり、
+    //     再描画時にその集合から checked を組み立て直すため、チップのチェック状態や
+    //     選択中の児童がこの再描画で崩れることはない。
+    function refreshDeviceViews() {
+      try { renderDevices(); } catch (e) {}
+      try { updateStatistics(); } catch (e) {}
+      try { updateClassFilterOptions(); } catch (e) {}
+    }
+
     function formatRelativeTime(dateStr) {
       if (!dateStr) return '-';
       const dt = new Date(dateStr);
@@ -4370,7 +6142,7 @@
           ? `<span class="text-slate-400 text-[11px]">クラス未設定</span>`
           : `<span class="text-slate-700 font-semibold text-[11px]">${escapeHtml(d.class_name)}</span>`;
 
-        // AI監視: 学習に関係のないサイトを開いている児童の氏名の横に注意マークを出す。
+        // サイト監視: 学習に関係のないサイトを開いている児童の氏名の横に注意マークを出す。
         // 監視がOFFのときは GAS 側が monitor_flag=false を返すため、ここには表示されない
         // （＝システム全体のON/OFFがそのまま表示に反映される）。
         const monitorBadge = d.monitor_flag
@@ -4378,6 +6150,21 @@
           : '';
         const monitorDetail = d.monitor_flag && d.monitor_at
           ? `<span class="text-[10px] text-rose-500 font-mono">${escapeHtml(d.monitor_at)}</span>`
+          : '';
+
+        // 【Request P】「予約実行中」バッジ。
+        //   スケジュール（時間制限タイマー）がいま効いている児童を一覧で一目で分かるようにする。
+        //   GAS は schedule_active_label に「どの予約か（備考 → 制限タイプ）」を入れて返す。
+        //   子GAS（R41）でも同じ項目が返るため、単一GAS／分校構成のどちらでも表示できる。
+        //   シートへの書き戻しは行わない（読み取り専用の集計）。
+        const schActive = !!d.schedule_active;
+        const schLabel = String(d.schedule_active_label || '');
+        const schCount = Number(d.schedule_active_count) || 0;
+        const schBadge = schActive
+          ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-violet-100 text-violet-800 border border-violet-300" title="予約（時間制限タイマー）により制限中${schLabel ? '：' + escapeHtml(schLabel) : ''}${schCount > 1 ? '（' + schCount + '件）' : ''}">
+               <svg class="w-3 h-3 mr-1 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+               予約実行中${schLabel ? '：' + escapeHtml(schLabel) : ''}${schCount > 1 ? '（' + schCount + '件）' : ''}
+             </span>`
           : '';
 
         html += `
@@ -4402,6 +6189,7 @@
                 <span class="font-bold text-slate-800 text-sm">${escapeHtml(d.student_name || '氏名未設定')}</span>
                 ${monitorBadge}
                 ${monitorDetail}
+                ${schBadge}
                 <span class="text-slate-300">•</span>
                 ${classBadge}
                 ${d.notes ? `<span class="text-[10px] text-slate-400 truncate max-w-xs">(${escapeHtml(d.notes)})</span>` : ''}
@@ -4573,6 +6361,14 @@
       const seq = ++mutationSeq;
       let applied = false;
 
+      // 【要件2】操作開始の時点で世代を進め、これ以前に発行された loadDevices の
+      //   応答をすべて無効化する。自動更新は操作後も 5 秒間隔で走り続けるため、
+      //   これをしないと「操作前に発行された取得」が操作後に結果を返し、
+      //   楽観更新を古い状態で上書きしてしまう（＝先祖返りの直接原因）。
+      //   loadDevices 側は `mySeq !== loadSeq` で自分の応答を捨てるので、
+      //   ここで 1 進めるだけで、既に飛んでいる取得はすべて破棄される。
+      try { loadSeq++; } catch (eSeq) {}
+
       // 1) 楽観的UI（押下と同値・0.1秒以内）
       if (typeof o.apply === 'function') {
         try { o.apply(); applied = true; } catch (e) {}
@@ -4597,6 +6393,9 @@
         if (applied && typeof o.revert === 'function') {
           try { o.revert(); } catch (e) {}
         }
+        // revert した以上、期待値はもう正しくない。保護を残すと以後の
+        // 正当なサーバー更新までブロックしてしまうので必ず一緒に解除する。
+        try { if (o.guardIds) clearOptimisticGuard(o.guardIds); } catch (e) {}
         const m0 = (eStart && eStart.message) ? eStart.message : String(eStart);
         try { showToast((o.errorPrefix || 'エラー') + ': ' + m0, 'error'); } catch (e) {}
         if (o.busy) { try { setBulkActionBusy(false); } catch (e) {} }
@@ -4615,7 +6414,9 @@
           const delay = (typeof o.refreshDelay === 'number') ? o.refreshDelay : 1500;
           setTimeout(function () {
             if (seq !== mutationSeq) return;
-            try { loadDevices(true); } catch (e) {}
+            // 【R55】操作直後も「最新ステータス取得」＝fresh 経路で取り直す。
+            //   タイマーを待たずに取得するので、画面と実機状態がズレない。
+            try { loadDevices(true, { fresh: true, trigger: 'mutation' }); } catch (e) {}
           }, delay);
         }
       }).catch(function (err) {
@@ -4624,6 +6425,8 @@
         if (applied && typeof o.revert === 'function') {
           try { o.revert(); } catch (e) {}
         }
+        // ロールバックしたので保護も解除する（残すと以後の更新を誤って拒む）
+        try { if (o.guardIds) clearOptimisticGuard(o.guardIds); } catch (e) {}
         refreshSuppressedUntil = 0;
         const msg = (err && err.message) ? err.message : String(err);
         try { showToast((o.errorPrefix || '通信失敗') + ': ' + msg, 'error'); } catch (e) {}
@@ -4696,20 +6499,25 @@
           const d = devicesData.find(x => x.student_id === id);
           if (d) d.screen_lock = state;
         });
-        try { renderDevices(); updateStatistics(); } catch (e) {}
+        try { refreshDeviceViews(); } catch (e) {}
       };
       const revertOptimisticLock = () => {
         ids.forEach(id => {
           const d = devicesData.find(x => x.student_id === id);
           if (d && Object.prototype.hasOwnProperty.call(prevLocks, id)) d.screen_lock = prevLocks[id];
         });
-        try { renderDevices(); updateStatistics(); } catch (e) {}
+        try { refreshDeviceViews(); } catch (e) {}
       };
+
+      // 【保護】この操作の対象児童について「あるべき状態」を記録する。
+      //   以後 12 秒間、サーバーから操作前の値が届いても上書きさせない。
+      armOptimisticGuard(ids, { screen_lock: !!locked });
 
       await runMutation({
         payload: { action: 'bulk_lock', student_ids: ids, locked: locked },
         apply: () => applyOptimisticLock(locked),
         revert: revertOptimisticLock,
+        guardIds: ids,
         successMessage: `画面ロックを ${locked ? 'ON' : 'OFF'} にしました`,
         errorPrefix: 'エラー',
         busy: true,
@@ -4738,21 +6546,23 @@
       // 【R37】個別操作も一括とまったく同じ経路（/exec 直接 fetch +
       //   楽観的UI + ビーコン0ms並列 + バックグラウンド継続）に統一する。
       const prevLock = dev ? !!dev.screen_lock : false;
+      armOptimisticGuard([studentId], { screen_lock: !!newLockState });
       await runMutation({
         payload: {
           action: 'update_single',
           student_id: studentId,
           data: { screen_lock: newLockState }
         },
+        guardIds: [studentId],
         apply: () => {
           const d = devicesData.find(x => x.student_id === studentId);
           if (d) d.screen_lock = !!newLockState;
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         revert: () => {
           const d = devicesData.find(x => x.student_id === studentId);
           if (d) d.screen_lock = prevLock;
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         successMessage: '画面ロック設定を更新しました',
         errorPrefix: '更新失敗',
@@ -4802,22 +6612,30 @@
         const d = devicesData.find(x => x.student_id === id);
         if (d) prevUrls[id] = d.broadcast_url || '';
       });
+      armOptimisticGuard(ids, { broadcast_url: url });
+      // 【要件1】この配信の broadcast_id はここで1つだけ採番し、全経路で共用する。
+      const bcId = mintBroadcastId();
       await runMutation({
-        payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
+        payload: { action: 'bulk_broadcast', student_ids: ids, url: url, broadcast_id: bcId },
         apply: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
-            if (d) d.broadcast_url = url;
+            if (d) {
+              d.broadcast_url = url;
+              // 端末一覧の表示も親と揃える（次の全件取得を待たない）
+              d.broadcast_id = bcId;
+            }
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         revert: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
             if (d && Object.prototype.hasOwnProperty.call(prevUrls, id)) d.broadcast_url = prevUrls[id];
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
+        guardIds: ids,
         successMessage: 'URLを配信しました',
         errorPrefix: '配信エラー',
         refreshDelay: 1500
@@ -5007,6 +6825,8 @@
         const d = devicesData.find(x => x.student_id === id);
         if (d) prevModes[id] = d.filter_mode || '';
       });
+      // 【保護】URL規制の実行も解除（mode==='OFF'）も、あるべき状態を記録する。
+      armOptimisticGuard(ids, { filter_mode: mode });
       await runMutation({
         payload: {
           action: 'bulk_filter',
@@ -5015,19 +6835,20 @@
           whitelist_urls: whitelist,
           blacklist_urls: blacklist
         },
+        guardIds: ids,
         apply: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
             if (d) d.filter_mode = mode;
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         revert: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
             if (d && Object.prototype.hasOwnProperty.call(prevModes, id)) d.filter_mode = prevModes[id];
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         afterSuccess: () => {
           if (saveAsPref && currentTeacher) {
@@ -5300,14 +7121,20 @@
         const d = devicesData.find(x => x.student_id === id);
         if (d) prevUrlsQuick[id] = d.broadcast_url || '';
       });
+      armOptimisticGuard(ids, { broadcast_url: url });
+      // 【要件1】マイURL配信も同じ採番方式（押下時に1つ）に統一する。
+      const bcIdQuick = mintBroadcastId();
       await runMutation({
-        payload: { action: 'bulk_broadcast', student_ids: ids, url: url },
+        payload: { action: 'bulk_broadcast', student_ids: ids, url: url, broadcast_id: bcIdQuick },
         apply: () => {
           ids.forEach(id => {
             const d = devicesData.find(x => x.student_id === id);
-            if (d) d.broadcast_url = url;
+            if (d) {
+              d.broadcast_url = url;
+              d.broadcast_id = bcIdQuick;
+            }
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
         revert: () => {
           ids.forEach(id => {
@@ -5316,8 +7143,9 @@
               d.broadcast_url = prevUrlsQuick[id];
             }
           });
-          try { renderDevices(); updateStatistics(); } catch (e) {}
+          try { refreshDeviceViews(); } catch (e) {}
         },
+        guardIds: ids,
         successMessage: `「${title || url}」を配信しました`,
         errorPrefix: '配信エラー',
         refreshDelay: 1500
@@ -5330,7 +7158,7 @@
       else container.classList.add('hidden');
     }
 
-    // ==================== AI監視設定（システム全体・管理者のみ） ====================
+    // ==================== サイト監視設定（システム全体・管理者のみ） ====================
     // 監視は「システム全体」の設定なので、ON/OFF とドメイン辞書は管理者だけが変更できる。
     // 一般教員が呼び出してもサーバー側(saveMonitoringSettings)で拒否される（二重の防御）。
 
@@ -5355,6 +7183,9 @@
         if (toggle) toggle.checked = (s.enabled === true);
         if (blockedEl) blockedEl.value = (Array.isArray(s.blocked_domains) ? s.blocked_domains : []).join('\n');
         if (learningEl) learningEl.value = (Array.isArray(s.learning_domains) ? s.learning_domains : []).join('\n');
+
+        // 【R56】管理アカウント専用のライブ視聴設定（上限・自動タイムアウト）を反映する。
+        applyLiveWatchSettingsToModal(s);
 
         if (infoEl) {
           infoEl.textContent = s.updated_at
@@ -5383,9 +7214,13 @@
       const enabled = !!(toggle && toggle.checked);
 
       if (enabled && blocked.length === 0) {
-        showAlertModal('設定を確認してください', 'AI監視を有効にするには、非学習ドメイン辞書に1件以上のドメインを登録してください。', 'warning');
+        showAlertModal('設定を確認してください', 'サイト監視を有効にするには、非学習ドメイン辞書に1件以上のドメインを登録してください。', 'warning');
         return;
       }
+
+      // 【R56】ライブ視聴の2項目（1教員あたり上限・自動タイムアウト秒）を同時に保存する。
+      //   保存先は PropertiesService（MONITOR_SETTINGS_V1）のみ。子GAS へも shard_apply で伝播する。
+      const liveWatchSettings = readLiveWatchSettingsFromModal();
 
       try {
         showToast('監視設定を保存中...', 'info');
@@ -5394,14 +7229,18 @@
           settings: {
             enabled: enabled,
             blocked_domains: blocked,
-            learning_domains: learning
+            learning_domains: learning,
+            live_watch_per_teacher_limit: liveWatchSettings.live_watch_per_teacher_limit,
+            live_watch_timeout_sec: liveWatchSettings.live_watch_timeout_sec
           }
         });
-        showToast(enabled ? 'AI監視を有効にしました' : 'AI監視を無効にしました', 'success');
+        showToast(enabled ? 'サイト監視を有効にしました' : 'サイト監視を無効にしました', 'success');
         closeModal('monitorModal');
         // 注意マークの表示／非表示を即座に反映する
         refreshSuppressedUntil = 0;
         await loadDevices();
+        // 【R56】上限・タイムアウトの変更を教員画面のインジケーターへ即時反映する。
+        try { await refreshLiveWatchStatus(true); } catch (eLW) {}
       } catch (err) {
         showToast('監視設定の保存に失敗しました: ' + err.message, 'error');
       }
@@ -5521,6 +7360,10 @@
       if (anBtn) anBtn.className = isAnnual ? activeCls : idleCls;
       // 児童タブへ切り替えた際に登録済み児童一覧を最新化
       if (isStudents) loadStudentList();
+      // 【Request N】年次更新タブを開いたら予約状態を取得する。
+      //   このAPIは「予約日時を過ぎて未実行なら実行する」フォールバック判定も行うため、
+      //   管理者が画面を開くだけで未実行の年次更新が自動実行される。
+      if (isAnnual && typeof refreshAnnualReservationStatus === 'function') refreshAnnualReservationStatus();
     }
 
     // 登録済み児童一覧を取得（管理者は全校。一般教員は自校＋未設定のみ）
@@ -5594,13 +7437,13 @@
     async function loadTeacherList() {
       const tbody = document.getElementById('teacherListBody');
       if (!tbody) return;
-      tbody.innerHTML = '<tr><td colspan="6" class="text-center text-slate-400 p-4">読み込み中...</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="text-center text-slate-400 p-4">読み込み中...</td></tr>';
       try {
         const res = await apiRequest({ action: 'get_teachers' });
         adminTeachers = (res && res.teachers) || [];
         renderTeacherList();
       } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="6" class="text-center text-rose-500 p-4">読み込み失敗: ${escapeHtml(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="text-center text-rose-500 p-4">読み込み失敗: ${escapeHtml(err.message)}</td></tr>`;
       }
     }
 
@@ -5608,7 +7451,7 @@
       const tbody = document.getElementById('teacherListBody');
       if (!tbody) return;
       if (!adminTeachers.length) {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-slate-400 p-4">教員アカウントがありません。</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="text-center text-slate-400 p-4">教員アカウントがありません。</td></tr>';
         return;
       }
       tbody.innerHTML = adminTeachers.map(t => {
@@ -5619,12 +7462,18 @@
         const schoolBadge = (!t.school || t.school === '未設定')
           ? '<span class="text-amber-700 font-semibold">未設定</span>'
           : escapeHtml(t.school);
+        // 【Request K】Google SSO許可バッジ（未設定＝既定ONなので、明示OFF以外は SSO可）
+        const ssoOn = !(t.sso_allowed === false || String(t.sso_allowed).trim().toLowerCase() === 'false');
+        const ssoBadge = ssoOn
+          ? '<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-100 text-emerald-700 border border-emerald-200">SSO可</span>'
+          : '<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-slate-100 text-slate-500 border border-slate-200">SSO不可</span>';
         return `<tr class="border-t border-slate-100 hover:bg-slate-50">
           <td class="p-2.5 font-mono text-[11px] text-slate-700 break-all">${escapeHtml(t.email)}</td>
           <td class="p-2.5 text-slate-800">${escapeHtml(t.name || '-')}</td>
           <td class="p-2.5 text-slate-600">${schoolBadge}</td>
           <td class="p-2.5">${roleBadge}</td>
           <td class="p-2.5 text-slate-600">${escapeHtml(t.target_class || '-')}</td>
+          <td class="p-2.5">${ssoBadge}</td>
           <td class="p-2.5 text-right">
             <button onclick="startEditTeacher('${escapeHtml(t.email)}')" title="編集" class="p-1.5 text-indigo-600 hover:bg-indigo-50 rounded-lg transition border border-transparent hover:border-indigo-200">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
@@ -5648,6 +7497,15 @@
       if (schSel) schSel.value = SCHOOLS.includes(t.school) ? t.school : '未設定';
       document.getElementById('newTeacherRole').value = /^(ADMIN|SUPERADMIN|SYSTEM_ADMIN)$/i.test(String(t.role||'')) ? 'ADMIN' : 'TEACHER';
       document.getElementById('newTeacherClass').value = t.target_class || '';
+      // 【Request K】SSO許可・登録URL情報・個別ホワイト/ブラックリストも復元する
+      const ssoEl = document.getElementById('newTeacherSsoAllowed');
+      if (ssoEl) ssoEl.checked = !(t.sso_allowed === false);
+      const urlsEl = document.getElementById('newTeacherUrls');
+      if (urlsEl) urlsEl.value = Array.isArray(t.urls) ? t.urls.join('\n') : String(t.urls || '');
+      const wlEl = document.getElementById('newTeacherWhitelist');
+      if (wlEl) wlEl.value = t.filter_whitelist || '';
+      const blEl = document.getElementById('newTeacherBlacklist');
+      if (blEl) blEl.value = t.filter_blacklist || '';
       document.getElementById('addTeacherBtn').textContent = '教員情報を更新';
       document.getElementById('addTeacherBtn').className = 'px-4 py-2 text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg shadow-sm transition';
       document.getElementById('cancelTeacherEditBtn').classList.remove('hidden');
@@ -5665,6 +7523,15 @@
       document.getElementById('newTeacherName').value = '';
       document.getElementById('newTeacherRole').value = 'TEACHER';
       document.getElementById('newTeacherClass').value = '';
+      // 【Request K】追加項目のリセット（SSOは安全側の既定ON）
+      const ssoEl = document.getElementById('newTeacherSsoAllowed');
+      if (ssoEl) ssoEl.checked = true;
+      const urlsEl = document.getElementById('newTeacherUrls');
+      if (urlsEl) urlsEl.value = '';
+      const wlEl = document.getElementById('newTeacherWhitelist');
+      if (wlEl) wlEl.value = '';
+      const blEl = document.getElementById('newTeacherBlacklist');
+      if (blEl) blEl.value = '';
       document.getElementById('addTeacherBtn').textContent = '教員を登録';
       document.getElementById('addTeacherBtn').className = 'px-4 py-2 text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg shadow-sm transition';
       document.getElementById('cancelTeacherEditBtn').classList.add('hidden');
@@ -5679,20 +7546,31 @@
       const school = document.getElementById('newTeacherSchool').value;
       const role = document.getElementById('newTeacherRole').value;
       const targetClass = document.getElementById('newTeacherClass').value.trim();
+      // 【Request K】SSO許可・登録URL情報・個別ホワイト/ブラックリスト
+      const ssoEl = document.getElementById('newTeacherSsoAllowed');
+      const ssoAllowed = ssoEl ? !!ssoEl.checked : true;
+      const urlsRaw = document.getElementById('newTeacherUrls').value;
+      const urls = urlsRaw.split(/[\r\n]+/).map(u => u.trim()).filter(Boolean);
+      const whitelist = document.getElementById('newTeacherWhitelist').value.trim();
+      const blacklist = document.getElementById('newTeacherBlacklist').value.trim();
       const btn = document.getElementById('addTeacherBtn');
 
       if (!email) { showAlertModal('入力不足', 'メールアドレスを入力してください。', 'warning'); return; }
-      if (!editingTeacherEmail && !password) { showAlertModal('入力不足', 'パスワードを入力してください。', 'warning'); return; }
+      // SSO許可がONならパスワード未設定でも登録できる（手動ログイン併用時のみ入力）
+      if (!editingTeacherEmail && !password && !ssoAllowed) {
+        showAlertModal('入力不足', 'パスワードを入力するか、「GoogleアカウントSSO許可」を有効にしてください。', 'warning');
+        return;
+      }
 
       try {
         btn.disabled = true;
         const original = btn.textContent;
         btn.textContent = '処理中...';
         if (editingTeacherEmail) {
-          await apiRequest({ action: 'update_teacher', data: { email, password, name, school, role, target_class: targetClass } });
+          await apiRequest({ action: 'update_teacher', data: { email, password, name, school, role, target_class: targetClass, sso_allowed: ssoAllowed, urls: urls, filter_whitelist: whitelist, filter_blacklist: blacklist } });
           showToast('教員情報を更新しました', 'success');
         } else {
-          await apiRequest({ action: 'add_teacher', data: { email, password, name, school, role, target_class: targetClass } });
+          await apiRequest({ action: 'add_teacher', data: { email, password, name, school, role, target_class: targetClass, sso_allowed: ssoAllowed, urls: urls, filter_whitelist: whitelist, filter_blacklist: blacklist } });
           showToast('教員を登録しました', 'success');
         }
         resetTeacherForm();
@@ -5949,6 +7827,218 @@
         ).join('<br>') + (list.length > 500 ? '<br>…他 ' + (list.length - 500) + ' 件' : '');
       } catch (err) {
         box.innerHTML = `<span class="text-rose-500">読み込み失敗: ${escapeHtml(err.message)}</span>`;
+      }
+    }
+
+    // ==================== 【Request N】予約実行型 年次更新 ====================
+    //   3月のうちに「実行予定日時」「次年度 児童CSV」「次年度 教員CSV」を登録すると、
+    //   指定日時に GAS 側の時刻トリガーが自動で年次更新を実行する。
+    //   CSV の解析はサーバー側（gas/Code.gs の parseAnnualCsv_）で行い、
+    //   ここではプレビュー表示のために同じ規則でブラウザ側でも分解する。
+    let annualReserveStudentCsv = '';
+    let annualReserveTeacherCsv = '';
+
+    // CSV を「行×列」に分解する（"..." 内のカンマ・改行・"" に対応）
+    function annualCsvSplit(text) {
+      const s = String(text || '').replace(/^\uFEFF/, '');
+      const rows = []; let row = []; let f = ''; let q = false;
+      for (let i = 0; i < s.length; i++) {
+        const c = s.charAt(i);
+        if (q) {
+          if (c === '"') { if (s.charAt(i + 1) === '"') { f += '"'; i++; } else { q = false; } }
+          else f += c;
+          continue;
+        }
+        if (c === '"') q = true;
+        else if (c === ',') { row.push(f); f = ''; }
+        else if (c === '\r') { /* CRLF の CR は無視 */ }
+        else if (c === '\n') { row.push(f); rows.push(row); row = []; f = ''; }
+        else f += c;
+      }
+      if (f !== '' || row.length) { row.push(f); rows.push(row); }
+      return rows
+        .map(function (r) { return r.map(function (v) { return String(v == null ? '' : v).trim(); }); })
+        .filter(function (r) { return r.some(function (v) { return v !== ''; }); });
+    }
+
+    function annualReservePreviewHtml(text) {
+      const rows = annualCsvSplit(text);
+      if (rows.length < 2) return '<span class="text-rose-500">データ行がありません（1行目をヘッダーにしてください）</span>';
+      const head = rows[0];
+      const body = rows.slice(1);
+      let html = `<b class="text-slate-700">${body.length} 件</b> <span class="text-slate-500">（列: ${escapeHtml(head.join(' / '))}）</span>`;
+      html += '<div class="mt-1 space-y-0.5 text-slate-600">' +
+        body.slice(0, 8).map(function (r) { return '・' + escapeHtml(r.join(' / ')); }).join('<br>') + '</div>';
+      if (body.length > 8) html += `<div class="text-slate-400">…他 ${body.length - 8} 件</div>`;
+      return html;
+    }
+
+    async function onAnnualReserveStudentFile(input) {
+      const box = document.getElementById('annualReserveStudentPreview');
+      const f = input.files && input.files[0];
+      if (!f) { annualReserveStudentCsv = ''; if (box) box.textContent = '未選択'; return; }
+      try {
+        annualReserveStudentCsv = await f.text();
+        if (box) box.innerHTML = annualReservePreviewHtml(annualReserveStudentCsv);
+      } catch (e) {
+        annualReserveStudentCsv = '';
+        if (box) box.innerHTML = '<span class="text-rose-500">読み込みエラー: ' + escapeHtml(e.message) + '</span>';
+      }
+    }
+
+    async function onAnnualReserveTeacherFile(input) {
+      const box = document.getElementById('annualReserveTeacherPreview');
+      const f = input.files && input.files[0];
+      if (!f) { annualReserveTeacherCsv = ''; if (box) box.textContent = '未選択'; return; }
+      try {
+        annualReserveTeacherCsv = await f.text();
+        if (box) box.innerHTML = annualReservePreviewHtml(annualReserveTeacherCsv);
+      } catch (e) {
+        annualReserveTeacherCsv = '';
+        if (box) box.innerHTML = '<span class="text-rose-500">読み込みエラー: ' + escapeHtml(e.message) + '</span>';
+      }
+    }
+
+    function annualReserveReadForm() {
+      const atEl = document.getElementById('annualReserveAt');
+      const clEl = document.getElementById('annualReserveClearPrev');
+      return {
+        run_at: (atEl && atEl.value ? atEl.value : '').trim(),
+        clear_previous: !!(clEl && clEl.checked),
+        student_csv: annualReserveStudentCsv,
+        teacher_csv: annualReserveTeacherCsv
+      };
+    }
+
+    function annualReserveStatusHtml(plan, fallback) {
+      if (!plan) return '<span class="text-slate-400">予約は登録されていません。</span>';
+      const st = String(plan.status || 'pending');
+      let badge = '';
+      if (st === 'done') badge = '<span class="px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 font-bold">実行完了</span>';
+      else if (st === 'running') badge = '<span class="px-2 py-0.5 rounded bg-amber-100 text-amber-700 font-bold">実行中</span>';
+      else if (st === 'error') badge = '<span class="px-2 py-0.5 rounded bg-rose-100 text-rose-700 font-bold">エラー</span>';
+      else if (plan.is_due) badge = '<span class="px-2 py-0.5 rounded bg-amber-100 text-amber-700 font-bold">期限到来（未実行）</span>';
+      else badge = '<span class="px-2 py-0.5 rounded bg-indigo-100 text-indigo-700 font-bold">待機中</span>';
+      let html = badge + ' <span class="text-slate-600">実行予定: ' + escapeHtml(plan.run_at_text || '-') + '</span>';
+      if (plan.ran_at_text) html += ' <span class="text-slate-600">／ 実行完了日時: ' + escapeHtml(plan.ran_at_text) + '</span>';
+      const c = plan.counts || null;
+      if (c) {
+        html += '<div class="mt-1 text-slate-600">取込件数: 児童 追加' + (c.students_added || 0) +
+          ' / 更新' + (c.students_updated || 0) + ' / 削除' + (c.students_removed || 0) +
+          ' ・ 教員 追加' + (c.teachers_added || 0) + ' / 更新' + (c.teachers_updated || 0) + '</div>';
+        if (c.child_urls) {
+          html += '<div class="text-slate-600">R41子GAS: ' + (c.child_ok || 0) + ' / ' + c.child_urls +
+            ' 校クリア成功' + (c.child_failed ? '（失敗 ' + c.child_failed + ' 校）' : '') + '</div>';
+        }
+        if (c.previous_rows_deleted) {
+          html += '<div class="text-slate-600">前年度 端末行の削除: ' + c.previous_rows_deleted + ' 行</div>';
+        }
+      } else {
+        html += '<div class="mt-1 text-slate-600">予定内容: 児童 ' + (plan.student_count || 0) +
+          ' 件 / 教員 ' + (plan.teacher_count || 0) + ' 件 ・ 前年度データ削除 ' +
+          (plan.clear_previous ? 'あり' : 'なし') + '</div>';
+      }
+      if (plan.last_error) html += '<div class="mt-1 text-rose-600">エラー: ' + escapeHtml(plan.last_error) + '</div>';
+      if (fallback && fallback.due && fallback.executed) {
+        html += '<div class="mt-1 text-emerald-700 font-bold">予約日時を過ぎていたため自動実行しました。</div>';
+      }
+      return html;
+    }
+
+    async function refreshAnnualReservationStatus() {
+      const box = document.getElementById('annualReserveStatusBox');
+      if (!box) return;
+      if (!isAdminUser()) {
+        box.innerHTML = '<span class="text-slate-400">予約の管理は管理者のみ表示されます。</span>';
+        return;
+      }
+      try {
+        const res = await apiRequest({ action: 'annual_reservation_status' });
+        box.innerHTML = annualReserveStatusHtml((res && res.plan) || null, (res && res.fallback) || null);
+      } catch (err) {
+        box.innerHTML = '<span class="text-rose-500">状態取得に失敗: ' + escapeHtml(err.message) + '</span>';
+      }
+    }
+
+    async function saveAnnualReservation() {
+      if (!isAdminUser()) { showAlertModal('権限がありません', '管理者のみ操作できます。', 'error'); return; }
+      const form = annualReserveReadForm();
+      if (!form.run_at) {
+        showAlertModal('実行予定日時を指定してください', '例: 2027-04-01 06:00 のように、次年度に切り替える日時を入力してください。', 'warning');
+        return;
+      }
+      if (!String(form.student_csv).trim() && !String(form.teacher_csv).trim()) {
+        showAlertModal('CSVが未選択です', '次年度の児童リスト、または教員リストのCSVを読み込んでください。', 'warning');
+        return;
+      }
+      const btn = document.getElementById('annualReserveSaveBtn');
+      try {
+        btn.disabled = true; const orig = btn.textContent; btn.textContent = '保存中...';
+        const res = await apiRequest({ action: 'annual_reservation_save', data: form });
+        const p = (res && res.plan) || {};
+        btn.textContent = orig;
+        const warn = [].concat(p.student_errors || [], p.teacher_errors || []);
+        showAlertModal('年次更新を予約保存しました',
+          '実行予定: ' + (p.run_at_text || form.run_at) +
+          '\n児童: ' + (p.student_count || 0) + ' 件 / 教員: ' + (p.teacher_count || 0) + ' 件' +
+          '\n前年度データ削除: ' + (p.clear_previous ? 'あり' : 'なし') +
+          (warn.length ? '\n\n警告:\n' + warn.slice(0, 10).join('\n') : ''), 'success');
+        await refreshAnnualReservationStatus();
+      } catch (err) {
+        showAlertModal('予約の保存に失敗しました', err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '保存中...') btn.textContent = '年次更新を予約保存';
+      }
+    }
+
+    async function runAnnualReservationNow() {
+      if (!isAdminUser()) { showAlertModal('権限がありません', '管理者のみ操作できます。', 'error'); return; }
+      const form = annualReserveReadForm();
+      const hasCsv = !!String(form.student_csv).trim() || !!String(form.teacher_csv).trim();
+      const msg = hasCsv
+        ? 'この内容で年次更新を「今すぐ」実行します。\n前年度データ削除がONの場合、端末一覧の児童行が削除されます。\nよろしいですか？'
+        : '保存済みの予約内容で年次更新を「今すぐ」実行します。\nよろしいですか？';
+      if (!confirm(msg)) return;
+      const btn = document.getElementById('annualReserveRunNowBtn');
+      try {
+        btn.disabled = true; const orig = btn.textContent; btn.textContent = '実行中...';
+        const res = await apiRequest({ action: 'annual_rollover_run_now', data: form });
+        const r = (res && res.result) || {};
+        const c = r.counts || {};
+        btn.textContent = orig;
+        showAlertModal('年次更新 実行完了',
+          (r.executed ? '実行しました。' : '実行済みのためスキップしました。') +
+          '\n実行日時: ' + (r.ran_at_text || '-') +
+          '\n児童: 追加' + (c.students_added || 0) + ' / 更新' + (c.students_updated || 0) + ' / 削除' + (c.students_removed || 0) +
+          '\n教員: 追加' + (c.teachers_added || 0) + ' / 更新' + (c.teachers_updated || 0) +
+          (c.child_urls ? '\nR41子GAS: ' + (c.child_ok || 0) + ' / ' + c.child_urls + ' 校クリア成功' : ''), 'success');
+        await refreshAnnualReservationStatus();
+        await loadStudentList().catch(function () {});
+        await loadDevices(true).catch(function () {});
+      } catch (err) {
+        showAlertModal('年次更新の実行に失敗しました', err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '実行中...') btn.textContent = '今すぐテスト実行／即時反映';
+      }
+    }
+
+    async function cancelAnnualReservation() {
+      if (!isAdminUser()) { showAlertModal('権限がありません', '管理者のみ操作できます。', 'error'); return; }
+      if (!confirm('年次更新の予約をキャンセルします。よろしいですか？')) return;
+      const btn = document.getElementById('annualReserveCancelBtn');
+      try {
+        btn.disabled = true; const orig = btn.textContent; btn.textContent = '処理中...';
+        const res = await apiRequest({ action: 'annual_reservation_cancel' });
+        btn.textContent = orig;
+        showAlertModal('予約のキャンセル', (res && res.message) || 'キャンセルしました', 'success');
+        await refreshAnnualReservationStatus();
+      } catch (err) {
+        showAlertModal('キャンセルに失敗しました', err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '処理中...') btn.textContent = '予約をキャンセル';
       }
     }
 
