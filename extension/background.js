@@ -1932,20 +1932,22 @@ async function downscaleForSheet(dataUrl) {
 //     ・LIVE_WATCH_MAX_B64（30,000）は上限として維持する（固定仕様）。
 // ============================================================================
 const LIVE_WATCH_MAX_B64 = 30000;          // 送信する Base64 の上限（要件: 30,000 文字以内）
-const LIVE_WATCH_TARGET_MAX_B64 = 8000;    // 【R61】目標サイズの上限（約6KB）
-const LIVE_WATCH_TARGET_MIN_B64 = 4000;    // 【R61】目標サイズの下限（4KB を下回るなら画質を上げる）
-const LIVE_WATCH_TARGET_WIDTH = 320;       // 【R61】目標の横幅（320px へ軽量化）
-const LIVE_WATCH_MIN_WIDTH = 200;          // 縮小の下限（これ以上は落とさない）
-// 【R61】品質は 25% を起点にする。1 枚あたり 6KB 前後に収まり、
-//   子GAS への転送・管理画面のデコード・シリアライズが最短になる。
-const LIVE_WATCH_QUALITIES = [0.25, 0.22, 0.20, 0.16, 0.12, 0.10];
-const LIVE_WATCH_CAPTURE_QUALITY = 25;     // captureVisibleTab の品質（25%）
-// 【R60】ライブ視聴専用ループの周期（0.8 秒）。ハートビート（1.5 秒）とは
-//   独立して回すため、同期通信が遅い時間帯でも画像の更新ペースを保てる。
-const LIVE_WATCH_LOOP_MS = 800;
-// 【R60】タブ切り替え（onActivated / onUpdated）で「即座に 1 枚」撮るためのデバウンス。
-//   連続したイベント（複数タブの一斉復元など）で撮影が乱発しないよう 250ms 待つ。
-const LIVE_WATCH_TAB_HOOK_DEBOUNCE_MS = 250;
+// 【R63】画質を大幅に引き上げる。実機検証で「6KB と 25KB の差は通信時間に
+//   ほとんど影響せず、支配的なのは google.script.run の往復回数そのもの」と
+//   判明した。よって上限 30,000 の枠内で最大限鮮明にする（文字が読める画質）。
+const LIVE_WATCH_TARGET_MAX_B64 = 26000;   // 【R63】目標サイズの上限（上限 30,000 以内で最大限鮮明）
+const LIVE_WATCH_TARGET_MIN_B64 = 16000;   // 【R63】目標サイズの下限（これ未満なら画質を上げる）
+const LIVE_WATCH_TARGET_WIDTH = 640;       // 【R63】目標の横幅（640px＝2 倍解像度で文字が読める）
+const LIVE_WATCH_MIN_WIDTH = 320;          // 縮小の下限（640px から段階的に落とす／320px 未満は粗すぎる）
+// 【R63】品質は 55% を起点に、高画質側から順に探索する。
+//   上限（26,000）に収まる最も高画質な組み合わせを選ぶ。
+const LIVE_WATCH_QUALITIES = [0.55, 0.48, 0.42, 0.36, 0.30];
+const LIVE_WATCH_CAPTURE_QUALITY = 55;     // captureVisibleTab の品質（55%）
+// 【R63】ライブ視聴専用ループの周期（0.7 秒）。さらに詰めて体感を上げる。
+const LIVE_WATCH_LOOP_MS = 700;
+// 【R63】タブ切り替え（onActivated / onUpdated）で「即座に 1 枚」撮るためのデバウンス。
+//   150ms に短縮し、切り替えから反映までの待ちを最小化する。
+const LIVE_WATCH_TAB_HOOK_DEBOUNCE_MS = 150;
 let liveWatchActive = false;               // ハートビート応答 live_watch の写し
 let liveWatchInFlight = false;             // 送信の多重実行ガード（in-flight 排他）
 let liveWatchLastSentMs = 0;               // 直近の送信時刻（診断用）
@@ -2035,7 +2037,9 @@ async function downscaleForLiveWatch(dataUrl) {
 //   null を返して「送信ゼロ」になり、管理画面が「端末の送信を待っています…」のまま
 //   固まるのを避けるため、撮影品質を段階的に落として再撮影するフォールバックを持つ。
 //   それでも上限に収まらないときだけ送信を見送る（壊れたデータは送らない）。
-const LIVE_WATCH_FALLBACK_QUALITIES = [40, 28, 18, 10];
+// 【R63】撮影フォールバックも高画質側から落とす（55% 起点）。
+//   OffscreenCanvas が使えない環境でも「読める画質」を優先する。
+const LIVE_WATCH_FALLBACK_QUALITIES = [55, 48, 40, 30];
 
 /**
  * 軽量フレームを1枚取得する（撮影 → 縮小 → 収まらなければ品質を落として再撮影）。
@@ -2271,8 +2275,9 @@ const NEW_TAB_PAGE_PREFIXES = [
 ];
 
 // 仮想プレビューの描画候補（広い順）と JPEG 品質候補
-const NEW_TAB_FRAME_WIDTHS = [800, 640, 512, 420, 360];
-const NEW_TAB_FRAME_QUALITIES = [0.5, 0.42, 0.35, 0.28, 0.2];
+// 【R63】文字が読めるよう 640px を最優先にし、品質も 55% 起点へ引き上げる。
+const NEW_TAB_FRAME_WIDTHS = [640, 560, 480, 400, 360];
+const NEW_TAB_FRAME_QUALITIES = [0.55, 0.48, 0.42, 0.36, 0.30];
 
 /** その URL が Chrome の「新しいタブ」かどうか。 */
 function isNewTabPageUrl_(url) {
@@ -2318,7 +2323,8 @@ function newTabFrameTimeText_() {
  */
 async function drawNewTabPreviewFrame_(width) {
   if (typeof OffscreenCanvas !== 'function') return null;
-  const W = Math.max(320, Math.round(Number(width) || NEW_TAB_FRAME_WIDTHS[0]));
+  // 【R63】呼び出し側の指定幅をそのまま使う（640px 指定を 320px に丸めない）。
+  const W = Math.max(360, Math.round(Number(width) || NEW_TAB_FRAME_WIDTHS[0]));
   const H = Math.round(W * 0.5625);   // 16:9（Chromebook の画面比に近づける）
   try {
     const canvas = new OffscreenCanvas(W, H);
@@ -2417,7 +2423,7 @@ async function drawNewTabPreviewFrame_(width) {
 
 /**
  * 新しいタブ用の仮想プレビュー 1 枚を生成する。
- *   maxLen は呼び出し側の上限（ライブ視聴=10,000 / 画面一覧=42,000）。
+ *   maxLen は呼び出し側の上限（ライブ視聴=26,000 / 画面一覧=42,000）。
  *   どの横幅でも上限に収まらなければ、必ず上限内に収まる静的プレースホルダを返す。
  */
 async function renderNewTabPreviewFrame_(maxLen) {

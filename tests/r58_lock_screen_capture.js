@@ -484,9 +484,9 @@ check('D7 ロック中に縮小できなくても状態フレームで送信す�
   envD7.fetched.length ? envD7.fetched[0].body.action : null);
 
 // ============================================================================
-// E. 出荷物と固定仕様（v1.6.13）
+// E. 出荷物と固定仕様（v1.6.14）
 // ============================================================================
-console.log('\n===== E. v1.6.13 出荷物と固定仕様 =====');
+console.log('\n===== E. v1.6.14 出荷物と固定仕様 =====');
 
 function zipEntry(zipPath, entry) {
   return execSync(
@@ -504,7 +504,7 @@ function zipNames(zipPath) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('E1 extension/manifest.json の version は 1.6.13', manifest.version === '1.6.13', manifest.version);
+check('E1 extension/manifest.json の version は 1.6.14', manifest.version === '1.6.14', manifest.version);
 check('E2 default_popup を持たない（児童のアイコン操作は無反応）',
   !manifest.action || !manifest.action.default_popup);
 const perms = (manifest.permissions || []).slice().sort().join(',');
@@ -514,16 +514,16 @@ check("E4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(
 check('E5 ACTIVE_SYNC_MS（1.5 秒）は維持', /const ACTIVE_SYNC_MS = 1500;/.test(bgSrc));
 
 const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-check('E6 dist/store.zip の manifest.version は 1.6.13', sm.version === '1.6.13', sm.version);
+check('E6 dist/store.zip の manifest.version は 1.6.14', sm.version === '1.6.14', sm.version);
 check('E7 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
 
 const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-check('E8 dist/direct.zip の manifest.version も 1.6.13', dm.version === '1.6.13', dm.version);
+check('E8 dist/direct.zip の manifest.version も 1.6.14', dm.version === '1.6.14', dm.version);
 check('E9 dist/direct.zip は検証用（popup.html 同梱）',
   !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
 const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-check("E10 dist/update.xml の version は 1.6.13", /version='1\.6\.13'/.test(xml),
+check("E10 dist/update.xml の version は 1.6.14", /version='1\.6\.14'/.test(xml),
   (xml.match(/version='[^']+'/) || [])[0]);
 
 // 【R59】ロック画面・規制画面の上部ステータス帯は撤去し、R57 以前の構成へ戻した。

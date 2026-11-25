@@ -3210,6 +3210,53 @@ function liveWatchIsWatched_(studentId) {
   }
 }
 
+/**
+ * 【R63】ライブ視聴の使用枠だけを返す軽量版（シートも子GASも触らない）。
+ *
+ *   目的: 管理画面が live_watch_frames の応答に同梱して受け取ることで、
+ *   映像取得とは別に live_watch_status を叩く必要をなくす（往復を 1 本化）。
+ *   したがってここでは UrlFetchApp（子GAS）を使わず、親の台帳
+ *   （CacheService の live_watch_pool_v1）＋ PropertiesService の設定だけで完結させる。
+ *
+ *   戻り値は liveWatchStatus と同じ形（used / max / students / teacher_students /
+ *   timeout_sec 等）にそろえ、管理画面のインジケーター更新にそのまま使える。
+ */
+function liveWatchStatusLite_(teacher) {
+  const st = liveWatchSettings_();
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+  if (p.changed) liveWatchWritePool_(p.reg);
+  const email = liveWatchTeacherKey_(teacher);
+  const used = liveWatchUniqueCount_(p.reg, now, st.timeout_sec);
+  const mine = email ? liveWatchTeacherCount_(p.reg, email, now, st.timeout_sec) : 0;
+  const students = Object.keys(p.reg.students);
+  const teacherStudents = [];
+  if (email) {
+    for (let i = 0; i < students.length; i++) {
+      const e = p.reg.students[students[i]] || {};
+      const ts = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+      if (liveWatchSessionActive_(ts, email, now, st.timeout_sec)) teacherStudents.push(students[i]);
+    }
+  }
+  return {
+    success: true,
+    used: used,
+    max: MAX_LIVE_WATCH_DEVICES,
+    remaining: Math.max(0, MAX_LIVE_WATCH_DEVICES - used),
+    full: used >= MAX_LIVE_WATCH_DEVICES,
+    teacher_used: mine,
+    teacher_limit: st.per_teacher_limit,
+    teacher_unlimited: st.unlimited,
+    disabled: st.disabled,
+    timeout_sec: st.timeout_sec,
+    ttl_sec: LIVE_WATCH_TTL_SEC,
+    extend_sec: LIVE_WATCH_EXTEND_SEC,
+    students: students,
+    teacher_students: teacherStudents,
+    lite: true
+  };
+}
+
 /** 現在のプール使用状況（教員画面のインジケーターが使う）。 */
 function liveWatchStatus(teacher) {
   const st = liveWatchSettings_();
@@ -3838,7 +3885,17 @@ function liveWatchApplyBatchSharded(teacher, studentIds, op) {
  *   ※ liveWatchStatusSharded 側の短時間キャッシュ（2 秒）は「使用枠の集計」だけを
  *     対象にしており、画像には一切使っていない（status が 2 秒古くても画像は最新）。
  */
-function liveWatchGetFramesSharded(studentIds, teacher) {
+function liveWatchGetFramesSharded(studentIds, teacher, withStatus) {
+  const frames = liveWatchGetFramesSharded_(studentIds, teacher);
+  // 【R63】管理画面は映像と使用枠を 1 往復で受け取る（別口 status 通信を廃止）。
+  if (withStatus === true) {
+    return { frames: frames, status: liveWatchStatusLite_(teacher) };
+  }
+  return frames;
+}
+
+/** 従来の frames 配列を返す本体（R57 の親子マージ処理そのもの）。 */
+function liveWatchGetFramesSharded_(studentIds, teacher) {
   const ids = Array.isArray(studentIds) ? studentIds : [];
   const local = liveWatchGetFrames(ids);
   const urls = liveWatchShardTargetUrls_(teacher);
@@ -9719,7 +9776,15 @@ function api_liveWatchFrames(token, studentIds) {
     // 【R62】シートを開かないスコープ判定（索引キャッシュのみ）を使う。
     const scoped = liveWatchScopeStudentIds_(studentIds, currentTeacher);
     // 【R57】端末は子GASへ live_frame を送るため、子GASからも並列取得してマージする。
-    return { success: true, data: liveWatchGetFramesSharded(scoped.ids, currentTeacher), ids: scoped.ids };
+    // 【R63】使用枠ステータスも同じ応答に同梱する（＝ live_watch_status の別通信を廃止し、
+    //   映像取得 1 本に完全集約する）。status は親の台帳＋設定のみで作るため追加の往復は無い。
+    const got = liveWatchGetFramesSharded(scoped.ids, currentTeacher, true);
+    return {
+      success: true,
+      data: (got && Array.isArray(got.frames)) ? got.frames : [],
+      ids: scoped.ids,
+      status: (got && got.status) ? got.status : null
+    };
   } catch (err) {
     return { success: false, error: err.toString() };
   }

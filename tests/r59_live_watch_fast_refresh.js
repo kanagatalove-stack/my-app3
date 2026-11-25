@@ -21,7 +21,7 @@
 //    D. 拡張機能は live_watch の false → true 遷移で即座に 1 枚目を撮る
 //    E. 拡張機能は独立ループ（1.0〜1.5 秒）で撮影し、1 枚 12〜18KB に収める
 //    F. 親GAS は毎回 子GAS から最新フレームを並列取得する（古い画像を溜めない）
-//    G. 出荷物は v1.6.13（固定仕様は維持）
+//    G. 出荷物は v1.6.14（固定仕様は維持）
 // =============================================================================
 'use strict';
 
@@ -120,8 +120,9 @@ const gapMs = constNum(html, 'LIVE_WATCH_PIPELINE_GAP_MS');
 const bootGapMs = constNum(html, 'LIVE_WATCH_BOOT_GAP_MS');
 const bootWindowMs = constNum(html, 'LIVE_WATCH_BOOT_MS');
 
-check('B1 応答後の待ちは 300ms（R61: google.script.run 直結の連続パイプライン）', gapMs === 300, gapMs);
-check('B2 開始直後の待ちも 300ms（0.8〜1.0 秒周期の廃止）', bootGapMs === 300, bootGapMs);
+// 【R63】往復の待ちは純粋なロスなので 50ms へ短縮
+check('B1 応答後の待ちは 50ms（R63: 応答直後に次を撃つ）', gapMs === 50, gapMs);
+check('B2 開始直後の待ちも 50ms（R63）', bootGapMs === 50, bootGapMs);
 check('B3 「開始直後」は 6 秒間', bootWindowMs === 6000, bootWindowMs);
 check('B4 開始直後は短い待ちを返す（getLiveWatchPipelineGapMs）',
   /function getLiveWatchPipelineGapMs\(\)/.test(html) &&
@@ -286,11 +287,12 @@ check('C9 周回遅れの応答（通し番号が古い）は画面へ反映し�
 intervals.length = 0;
 clock.now = 5000000;
 run('liveWatchStartedAt = ' + clock.now + '; liveWatchPollTimer = null;');
-check('C10 開始直後の待ちは 300ms（R61）',
-  ctx.getLiveWatchPipelineGapMs() === 300, ctx.getLiveWatchPipelineGapMs());
+// 【R63】待ちは 50ms（往復回数が支配的なため待ちは純ロス）
+check('C10 開始直後の待ちは 50ms（R63）',
+  ctx.getLiveWatchPipelineGapMs() === 50, ctx.getLiveWatchPipelineGapMs());
 clock.now = 5000000 + 6000;
-check('C11 6 秒経過後も 300ms を保つ（空き時間を作らない）',
-  ctx.getLiveWatchPipelineGapMs() === 300, ctx.getLiveWatchPipelineGapMs());
+check('C11 6 秒経過後も 50ms を保つ（空き時間を作らない／R63）',
+  ctx.getLiveWatchPipelineGapMs() === 50, ctx.getLiveWatchPipelineGapMs());
 run('liveWatchStartedAt = 0;');
 
 // =============================================================================
@@ -409,14 +411,14 @@ const qualities = (function () {
   return m[1].split(',').map(function (s) { return Number(s.trim()); });
 })();
 
-check('E1 独立ループの周期は 800ms（R60 で短縮）', loopMs === 800, loopMs);
-check('E2 目標サイズの上限は 8,000 文字（約6KB / R61）', targetMax === 8000, targetMax);
-check('E3 目標サイズの下限は 4,000 文字', targetMin === 4000, targetMin);
+check('E1 独立ループの周期は 700ms（R63 でさらに短縮）', loopMs === 700, loopMs);
+check('E2 目標サイズの上限は 26,000 文字（R63: 上限30,000内で最大限鮮明）', targetMax === 26000, targetMax);
+check('E3 目標サイズの下限は 16,000 文字（R63）', targetMin === 16000, targetMin);
 check('E4 目標より小さい画像は「目標レンジ内」として採用する',
   /b64\.length >= LIVE_WATCH_TARGET_MIN_B64 && b64\.length <= LIVE_WATCH_TARGET_MAX_B64/.test(bgSrc));
-check('E5 縮小の目標横幅は 320px', targetWidth === 320, targetWidth);
-check('E6 撮影品質は 25%', captureQuality === 25, captureQuality);
-check('E7 縮小品質の起点は 25%', Math.abs(qualities[0] - 0.25) < 0.001, qualities[0]);
+check('E5 縮小の目標横幅は 640px（R63）', targetWidth === 640, targetWidth);
+check('E6 撮影品質は 55%（R63）', captureQuality === 55, captureQuality);
+check('E7 縮小品質の起点は 55%（R63）', Math.abs(qualities[0] - 0.55) < 0.001, qualities[0]);
 check('E8 送信の上限 30,000 文字は維持（固定仕様）', maxB64 === 30000, maxB64);
 check('E9 ACTIVE_SYNC_MS（1.5 秒）は維持（固定仕様）', activeSync === 1500, activeSync);
 check('E10 ハートビートの完了を待たない（await せずに追撃する）',
@@ -440,7 +442,8 @@ check('E14 ループは live_watch=false で止まる',
 // =============================================================================
 console.log('===== F. 親GAS のフレーム取得（キャッシュしない） =====');
 
-const framesBody = extract(gasSrc, 'liveWatchGetFramesSharded');
+// 【R63】frames の実体は liveWatchGetFramesSharded_（公開関数は status 同梱ラッパー）。
+const framesBody = extract(gasSrc, 'liveWatchGetFramesSharded_');
 check('F1 フレーム取得は毎回 子GAS へ並列取得する（liveWatchShardPost_）',
   /liveWatchShardPost_\(urls, \{[\s\S]{0,200}?action: LIVE_WATCH_SHARD_FRAMES/.test(framesBody));
 check('F2 フレーム取得の結果をキャッシュしない（cache.put / setValue を持たない）',
@@ -456,9 +459,9 @@ check('F6 単独モード（シャード未設定）は従来どおりローカ�
   /if \(!urls\.length\) return local;/.test(framesBody));
 
 // =============================================================================
-// G. 出荷物 v1.6.13（固定仕様の維持）
+// G. 出荷物 v1.6.14（固定仕様の維持）
 // =============================================================================
-console.log('===== G. v1.6.13 出荷物と固定仕様 =====');
+console.log('===== G. v1.6.14 出荷物と固定仕様 =====');
 
 function zipEntry(zipPath, entry) {
   return execSync(
@@ -476,7 +479,7 @@ function zipNames(zipPath) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('G1 extension/manifest.json の version は 1.6.13', manifest.version === '1.6.13', manifest.version);
+check('G1 extension/manifest.json の version は 1.6.14', manifest.version === '1.6.14', manifest.version);
 check('G2 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
 const perms = (manifest.permissions || []).slice().sort().join(',');
 check('G3 権限は既存のまま（新規権限の追加なし＝再同意プロンプトを出さない）',
@@ -484,15 +487,15 @@ check('G3 権限は既存のまま（新規権限の追加なし＝再同意プ�
 check("G4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 
 const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-check('G5 dist/store.zip の manifest.version は 1.6.13', sm.version === '1.6.13', sm.version);
+check('G5 dist/store.zip の manifest.version は 1.6.14', sm.version === '1.6.14', sm.version);
 check('G6 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
 const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-check('G7 dist/direct.zip の manifest.version も 1.6.13', dm.version === '1.6.13', dm.version);
+check('G7 dist/direct.zip の manifest.version も 1.6.14', dm.version === '1.6.14', dm.version);
 check('G8 dist/direct.zip は検証用（popup.html 同梱）',
   !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
 const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-check("G9 dist/update.xml の version は 1.6.13", /version='1\.6\.13'/.test(xml),
+check("G9 dist/update.xml の version は 1.6.14", /version='1\.6\.14'/.test(xml),
   (xml.match(/version='[^']+'/) || [])[0]);
 
 const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'dist/managed_policy.json'), 'utf8'));

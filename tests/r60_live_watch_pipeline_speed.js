@@ -16,7 +16,7 @@
 //    D. 拡張機能は LIVE_WATCH_LOOP_MS === 800 / LIVE_WATCH_TARGET_MAX_B64 === 8000
 //       ＋ タブ切り替え（tabs.onActivated）で即時キャプチャ
 //    E. 親GAS はフレームをキャッシュしない（毎回 shardFetchMany）
-//    F. 出荷物 v1.6.13（固定仕様の維持）
+//    F. 出荷物 v1.6.14（固定仕様の維持）
 // =============================================================================
 'use strict';
 
@@ -245,8 +245,9 @@ async function main() {
   const tickFn = extract(html, 'liveWatchPollTick');
   const apiBody = extract(html, 'apiRequest');
 
-  check('C1 応答後の待ちは 300ms（R61）', gapMs === 300, gapMs);
-  check('C2 開始直後の待ちも 300ms（R61）', bootGapMs === 300, bootGapMs);
+  // 【R63】応答後 50ms で次を撃つ（往復回数が支配的なため待ちは純ロス）
+  check('C1 応答後の待ちは 50ms（R63）', gapMs === 50, gapMs);
+  check('C2 開始直後の待ちも 50ms（R63）', bootGapMs === 50, bootGapMs);
   check('C3 再帰 setTimeout で「応答完了直後に次を投げる」',
     /setTimeout\(function \(\) \{[\s\S]{0,600}?scheduleLiveWatchPipeline\(\)/.test(schedFn));
   check('C4 タイマーは常に 1 本（張り直す前に破棄する）',
@@ -383,8 +384,9 @@ async function main() {
   check('C15 1 周走ると画像を取得し、応答直後に次のタイマーを張る（1 本だけ）',
     apiCalls === 1 && timers.length === 1,
     { calls: apiCalls, timers: timers.map(function (t) { return t.ms; }) });
-  check('C16 2 周目の待ちは 300ms（開始直後 / R61）',
-    timers[0].ms === 300, timers[0].ms);
+  // 【R63】待ちは 50ms
+  check('C16 2 周目の待ちは 50ms（開始直後 / R63）',
+    timers[0].ms === 50, timers[0].ms);
 
   const t1 = timers.shift();
   t1.fn();
@@ -394,8 +396,8 @@ async function main() {
 
   // 6 秒経過後も 150〜250ms を保つ
   clock.now += 6000;
-  check('C18 6 秒経過後も待ちは 300ms（R61）',
-    ictx.getLiveWatchPipelineGapMs() === 300,
+  check('C18 6 秒経過後も待ちは 50ms（R63）',
+    ictx.getLiveWatchPipelineGapMs() === 50,
     ictx.getLiveWatchPipelineGapMs());
 
   // 枠が 0 になったら止まる
@@ -432,12 +434,12 @@ async function main() {
   const maxB64 = constNum(bgSrc, 'LIVE_WATCH_MAX_B64');
   const activeSync = constNum(bgSrc, 'ACTIVE_SYNC_MS');
 
-  check('D1 LIVE_WATCH_LOOP_MS === 800', loopMs === 800, loopMs);
-  check('D2 LIVE_WATCH_TARGET_MAX_B64 === 8000（約6KB / R61）', targetMax === 8000, targetMax);
-  check('D3 目標下限は 4,000 文字', targetMin === 4000, targetMin);
-  check('D4 横幅は 320px', targetWidth === 320, targetWidth);
-  check('D5 撮影品質は 25%', capQuality === 25, capQuality);
-  check('D6 タブ切り替えフックのデバウンスは 250ms', debounceMs === 250, debounceMs);
+  check('D1 LIVE_WATCH_LOOP_MS === 700（R63）', loopMs === 700, loopMs);
+  check('D2 LIVE_WATCH_TARGET_MAX_B64 === 26000（R63）', targetMax === 26000, targetMax);
+  check('D3 目標下限は 16,000 文字（R63）', targetMin === 16000, targetMin);
+  check('D4 横幅は 640px（R63）', targetWidth === 640, targetWidth);
+  check('D5 撮影品質は 55%（R63）', capQuality === 55, capQuality);
+  check('D6 タブ切り替えフックのデバウンスは 150ms（R63）', debounceMs === 150, debounceMs);
   check('D7 送信上限 30,000 文字は維持（固定仕様）', maxB64 === 30000, maxB64);
   check('D8 ACTIVE_SYNC_MS（1.5 秒）は維持（固定仕様）', activeSync === 1500, activeSync);
   check('D9 tabs.onActivated を購読している',
@@ -490,8 +492,8 @@ async function main() {
 
   dctx.liveWatchActive = true;
   dctx.scheduleLiveWatchTabHook();
-  check('D16 ライブ視聴中のタブ切り替えは 250ms のタイマーを 1 本だけ張る',
-    dTimers.length === 1 && dTimers[0].ms === 250, dTimers.map(function (t) { return t.ms; }));
+  check('D16 ライブ視聴中のタブ切り替えは 150ms のタイマーを 1 本だけ張る（R63）',
+    dTimers.length === 1 && dTimers[0].ms === 150, dTimers.map(function (t) { return t.ms; }));
 
   dctx.scheduleLiveWatchTabHook();
   check('D17 連続イベントはデバウンス（タイマーは常に 1 本）', dTimers.length === 1, dTimers.length);
@@ -518,7 +520,8 @@ async function main() {
   // ===========================================================================
   console.log('===== E. 親GAS のフレーム取得と最短応答 =====');
 
-  const framesBody = extract(gasSrc, 'liveWatchGetFramesSharded');
+  // 【R63】frames の実体は liveWatchGetFramesSharded_（公開関数は status 同梱ラッパー）。
+  const framesBody = extract(gasSrc, 'liveWatchGetFramesSharded_');
   const startApi = extract(gasSrc, 'api_liveWatchStart');
   const framesApi = extract(gasSrc, 'api_liveWatchFrames');
 
@@ -537,9 +540,9 @@ async function main() {
     /if \(!urls\.length\) return local;/.test(framesBody));
 
   // ===========================================================================
-  // F. 出荷物 v1.6.13（固定仕様の維持）
+  // F. 出荷物 v1.6.14（固定仕様の維持）
   // ===========================================================================
-  console.log('===== F. v1.6.13 出荷物と固定仕様 =====');
+  console.log('===== F. v1.6.14 出荷物と固定仕様 =====');
 
   function zipEntry(zipPath, entry) {
     return execSync(
@@ -557,7 +560,7 @@ async function main() {
   }
 
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-  check('F1 extension/manifest.json の version は 1.6.13', manifest.version === '1.6.13', manifest.version);
+  check('F1 extension/manifest.json の version は 1.6.14', manifest.version === '1.6.14', manifest.version);
   check('F2 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
   const perms = (manifest.permissions || []).slice().sort().join(',');
   check('F3 権限は既存のまま（新規権限の追加なし＝再同意プロンプトを出さない）',
@@ -565,15 +568,15 @@ async function main() {
   check("F4 DEFAULT_GAS_URL は '' のまま", /const DEFAULT_GAS_URL = '';/.test(bgSrc));
 
   const sm = JSON.parse(zipEntry('dist/store.zip', 'manifest.json'));
-  check('F5 dist/store.zip の manifest.version は 1.6.13', sm.version === '1.6.13', sm.version);
+  check('F5 dist/store.zip の manifest.version は 1.6.14', sm.version === '1.6.14', sm.version);
   check('F6 dist/store.zip に default_popup が無い', !sm.action || !sm.action.default_popup);
   const dm = JSON.parse(zipEntry('dist/direct.zip', 'manifest.json'));
-  check('F7 dist/direct.zip の manifest.version も 1.6.13', dm.version === '1.6.13', dm.version);
+  check('F7 dist/direct.zip の manifest.version も 1.6.14', dm.version === '1.6.14', dm.version);
   check('F8 dist/direct.zip は検証用（popup.html 同梱）',
     !!dm.action && !!dm.action.default_popup && /(^|\n)popup\.html(\n|$)/.test(zipNames('dist/direct.zip')));
 
   const xml = fs.readFileSync(path.join(ROOT, 'dist/update.xml'), 'utf8');
-  check("F9 dist/update.xml の version は 1.6.13", /version='1\.6\.13'/.test(xml),
+  check("F9 dist/update.xml の version は 1.6.14", /version='1\.6\.14'/.test(xml),
     (xml.match(/version='[^']+'/g) || []).join(' '));
 
   const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'dist/managed_policy.json'), 'utf8'));

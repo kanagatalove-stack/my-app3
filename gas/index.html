@@ -215,7 +215,7 @@
               <span id="currentTeacherClassBadge" class="bg-indigo-900/90 border border-indigo-400/40 px-2 py-0.5 rounded text-[11px] font-semibold text-amber-300">対象: 未設定</span>
               <!-- 【R62】デプロイ反映の目視確認用。親GASの版数がここに出る。 -->
               <span>|</span>
-              <span id="appVersionBadge" title="管理画面（親GAS）の版数。デプロイ反映の確認に使用します。" class="bg-emerald-900/80 border border-emerald-400/40 px-2 py-0.5 rounded text-[11px] font-mono font-bold text-emerald-200">v1.6.13</span>
+              <span id="appVersionBadge" title="管理画面（親GAS）の版数。デプロイ反映の確認に使用します。" class="bg-emerald-900/80 border border-emerald-400/40 px-2 py-0.5 rounded text-[11px] font-mono font-bold text-emerald-200">v1.6.14</span>
             </div>
           </div>
         </div>
@@ -3780,8 +3780,10 @@
     //   応答完了後 300ms で次を発行する（往復 3 秒 ＋ 待ち 0.3 秒）。
     //   併せて 5000ms のクライアント側セーフティタイムアウトを置き、応答が
     //   ハングしても in-flight 排他を解放して次の周回へ必ず進める。
-    const LIVE_WATCH_PIPELINE_GAP_MS = 300;        // 通常時の待ち（応答完了後 300ms）
-    const LIVE_WATCH_BOOT_GAP_MS = 300;            // 開始直後の待ち（300ms）
+    // 【R63】往復の待ちを 300ms → 50ms へ短縮する。実機で「通信時間は往復回数に
+    //   支配され、待ち時間は純粋なロス」と判明したため、応答が返った瞬間に次を撃つ。
+    const LIVE_WATCH_PIPELINE_GAP_MS = 50;         // 通常時の待ち（応答完了後 50ms）
+    const LIVE_WATCH_BOOT_GAP_MS = 50;             // 開始直後の待ち（50ms）
     const LIVE_WATCH_BOOT_MS = 6000;               // 「開始直後」とみなす時間
     const LIVE_WATCH_EXTEND_MS = 10000;            // 延長ハートビート（TTL 25 秒より短い）
     const LIVE_WATCH_FRAME_SAFETY_MS = 5000;       // 【R61】取得のセーフティタイムアウト（ハング解放）
@@ -3878,8 +3880,18 @@
       if (startBtn) startBtn.disabled = (s.disabled === true);
     }
 
-    /** 使用枠の最新値を取り直してインジケーターを更新する（読み取りのみ）。 */
-    async function refreshLiveWatchStatus(silent) {
+    /**
+     * 使用枠の最新値を取り直してインジケーターを更新する（読み取りのみ）。
+     *
+     * 【R63】ライブ視聴中（タイル 1 件以上）は独立した live_watch_status 通信を
+     *   行わない。使用枠は live_watch_frames の応答に同梱されて届くため、
+     *   別口の通信は RPC キューを奪い「タブ切り替えから反映まで 5〜10 秒」の
+     *   直接原因になっていた。force=true のときだけ強制的に取りに行く。
+     */
+    async function refreshLiveWatchStatus(silent, force) {
+      if (force !== true && isLiveWatchStreaming()) {
+        return liveWatchStatusInfo;
+      }
       try {
         const res = await apiRequest({ action: 'live_watch_status' });
         if (res && res.success !== false) {
@@ -3891,6 +3903,32 @@
         if (!silent) console.warn('live_watch_status 取得失敗:', e && e.message ? e.message : e);
         return null;
       }
+    }
+
+    /**
+     * 【R63】live_watch_frames の応答に同梱された使用枠ステータスを反映する。
+     *   これにより「映像取得」と「使用枠取得」を 1 往復に完全集約する
+     *   （独立した live_watch_status ポーリングを廃止できる）。
+     *   status が無い（旧サーバー）応答では何もしない（従来動作を壊さない）。
+     */
+    function applyLiveWatchStatus(status) {
+      if (!status || typeof status !== 'object') return;
+      if (status.success === false) return;
+      const base = liveWatchStatusInfo || {};
+      liveWatchStatusInfo = Object.assign({}, base, {
+        used: (typeof status.used === 'number') ? status.used : base.used,
+        max: (typeof status.max === 'number') ? status.max : base.max,
+        remaining: (typeof status.remaining === 'number') ? status.remaining : base.remaining,
+        full: (typeof status.full === 'boolean') ? status.full : base.full,
+        teacher_used: (typeof status.teacher_used === 'number') ? status.teacher_used : base.teacher_used,
+        teacher_limit: (typeof status.teacher_limit === 'number') ? status.teacher_limit : base.teacher_limit,
+        teacher_unlimited: (typeof status.teacher_unlimited === 'boolean') ? status.teacher_unlimited : base.teacher_unlimited,
+        timeout_sec: (typeof status.timeout_sec === 'number') ? status.timeout_sec : base.timeout_sec,
+        disabled: (typeof status.disabled === 'boolean') ? status.disabled : base.disabled,
+        students: Array.isArray(status.students) ? status.students : base.students,
+        teacher_students: Array.isArray(status.teacher_students) ? status.teacher_students : base.teacher_students
+      });
+      updateLiveWatchIndicators(liveWatchStatusInfo);
     }
 
     /** ライブ枠の一覧を描画する（枠の増減時にだけ呼ぶ＝画像更新は img.src の差し替えのみ）。 */
@@ -3928,7 +3966,13 @@
           '    </button>',
           '  </div>',
           '  <div class="relative bg-black" style="aspect-ratio:16/9">',
-          '    <img id="liveFrameImg' + i + '" alt="' + name + ' の現在画面" class="absolute inset-0 w-full h-full object-contain hidden">',
+          // 【R63】640px の高画質フレームを等倍系で鮮明に表示する。
+          //   object-fit: contain ＋ width:100%;height:auto で縦横比を保ち、
+          //   image-rendering は既定（auto）のままにして補間でぼかさない。
+          '    <img id="liveFrameImg' + i + '" alt="' + name + ' の現在画面"',
+          '         class="absolute inset-0 w-full h-full object-contain hidden cursor-zoom-in"',
+          '         style="object-fit:contain;width:100%;height:auto;image-rendering:auto"',
+          '         onclick="zoomLiveFrame(' + i + ')" title="クリックで拡大表示">',
           '    <div id="liveFrameEmpty' + i + '" class="absolute inset-0 flex items-center justify-center text-[11px] text-slate-400">' +
             (slot.pending ? '<span class="animate-pulse">枠を確保しています...</span>' : '端末の送信を待っています...') + '</div>',
           '  </div>',
@@ -3977,6 +4021,40 @@
       if (liveWatchSlots.length !== before) renderLiveWatchGrid();
       if (liveWatchSlots.length === 0) stopLiveWatchPolling();
       return before - liveWatchSlots.length;
+    }
+
+    /**
+     * 【R63】枠の画像をクリックしたときの拡大表示（画面いっぱいに近い大きさで見る）。
+     *   640px のフレームを等倍以上に引き伸ばして「文字が読める」状態にする。
+     *   オーバーレイの任意の場所をクリック／Esc で閉じる。DOM は使い捨てる。
+     */
+    function zoomLiveFrame(i) {
+      const src = document.getElementById('liveFrameImg' + i);
+      if (!src) return;
+      const url = src.getAttribute('src');
+      if (!url) return;
+      const slot = liveWatchSlots[i] || {};
+      const overlay = document.createElement('div');
+      overlay.id = 'liveFrameZoomOverlay';
+      overlay.className = 'fixed inset-0 z-[9999] bg-black/85 flex flex-col items-center justify-center p-4 cursor-zoom-out';
+      const title = document.createElement('div');
+      title.className = 'text-slate-100 text-sm font-bold mb-2';
+      title.textContent = String(slot.name || slot.studentId || '') + '（クリックで閉じる）';
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = '拡大表示';
+      img.className = 'max-w-full max-h-[85vh] object-contain bg-black rounded-lg shadow-2xl';
+      img.style.imageRendering = 'auto';
+      overlay.appendChild(title);
+      overlay.appendChild(img);
+      const close = function () {
+        try { overlay.remove(); } catch (e) {}
+        try { document.removeEventListener('keydown', onKey); } catch (e2) {}
+      };
+      const onKey = function (ev) { if (ev && ev.key === 'Escape') close(); };
+      overlay.addEventListener('click', close);
+      try { document.addEventListener('keydown', onKey); } catch (e3) {}
+      document.body.appendChild(overlay);
     }
 
     /** 取得した画像を枠へ反映する（枠の並びは renderLiveWatchGrid が決めた順）。 */
@@ -4044,7 +4122,7 @@
         return;
       }
 
-      const info = await refreshLiveWatchStatus(true);
+      const info = await refreshLiveWatchStatus(true, true);
       if (info && info.disabled === true) {
         showAlertModal('ライブ視聴は制限されています',
           '現在管理者によりライブ視聴が制限されています。', 'warning');
@@ -4301,6 +4379,15 @@
             renderLiveWatchGrid();
             if (liveWatchSlots.length === 0) { stopLiveWatchPolling(); return; }
           }
+          // 【R63】延長応答にも使用枠が載っている。映像と同じ周回で反映する。
+          if (ext && typeof ext.used === 'number') {
+            applyLiveWatchStatus({
+              used: ext.used, max: ext.max, remaining: ext.remaining,
+              teacher_used: ext.teacher_used, teacher_limit: ext.teacher_limit,
+              teacher_unlimited: ext.teacher_unlimited, timeout_sec: ext.timeout_sec,
+              disabled: ext.disabled
+            });
+          }
         } catch (eExt) { /* 延長失敗は次周で再試行（TTL 25 秒あるため猶予あり） */ }
       }
 
@@ -4336,6 +4423,9 @@
         if (mySeq < liveWatchFramesAppliedSeq) return;
         liveWatchFramesAppliedSeq = mySeq;
         if (res && Array.isArray(res.data)) updateLiveWatchImages(res.data);
+        // 【R63】同梱ステータスでヘッダーの「全体 X/24台」を更新する
+        //   （＝ live_watch_status の別通信を不要にする）。
+        if (res && res.status) applyLiveWatchStatus(res.status);
       } catch (eF) {
         // 画像 1 枚の失敗で枠を閉じない（次の周で取り直す）
       } finally {

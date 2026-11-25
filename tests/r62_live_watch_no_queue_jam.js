@@ -1,5 +1,5 @@
 // ============================================================================
-// r62_live_watch_no_queue_jam.js — R62 / v1.6.13
+// r62_live_watch_no_queue_jam.js — R62 / v1.6.14
 //
 //  【実機で確定した症状】
 //    ライブ視聴の更新時刻が「15:40:41 → 15:41:09 → 15:41:27」＝ 18 秒間隔。
@@ -13,7 +13,7 @@
 //       スキップし、全タイル停止後に自動再開する（gas/index.html）。
 //    B. api_liveWatchStart / api_liveWatchFrames が SpreadsheetApp.openById を
 //       1 回も呼ばずに子GASへ転送し応答を返す（gas/Code.gs・vm 実行）。
-//    C. v1.6.13 の配布物（dist/*.zip, update.xml）が再生成され、固定仕様
+//    C. v1.6.14 の配布物（dist/*.zip, update.xml）が再生成され、固定仕様
 //       （default_popup なし / DEFAULT_GAS_URL = '' / 新規権限なし）が維持される。
 //
 //  明示リスト方式（必要な関数・定数だけを列挙して読み込む）。
@@ -97,7 +97,7 @@ check('A9 ライブ視聴停止時にポーリングを止める既存処理が�
   /liveWatchSlots\.length === 0\) stopLiveWatchPolling\(\)/.test(html));
 
 // ヘッダーの版数表示（デプロイ反映の目視確認）
-check('A10 ヘッダーに v1.6.13 の版数バッジがある', /id="appVersionBadge"[\s\S]{0,200}?v1\.6\.13/.test(html));
+check('A10 ヘッダーに v1.6.14 の版数バッジがある', /id="appVersionBadge"[\s\S]{0,200}?v1\.6\.14/.test(html));
 check('A11 アセット版数のメタ情報は不変（20261108）',
   /name="app-asset-version"[^>]*content="20261108"/.test(html));
 
@@ -234,23 +234,24 @@ check('B18 索引経由の判定でも openById は 0 回', sheetTouches === 0, 
 cacheStore.clear(); warm.forEach(function (v, k) { cacheStore.set(k, v); });
 
 // ============================================================================
-// C. 拡張機能 v1.6.13 の配布物
+// C. 拡張機能 v1.6.14 の配布物
 // ============================================================================
-console.log('\n===== C. 配布物（v1.6.13） =====');
+console.log('\n===== C. 配布物（v1.6.14） =====');
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/manifest.json'), 'utf8'));
-check('C1 extension/manifest.json の version は 1.6.13', manifest.version === '1.6.13', manifest.version);
+check('C1 extension/manifest.json の version は 1.6.14', manifest.version === '1.6.14', manifest.version);
 check('C2 新規権限なし（alarms/identity/identity.email/idle/storage/tabs のみ）',
   JSON.stringify((manifest.permissions || []).slice().sort()) ===
   JSON.stringify(['alarms', 'identity', 'identity.email', 'idle', 'storage', 'tabs']),
   manifest.permissions);
 check('C3 default_popup を持たない', !manifest.action || !manifest.action.default_popup);
 check('C4 DEFAULT_GAS_URL は空のまま', /const DEFAULT_GAS_URL = '';/.test(bgSrc));
-check('C5 ライブ視聴の固定仕様（8000/4000/320/25%）',
-  /const LIVE_WATCH_TARGET_MAX_B64 = 8000;/.test(bgSrc) &&
-  /const LIVE_WATCH_TARGET_MIN_B64 = 4000;/.test(bgSrc) &&
-  /const LIVE_WATCH_TARGET_WIDTH = 320;/.test(bgSrc) &&
-  /const LIVE_WATCH_CAPTURE_QUALITY = 25;/.test(bgSrc));
+// 【R63】高画質化（26000/16000/640/55%）。送信上限 30,000 は固定仕様として不変。
+check('C5 ライブ視聴の固定仕様（26000/16000/640/55%）',
+  /const LIVE_WATCH_TARGET_MAX_B64 = 26000;/.test(bgSrc) &&
+  /const LIVE_WATCH_TARGET_MIN_B64 = 16000;/.test(bgSrc) &&
+  /const LIVE_WATCH_TARGET_WIDTH = 640;/.test(bgSrc) &&
+  /const LIVE_WATCH_CAPTURE_QUALITY = 55;/.test(bgSrc));
 
 function unzipEntry(zip, entry) {
   try {
@@ -272,10 +273,10 @@ const sm = unzipEntry(distStore, 'manifest.json');
 const dm = unzipEntry(distDirect, 'manifest.json');
 const smJ = sm ? JSON.parse(sm) : null;
 const dmJ = dm ? JSON.parse(dm) : null;
-check('C10 store.zip の manifest.version は 1.6.13', !!smJ && smJ.version === '1.6.13', smJ && smJ.version);
-check('C11 direct.zip の manifest.version も 1.6.13', !!dmJ && dmJ.version === '1.6.13', dmJ && dmJ.version);
+check('C10 store.zip の manifest.version は 1.6.14', !!smJ && smJ.version === '1.6.14', smJ && smJ.version);
+check('C11 direct.zip の manifest.version も 1.6.14', !!dmJ && dmJ.version === '1.6.14', dmJ && dmJ.version);
 const xml = fs.existsSync(distXml) ? fs.readFileSync(distXml, 'utf8') : '';
-check("C12 update.xml の version は '1.6.13'", /version='1\.6\.13'/.test(xml),
+check("C12 update.xml の version は '1.6.14'", /version='1\.6\.14'/.test(xml),
   (xml.match(/version='[^']*'/) || [''])[0]);
 check('C13 store.zip に default_popup が無い', !!smJ && (!smJ.action || !smJ.action.default_popup));
 check('C14 direct.zip は検証用（default_popup: popup.html）',
@@ -284,7 +285,7 @@ const storeBg = unzipEntry(distStore, 'background.js');
 check('C15 store.zip の background.js は extension/background.js と完全一致', storeBg === bgSrc);
 check('C16 store.zip の JS に R60 の新しいタブ仮想プレビューが含まれる',
   /drawNewTabPreviewFrame_/.test(storeBg || '') && /isNewTabPageUrl_/.test(storeBg || ''));
-check('C17 popup.html に v1.6.13 表記', /v1\.6\.13/.test(unzipEntry(distDirect, 'popup.html') || ''));
+check('C17 popup.html に v1.6.14 表記', /v1\.6\.14/.test(unzipEntry(distDirect, 'popup.html') || ''));
 
 console.log('\n===== 結果: PASS=' + pass + ' FAIL=' + fail + ' =====');
 process.exit(fail === 0 ? 0 : 1);
