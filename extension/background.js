@@ -1974,6 +1974,53 @@ async function downscaleForLiveWatch(dataUrl) {
   return null;
 }
 
+// 【v1.6.8 / R57】Service Worker 環境では OffscreenCanvas / createImageBitmap が
+//   使えない（または convertToBlob が失敗する）ことがある。その場合に縮小処理で
+//   null を返して「送信ゼロ」になり、管理画面が「端末の送信を待っています…」のまま
+//   固まるのを避けるため、撮影品質を段階的に落として再撮影するフォールバックを持つ。
+//   それでも上限に収まらないときだけ送信を見送る（壊れたデータは送らない）。
+const LIVE_WATCH_FALLBACK_QUALITIES = [40, 28, 18, 10];
+
+/**
+ * 軽量フレームを1枚取得する（撮影 → 縮小 → 収まらなければ品質を落として再撮影）。
+ *   戻り値: data URL(JPEG) or null
+ *   ・1 回目の captureVisibleTab は従来どおり quality 40。
+ *   ・OffscreenCanvas が使えるなら 480px へ縮小する。
+ *   ・使えない／失敗した場合は、captureVisibleTab の品質だけを下げて再撮影する。
+ */
+async function captureLightweightLiveFrame_(windowId) {
+  let lastRaw = null;
+  for (let i = 0; i < LIVE_WATCH_FALLBACK_QUALITIES.length; i++) {
+    let raw = null;
+    try {
+      raw = await chrome.tabs.captureVisibleTab(windowId, {
+        format: 'jpeg',
+        quality: LIVE_WATCH_FALLBACK_QUALITIES[i]
+      });
+    } catch (eCap) {
+      return null; // 撮影自体ができない（保護ページ等）
+    }
+    if (!raw || !/^data:image\//.test(raw)) return null;
+    lastRaw = raw;
+
+    // ① まず縮小を試す（成功すれば 480px 前後の軽量画像）
+    const scaled = await downscaleForLiveWatch(raw);
+    if (scaled) return scaled;
+
+    // ② 縮小できなかった場合は、原寸のまま上限に収まっているか確認する
+    const b64len = String(raw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+    if (b64len <= LIVE_WATCH_MAX_B64) return raw;
+
+    // ③ どちらも不可 → 次の（より低い）品質で再撮影する
+  }
+  // 最後の手段: 最高圧縮の撮影結果が上限内なら送る
+  if (lastRaw) {
+    const b64len = String(lastRaw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+    if (b64len <= LIVE_WATCH_MAX_B64) return lastRaw;
+  }
+  return null;
+}
+
 /**
  * live_watch フラグの反映（毎ハートビートで呼ばれる）。
  *   true  … 以後のポーリングで撮影・送信を開始する
@@ -2040,7 +2087,14 @@ async function liveWatchCaptureOnce() {
     }
     if (!raw || !/^data:image\//.test(raw)) return false;
 
-    const dataUrl = await downscaleForLiveWatch(raw);
+    // 【R57】縮小（OffscreenCanvas）が使えない Service Worker でも送信が
+    //   握りつぶされないよう、失敗時は撮影品質を段階的に落として再撮影する。
+    //   1 枚目が既に上限内ならそのまま使う（無駄な再撮影をしない）。
+    let dataUrl = raw;
+    const rawLen = String(raw).replace(/^data:image\/[a-z]+;base64,/i, '').length;
+    if (rawLen > LIVE_WATCH_MAX_B64) {
+      dataUrl = await captureLightweightLiveFrame_(tab.windowId);
+    }
     if (!dataUrl) return false;
     if (!liveWatchActive) return false; // 縮小中に停止されたら送らない
 

@@ -1088,6 +1088,20 @@ function doPost(e) {
     if (action === 'shard_list') {
       return jsonResponse(shardListForParent(payload));
     }
+    // 【R57】ライブ視聴の親子ルーティング（子GAS側の受信口）。
+    //   親は「親の台帳」を更新したうえで、同じ操作をここへ並列転送してくる。
+    //   これが無いと子GASのハートビート応答が live_watch:false のままになり、
+    //   端末は撮影を開始しない（＝管理画面が永久に「送信を待っています」）。
+    //   認証は教員トークンではなく共有シークレット（1校独立運用のため自校のみ到達可能）。
+    if (action === LIVE_WATCH_SHARD_APPLY) {
+      return jsonResponse(liveWatchShardApplyFromParent(payload));
+    }
+    if (action === LIVE_WATCH_SHARD_FRAMES) {
+      return jsonResponse(liveWatchShardFramesFromParent(payload));
+    }
+    if (action === LIVE_WATCH_SHARD_STATUS) {
+      return jsonResponse(liveWatchShardStatusFromParent(payload));
+    }
     // 子GASが「この児童は誰か（氏名・学校・クラス）」を親の名簿へ問い合わせる。
     // 子は名簿を持たないため、これが無いとクラス未取得の端末が永久に直らない。
     if (action === 'shard_lookup') {
@@ -1168,26 +1182,31 @@ function doPost(e) {
     }
 
     // D1-3. 【v1.6.8】ライブ視聴の使用枠状況（読み取りは全教員可）
+    //   【R57】R41分散時は子GASの台帳と和集合を取る（子の端末が実際に撮影しているため）。
     if (action === 'live_watch_status') {
-      return jsonResponse(liveWatchStatus(currentTeacher));
+      return jsonResponse(liveWatchStatusSharded(currentTeacher));
     }
     // D1-4. 【v1.6.8】ライブ視聴の開始（相乗りは満枠でも許可／新規は24台まで）
+    //   【R57】親の台帳を更新したうえで、対象スコープの子GASへも転送して
+    //   子の台帳に登録する（＝子のハートビート応答が live_watch:true になる）。
     if (action === 'live_watch_start') {
-      return jsonResponse(liveWatchApplyBatch(currentTeacher, payload.student_ids, 'start'));
+      return jsonResponse(liveWatchApplyBatchSharded(currentTeacher, payload.student_ids, 'start'));
     }
     // D1-5. 【v1.6.8】視聴枠の延長ハートビート（管理画面が開いている間だけ）
     if (action === 'live_watch_extend') {
-      return jsonResponse(liveWatchApplyBatch(currentTeacher, payload.student_ids, 'extend'));
+      return jsonResponse(liveWatchApplyBatchSharded(currentTeacher, payload.student_ids, 'extend'));
     }
     // D1-6. 【v1.6.8】視聴枠の解放（枠を閉じた／タブ非表示／タイムアウト）
     if (action === 'live_watch_stop') {
-      return jsonResponse(liveWatchApplyBatch(currentTeacher, payload.student_ids, 'stop'));
+      return jsonResponse(liveWatchApplyBatchSharded(currentTeacher, payload.student_ids, 'stop'));
     }
     // D1-7. 【v1.6.8】最新ライブ画像の取得（管理画面が 1.5〜2 秒間隔で叩く）
+    //   【R57】端末は子GASへ live_frame を送るため、子GASからも並列取得して
+    //   「新しい撮影時刻の画像」を優先してマージする。
     if (action === 'live_watch_frames') {
       const ids = Array.isArray(payload.student_ids) ? payload.student_ids : [];
       const scoped = scopeStudentIdsForTeacher(ids, currentTeacher);
-      const frames = liveWatchGetFrames(scoped.ids);
+      const frames = liveWatchGetFramesSharded(scoped.ids, currentTeacher);
       return jsonResponse({ success: true, data: frames, ids: scoped.ids });
     }
 
@@ -3451,6 +3470,441 @@ function liveWatchApplyBatch(teacher, studentIds, op) {
     disabled: st.disabled, timeout_sec: st.timeout_sec,
     ttl_sec: LIVE_WATCH_TTL_SEC, extend_sec: LIVE_WATCH_EXTEND_SEC
   };
+}
+
+// ============================================================================
+// 【R57】R41分散構成におけるライブ視聴の親子ルーティング
+//
+//   【実機で確定した不具合】
+//     R56 までは、管理画面が親GASの api_liveWatch* を叩くと「親GASの
+//     CacheService（live_watch_pool_v1）」だけが更新されていた。ところが
+//     児童端末は R41 で子GASへ直接ハートビートし、live_frame も子GASへ送る。
+//     そのため次の 2 点が噛み合わず、管理画面は「端末の送信を待っています…」の
+//     まま画像が出なかった（拡張機能 v1.6.8・親子とも再デプロイ済みでも再現）。
+//       ① 子GASのハートビート応答が live_watch: false のまま
+//          → 端末は「撮影しない」ので、そもそも画像が発生しない
+//       ② 子GASのキャッシュに溜まったフレームを親が読めない
+//          → 画像が発生しても、管理画面（親）には届かない
+//
+//   【本ブロックの役割】双方向を接続する。
+//     ① 親 → 子（start / extend / stop）
+//        親の台帳（全体24枠プールの正）を更新したうえで、shardFetchMany で
+//        対象スコープの子GASへ並列転送し、子の台帳にも「同じ TTL・同じ
+//        自動タイムアウト起点」で登録／解除する。
+//    ② 子 → 親（frames / status）
+//        子GASから最新フレーム（および使用中の児童ID）を並列取得してマージし、
+//        管理画面へ 1 つの応答として返す。
+//
+//   【単独モード】SHARD_MODE 無効・子URL 0 件のときは子への転送を行わず、
+//     従来どおり親のローカルキャッシュだけで完結する（挙動不変）。
+//
+//   【通信量】extend は 10 秒に 1 回、frames は 1.8 秒に 1 回だが、転送先は
+//     教員のスコープ内の子GAS（一般教員は自校＝1〜2 校）に限定する。
+//     管理者（全校）でも 14 校 × 0.55 req/秒程度に収まる。
+// ============================================================================
+const LIVE_WATCH_SHARD_APPLY = 'live_watch_shard_apply';
+const LIVE_WATCH_SHARD_FRAMES = 'live_watch_shard_frames';
+const LIVE_WATCH_SHARD_STATUS = 'live_watch_shard_status';
+const LIVE_WATCH_SHARD_STATUS_TTL_SEC = 2;   // status 集約の短時間キャッシュ（連打を吸収）
+
+/**
+ * 親が転送すべき子GASのURL一覧。
+ *   単独モード（親でない／子URL 0 件）は [] を返す＝ローカル完結。
+ */
+function liveWatchShardTargetUrls_(teacher) {
+  try {
+    if (typeof isShardParent !== 'function' || !isShardParent()) return [];
+    const cfg = shardConfigCached();
+    return shardUrlsForTeacher(cfg, teacher);
+  } catch (e) {
+    return [];
+  }
+}
+
+/** URL 一覧から短いキャッシュキーを作る（14 校分でも 250 文字に収める）。 */
+function liveWatchShardKey_(urls, extra) {
+  const joined = (Array.isArray(urls) ? urls.join(',') : '') + '|' + String(extra || '');
+  let h = 5381;
+  for (let i = 0; i < joined.length; i++) {
+    h = ((h * 33) + joined.charCodeAt(i)) % 2147483647;
+  }
+  return 'lw_shard_' + h.toString(36);
+}
+
+/** 子GASへ 1 アクションを並列 POST し、解析済みの応答配列を返す。 */
+function liveWatchShardPost_(urls, bodyObj) {
+  const out = [];
+  if (!Array.isArray(urls) || !urls.length) return out;
+  let secret = '';
+  try { secret = String(shardConfigCached().sec || ''); } catch (e) { secret = ''; }
+  const body = JSON.stringify(bodyObj || {});
+  const requests = [];
+  for (let i = 0; i < urls.length; i++) {
+    requests.push({
+      url: urls[i], method: 'post', contentType: 'application/json',
+      payload: body, muteHttpExceptions: true
+    });
+  }
+  let responses = [];
+  try {
+    responses = shardFetchMany(requests) || [];
+  } catch (e) {
+    responses = [];
+  }
+  for (let i = 0; i < responses.length; i++) {
+    const res = responses[i];
+    if (!res) { out.push(null); continue; }
+    let code = 0;
+    try { code = res.getResponseCode(); } catch (e2) { code = 0; }
+    if (code !== 200) { out.push(null); continue; }
+    let txt = '';
+    try { txt = res.getContentText(); } catch (e3) { txt = ''; }
+    let json = null;
+    try { json = JSON.parse(txt); } catch (e4) { json = null; }
+    out.push(json);
+  }
+  return out;
+}
+
+/**
+ * 子GAS側: 親から転送された start / extend / stop を自分の台帳へ適用する。
+ *
+ * ・教員の権限（学校・クラス境界）と 1 教員あたり上限は **親が既に判定済み**。
+ *   子は「全児童の名簿を持たない」ため再判定できない。よって子では
+ *   上限・スコープ判定を行わず、台帳への登録／解除だけを行う（二重判定の回避）。
+ * ・ただし「管理者が機能停止（0）にした」ことは子にも伝播済みなので、
+ *   新規の start は その場合だけ拒否する。
+ * ・opened_at（自動タイムアウトの起点）は既存値を維持し、extend では延ばさない
+ *   （延ばすと自動タイムアウトが永久に来なくなる）。
+ */
+function liveWatchShardApplyFromParent(payload) {
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  const op = String((payload && payload.op) || 'start');
+  const ids = Array.isArray(payload && payload.student_ids) ? payload.student_ids : [];
+  const email = String((payload && payload.teacher_email) || '').trim().toLowerCase();
+  const timeoutSec = normalizeLiveWatchTimeoutSec(payload && payload.timeout_sec);
+  if (!email && op !== 'stop') {
+    return { success: false, error: 'teacher_email is required' };
+  }
+
+  let st = null;
+  try { st = liveWatchSettings_(); } catch (e) { st = null; }
+  if (op !== 'stop' && st && st.disabled) {
+    return {
+      success: false, code: 'LIVE_WATCH_DISABLED',
+      error: '現在管理者によりライブ視聴が制限されています',
+      results: [], timeout_sec: timeoutSec
+    };
+  }
+
+  const now = liveWatchNowMs_();
+  const reg = liveWatchReadPool_();
+  const results = [];
+  let cleared = 0;
+
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] === undefined || ids[i] === null ? '' : ids[i]).trim();
+    if (!sid) continue;
+
+    if (op === 'stop') {
+      const entry = reg.students[sid];
+      let still = false;
+      if (entry && entry.teachers && email && entry.teachers[email]) {
+        delete entry.teachers[email];
+      }
+      if (entry) {
+        const keys = Object.keys(entry.teachers || {});
+        if (keys.length) {
+          still = true;
+          reg.students[sid] = entry;
+        } else {
+          delete reg.students[sid];
+          try { liveWatchClearFrame_(sid); cleared++; } catch (eC) {}
+        }
+      }
+      results.push({ student_id: sid, success: true, live_watch: still });
+      continue;
+    }
+
+    // start / extend: 台帳へ登録（既存なら TTL だけ延長）
+    const entry = reg.students[sid] || { stream_opened_at: now, teachers: {} };
+    if (!entry.stream_opened_at) entry.stream_opened_at = now;
+    if (!entry.teachers || typeof entry.teachers !== 'object') entry.teachers = {};
+    const cur = entry.teachers[email];
+    if (cur && typeof cur === 'object') {
+      cur.expires_at = now + LIVE_WATCH_TTL_SEC * 1000;   // opened_at は変えない
+    } else {
+      entry.teachers[email] = { opened_at: now, expires_at: now + LIVE_WATCH_TTL_SEC * 1000 };
+    }
+    reg.students[sid] = entry;
+    results.push({ student_id: sid, success: true, live_watch: true });
+  }
+
+  liveWatchWritePool_(reg);
+  let usedNow = 0;
+  try { usedNow = liveWatchUniqueCount_(reg, now, timeoutSec); } catch (e6) { usedNow = 0; }
+  return {
+    success: true, op: op, saved: results.length, cleared_frames: cleared,
+    results: results, used: usedNow, max: MAX_LIVE_WATCH_DEVICES,
+    timeout_sec: timeoutSec, ttl_sec: LIVE_WATCH_TTL_SEC
+  };
+}
+
+/** 子GAS側: 親が画像を集約しに来たときの応答（自分のキャッシュにある分だけ返す）。 */
+function liveWatchShardFramesFromParent(payload) {
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  const ids = Array.isArray(payload && payload.student_ids) ? payload.student_ids : [];
+  return { success: true, data: liveWatchGetFrames(ids) };
+}
+
+/** 子GAS側: 親が使用枠を集約しに来たときの応答。 */
+function liveWatchShardStatusFromParent(payload) {
+  if (!shardSecretMatches(payload && payload.shard_secret)) {
+    return { success: false, error: 'unauthorized（共有シークレットが一致しません）' };
+  }
+  const email = String((payload && payload.teacher_email) || '').trim().toLowerCase();
+  let st = null;
+  try { st = liveWatchSettings_(); } catch (e) { st = null; }
+  const timeoutSec = (st && st.timeout_sec) ? st.timeout_sec
+    : normalizeLiveWatchTimeoutSec(payload && payload.timeout_sec);
+  const now = liveWatchNowMs_();
+  const p = liveWatchPrune_(liveWatchReadPool_(), now, timeoutSec);
+  if (p.changed) liveWatchWritePool_(p.reg);
+
+  const students = Object.keys(p.reg.students);
+  const mine = [];
+  if (email) {
+    for (let i = 0; i < students.length; i++) {
+      const e = p.reg.students[students[i]] || {};
+      const ts = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+      if (liveWatchSessionActive_(ts, email, now, timeoutSec)) mine.push(students[i]);
+    }
+  }
+  return {
+    success: true,
+    used: liveWatchUniqueCount_(p.reg, now, timeoutSec),
+    students: students,
+    teacher_students: mine,
+    timeout_sec: timeoutSec
+  };
+}
+
+/**
+ * 親GAS側: start / extend / stop を「親の台帳」＋「子の台帳」の両方へ適用する。
+ *   子への転送に失敗しても親の結果は必ず返す（管理画面の操作を止めない）。
+ */
+function liveWatchApplyBatchSharded(teacher, studentIds, op) {
+  const local = liveWatchApplyBatch(teacher, studentIds, op);
+  const urls = liveWatchShardTargetUrls_(teacher);
+  if (!urls.length) return local;   // 単独モード（従来どおり）
+
+  const ids = Array.isArray(studentIds) ? studentIds : [];
+  const email = liveWatchTeacherKey_(teacher);
+  let st = null;
+  try { st = liveWatchSettings_(); } catch (e) { st = null; }
+  const timeoutSec = (st && st.timeout_sec) ? st.timeout_sec : LIVE_WATCH_DEFAULT_TIMEOUT_SEC;
+
+  let parsed = [];
+  try {
+    parsed = liveWatchShardPost_(urls, {
+      action: LIVE_WATCH_SHARD_APPLY,
+      shard_secret: shardConfigCached().sec,
+      op: op,
+      student_ids: ids,
+      teacher_email: email,
+      timeout_sec: timeoutSec
+    });
+  } catch (eFwd) {
+    parsed = [];
+  }
+  let okCount = 0;
+  const failed = [];
+  for (let i = 0; i < parsed.length; i++) {
+    if (parsed[i] && parsed[i].success === true) okCount++;
+    else failed.push(urls[i] || '');
+  }
+  local.shard = {
+    op: op, sent: urls.length, ok: okCount, failed: failed,
+    single_mode: false
+  };
+  return local;
+}
+
+/**
+ * 親GAS側: 子GASから最新フレームを並列取得し、ローカルの分とマージする。
+ *   同一児童が複数の GAS に存在し得るため「新しい at（撮影時刻）を優先」する。
+ *   live_watch は OR（どこかで視聴中なら true）。
+ */
+function liveWatchGetFramesSharded(studentIds, teacher) {
+  const ids = Array.isArray(studentIds) ? studentIds : [];
+  const local = liveWatchGetFrames(ids);
+  const urls = liveWatchShardTargetUrls_(teacher);
+  if (!urls.length) return local;   // 単独モード（従来どおり）
+
+  let secret = '';
+  try { secret = String(shardConfigCached().sec || ''); } catch (e) { secret = ''; }
+  let parsed = [];
+  try {
+    parsed = liveWatchShardPost_(urls, {
+      action: LIVE_WATCH_SHARD_FRAMES,
+      shard_secret: secret,
+      student_ids: ids
+    });
+  } catch (eF) {
+    parsed = [];
+  }
+
+  const byId = {};
+  const order = [];
+  const take = function (f) {
+    if (!f || typeof f !== 'object') return;
+    const sid = String(f.student_id || '').trim();
+    if (!sid) return;
+    if (!byId[sid]) {
+      byId[sid] = {
+        student_id: sid, live_watch: false, at: 0, at_text: '',
+        data_url: '', has_image: false
+      };
+      order.push(sid);
+    }
+    const cur = byId[sid];
+    if (f.live_watch === true) cur.live_watch = true;
+    const at = Number(f.at) || 0;
+    const hasImg = (f.has_image === true) && !!f.data_url;
+    if (hasImg && (!cur.has_image || at > cur.at)) {
+      cur.at = at;
+      cur.at_text = String(f.at_text || '');
+      cur.data_url = String(f.data_url || '');
+      cur.has_image = true;
+    } else if (!hasImg && at > cur.at) {
+      cur.at = at;
+      cur.at_text = String(f.at_text || '');
+    }
+  };
+
+  // ローカル → 子の順に取り込む（子の方が新しい画像を持つ場合に上書きされる）
+  for (let i = 0; i < local.length; i++) take(local[i]);
+  for (let i = 0; i < parsed.length; i++) {
+    const body = parsed[i];
+    if (!body || body.success === false || !Array.isArray(body.data)) continue;
+    for (let j = 0; j < body.data.length; j++) take(body.data[j]);
+  }
+
+  const out = [];
+  for (let i = 0; i < order.length; i++) out.push(byId[order[i]]);
+  // 要求したが どこにも無い児童も従来どおり枠として返す（画面の「待機中」表示用）
+  for (let i = 0; i < ids.length; i++) {
+    const sid = String(ids[i] === undefined || ids[i] === null ? '' : ids[i]).trim();
+    if (!sid || byId[sid]) continue;
+    out.push({ student_id: sid, live_watch: false, at: 0, at_text: '', data_url: '', has_image: false });
+  }
+  return out;
+}
+
+/**
+ * 親GAS側: 使用枠を「親の台帳」＋「子の台帳」の和集合で返す。
+ *   ・used              … ユニーク端末数（和集合）
+ *   ・teacher_used      … その教員が見ている端末数（和集合）
+ *   ・students          … 視聴中の児童ID（和集合。管理画面の整合確認用）
+ *   設定（上限・タイムアウト・停止中）は親の値が正（子へ伝播済み）なので親を使う。
+ */
+function liveWatchStatusSharded(teacher) {
+  const local = liveWatchStatus(teacher);
+  const urls = liveWatchShardTargetUrls_(teacher);
+  if (!urls.length) return local;   // 単独モード（従来どおり）
+
+  const email = liveWatchTeacherKey_(teacher);
+  const cacheKey = liveWatchShardKey_(urls, email);
+  let mine = [];
+  let childUsed = 0;
+
+  // 短時間キャッシュ（管理画面のポーリングで子GASを叩き過ぎない）
+  let cached = null;
+  try {
+    const c = liveWatchCache_();
+    if (c) {
+      const raw = c.get(cacheKey);
+      if (raw) {
+        const o = JSON.parse(raw);
+        if (o && typeof o === 'object') cached = o;
+      }
+    }
+  } catch (e) { cached = null; }
+
+  if (cached) {
+    mine = Array.isArray(cached.teacher_students) ? cached.teacher_students : [];
+    childUsed = Number(cached.used) || 0;
+  } else {
+    let secret = '';
+    try { secret = String(shardConfigCached().sec || ''); } catch (e) { secret = ''; }
+    let parsed = [];
+    try {
+      parsed = liveWatchShardPost_(urls, {
+        action: LIVE_WATCH_SHARD_STATUS,
+        shard_secret: secret,
+        teacher_email: email
+      });
+    } catch (eS) {
+      parsed = [];
+    }
+    for (let i = 0; i < parsed.length; i++) {
+      const b = parsed[i];
+      if (!b || b.success === false) continue;
+      childUsed = Math.max(childUsed, Number(b.used) || 0);
+      if (Array.isArray(b.teacher_students)) mine = mine.concat(b.teacher_students);
+    }
+    try {
+      const c = liveWatchCache_();
+      if (c) {
+        c.put(cacheKey, JSON.stringify({ used: childUsed, teacher_students: mine }),
+          LIVE_WATCH_SHARD_STATUS_TTL_SEC);
+      }
+    } catch (e) { /* キャッシュ不可でも結果は返す */ }
+  }
+
+  // 和集合（親・子で同じ児童が重複しても 1 台と数える）
+  const union = {};
+  const localStudents = Array.isArray(local.students) ? local.students : [];
+  for (let i = 0; i < localStudents.length; i++) {
+    const sid = String(localStudents[i] || '').trim();
+    if (sid) union[sid] = true;
+  }
+  const used = Math.max(Number(local.used) || 0, childUsed, Object.keys(union).length);
+  const teacherUnion = {};
+  const localMine = (function () {
+    // 親の台帳で その教員が見ている児童ID（返り値には無いので台帳から拾う）
+    try {
+      const st = liveWatchSettings_();
+      const now = liveWatchNowMs_();
+      const p = liveWatchPrune_(liveWatchReadPool_(), now, st.timeout_sec);
+      const out = [];
+      const keys = Object.keys(p.reg.students);
+      for (let i = 0; i < keys.length; i++) {
+        const e = p.reg.students[keys[i]] || {};
+        const ts = (e.teachers && typeof e.teachers === 'object') ? e.teachers : {};
+        if (email && liveWatchSessionActive_(ts, email, now, st.timeout_sec)) out.push(keys[i]);
+      }
+      return out;
+    } catch (e) { return []; }
+  })();
+  for (let i = 0; i < localMine.length; i++) teacherUnion[localMine[i]] = true;
+  for (let i = 0; i < mine.length; i++) {
+    const sid = String(mine[i] || '').trim();
+    if (sid) teacherUnion[sid] = true;
+  }
+
+  const merged = local;
+  merged.used = Math.min(MAX_LIVE_WATCH_DEVICES, used);
+  merged.remaining = Math.max(0, MAX_LIVE_WATCH_DEVICES - merged.used);
+  merged.full = merged.used >= MAX_LIVE_WATCH_DEVICES;
+  merged.teacher_used = Object.keys(teacherUnion).length;
+  merged.students = Object.keys(union);
+  merged.shard = { children: urls.length, child_used: childUsed, single_mode: false };
+  return merged;
 }
 
 /**
@@ -9106,7 +9560,8 @@ function api_liveWatchStatus(token) {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
-    return liveWatchStatus(currentTeacher);
+    // 【R57】R41分散時は子GASの使用枠と和集合を取る（単独モードは従来どおり）。
+    return liveWatchStatusSharded(currentTeacher);
   } catch (err) {
     return { success: false, error: err.toString() };
   }
@@ -9118,7 +9573,8 @@ function api_liveWatchStart(token, studentIds) {
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
     const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
-    return liveWatchApplyBatch(currentTeacher, scoped.ids, 'start');
+    // 【R57】親の台帳＋子GASの台帳の両方に登録する（子のハートビートが live_watch:true になる）。
+    return liveWatchApplyBatchSharded(currentTeacher, scoped.ids, 'start');
   } catch (err) {
     return { success: false, error: err.toString() };
   }
@@ -9129,7 +9585,7 @@ function api_liveWatchExtend(token, studentIds) {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
-    return liveWatchApplyBatch(currentTeacher, studentIds, 'extend');
+    return liveWatchApplyBatchSharded(currentTeacher, studentIds, 'extend');
   } catch (err) {
     return { success: false, error: err.toString() };
   }
@@ -9140,7 +9596,7 @@ function api_liveWatchStop(token, studentIds) {
     const auth = verifyToken(token);
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
-    return liveWatchApplyBatch(currentTeacher, studentIds, 'stop');
+    return liveWatchApplyBatchSharded(currentTeacher, studentIds, 'stop');
   } catch (err) {
     return { success: false, error: err.toString() };
   }
@@ -9152,7 +9608,8 @@ function api_liveWatchFrames(token, studentIds) {
     if (!auth.valid) return { success: false, need_auth: true, error: '認証セッションが無効です' };
     const currentTeacher = resolveCurrentTeacher(auth.teacher);
     const scoped = scopeStudentIdsForTeacher(studentIds, currentTeacher);
-    return { success: true, data: liveWatchGetFrames(scoped.ids), ids: scoped.ids };
+    // 【R57】端末は子GASへ live_frame を送るため、子GASからも並列取得してマージする。
+    return { success: true, data: liveWatchGetFramesSharded(scoped.ids, currentTeacher), ids: scoped.ids };
   } catch (err) {
     return { success: false, error: err.toString() };
   }
